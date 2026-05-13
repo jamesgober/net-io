@@ -1,0 +1,46 @@
+[package]
+name = "net-io"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+readme = "README.md"
+license = "Apache-2.0"
+
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+description = "Purpose-built network IO substrate for Rust. TCP / QUIC listeners, connection lifecycle, framing-over-stream, session state, request multiplexing, backpressure, timeouts. Built for enterprise-grade high-throughput servers (HiveDB and friends)."
+
+keywords = [
+    "network",
+    "tcp",
+    "quic",
+    "server",
+    "io"
+]
+
+categories = [
+    "network-programming",
+    "asynchronous"
+]
+
+documentation = "https://docs.rs/net-io"
+repository    = "https://github.com/jamesgober/net-io"
+homepage      = "https://github.com/jamesgober/net-io"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[features]
+default = ["std"]
+std = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
