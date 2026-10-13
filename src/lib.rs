@@ -1,16 +1,39 @@
-//! Purpose-built network IO substrate for Rust. TCP / QUIC listeners, connection lifecycle, framing-over-stream, session state, request multiplexing, backpressure, timeouts. Built for enterprise-grade high-throughput servers (HiveDB and friends).
+//! # net_io
 //!
-//! # Status
+//! The network IO substrate for the `-net` and `-io` crates: the entrance
+//! and exit every service shares. It owns listeners and sockets (TCP, UDP,
+//! Unix domain sockets, Windows named pipes), the lifecycle of each
+//! connection, the limits and timeouts that keep a peer from pinning the
+//! server, graceful drain, the PROXY protocol for running behind a reverse
+//! proxy, and the seams that TLS and the connection gate plug into.
 //!
-//! This crate is in early scaffolding. The public API is not yet
-//! defined. See [the repository](https://github.com/jamesgober/net-io)
-//! and `.dev/ROADMAP.md` for the milestone plan.
+//! It is protocol-free. It moves bytes and knows who is on the other end of
+//! a connection; it does not know whether those bytes are HTTP, a database
+//! wire protocol, or Raft messages. Protocol engines such as `http-net` and
+//! `ws-net` sit on top of it.
+//!
+//! ## Status
+//!
+//! Scaffold. The design is written down in `dev/PLAN.md` and the milestone
+//! schedule in `dev/ROADMAP.md` (both in the
+//! [repository](https://github.com/jamesgober/net-io)); the public API
+//! begins with `0.2.0`.
 
 #![doc(html_root_url = "https://docs.rs/net-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod tests {
+    use super::VERSION;
+
+    #[test]
+    fn version_matches_manifest() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(VERSION.split('.').count(), 3, "expected MAJOR.MINOR.PATCH");
+    }
+}

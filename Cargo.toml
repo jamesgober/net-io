@@ -1,46 +1,69 @@
+# =============================================================================
+#  R E P S   ·   net-io
+# =============================================================================
 [package]
-name = "net-io"
+name    = "net-io"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
 readme = "README.md"
-license = "Apache-2.0"
 
-authors = [
-    "James Gober <me@jamesgober.com>"
-]
+# Description
+description = "Network IO substrate for Rust: TCP, UDP and local-socket listeners, connection lifecycle, limits, graceful drain, PROXY protocol, and a TLS seam. Protocol-free and dependency-free."
 
-description = "Purpose-built network IO substrate for Rust. TCP / QUIC listeners, connection lifecycle, framing-over-stream, session state, request multiplexing, backpressure, timeouts. Built for enterprise-grade high-throughput servers (HiveDB and friends)."
+# Keywords (5 max)
+keywords = ["network", "tcp", "udp", "server", "socket"]
 
-keywords = [
-    "network",
-    "tcp",
-    "quic",
-    "server",
-    "io"
-]
+# Categories
+categories = ["network-programming"]
 
-categories = [
-    "network-programming",
-    "asynchronous"
-]
-
-documentation = "https://docs.rs/net-io"
-repository    = "https://github.com/jamesgober/net-io"
+# Links
 homepage      = "https://github.com/jamesgober/net-io"
+repository    = "https://github.com/jamesgober/net-io"
+documentation = "https://docs.rs/net-io"
+
+# Authors
+authors = ["James Gober <me@jamesgober.com>"]
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[dependencies]
+[lib]
+name = "net_io"
+path = "src/lib.rs"
 
+
+# FEATURE FLAGS
+# #################################
+[features]
+default = []
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+# None. Sockets, socket options, the drivers, and the PROXY protocol parser
+# are all in this crate. TLS plugs in through a trait from a separate crate.
+
+
+# DEV DEPENDENCIES
+# #################################
 [dev-dependencies]
 
-[features]
-default = ["std"]
-std = []
 
+# RELEASE PROFILE
+# #################################
 [profile.release]
-opt-level = 3
-lto = "thin"
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"

@@ -1,44 +1,19 @@
-# Development
-/dev
+# Development (dev/ is committed; .dev/ and .claude/ stay local)
 /.dev
-DIRECTIVE.md
-DIRECTIVES.md
-PLANNING.md
+/.claude
 
-# Rust/Cargo Build Artifacts
+# Rust / Cargo
 /target/
 **/*.rs.bk
 
-# Dependencies
-/node_modules/
-/vendor/
-
-# Editor & OS Junk
+# Editor & OS junk
 /.vscode
 .DS_Store
-.Spotlight-V100
-.Trash-*
-.Trashes
-.directory
-.LSOverride
-.AppleDouble
-Desktop.ini
-ehthumbs.db
 Thumbs.db
-$RECYCLE.BIN/
+Desktop.ini
 
-# Environment & Secrets
+# Secrets
 .env
-/config/
-storage/*.key
-Homestead.yaml
-Homestead.json
-/config.json
 
-# Sublime Text & Other IDEs
-*.tmlanguage.cache
-*.tmPreferences.cache
-*.stTheme.cache
-*.sublime-workspace
-*.sublime-project
-._*
+# Libraries do not commit the lockfile
+Cargo.lock

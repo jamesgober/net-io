@@ -1,3 +1,2 @@
-# clippy configuration for net-io
 avoid-breaking-exported-api = true
-msrv = "1.75"
+msrv = "1.85"
