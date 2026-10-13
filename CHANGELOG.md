@@ -11,6 +11,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `dev/PLAN.md`: the security crates now have names and repositories
+  (`shield-sec`, `sentinel-sec`); the stack table records which crates have
+  their own plans and adds the form crate; decisions D-010 (names), D-011
+  (the protocol-parser role), and D-012 (no home-made TLS); `rate-net` and
+  `better-bucket` are not used by bouncer-io until they are dependency-free.
+
 ---
 
 ## [0.1.0] - 2026-10-13

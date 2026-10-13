@@ -70,7 +70,7 @@ Each stage rejects as early and as cheaply as it can. An IP ban costs nanosecond
   │ customs-sec: body     │  payload matches the contract ──────────┘
   └───────────────────────┘
 
-  underneath everything: hive-shield (hardening)   watching everything: sentinel (detection)
+  underneath everything: shield-sec (hardening)   watching everything: sentinel-sec (detection)
   spine for everything: service-kernel (lifecycle, workers, events, health, shutdown)
 ```
 
@@ -113,7 +113,7 @@ Why it matters:
 | **Trusted proxies** | one `TrustedProxies` list (CIDRs) | the single source of truth; the web layer uses the same list for `X-Forwarded-For` |
 | **TLS seam** | traits a TLS engine implements; access to the raw ClientHello | TLS without a TLS dependency in this crate; fingerprinting for the gate |
 | **Gate seam** | admission hook at accept, egress hook before every write, kill handle per connection | how bouncer-io enforces without net-io depending on it |
-| **Events** | an event sink trait (opened, admitted, refused, limit hit, closed with reason) | logs, metrics, service-kernel, and sentinel subscribe without net-io depending on them |
+| **Events** | an event sink trait (opened, admitted, refused, limit hit, closed with reason) | logs, metrics, service-kernel, and sentinel-sec subscribe without net-io depending on them |
 
 ### 3.2 Out of scope, and where it goes
 
@@ -248,7 +248,7 @@ Per-IP and per-prefix caps live in bouncer-io, which sees every admission.
 
 - `DrainController` stops accepting, signals the protocol layer to finish in-flight work (HTTP: `Connection: close` on the next response), and force-kills what remains at the deadline.
 - Listener hand-off: a new process inherits the listening sockets (systemd `LISTEN_FDS` on Linux, descriptor passing over a Unix socket, handle duplication on Windows), starts accepting, and the old process drains. No port is ever closed during a deploy.
-- Bind privileged ports (80, 443) first, then drop privileges (hive-shield) before reading any untrusted byte.
+- Bind privileged ports (80, 443) first, then drop privileges (shield-sec) before reading any untrusted byte.
 
 ### 5.9 UDP specifics
 
@@ -269,7 +269,7 @@ Per-IP and per-prefix caps live in bouncer-io, which sees every admission.
 
 - `NetError` is `#[non_exhaustive]`, with one variant per distinct failure and the OS error kept as a source.
 - `CloseReason` on every close.
-- `EventSink` receives typed events. A no-op sink costs nothing; log-io, metrics-lib, service-kernel's event bus, and sentinel each implement it without net-io depending on them.
+- `EventSink` receives typed events. A no-op sink costs nothing; log-io, metrics-lib, service-kernel's event bus, and sentinel-sec each implement it without net-io depending on them.
 
 ---
 
@@ -302,10 +302,10 @@ net-io is the first and last thing every connection touches, so it owns these gu
 | UDP spoofing and amplification | no trust before proof of reachability, no amplification, per-source budgets |
 | data leaving a revoked connection | mandatory egress check before every write; wipe and replace; abortive close |
 | local socket hijack | socket file permissions, peer credentials |
-| privilege | bind first, then drop privileges (with hive-shield) |
+| privilege | bind first, then drop privileges (with shield-sec) |
 | descriptor leaks | every close path tested; leak tests in CI |
 
-Policy (who is banned, how scores work, what counts as suspicious) belongs to bouncer-io and sentinel. Their design is kept in a private document, outside this repository.
+Policy (who is banned, how scores work, what counts as suspicious) belongs to bouncer-io and sentinel-sec; see their own plans.
 
 ---
 
@@ -325,7 +325,7 @@ Policy (who is banned, how scores work, what counts as suspicious) belongs to bo
 | `wire-codec` | 1.0.0 | binary framing for non-HTTP protocols |
 | `pack-io` | 1.0.1 | binary serialization with schema evolution |
 | `rpc-io` | 0.2.0 | JSON-RPC 2.0 engine |
-| `rate-net`, `better-bucket` | 1.0.0 | rate limiting inside bouncer-io |
+| `rate-net`, `better-bucket` | 1.0.0 | rate limiting; not used by bouncer-io until they drop their third-party dependencies (bouncer-io O-1) |
 | `clock-lib` | 1.0.0 | monotonic time, mockable for deterministic timeout tests |
 | `id-forge` | | request and session ids |
 | `crypt-io`, `key-vault` | 1.1.0 | hashing, AEAD, Argon2id, key storage (gate-net, sessions) |
@@ -338,27 +338,33 @@ Policy (who is banned, how scores work, what counts as suspicious) belongs to bo
 | `jsonx-lib` | | strict JSON for customs-sec |
 | `path-lib` | 0.1.0 | hardened path joining (uploads, static files) |
 | `unicode-lang` | | normalization and identifier checks in customs-sec |
-| `sandbox-sec` | stub | process sandboxing for hive-shield |
+| `sandbox-sec` | stub | process sandboxing mechanisms under shield-sec |
 
 ### 8.3 Crates to build or finish
+
+Each crate below that has a repository carries its own `dev/PLAN.md`; this table only places it in the stack.
 
 | Crate | Status | Purpose |
 |---|---|---|
 | **net-io** | this crate | transport substrate |
-| **bouncer-io** | stub | the door: ban list, caps, rates, in-flight revocation, egress wipe-and-eject |
-| **tls-net** | new | adapter from rustls to net-io's TLS seam (rustls is one of the few accepted third-party crates) |
+| **bouncer-io** | repo, plan written | the door: ban memory, in-flight revocation, egress wipe-and-eject |
+| **customs-sec** | repo, plan written | contract inspection, inbound and outbound |
+| **gate-net** | repo, plan written | authentication and sessions (protocol-free) |
+| **gate-sec** | repo, plan written | authorization: permissions and policy |
+| **shield-sec** | repo (private), plan written | hardening, inner firewalls, data protection, containment |
+| **sentinel-sec** | repo (private), plan written | detection, patrol, risk scoring; enforces through bouncer-io and shield-sec |
+| **sandbox-sec** | repo, plan written | sandbox mechanisms under shield-sec |
+| **tls-net** | new | adapter from rustls to net-io's TLS seam; we do not write TLS (D-003) |
 | **fcgi-net** | new | FastCGI engine, sans-IO |
-| **gate-net** | new | authentication and sessions (protocol-free) |
-| **gate-sec** | new | authorization: permissions and policy |
-| **customs-sec** | new | contract inspection, inbound and outbound |
-| **hive-shield** | new | hardening layer (privileges, sandbox, secrets, lockdown modes) |
-| sentinel (name open) | new | detection, patrol, risk scoring; enforces through bouncer-io and hive-shield |
+| form crate (name open) | new | `x-www-form-urlencoded` and streaming multipart parsing with budgets |
 | users core (name open) | new | user records; consumes and bridges gate-net and gate-sec |
-| web layer | new | router, handlers, middleware, ingress adapters, render hand-off (a third-party render crate at first, loosely coupled, replaced by our own) |
+| web layer | new | router, handlers, middleware, ingress adapters, static files, render hand-off (a third-party render crate at first, loosely coupled, replaced by our own) |
 | **quic-net** | later | QUIC on net-io's UDP |
 | **dns-net** | later | resolver |
 
-Names checked as free on crates.io on 2026-10-13: gate-net, gate-sec, customs-sec, hive-shield, tls-net, fcgi-net, quic-net, dns-net, bouncer-net. `sentinel` is taken; `sentinel-sec` is free.
+The full deliverables map for the web and service stack, including the smaller supporting crates (URL handling, compression, encodings, SMTP, jobs), is kept in the portfolio's private strategy notes.
+
+Names checked as free on crates.io on 2026-10-13: gate-net, gate-sec, customs-sec, shield-sec, sentinel-sec, tls-net, fcgi-net, quic-net, dns-net, bouncer-net. `sentinel` is taken.
 
 ### 8.4 Dependency hygiene elsewhere
 
@@ -408,7 +414,6 @@ These are James's calls. Each is written so it can be answered with one line.
 | O-1 | REPS says "MUST use tokio". net-io uses its own drivers and no async runtime. Keep REPS as is and record net-io as an exception, or change the REPS rule portfolio-wide to "no rented runtime"? | change REPS portfolio-wide, since http-net and ws-net already follow the no-runtime rule |
 | O-2 | Hosting: does the cPanel server have WHM/root, or is it shared hosting? | if shared, FastCGI moves into the first run |
 | O-3 | Publish `0.1.0` to crates.io now to claim the `net-io` name? | yes; the name is free today |
-| O-4 | Name for the detection crate (sentinel). `sentinel` is taken on crates.io. | `sentinel-sec` |
 | O-5 | Name for the users core that bridges gate-net and gate-sec. | open |
 
 ---
@@ -423,7 +428,7 @@ Ideas worth keeping that are not scheduled yet. Each moves into the roadmap with
 - **TCP Fast Open and `TCP_DEFER_ACCEPT`:** fewer round trips; no worker woken until data arrives.
 - **Reverse-proxy client mode (`proxy-net`):** our own server forwarding to backends, for the "all options" goal.
 - **HTTP/2 and HTTP/3 engines** on top of net-io and quic-net.
-- **Connection fingerprint library:** ClientHello (JA4-style) and TCP-level fingerprints shared by bouncer-io and sentinel.
+- **Connection fingerprint library:** ClientHello (JA4-style) and TCP-level fingerprints shared by bouncer-io and sentinel-sec.
 
 ---
 
@@ -439,4 +444,7 @@ Ideas worth keeping that are not scheduled yet. Each moves into the roadmap with
 | D-006 | 2026-10-13 | net-io defines gate, TLS, and event traits; implementers depend on net-io, never the reverse | one-way dependencies; protocol-free rule |
 | D-007 | 2026-10-13 | Mandatory egress check before every socket write, with wipe-and-replace and abortive close | no byte leaves a revoked connection even if a handler skips its checkpoints |
 | D-008 | 2026-10-13 | Template aligned with http-net: edition 2024, MSRV 1.85, `Apache-2.0 OR MIT`, `dev/` committed and `.dev/` private | portfolio consistency; the old scaffold (edition 2021, MSRV 1.75, Apache only) was never published |
-| D-009 | 2026-10-13 | Naming: `gate-net` for authentication and sessions, `gate-sec` for authorization, `bouncer-io` for the door, `customs-sec` for contract inspection, `hive-shield` for hardening | James's naming; network gate = who you are, security gate = what you may do |
+| D-009 | 2026-10-13 | Naming: `gate-net` for authentication and sessions, `gate-sec` for authorization, `bouncer-io` for the door, `customs-sec` for contract inspection | James's naming; network gate = who you are, security gate = what you may do |
+| D-010 | 2026-10-13 | `shield-sec` (was "hive-shield") and `sentinel-sec` (resolves O-4; `sentinel` is taken) | public crate names in the `-sec` family |
+| D-011 | 2026-10-13 | "Protocol parser" in the request path is a role, not a crate: `http-net`, `ws-net`, `fcgi-net`, `rpc-io`, and each service's own wire format fill it | each protocol keeps its own engine above the protocol-free layers |
+| D-012 | 2026-10-13 | We never write our own TLS; `tls-net` stays a thin adapter | TLS safety comes from years of audits, constant-time code, and side-channel work; a home-made TLS would be the weakest link in a security-first stack |
