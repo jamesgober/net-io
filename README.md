@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). No dependencies: OS calls the standard library does not expose go through the crate's own fenced FFI layer.
     </p>
     <blockquote>
-        <strong>Status: scaffold (<code>0.1.0</code>).</strong> No functional code yet. The design is written down in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a> and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>; the public API is locked in <code>0.2.0</code>.
+        <strong>Status: design lock (<code>0.2.0</code>).</strong> No functional code yet. The public API is locked in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. <code>0.3.0</code> brings TCP with the blocking driver.
     </blockquote>
 </div>
 
@@ -41,13 +41,34 @@
 | Area | Planned |
 |---|---|
 | Transports | TCP, UDP, Unix domain sockets (Unix and Windows), Windows named pipes |
-| Socket options | `TCP_NODELAY`, keepalive tuning, `SO_REUSEADDR`, `SO_REUSEPORT`, `IPV6_V6ONLY`, buffer sizes, linger |
-| Connections | a never-reused `ConnectionId`, `ConnInfo` (local, peer, real peer, transport, timestamps), lifecycle states, a `CloseReason` on every close |
-| Limits | global connection cap, accept backlog, handshake, idle, read, write, and total deadlines, minimum transfer rate, bounded buffers |
-| Drivers | a bounded blocking worker pool first; its own reactor (epoll, kqueue, IOCP) second |
+| Socket options | `TCP_NODELAY`, keepalive tuning, linger, buffer sizes, `SO_REUSEADDR` / `SO_EXCLUSIVEADDRUSE`, `SO_REUSEPORT`, `IPV6_V6ONLY`, and the server options `std` does not expose |
+| Connections | a never-reused `ConnectionId`, `ConnectionInfo` (endpoints, real client behind a trusted proxy, transport, TLS facts), one `CloseReason` on every close |
+| Limits | global, per-listener, and per-source caps; handshake, idle, read, write, and total deadlines; a minimum transfer rate against slowloris and slow-read; bounded buffers and queues |
+| Drivers | a bounded blocking worker pool (`0.3.0`); its own reactor on epoll, kqueue, and IOCP (`0.5.0`); one completion-shaped interface |
+| Sessions | sans-IO protocol engines driven the same way on every driver, with zero-copy input and an O(1) buffer hand-off |
 | Behind a proxy | PROXY protocol v1 and v2, honoured only from configured trusted proxies |
-| Restarts | graceful drain; inherited listeners (`LISTEN_FDS`) and listener hand-off |
-| Seams | admission and egress hooks with a kill handle for a connection gate; a sans-IO TLS seam with ClientHello capture; an event sink for logs and metrics |
+| Restarts | a door that opens last and closes first, graceful drain, systemd socket activation, FastCGI descriptor 0, listener hand-off between processes |
+| Seams | a gate (admission before any byte is read, a check before every write, kill from any thread), a sans-IO TLS seam, an event sink, a control line, a completion queue for offloaded work |
+
+The planned simplest use (from `0.3.0`; the full API is in [`docs/API.md`](./docs/API.md)):
+
+```rust
+fn main() -> Result<(), net_io::NetError> {
+    // Echo server on a bounded worker pool with every default limit applied.
+    let server = net_io::serve("127.0.0.1:7000", |conn| {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = conn.recv(&mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            conn.send_all(&buf[..n])?;
+        }
+    })?;
+    server.wait_for_stop(); // runs until server.handle().request_stop(), then drains
+    Ok(())
+}
+```
 
 <br>
 
@@ -71,8 +92,8 @@ See <a href="./dev/DIRECTIVES.md"><code>dev/DIRECTIVES.md</code></a> for enginee
     <h2>License</h2>
     <p>Licensed under either of</p>
     <ul>
-        <li><b>Apache License, Version 2.0</b> &mdash; <a href="./LICENSE-APACHE">LICENSE-APACHE</a></li>
-        <li><b>MIT License</b> &mdash; <a href="./LICENSE-MIT">LICENSE-MIT</a></li>
+        <li><b>Apache License, Version 2.0</b>: <a href="./LICENSE-APACHE">LICENSE-APACHE</a></li>
+        <li><b>MIT License</b>: <a href="./LICENSE-MIT">LICENSE-MIT</a></li>
     </ul>
     <p>at your option.</p>
 </div>

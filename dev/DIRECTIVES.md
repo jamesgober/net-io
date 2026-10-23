@@ -1,4 +1,4 @@
-# net-io &mdash; Engineering Directives
+# net-io - Engineering Directives
 
 > Engineering standards and the definition of done for this project. Read alongside `REPS.md` (root, authoritative), [`PLAN.md`](./PLAN.md) (design and decisions), and [`ROADMAP.md`](./ROADMAP.md) (current phase). If anything here conflicts with `REPS.md`, `REPS.md` wins, except where `PLAN.md` records an approved exception.
 
@@ -19,7 +19,7 @@ net-io owns sockets, connection lifecycle, limits and timeouts, drain, the PROXY
 ## 2. Engineering law (non-negotiable)
 
 - **Ours, not rented.** No third-party runtime dependency. OS calls `std` lacks go through our own FFI declarations in `sys/`. Dev-only test tooling (`criterion`, `proptest`) is allowed.
-- **Protocol-free.** Nothing in this crate knows the format of the bytes it carries. Hooks are traits defined here and implemented elsewhere; this crate never depends on its implementers.
+- **Protocol-free.** Nothing in this crate knows the format of the bytes it carries. Hooks (the gate, the TLS seam, the event sink, the control line) are traits defined here and implemented elsewhere; this crate never depends on its implementers.
 - **Unsafe is fenced.** `unsafe` only inside `sys/`, every block with a `// SAFETY:` comment stating the invariants, how they are established, and the platform contract (man page or Microsoft documentation) it relies on. Everything else is `#![deny(unsafe_code)]`. Until `sys/` exists the crate is `#![forbid(unsafe_code)]`.
 - **Hostile-input hardening.** Every peer may be adversarial: explicit budgets for bytes, time, and counts, checked before the resource is committed; no reachable panics; fail closed.
 - **Performance.** Peak is the baseline: allocation-free hot paths, no lock on the accept or write path that a lock-free design can avoid, no "faster" claim without `criterion` numbers at realistic scale.
@@ -46,13 +46,15 @@ net-io owns sockets, connection lifecycle, limits and timeouts, drain, the PROXY
 
 ## 4. Project-specific invariants
 
-- No byte is read from a connection before the admission hook has allowed it.
-- No byte is written to a connection without passing the egress hook; a denied write never leaves partial output on the wire.
+- No byte is read from a connection before `Gate::admit` has allowed it.
+- No byte is written to a connection without passing `Gate::check` first; a denial never mixes denial bytes into a partially sent response (it resets instead).
 - Every connection ends with exactly one closed event carrying a `CloseReason`.
 - A PROXY header is honoured only from a peer in `TrustedProxies`; when one is required and missing, the connection is refused.
 - Every buffer, queue, and wait is bounded; limits are checked before allocation.
 - Descriptor and handle counts return to baseline after every connection closes, on every close path.
 - `ConnectionId`s are never reused within a process.
+- The public API is exactly `docs/API.md`; a name or signature changes only with a decision-log entry in `PLAN.md`.
+- `unsafe` appears only under `src/sys/`, and every OS function, constant, and struct it declares is listed in `SYS-SURFACE.md`.
 
 ---
 
