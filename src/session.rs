@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::buf::{Buffer, BufferPool};
 use crate::completer::Completer;
@@ -643,6 +643,30 @@ impl SessionContext<'_> {
     /// The deadline for the current exchange (`None` clears it).
     pub fn set_exchange_deadline(&mut self, at: Option<Instant>) {
         self.link.set_exchange_deadline(at);
+    }
+
+    /// Overrides this connection's idle timeout from its next wait for an
+    /// exchange on; `None` restores the listener's limit. For example, a
+    /// protocol shortens keep-alive while the worker pool is nearly full.
+    /// Values below the timer tick are raised to one tick.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use net_io::{Input, Session, SessionContext, Step};
+    ///
+    /// struct KeepAlive;
+    /// impl Session for KeepAlive {
+    ///     fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+    ///         let n = input.bytes().len();
+    ///         input.consume(n);
+    ///         let short = (cx.pressure() > 0.75).then_some(Duration::from_secs(2));
+    ///         cx.set_idle_timeout(short);
+    ///         Step::Write
+    ///     }
+    /// }
+    /// ```
+    pub fn set_idle_timeout(&mut self, timeout: Option<Duration>) {
+        self.link.set_idle_timeout(timeout);
     }
 
     /// Whether drain started: finish the current exchange, then close.

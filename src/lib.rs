@@ -94,6 +94,7 @@ mod tcp;
 mod testing;
 mod time;
 mod tls;
+mod trusted;
 
 /// Fault injection for net-io's own tests, compiled only with `--cfg net_io_shim`.
 /// Not part of the public API and not covered by semver.
@@ -138,6 +139,7 @@ pub use tls::{
     NoTls, NoTlsSession, TlsAcceptor, TlsCloseKind, TlsError, TlsEvent, TlsFailure, TlsInfo,
     TlsProgress, TlsSession,
 };
+pub use trusted::TrustedProxies;
 
 /// Crate version string, populated by Cargo at build time.
 ///

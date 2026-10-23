@@ -85,6 +85,8 @@ pub(crate) struct Link {
     auto_phase: bool,
     /// Bytes went out since the last bytes came in.
     replied: bool,
+    /// The idle timeout from the limits, restored when an override is cleared.
+    base_idle: Duration,
 }
 
 impl Link {
@@ -128,6 +130,7 @@ impl Link {
             likely_more: false,
             auto_phase: phase == Phase::Idle,
             replied: false,
+            base_idle: limits.idle_timeout,
         };
         if phase == Phase::Receiving {
             link.rate_in.activate(now);
@@ -185,11 +188,18 @@ impl Link {
         let now = self.now();
         let in_active = self.rate_in.is_active();
         self.limits = limits;
+        self.base_idle = limits.idle_timeout;
         self.rate_in = Rate::new(limits.min_rate, now);
         self.rate_out = Rate::new(limits.min_rate, now);
         if in_active {
             self.rate_in.activate(now);
         }
+    }
+
+    /// This connection's idle timeout from its next idle wait on (`None`: the
+    /// limits' value again). At least one tick.
+    pub(crate) fn set_idle_timeout(&mut self, timeout: Option<Duration>) {
+        self.limits.idle_timeout = timeout.map_or(self.base_idle, |t| t.max(self.limits.tick));
     }
 
     pub(crate) fn killed(&self) -> Option<KillReason> {

@@ -713,7 +713,7 @@ impl TrustedProxies {
 }
 ```
 
-The one list of proxies whose claims about the client address are believed: PROXY headers here, and `X-Forwarded-For` / `Forwarded` in the web layer, which should use the same value. Keep it minimal: a trusted proxy can claim any client address. P0, Tier 1, `0.4.0`; `contains` under 20 ns for 16 blocks [est.], no allocation. The lookup is a binary search over IPv4 and IPv6 blocks kept separately.
+The one list of proxies whose claims about the client address are believed: PROXY headers here, and `X-Forwarded-For` / `Forwarded` in the web layer, which should use the same value. Keep it minimal: a trusted proxy can claim any client address. P0, Tier 1, `0.3.0` (moved from `0.4.0`, D-081: serve-net's 0.3 takes one for `X-Forwarded-For`); `contains` under 20 ns for 16 blocks [est.], no allocation. The lookup is a binary search over IPv4 and IPv6 blocks kept separately.
 
 Errors: as `Cidr::parse`, plus `TooMany { max: 1024 }`.
 
@@ -1430,6 +1430,7 @@ impl SessionContext<'_> {
     pub fn now(&self) -> Instant;                         // the worker's clock, read once per loop iteration
     pub fn set_phase(&mut self, phase: Phase);
     pub fn set_exchange_deadline(&mut self, at: Option<Instant>);
+    pub fn set_idle_timeout(&mut self, timeout: Option<Duration>);   // this connection, from its next idle wait; None: the limit again
     pub fn draining(&self) -> bool;                        // finish the current exchange, then close
     pub fn pressure(&self) -> f32;                         // 0.0 to 1.0; 1.0 under ControlState::Shed
     pub fn kill_handle(&self) -> KillHandle;
@@ -1441,7 +1442,7 @@ impl SessionContext<'_> {
 }
 ```
 
-Everything a session may touch, scoped to one call. `pressure` is the fraction of busy workers (blocking driver) or of `max_connections` in use (reactor); a protocol layer uses it to stop offering keep-alive above about 0.9. `grow_input` moves the unconsumed input into a larger buffer, up to the maximum read class (`LimitsBuilder::read_class`); above it the error is `Limit { which: ReadBuffer }`. Each method costs under 5 ns [est.]. P0 (`pressure`, `grow_input` P1), Tier 3, `0.3.0`.
+Everything a session may touch, scoped to one call. `pressure` is the fraction of busy workers (blocking driver) or of `max_connections` in use (reactor); a protocol layer uses it to stop offering keep-alive above about 0.9. `grow_input` moves the unconsumed input into a larger buffer, up to the maximum read class (`LimitsBuilder::read_class`); above it the error is `Limit { which: ReadBuffer }`. `set_idle_timeout` overrides the idle timeout for this connection only (for example 2 s of keep-alive while the pool is over 75% busy), raised to at least one tick; `None` restores the listener's limit (D-081). Each method costs under 5 ns [est.]. P0 (`pressure`, `grow_input`, `set_idle_timeout` P1), Tier 3, `0.3.0`.
 
 ### `Input`
 

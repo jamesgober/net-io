@@ -110,9 +110,9 @@ fn test_many_clients_concurrently() {
     let server = ServerBuilder::new()
         .listener(ListenerSpec::tcp("127.0.0.1:0"))
         .driver(DriverKind::Blocking)
-        // Headroom over the 8 clients: a closing connection holds its slot until the
-        // worker finishes it, and the next one from the same client may arrive first.
-        .workers(16)
+        // Headroom over the 8 clients (4x): a closing connection holds its slot until
+        // the worker finishes it, and the next one from the same client may arrive first.
+        .workers(32)
         .sessions(|_: &ConnectionInfo| Echo)
         .gate(AllowAll)
         .build()
@@ -509,4 +509,72 @@ fn test_peer_that_never_reads_hits_the_write_timeout() {
         server.stats()
     );
     assert_eq!(server.stats().timeouts, 1);
+}
+
+#[test]
+fn test_idle_override_applies_to_one_connection() {
+    struct Short;
+    impl Session for Short {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            cx.set_idle_timeout(Some(Duration::from_millis(100)));
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            Step::Write
+        }
+    }
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .limits(limits(|b| b.idle_timeout(Duration::from_secs(30))))
+        .sessions(|_: &ConnectionInfo| Short)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let mut c = client(addr(&server));
+    assert_eq!(round_trip(&mut c, b"x"), b"x");
+    let start = Instant::now();
+    assert!(closed_by_server(&mut c));
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "the 30 s limit applied"
+    );
+    assert!(eventually(WAIT, || server
+        .stats()
+        .closed_for(CloseReason::Idle)
+        == 1));
+}
+
+#[test]
+fn test_exchange_timeout_can_answer_then_close_gracefully() {
+    use net_io::TimeoutKind;
+    struct Slow;
+    impl Session for Slow {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            cx.set_phase(Phase::Receiving);
+            let at = cx.now() + Duration::from_millis(100);
+            cx.set_exchange_deadline(Some(at));
+            Step::Read
+        }
+        fn on_timeout(&mut self, cx: &mut SessionContext<'_>, which: TimeoutKind) -> Step {
+            assert_eq!(which, TimeoutKind::Exchange);
+            let _ = cx.output().push(b"408\n");
+            Step::Write
+        }
+        fn on_writable(&mut self, _cx: &mut SessionContext<'_>) -> Step {
+            Step::Close
+        }
+    }
+    let server = net_io::serve_sessions("127.0.0.1:0", |_: &ConnectionInfo| Slow).expect("serve");
+    let mut c = client(addr(&server));
+    c.write_all(b"GET / HTTP/1.1\r\n").expect("write");
+    let mut reply = Vec::new();
+    std::io::Read::read_to_end(&mut c, &mut reply).expect("graceful close, not a reset");
+    assert_eq!(reply, b"408\n");
+    assert!(eventually(WAIT, || server
+        .stats()
+        .closed_for(CloseReason::SessionClosed)
+        == 1));
+    assert_eq!(server.stats().closed_for(CloseReason::ExchangeDeadline), 0);
 }

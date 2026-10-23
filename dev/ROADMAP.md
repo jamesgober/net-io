@@ -48,7 +48,7 @@ Exit: a TCP echo service runs on Linux, macOS, and Windows under the blocking dr
 |---|---|
 | Tier 1 | `listen`, `connect`, `serve`, `serve_sessions`, `VERSION` |
 | Errors | `NetError` (TCP variants), `ErrorClass`, `CloseReason`, `RefusalCause`, `LimitKind`, `TimeoutKind`, `KillReason`, `Direction`, `OsErrorClass`, `ConfigReason` |
-| Addresses | `normalize`, `normalize_socket`, `Cidr`, `PrefixKey`, `PrefixPolicy`, `AddrError` |
+| Addresses | `normalize`, `normalize_socket`, `Cidr`, `PrefixKey`, `PrefixPolicy`, `AddrError`, `TrustedProxies` (moved from 0.4 for serve-net, D-081) |
 | Identity | `ConnectionId`, `ListenerId`, `WorkerId`, `Lane`, `GateTag`, `ConnectionInfo` (TCP fields, `client_addr`, `client_key`, `for_testing`), `Transport`, `Origin`, `Endpoint` (Ip) |
 | Limits | `Limits`, `LimitsBuilder` (all but `pressure`, `lane_reserve`), `MinRate`, `SizeClass` |
 | TCP | `TcpListener` (all), `TcpConnection` (all but `send_file`, `set_gate`), `ConnectOptions` (without Happy Eyeballs), `connect_host` |
@@ -73,7 +73,7 @@ Done:
 - [x] No allocation in steady-state echo (`tests/alloc.rs`); no descriptor leak over 100,000 connections (`tests/leak.rs`, CI runs the full count).
 - [x] Benchmark baselines B-2, B-7, B-13, B-14 in `docs/PERFORMANCE.md`; `docs/PLATFORM-NOTES.md` draft; examples `echo_blocking`, `echo_sessions`, `kill_and_drain`, `gate`.
 - [x] Appendix A cases mapped to their tests in `dev/EDGE-CASES.md`.
-- [x] Decisions D-062 to D-080 logged.
+- [x] Decisions D-062 to D-081 logged; `TrustedProxies` and `SessionContext::set_idle_timeout` added at serve-net's request (D-081).
 
 Moved to a later version (anti-deferral record):
 
@@ -90,11 +90,11 @@ Exit: net-io runs behind Apache and nginx over TCP and over a Unix socket with t
 | Area | Items |
 |---|---|
 | PROXY | `ProxyMode`, `ProxyVersions`, `ProxyParser`, `ProxyProgress`, `ProxyHeader`, `Tlvs`, `Tlv`, `ProxyAddress`, `ProxySsl`, `ProxyFacts`, `ProxyError`, CRC32C, server integration, `Gate::readmit`, `ConnectionInfo::real_peer` |
-| Trusted proxies | `TrustedProxies` |
+| Trusted proxies | per-listener trusted proxies for PROXY (`TrustedProxies` itself shipped in 0.3, D-081) |
 | UDP | `UdpSocket` (bind, recv/send, connect, guard, budgets, `mark_verified`), `Datagram`, `UdpOptions`, `UdpBudget` (`UdpSession` at 0.6) |
 | Unix sockets | `UnixListener`, `UnixConnection`, `LocalOptions`, `peer_credentials`, `send_descriptors`, `recv_descriptors`, `Descriptors`, `bind_atomic`, `listen_local` / `connect_local` on Unix, `ListenerSpec::unix` |
 | TLS seam | `TlsAcceptor`, `TlsSession`, `TlsProgress`, `TlsEvent`, `TlsCloseKind`, `TlsInfo`, `TlsError`, `TlsFailure`, `NoTls`, server integration; tls-net built against 0.4 in its own repository |
-| Restarts | `systemd`, `systemd_named`, `fastcgi_listener`, `InheritedListener`, `InheritError`, `ListenerHandle`, `send_listeners`, `recv_listeners`, `HandoffPeer`, `HandoffError`, `Server::release_listeners`, `ListenerSpec::adopt` |
+| Restarts | `systemd`, `systemd_named`, `fastcgi_listener`, `InheritedListener`, `InheritError`, `ListenerHandle`, `send_listeners`, `recv_listeners`, `HandoffPeer`, `HandoffError`, `Server::release_listeners`, `ListenerSpec::adopt`; `Server::add_listener` / `remove_listener` and the raw monotonic clock for `MONOTONIC_USEC` (serve-net 0.4 reload and systemd, D-081) |
 | Back-channel | `Server::adopt`, `AdoptSpec`, `AdmitStage::{Adopt, Dialed}`, `TcpConnection::set_gate` |
 | Tests | fuzz targets (PROXY, manifest, systemd environment, CIDR, trusted proxies); conformance vectors; cross-process tests; edge cases 13-17, 76-85, 90-104 |
 | Docs | `docs/SECURITY.md` draft; examples `behind_proxy.rs`, `unix_socket.rs`, `handoff_restart.rs`, `systemd_activation.rs`, `fastcgi_detect.rs`, `udp_echo.rs` |

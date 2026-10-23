@@ -94,8 +94,8 @@ impl Ring {
             let slot = &self.slots[pos & self.mask];
             let seq = slot.seq.load(Ordering::Acquire);
             let diff = seq as isize - pos as isize;
-            if diff == 0 {
-                match self.tail.compare_exchange_weak(
+            match diff.cmp(&0) {
+                std::cmp::Ordering::Equal => match self.tail.compare_exchange_weak(
                     pos,
                     pos.wrapping_add(1),
                     Ordering::Relaxed,
@@ -109,11 +109,10 @@ impl Ring {
                         return true;
                     }
                     Err(actual) => pos = actual,
-                }
-            } else if diff < 0 {
-                return false;
-            } else {
-                pos = self.tail.load(Ordering::Relaxed);
+                },
+                // The slot still holds an item the consumer has not taken: full.
+                std::cmp::Ordering::Less => return false,
+                std::cmp::Ordering::Greater => pos = self.tail.load(Ordering::Relaxed),
             }
         }
     }
@@ -137,7 +136,7 @@ impl Ring {
         Some(item)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn is_empty(&self) -> bool {
         let pos = self.head.load(Ordering::Relaxed);
         self.slots[pos & self.mask].seq.load(Ordering::Acquire) != pos.wrapping_add(1)

@@ -46,6 +46,11 @@ every limit, the gate seam, sans-IO sessions, kill, and graceful drain.
 - `ControlLine`, `SimpleControl`, `NoControl`: shed lanes, lockdown, drain,
   and stop, read with one atomic load per check.
 - `EventSink` and `Event` with coalescing of refusal floods.
+- `TrustedProxies`: the one list of proxies whose client-address claims are
+  believed, with an allocation-free binary-search lookup (brought forward
+  from `0.4.0` for serve-net).
+- `SessionContext::set_idle_timeout`: a per-connection idle timeout, for
+  example to shorten keep-alive while the worker pool is nearly full.
 - `Cidr`, `PrefixKey`, `normalize`, and the error types (`NetError` with
   `class`, `is_retryable`, and `os_error_code`, `CloseReason`,
   `RefusalCause`, and the rest).
