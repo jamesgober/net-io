@@ -267,9 +267,11 @@ mod tests {
             TrustedProxies::parse("10.0.0.1/8"),
             Err(AddrError::HostBitsSet)
         );
-        let many: String = (0..1025u32)
-            .map(|i| format!("10.{}.{}.0/24 ", i / 256, i % 256))
-            .collect();
+        let mut many = String::new();
+        for i in 0..1025u32 {
+            use std::fmt::Write;
+            let _ = write!(many, "10.{}.{}.0/24 ", i / 256, i % 256);
+        }
         assert_eq!(
             TrustedProxies::parse(&many),
             Err(AddrError::TooMany { max: 1024 })
