@@ -33,7 +33,7 @@ No hard task moved later: io_uring was "later, Linux only" in the 0.1 plan and i
 Exit: James approves `docs/API.md`; every spike has a written result; CI green.
 - [x] `docs/API.md`: every public item with signatures, behaviour, errors, cost, grade, tier, version, examples; final names (D-017); final defaults with reasons.
 - [x] `dev/SYS-SURFACE.md`: the OS functions, constants, and structs per platform, with the documentation each relies on.
-- [x] `dev/PLAN.md` rewritten from the specification; decisions D-013 to D-058 logged.
+- [x] `dev/PLAN.md` rewritten from the specification; decisions D-013 to D-060 logged.
 - [x] This roadmap rewritten.
 - [x] Gate seam shape proposed to bouncer-io for both 0.2 locks (D-018).
 - [x] TLS seam condition (X-2) checked against rustls 0.23.46: holds (D-019).
@@ -49,13 +49,13 @@ Exit: a TCP echo service runs on Linux, macOS, and Windows under the blocking dr
 | Tier 1 | `listen`, `connect`, `serve`, `serve_sessions`, `VERSION` |
 | Errors | `NetError` (TCP variants), `ErrorClass`, `CloseReason`, `RefusalCause`, `LimitKind`, `TimeoutKind`, `KillReason`, `Direction`, `OsErrorClass`, `ConfigReason` |
 | Addresses | `normalize`, `normalize_socket`, `Cidr`, `PrefixKey`, `PrefixPolicy`, `AddrError` |
-| Identity | `ConnectionId`, `ListenerId`, `WorkerId`, `Lane`, `ConnectionInfo` (TCP fields), `Transport`, `Origin`, `Endpoint` (Ip) |
+| Identity | `ConnectionId`, `ListenerId`, `WorkerId`, `Lane`, `GateTag`, `ConnectionInfo` (TCP fields, `client_addr`, `client_key`, `for_testing`), `Transport`, `Origin`, `Endpoint` (Ip) |
 | Limits | `Limits`, `LimitsBuilder` (all but `pressure`, `lane_reserve`), `MinRate`, `SizeClass` |
 | TCP | `TcpListener` (all), `TcpConnection` (all but `send_file`, `set_gate`), `ConnectOptions` (without Happy Eyeballs), `connect_host` |
-| Options | option rows graded P0/P1 (and `ttl`) for 0.3; `ListenOptions`, `ConnectionOptions`, `Keepalive`, `Linger`, `SocketOptions` |
+| Options | option rows graded P0/P1 (and `ttl`) for 0.3; `ListenOptions`, `TcpOptions`, `Keepalive`, `Linger`, `SocketOptions` |
 | Gate | `Gate` (`Accept`), `Admitted`, `Refusal`, `WriteCheck`, `Denial`, `AllowAll`, `KillHandle` |
 | Sessions | `Session`, `SessionFactory`, `Step`, `Phase`, `SessionContext`, `Input` (with `swap`), `Output` (without `push_file`), `SwapError`, `OutputFull` |
-| Server | `ServerBuilder` (TCP listeners, `handler`, `sessions`), `ListenerSpec::tcp`, `Server` (door, drain, shutdown, wait, handle, stats), `ServerHandle`, `DrainReport`, `Stats`, `ListenerInfo`, `DoorState` |
+| Server | `ServerBuilder` (TCP listeners, `handler`, `sessions`), `ListenerSpec::tcp`, `Server` (door, drain, shutdown, `wait_for_stop`, handle, stats), `ServerHandle`, `DrainReport`, `Stats`, `ListenerInfo`, `DoorState` |
 | Control, events | `ControlLine`, `ControlState`, `NoControl`, `SimpleControl`, `EventSink`, `NoopSink`, `Event` (TCP events, coalescing) |
 | Completer | `Completer`, `PostError` (blocking driver) |
 | Buffers, time | `Buffer`, `BufferPool`, `PoolStats`, `Clock`, `MonotonicClock`, `ManualClock`, `DriverKind` |
@@ -69,10 +69,10 @@ Exit: net-io runs behind Apache and nginx over TCP and over a Unix socket with t
 
 | Area | Items |
 |---|---|
-| PROXY | `ProxyMode`, `ProxyVersions`, `ProxyParser`, `ProxyProgress`, `ProxyHeader`, `Tlvs`, `Tlv`, `ProxyAddress`, `ProxySsl`, `ProxyFacts`, `ProxyError`, CRC32C, server integration, `Gate::readmit`, `ConnectionInfo::real_peer`, `client_addr`, `client_key` |
+| PROXY | `ProxyMode`, `ProxyVersions`, `ProxyParser`, `ProxyProgress`, `ProxyHeader`, `Tlvs`, `Tlv`, `ProxyAddress`, `ProxySsl`, `ProxyFacts`, `ProxyError`, CRC32C, server integration, `Gate::readmit`, `ConnectionInfo::real_peer` |
 | Trusted proxies | `TrustedProxies` |
-| UDP | `UdpSocket` (bind, recv/send, connect, guard, budgets, `mark_verified`), `Datagram`, `UdpOptions`, `UdpBudget` |
-| Unix sockets | `UnixListener`, `UnixConnection`, `LocalOptions`, `peer_credentials`, `send_descriptors`, `recv_descriptors`, `Descriptors`, `bind_in_dir`, `listen_local` / `connect_local` on Unix, `ListenerSpec::unix` |
+| UDP | `UdpSocket` (bind, recv/send, connect, guard, budgets, `mark_verified`), `Datagram`, `UdpOptions`, `UdpBudget` (`UdpSession` at 0.6) |
+| Unix sockets | `UnixListener`, `UnixConnection`, `LocalOptions`, `peer_credentials`, `send_descriptors`, `recv_descriptors`, `Descriptors`, `bind_atomic`, `listen_local` / `connect_local` on Unix, `ListenerSpec::unix` |
 | TLS seam | `TlsAcceptor`, `TlsSession`, `TlsProgress`, `TlsEvent`, `TlsCloseKind`, `TlsInfo`, `TlsError`, `TlsFailure`, `NoTls`, server integration; tls-net built against 0.4 in its own repository |
 | Restarts | `systemd`, `systemd_named`, `fastcgi_listener`, `InheritedListener`, `InheritError`, `ListenerHandle`, `send_listeners`, `recv_listeners`, `HandoffPeer`, `HandoffError`, `Server::release_listeners`, `ListenerSpec::adopt` |
 | Back-channel | `Server::adopt`, `AdoptSpec`, `AdmitStage::{Adopt, Dialed}`, `TcpConnection::set_gate` |
@@ -96,7 +96,7 @@ Exit: 10,000 idle connections held on each OS with bounded memory, and throughpu
 ## v0.6.0 - Optimisation
 Exit: every benchmark meets the 1.2x gate against the best Rust competitor at equal or stronger security, or the miss is recorded with James's written decision; no regression over 5% between 0.5 and 0.6 baselines; every P2 item shipped or moved here with a reason.
 
-Items: `compare/` harness; B-1 to B-14 in `docs/PERFORMANCE.md`; P2 items: `SO_REUSEPORT` per-worker listeners, `incoming_cpu`, `defer_accept`, server `fast_open`, `user_timeout`, `send_file` / `Output::push_file`, UDP `recv_batch` / `send_batch`, packet info, multicast, `UdpSession`, `Placement`, adaptive deadlines (`Pressure`), `lane_reserve`, `ListenerSpec::lockdown_allowed`, `encode_v1` / `encode_v2`, FastCGI on Windows if OD-26 says so.
+Items: `compare/` harness; B-1 to B-14 in `docs/PERFORMANCE.md`; P2 items: `SO_REUSEPORT` per-worker listeners, `incoming_cpu`, `defer_accept`, server `fast_open`, `user_timeout`, `send_file` / `Output::push_file`, UDP `recv_batch` / `send_batch` (`DatagramBuffer`, `OutgoingDatagram`), packet info, multicast (`MulticastInterface`), `UdpSession` / `UdpContext` / `ListenerSpec::udp`, `Placement`, adaptive deadlines (`Pressure`), `lane_reserve`, `ListenerSpec::lockdown_allowed`, `encode_v1` / `encode_v2`, FastCGI on Windows if OD-26 says so.
 
 ## v0.7.0 - Hardening
 Exit: zero open findings of severity medium or above; the soak shows no memory, descriptor, or handle growth and no stuck connection.

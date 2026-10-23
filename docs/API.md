@@ -50,7 +50,7 @@
   - [`ConnectOptions`](#connectoptions)
 - [Socket options](#socket-options)
   - [`ListenOptions`](#listenoptions)
-  - [`ConnectionOptions`, `Keepalive`, `Linger`](#connectionoptions-keepalive-linger)
+  - [`TcpOptions`, `Keepalive`, `Linger`](#tcpoptions-keepalive-linger)
   - [`SocketOptions`](#socketoptions)
   - [Option support by platform](#option-support-by-platform)
 - [Sessions](#sessions)
@@ -108,13 +108,13 @@ Every item carries three marks:
 
 ### Costs
 
-Every cost is a target. Numbers marked **[est.]** are estimates that a benchmark replaces at `0.6.0`; [`PERFORMANCE.md`](./PERFORMANCE.md) (from `0.6.0`) holds the measured numbers with method and hardware. "System calls" counts user-kernel round trips, which net-io treats as a hot-path cost like allocations.
+Every cost is a target. Numbers marked **[est.]** are estimates that a benchmark replaces at `0.6.0`; `docs/PERFORMANCE.md` (from `0.6.0`) holds the measured numbers with method and hardware. "System calls" counts user-kernel round trips, which net-io treats as a hot-path cost like allocations.
 
 ### Errors and panics
 
 - Every fallible function returns `Result<_, NetError>` unless the item says otherwise.
 - Every error enum and every extensible struct is `#[non_exhaustive]`. Match with a wildcard arm.
-- Every error's `Display` says what happened and what to do about it.
+- Every error type (`NetError`, `AddrError`, `ProxyError`, `TlsError`, `InheritError`, `HandoffError`, `PostError`, `SwapError`, `OutputFull`) implements `Display` (what happened and what to do) and `std::error::Error`, so `?` works into `Box<dyn Error>`; `NetError` also converts from `io::Error` and `AddrError`.
 - Library code never panics. A `Session`, `Gate`, or `EventSink` implementation that panics is caught at the boundary in `panic = "unwind"` builds: a gate panic counts as a refusal or denial (fail closed) and a session panic closes that connection with `CloseReason::SessionPanicked`. Under `panic = "abort"` the process exits; restarting it is the supervisor's job.
 - Every public type is `Send` and `Sync` unless its section says otherwise; this is checked by `const` assertions in the crate.
 
@@ -129,7 +129,7 @@ Every cost is a target. Numbers marked **[est.]** are estimates that a benchmark
 
 Targets with hand-written OS declarations: `x86_64` and `aarch64` on `linux-gnu`, `linux-musl`, `apple-darwin`, `unknown-freebsd`, `pc-windows-msvc`, `pc-windows-gnu`. On any other target the crate builds the blocking driver over `std` alone and returns `Unsupported` for options and features `std` lacks.
 
-Items that exist on one platform family only carry `#[cfg(unix)]` or `#[cfg(windows)]` in their signature. Each such item has a documented counterpart or a documented reason why there is none (see [`PLATFORM-NOTES.md`](./PLATFORM-NOTES.md), from `0.3.0`).
+Items that exist on one platform family only carry `#[cfg(unix)]` or `#[cfg(windows)]` in their signature. Each such item has a documented counterpart or a documented reason why there is none (see `docs/PLATFORM-NOTES.md`, from `0.3.0`).
 
 ### Feature flags
 
@@ -145,6 +145,8 @@ Items that exist on one platform family only carry `#[cfg(unix)]` or `#[cfg(wind
 | `executor` | off | adapter so an executor's worker threads park inside the reactor | `0.8.0` |
 
 Features are additive. `--no-default-features` builds TCP, the blocking driver, limits, hooks, and drain, and passes CI on its own. The crate has no runtime dependencies in any feature combination.
+
+Features gate machinery, not vocabulary: the plain data types that always-built items refer to exist in every build (`ProxyMode`, `ProxyFacts`, `ProxyError`, `TlsInfo`, `TlsError`, `TlsAcceptor`, `NoTls`, `InheritError`, `HandoffError`, `ListenerHandle`, `Endpoint`), so `ConnectionInfo`, `ListenerInfo`, and `NetError` have the same shape in every build. What a feature adds is the code that fills them: the PROXY parser and its server integration (`proxy`), UDP sockets (`udp`), local sockets, descriptor passing, and hand-off (`local`), the TLS server integration (`tls`), the reactor (`reactor`). Without a feature, a builder call that needs it (`ListenerSpec::proxy(Required)`, `ListenerSpec::tls(true)`) fails `build` with `Unsupported { feature }`.
 
 ---
 
@@ -175,8 +177,8 @@ fn main() -> Result<(), NetError> {
     assert_eq!(&reply, b"ping");
 
     // Stop: close the door, drain open connections, join the workers.
-    server.handle().stop();
-    let report = server.wait();
+    server.handle().request_stop();
+    let report = server.wait_for_stop();
     println!("{} closed gracefully, {} killed", report.graceful, report.killed);
     Ok(())
 }
@@ -227,7 +229,7 @@ Errors: `AddrInUse { addr }` (another process listens there; stop it, pick anoth
 ```rust
 let listener = net_io::listen("127.0.0.1:0")?;
 let addr = listener.local_addr()?;
-println!("listening on {addr}, backlog {}", listener.info().backlog);
+println!("listening on {addr}, backlog {:?}", listener.info().backlog);
 # Ok::<(), net_io::NetError>(())
 ```
 
@@ -255,7 +257,7 @@ Connects with a total timeout of 10 s across all resolved addresses (tried in or
 |---|---|---|---|
 | P0 | 1 | `0.3.0` | one round trip to the peer plus 3 to 4 system calls |
 
-Errors: `ConnectTimeout { addr, after }`, `ConnectionRefused { addr }`, `HostUnreachable { addr }`, `NetworkUnreachable { addr }`, `NoAddresses`. When several addresses were tried, the error is the last one and `NetError::attempts()` returns how many were tried.
+Errors: `ConnectTimeout { addr, after }`, `ConnectionRefused { addr }`, `HostUnreachable { addr }`, `NetworkUnreachable { addr }`, `NoAddresses`. When several addresses were tried, the error is the last one.
 
 ```rust,no_run
 let mut conn = net_io::connect("example.com:80")?;
@@ -277,11 +279,13 @@ where
 
 Builds and starts a server on the blocking driver with one TCP listener, default limits ([blocking defaults](#defaults-and-reasons)), [`AllowAll`](#allowall) as the gate, and no event sink, then opens the door. The handler runs once per accepted connection on a pool worker; when it returns `Ok(())` the connection closes gracefully, when it returns `Err` it closes abortively and the error is reported as `CloseReason::SessionError`. Every read and write inside the handler honours the connection's deadlines and the minimum transfer rate, so a slow or silent peer cannot hold a worker longer than the limits allow.
 
+The returned `Server` must be kept: dropping it stops the server (with a drain), so `net_io::serve(addr, handler)?;` on its own line starts and stops at once; the compiler warns about it (`#[must_use]`). Call `wait_for_stop()` to run until a stop is requested.
+
 `serve` uses `AllowAll` on purpose so the simplest program runs; a server facing the internet should set a [`Gate`](#gate) through [`ServerBuilder`](#serverbuilder).
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
-| P0 | 1 | `0.3.0` | one-time start; per connection see [`PERFORMANCE.md`](./PERFORMANCE.md) |
+| P0 | 1 | `0.3.0` | one-time start; per connection see `docs/PERFORMANCE.md` (from `0.6.0`) |
 
 Errors: as [`listen`](#listen), plus `InvalidConfig` when the default worker count exceeds the process's descriptor limit (raise the limit or use `ServerBuilder::workers`).
 
@@ -295,7 +299,7 @@ let server = net_io::serve("127.0.0.1:7001", |conn| {
     conn.write_all(line.to_uppercase().as_bytes())?;
     Ok(())
 })?;
-server.wait();
+server.wait_for_stop();
 # Ok::<(), net_io::NetError>(())
 ```
 
@@ -314,7 +318,7 @@ Any `Fn(&ConnectionInfo) -> S + Send + Sync + 'static` where `S: Session` is a `
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
-| P0 | 1 | `0.3.0` | per connection see [`PERFORMANCE.md`](./PERFORMANCE.md) |
+| P0 | 1 | `0.3.0` | per connection see `docs/PERFORMANCE.md` (from `0.6.0`) |
 
 ```rust,no_run
 use net_io::{Input, Session, SessionContext, Step};
@@ -323,18 +327,16 @@ struct Echo;
 
 impl Session for Echo {
     fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
-        let bytes = input.bytes();
-        if cx.output().push(bytes).is_err() {
-            return Step::Write; // output budget full: flush first, then we are called again
-        }
-        let n = bytes.len();
-        input.consume(n);
+        // Copy as much as the output budget takes; what is left stays in `input`,
+        // and net-io calls on_data again after the flush because the input changed.
+        let taken = cx.output().push_partial(input.bytes());
+        input.consume(taken);
         Step::Write
     }
 }
 
 let server = net_io::serve_sessions("127.0.0.1:7002", |_info: &net_io::ConnectionInfo| Echo)?;
-server.wait();
+server.wait_for_stop();
 # Ok::<(), net_io::NetError>(())
 ```
 
@@ -403,6 +405,8 @@ pub enum NetError {
     StaleSocketInUse { path: PathBuf },
     PipeNameInUse { name: String },
     NotFound,
+    FileTruncated { sent: u64 },
+    Address(AddrError),
     Proxy(ProxyError),
     Tls(TlsError),
     Inherit(InheritError),
@@ -417,12 +421,13 @@ pub enum NetError {
 impl NetError {
     pub fn class(&self) -> ErrorClass;
     pub fn is_retryable(&self) -> bool;
-    pub fn os_code(&self) -> Option<i32>;
-    pub fn attempts(&self) -> u32;
+    pub fn os_error_code(&self) -> Option<i32>;
 }
 impl fmt::Display for NetError;
 impl std::error::Error for NetError;      // source() returns the io::Error or the nested error
 impl From<NetError> for io::Error;        // kind mapped; the NetError is kept as the source
+impl From<io::Error> for NetError;        // Os { op: "io", source }, or the matching variant for timeouts, resets, broken pipes
+impl From<AddrError> for NetError;        // Address(..)
 ```
 
 The one error type of the crate. P0, Tier 1, `0.3.0` (variants for later features arrive with them).
@@ -452,6 +457,8 @@ The one error type of the crate. P0, Tier 1, `0.3.0` (variants for later feature
 | `StaleSocketInUse` | a live listener owns the socket path, or the path is not a socket | stop that listener or choose another path |
 | `PipeNameInUse` | another process created the named pipe first | possible squatting: choose another name or find the process |
 | `NotFound` | no local endpoint with that name | start the server first |
+| `FileTruncated` | a file shrank while `send_file` sent it (`sent` bytes left) | the connection was reset; send files that do not change while in flight |
+| `Address` | an address, CIDR, or trusted-proxy list did not parse | see [`AddrError`](#addrerror) |
 | `Proxy` | PROXY header invalid | see [`ProxyError`](#proxy-protocol) |
 | `Tls` | the TLS engine failed | see [`TlsError`](#tls-seam) |
 | `Inherit` | inherited descriptors failed verification | see [`InheritError`](#inherited-listeners) |
@@ -462,9 +469,9 @@ The one error type of the crate. P0, Tier 1, `0.3.0` (variants for later feature
 | `ForkedChild` | a `Server` was used in a child process after `fork` | create servers after forking, never before |
 | `Os` | any other OS failure | `op` names the call; `source` has the OS error |
 
-`class()` sorts errors for policy: `Config` (fix the configuration), `Resource` (descriptors, memory, buffers: retry later), `Peer` (the other side misbehaved or left), `Timeout`, `Policy` (gate, limits, refusal), `Platform` (unsupported), `Bug` (a contract was broken by the caller). `is_retryable()` is true for `Resource` and for `ConnectTimeout` and `TimedOut { kind: Connect }`. `os_code()` returns the raw OS error number when one exists. `attempts()` is the number of addresses tried for a connect error and 1 otherwise.
+`class()` sorts errors for policy: `Config` (fix the configuration), `Resource` (descriptors, memory, buffers: retry later), `Peer` (the other side misbehaved or left), `Timeout`, `Policy` (gate, limits, refusal), `Platform` (unsupported), `Bug` (a contract was broken by the caller). `is_retryable()` is true for `Resource` and for `ConnectTimeout` and `TimedOut { kind: Connect }`. `os_error_code()` returns the raw OS error number when one exists.
 
-`From<NetError> for io::Error` maps `TimedOut` and `ConnectTimeout` to `ErrorKind::TimedOut`, `ConnectionReset` to `ConnectionReset`, `BrokenPipe` to `BrokenPipe`, `ConnectionRefused` to `ConnectionRefused`, `AddrInUse` to `AddrInUse`, `AddrNotAvailable` to `AddrNotAvailable`, `PermissionDenied` to `PermissionDenied`, `NotFound` to `NotFound`, `Unsupported` to `Unsupported`, `InvalidConfig` to `InvalidInput`, and everything else to `Other`, always with the `NetError` as the inner error.
+`From<io::Error> for NetError` lets handlers use `?` on `std::io` calls (`ErrorKind::TimedOut` becomes `TimedOut { kind: Read }`, `ConnectionReset`, `BrokenPipe`, and the rest `Os { op: "io", source }`). `From<NetError> for io::Error` maps `TimedOut` and `ConnectTimeout` to `ErrorKind::TimedOut`, `ConnectionReset` to `ConnectionReset`, `BrokenPipe` to `BrokenPipe`, `ConnectionRefused` to `ConnectionRefused`, `AddrInUse` to `AddrInUse`, `AddrNotAvailable` to `AddrNotAvailable`, `PermissionDenied` to `PermissionDenied`, `NotFound` to `NotFound`, `Unsupported` to `Unsupported`, `InvalidConfig` to `InvalidInput`, and everything else to `Other`, always with the `NetError` as the inner error.
 
 ```rust,no_run
 use net_io::{ErrorClass, NetError};
@@ -513,7 +520,7 @@ impl CloseReason {
 }
 ```
 
-Every connection ends with exactly one `CloseReason`, delivered once to `Session::on_close`, `Gate::closed`, and the `Closed` event. P0, Tier 1, `0.3.0`. Four bytes, `Copy`.
+Every connection ends with exactly one `CloseReason`, delivered once to `Session::on_close`, `Gate::closed`, and the `Closed` event. P0, Tier 1, `0.3.0`. Eight bytes, `Copy`.
 
 Close style per reason (decision D-032): **graceful** (flush within the write deadline, FIN, then a bounded linger that reads and discards up to 64 KiB for up to 2 s so unread input does not turn into an RST that destroys the last response) for `PeerClosed`, `Idle`, `Drained`, `SessionClosed`; **abortive** (`SO_LINGER` 0, RST, kernel resources freed at once) for everything else: kills, egress denials, refusals, timeouts, slow peers, limits, the drain deadline, PROXY and TLS failures, session errors and panics.
 
@@ -540,7 +547,7 @@ Close style per reason (decision D-032): **graceful** (flush within the write de
 | `Shed` | the control line shed this lane |
 | `Shutdown` | the control line said `Stopping`, or `shutdown` ran |
 | `SessionClosed` | the session returned `Step::Close` |
-| `SessionError` | the session returned `Step::Abort`, or a `serve` handler returned `Err` |
+| `SessionError` | the session returned `Step::Abort` outside `on_timeout`, or a `serve` handler returned `Err` |
 | `SessionPanicked` | the session panicked (unwind builds) |
 | `Limit(which)` | a per-connection bound was hit (for example a full read buffer that the session never consumes) |
 | `Io(class)` | the OS reported an error not covered above |
@@ -589,7 +596,6 @@ pub enum ConfigReason {
     Missing,                                // a required part is not set (gate, trusted proxies, session factory)
     NotListening,                           // an adopted socket is not a listening socket
     Inconsistent,                           // values that contradict each other (for example pressure.high <= pressure.low)
-    DoorOpen,                               // the operation needs the door closed
 }
 ```
 
@@ -738,7 +744,7 @@ P0, Tier 2, `0.3.0`. Implements `Display` and `std::error::Error`.
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnectionId(NonZeroU64);
-impl ConnectionId { pub const fn get(self) -> u64; }
+impl ConnectionId { pub const fn get(self) -> u64; pub const fn new(id: u64) -> Option<ConnectionId>; }   // new: for tests and conversions; None for 0
 impl fmt::Display for ConnectionId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -765,7 +771,7 @@ pub struct GateTag(pub u64);
 
 An opaque importance class the gate assigns at admission: lower is more important. net-io uses it only to shed lanes at or above a floor under load (`ControlState::Shed`) and for per-lane connection reservations (`LimitsBuilder::lane_reserve`, `0.6.0`). What a lane means belongs to the application. P1, Tier 2, `0.3.0`.
 
-`GateTag` is an opaque value the gate returns at admission (`Admitted::tag`) and net-io stores in `ConnectionInfo::gate`. It lets a protocol engine name the connection to the gate (for example to open a per-request ticket) without being generic over the gate's type. A session can also mark the current response with a tag (`Output::begin_response(Some(tag))`), which the gate sees in `WriteCheck::response`; on HTTP/2, or behind a proxy that pools many clients on one connection, that is how a check judges the right request. net-io never interprets either value. `AllowAll` returns `GateTag(0)`. P1, Tier 2, `0.3.0` (decision D-051).
+`GateTag` is an opaque value the gate returns at admission (`Admitted::tag`) and net-io stores in `ConnectionInfo::gate`. It lets a protocol engine name the connection to the gate (for example to open a per-request ticket) without being generic over the gate's type. A session can also mark the current response with a tag (`Output::begin_tagged_response(tag)`), which the gate sees in `WriteCheck::response`; on HTTP/2, or behind a proxy that pools many clients on one connection, that is how a check judges the right request. net-io never interprets either value. `AllowAll` returns `GateTag(0)`. P1, Tier 2, `0.3.0` (decision D-051).
 
 ### `ConnectionInfo`
 
@@ -791,11 +797,12 @@ pub struct ConnectionInfo {
 impl ConnectionInfo {
     pub fn client_addr(&self) -> Option<SocketAddr>;                 // real_peer if set, else the IP peer
     pub fn client_key(&self, policy: PrefixPolicy) -> Option<PrefixKey>;
-    pub fn peer_ip(&self) -> Option<SocketAddr>;                      // the socket peer, ignoring PROXY
+    pub fn socket_peer(&self) -> Option<SocketAddr>;                  // the socket peer, ignoring PROXY
+    pub fn for_testing(peer: SocketAddr) -> ConnectionInfo;          // a fresh id, TCP, accepted now; fields are public to adjust
 }
 ```
 
-What net-io knows about one connection, built at accept and completed as the handshake reveals more. It holds no heap memory: Unix paths, pipe names, ALPN, SNI, and PROXY TLV copies live in fixed arrays, so building one never allocates [est. about 600 bytes]. `client_addr` is what gates, logs, and rate limits should use: it returns the PROXY-reported address only when that header came from a trusted proxy. P0, Tier 1, `0.3.0` (TCP fields), `0.4.0` (`real_peer`, `proxy`, `peer_credentials`, `tls`, `client_addr`, `client_key`).
+What net-io knows about one connection, built at accept and completed as the handshake reveals more. It holds no heap memory: Unix paths, pipe names, ALPN, SNI, and PROXY TLV copies live in fixed arrays, so building one never allocates [est. about 600 bytes]. `client_addr` is what gates, logs, and rate limits should use: it returns the PROXY-reported address only when that header came from a trusted proxy. P0, Tier 1, `0.3.0` (TCP fields, `client_addr`, `client_key`), `0.4.0` (`real_peer`, `proxy`, `peer_credentials`, `tls`). `for_testing` (P1, Tier 3, `0.3.0`) builds one that is attached to no socket, so gates and sessions can be unit-tested; its id comes from the same process counter, so it never collides with a real connection.
 
 ```rust,no_run
 let listener = net_io::listen("0.0.0.0:7000")?;
@@ -821,9 +828,9 @@ pub enum Endpoint {
     Pipe(PipeName),          // up to 256 UTF-16 units, fixed array
     Unnamed,                 // an unnamed Unix socket peer
 }
-impl Endpoint { pub fn ip(&self) -> Option<SocketAddr>; }
-pub struct UnixPath { /* [u8; 108] + len */ }  impl UnixPath { pub fn as_bytes(&self) -> &[u8]; #[cfg(unix)] pub fn as_path(&self) -> &Path; }
-pub struct PipeName { /* [u16; 256] + len */ } impl PipeName { pub fn as_wide(&self) -> &[u16]; pub fn to_string_lossy(&self) -> String; }
+impl Endpoint { pub fn socket_addr(&self) -> Option<SocketAddr>; }
+#[derive(Clone, Debug, PartialEq, Eq, Hash)] pub struct UnixPath { /* [u8; 108] + len */ }  impl UnixPath { pub fn as_bytes(&self) -> &[u8]; #[cfg(unix)] pub fn as_path(&self) -> &Path; }
+#[derive(Clone, Debug, PartialEq, Eq, Hash)] pub struct PipeName { /* [u16; 256] + len */ } impl PipeName { pub fn as_wide(&self) -> &[u16]; pub fn to_string_lossy(&self) -> String; }
 ```
 
 P0, Tier 2, `0.3.0` (`Ip`, `Tcp`, `Accepted`, `Dialed`), `0.4.0` (the rest).
@@ -845,55 +852,51 @@ Who is on the other end of a local socket, read once at accept: `SO_PEERCRED` (L
 
 ```rust
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq)]
-pub struct Limits { /* private fields, one per row of the defaults table */ }
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Limits { /* private: one optional value per row of the defaults table */ }
 
 impl Limits {
-    pub fn reactor_defaults() -> Limits;
-    pub fn blocking_defaults() -> Limits;
-    pub fn builder() -> LimitsBuilder;                         // starts from Limits::default()
+    pub fn builder() -> LimitsBuilder;                         // every value unset
+    pub fn reactor_defaults() -> Limits;                       // every value set to the reactor column
+    pub fn blocking_defaults() -> Limits;                      // every value set to the blocking column
     pub fn to_builder(&self) -> LimitsBuilder;
+    pub fn resolve(&self, driver: DriverKind) -> Limits;       // unset values filled from that driver's defaults
     pub fn validate(&self, workers: u16, descriptor_limit: Option<u64>) -> Result<(), NetError>;
-    // One getter per field:
-    pub fn max_connections(&self) -> u32;
-    pub fn max_per_listener(&self) -> u32;
-    pub fn max_per_source(&self) -> u32;
-    pub fn source_policy(&self) -> PrefixPolicy;
-    pub fn backlog(&self) -> u32;
-    pub fn accept_batch(&self) -> u16;
-    pub fn handshake(&self) -> Duration;
-    pub fn idle(&self) -> Duration;
-    pub fn read(&self) -> Duration;
-    pub fn write(&self) -> Duration;
-    pub fn park(&self) -> Duration;
-    pub fn min_rate(&self) -> MinRate;
-    pub fn proxy_header_max(&self) -> u16;
-    pub fn read_class(&self) -> SizeClass;
-    pub fn read_class_max(&self) -> SizeClass;
-    pub fn output_budget(&self) -> u32;
-    pub fn completion_queue(&self) -> u32;
-    pub fn buffer_budget(&self) -> u64;
-    pub fn drain(&self) -> Duration;
-    pub fn graceful_linger(&self) -> (Duration, u32);
-    pub fn refusal_bytes_max(&self) -> u16;
-    pub fn tick(&self) -> Duration;
+    // One getter per value; None = not set here (the driver's default applies):
+    pub fn max_connections(&self) -> Option<u32>;
+    pub fn max_per_listener(&self) -> Option<u32>;
+    pub fn max_per_source(&self) -> Option<(u32, PrefixPolicy)>;
+    pub fn backlog(&self) -> Option<u32>;
+    pub fn accept_batch(&self) -> Option<u16>;
+    pub fn handshake_timeout(&self) -> Option<Duration>;
+    pub fn idle_timeout(&self) -> Option<Duration>;
+    pub fn read_timeout(&self) -> Option<Duration>;
+    pub fn write_timeout(&self) -> Option<Duration>;
+    pub fn park_timeout(&self) -> Option<Duration>;
+    pub fn min_rate(&self) -> Option<MinRate>;
+    pub fn proxy_header_max(&self) -> Option<u16>;
+    pub fn read_class(&self) -> Option<(SizeClass, SizeClass)>;      // initial, maximum
+    pub fn output_budget(&self) -> Option<u32>;
+    pub fn completion_queue(&self) -> Option<u32>;
+    pub fn buffer_budget(&self) -> Option<u64>;
+    pub fn drain_timeout(&self) -> Option<Duration>;
+    pub fn graceful_linger(&self) -> Option<(Duration, u32)>;
+    pub fn refusal_bytes_max(&self) -> Option<u16>;
+    pub fn tick(&self) -> Option<Duration>;
     pub fn pressure(&self) -> Option<Pressure>;
-    pub fn lane_reserve(&self, lane: Lane) -> u32;
+    pub fn lane_reserve(&self, lane: Lane) -> Option<u32>;
 }
-impl Default for Limits;   // reactor_defaults() where the reactor is built, else blocking_defaults()
 ```
 
-Every bound net-io enforces, in one value. A server takes one `Limits` and each listener may override it (`ListenerSpec::limits`); a client `TcpConnection` takes one through `set_limits`. Limits are checked before the resource is committed: a connection over a cap is refused before any byte is read, a header over its size before buffering, a buffer before allocation. P0, Tier 2, `0.3.0`.
+Every bound net-io enforces, in one value. A `Limits` records only what was set; everything left unset takes the defaults of the driver that runs the connection (table below), so `Limits::builder().max_connections(100).build()` means "my cap, the driver's defaults for the rest" whichever driver the server picks. `Limits::default()` is the same as an empty builder. A server takes one `Limits` and each listener may override values of it (`ListenerSpec::limits`); a client `TcpConnection` takes one through `set_limits`. Limits are checked before the resource is committed: a connection over a cap is refused before any byte is read, a header over its size before buffering, a buffer before allocation. P0, Tier 2, `0.3.0`.
 
-A server built without `ServerBuilder::limits` uses the defaults of the driver it runs (`blocking_defaults` or `reactor_defaults`). To start a custom set from the blocking defaults, use `Limits::blocking_defaults().to_builder()`.
-
-`validate` is what `ServerBuilder::build` runs (Tier 3 for code that builds limits ahead of time). `descriptor_limit` is the process's open-descriptor limit (`RLIMIT_NOFILE` soft limit on Unix, `None` on Windows, where socket handles do not come from a small table).
+`resolve` returns the effective values for a driver (every getter then returns `Some`); `validate` is what `ServerBuilder::build` runs on the resolved values (Tier 3 for code that checks limits ahead of time). `descriptor_limit` is the process's open-descriptor limit (`RLIMIT_NOFILE` soft limit on Unix, `None` on Windows, where socket handles do not come from a small table).
 
 ### `LimitsBuilder`
 
 ```rust
 #[must_use]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct LimitsBuilder { /* ... */ }
 impl LimitsBuilder {
     pub fn max_connections(self, n: u32) -> Self;
@@ -901,18 +904,18 @@ impl LimitsBuilder {
     pub fn max_per_source(self, n: u32, policy: PrefixPolicy) -> Self;
     pub fn backlog(self, n: u32) -> Self;
     pub fn accept_batch(self, n: u16) -> Self;
-    pub fn handshake(self, d: Duration) -> Self;
-    pub fn idle(self, d: Duration) -> Self;
-    pub fn read(self, d: Duration) -> Self;
-    pub fn write(self, d: Duration) -> Self;
-    pub fn park(self, d: Duration) -> Self;
+    pub fn handshake_timeout(self, d: Duration) -> Self;
+    pub fn idle_timeout(self, d: Duration) -> Self;
+    pub fn read_timeout(self, d: Duration) -> Self;
+    pub fn write_timeout(self, d: Duration) -> Self;
+    pub fn park_timeout(self, d: Duration) -> Self;
     pub fn min_rate(self, rate: MinRate) -> Self;
     pub fn proxy_header_max(self, v2_body_bytes: u16) -> Self;
     pub fn read_class(self, initial: SizeClass, max: SizeClass) -> Self;
     pub fn output_budget(self, bytes: u32) -> Self;
     pub fn completion_queue(self, n: u32) -> Self;             // rounded up to a power of two
     pub fn buffer_budget(self, bytes: u64) -> Self;
-    pub fn drain(self, d: Duration) -> Self;
+    pub fn drain_timeout(self, d: Duration) -> Self;
     pub fn graceful_linger(self, d: Duration, bytes: u32) -> Self;
     pub fn refusal_bytes_max(self, n: u16) -> Self;             // at most 512
     pub fn tick(self, d: Duration) -> Self;                     // 1 ms to 100 ms
@@ -922,20 +925,20 @@ impl LimitsBuilder {
 }
 ```
 
-P0, Tier 2, `0.3.0` (except `pressure` and `lane_reserve`). `build` checks every value alone and against the others, and returns `InvalidConfig { field, reason }` on the first violation:
+P0, Tier 2, `0.3.0` (except `pressure` and `lane_reserve`). `build` checks the values that were set, alone and against each other, in the order of this table, and returns `InvalidConfig { field, reason }` for the first violation (`field` is the setter's name). The same checks run again in `ServerBuilder::build` on the values resolved for the driver, together with the checks that need the server (buffer budget against workers, caps against the descriptor limit).
 
 | Rule | `reason` |
 |---|---|
 | `max_connections`, `backlog`, `accept_batch`, `max_per_source`, `completion_queue`, `output_budget` are zero | `Zero` |
-| `max_per_listener > max_connections`, `max_per_source > max_connections` | `AboveGlobal` |
-| any deadline below one `tick` | `BelowTick` |
+| `max_per_listener > max_connections`, `max_per_source > max_connections` (both set) | `AboveGlobal` |
+| any timeout below one `tick` | `BelowTick` |
 | `min_rate.window < min_rate.check`, or `grace` or `check` zero while the rate is on | `WindowBelowCheck` / `Zero` |
-| `read_class.max < read_class.initial` | `Inconsistent` |
-| `refusal_bytes_max > 512`, `proxy_header_max > 65,535 - 16`, `completion_queue > 1,048,576` | `TooLarge { max }` |
+| `read_class` maximum below its initial class | `Inconsistent` |
+| `refusal_bytes_max > 512`, `proxy_header_max > 65,519`, `completion_queue > 1,048,576` | `TooLarge { max }` |
 | `pressure.high <= pressure.low`, `factor` outside (0, 1] | `Inconsistent` |
 | sum of `lane_reserve` above `max_connections` | `AboveGlobal` |
 
-The checks that need the server (buffer budget against workers, caps against the descriptor limit) run in `ServerBuilder::build` through `Limits::validate`.
+Defaults that depend on another value follow it: an unset `max_per_listener` equals `max_connections`, and an unset `max_per_source` is `min(default, max_connections)`, so setting only a small `max_connections` is always valid.
 
 ```rust
 use net_io::{Limits, MinRate};
@@ -943,17 +946,20 @@ use std::time::Duration;
 
 let limits = Limits::builder()
     .max_connections(20_000)
-    .idle(Duration::from_secs(15))
+    .idle_timeout(Duration::from_secs(15))
     .min_rate(MinRate::new(512, Duration::from_secs(10)))
     .build()?;
-assert_eq!(limits.max_connections(), 20_000);
+assert_eq!(limits.max_connections(), Some(20_000));
+assert_eq!(limits.read_timeout(), None); // the driver's default (30 s) applies
+assert_eq!(limits.resolve(net_io::DriverKind::Blocking).read_timeout(), Some(Duration::from_secs(30)));
 # Ok::<(), net_io::NetError>(())
 ```
 
 ```rust
-use net_io::{Limits, NetError, ConfigReason};
+use net_io::{ConfigReason, Limits, NetError};
 let err = Limits::builder().max_connections(100).max_per_listener(200).build().unwrap_err();
 assert!(matches!(err, NetError::InvalidConfig { field: "max_per_listener", reason: ConfigReason::AboveGlobal }));
+assert!(Limits::builder().max_connections(100).build().is_ok()); // max_per_source follows it down
 ```
 
 ### Defaults and reasons
@@ -961,23 +967,23 @@ assert!(matches!(err, NetError::InvalidConfig { field: "max_per_listener", reaso
 | Limit | Reactor | Blocking | Guards against | Reason for the value |
 |---|---|---|---|---|
 | `max_connections` | 10,000 | `workers` (128) | descriptor and memory exhaustion | fits the default `RLIMIT_NOFILE` of many servers (65,536 hard) with room for files; blocking: one connection per worker |
-| `max_per_listener` | `max_connections` | same | one listener starving others | equal by default; lower it for admin listeners |
-| `max_per_source` | 256 per IPv4 /32 or IPv6 /64 | 16 | one host taking every slot | browsers open 6 to 10 connections per host; 256 leaves room for NAT; blocking pools are small |
+| `max_per_listener` | follows `max_connections` | same | one listener starving others | equal by default; lower it for admin listeners |
+| `max_per_source` | 256 per IPv4 /32 or IPv6 /64, at most `max_connections` | 16, at most `max_connections` | one host taking every slot | browsers open 6 to 10 connections per host; 256 leaves room for NAT; blocking pools are small |
 | `backlog` | 1,024 | 1,024 | SYN bursts overflowing the accept queue | Linux caps it at `somaxconn` (4,096 since 5.4, 128 before) |
 | `accept_batch` | 64 | 16 | one listener starving other work | bounds accept work per wake-up |
-| `handshake` | 10 s | 10 s | PROXY or TLS that never finishes | a TLS handshake over a slow mobile link takes under 2 s; 10 s is generous |
-| `idle` | 60 s | 5 s | parked keep-alive connections | browsers keep idle connections 60 s to 300 s; an idle blocking connection holds a whole worker |
-| `read`, `write` | 30 s | 30 s | stalled sender or receiver | per operation; the minimum rate catches trickles sooner |
+| `handshake_timeout` | 10 s | 10 s | PROXY or TLS that never finishes | a TLS handshake over a slow mobile link takes under 2 s; 10 s is generous |
+| `idle_timeout` | 60 s | 5 s | parked keep-alive connections | browsers keep idle connections 60 s to 300 s; an idle blocking connection holds a whole worker |
+| `read_timeout`, `write_timeout` | 30 s | 30 s | stalled sender or receiver | per operation; the minimum rate catches trickles sooner |
 | `exchange` | none (set per exchange) | none | trickle inside every per-read timeout | only the protocol knows what an exchange is |
-| `park` | 30 s | 30 s | offloaded work that never returns | longer than any password hash or database call should take |
+| `park_timeout` | 30 s | 30 s | offloaded work that never returns | longer than any password hash or database call should take |
 | `min_rate` | 256 B/s over 10 s, after 5 s grace, checked every 1 s | same | slowloris (in), slow-read (out) | the same order as Apache `mod_reqtimeout`'s `MinRate=500`; active directions only |
-| `proxy_header_max` (v2 body) | 1,024 B | same | oversized v2 TLV blocks | covers a UNIX address block (216 B), a 128 B unique id, ALPN, authority, and SSL sub-TLVs; up to 65,535 - 16 |
+| `proxy_header_max` (v2 body) | 1,024 B | same | oversized v2 TLV blocks | covers a UNIX address block (216 B), a 128 B unique id, ALPN, authority, and SSL sub-TLVs; up to 65,519 |
 | PROXY v1 line | 107 B (fixed) | same | oversized v1 lines | the specification's maximum |
 | `read_class` | 16 KiB, may grow to 64 KiB | same | memory per connection | a typical request head fits 16 KiB |
 | `output_budget` | 64 KiB of pool memory per connection | same | memory per connection | static slices and file ranges do not count |
 | `completion_queue` | 1,024 per worker | 1 per worker | offload floods | a blocking worker serves one connection |
 | `buffer_budget` | 512 MiB | 64 MiB | total memory | at least `workers x 64 KiB x 2` (checked) |
-| `drain` | 30 s | 30 s | hung shutdowns | matches common orchestrator grace periods |
+| `drain_timeout` | 30 s | 30 s | hung shutdowns | matches common orchestrator grace periods |
 | `graceful_linger` | 2 s, 64 KiB | same | RST on unread data at close | enough for the peer to see the last response |
 | `refusal_bytes_max` | 512 B | same | refusals used as amplifiers | one canned status line and headers |
 | `tick` | 1 ms | 10 ms | timer resolution | blocking reads re-arm `SO_RCVTIMEO` only when the target moves by more than a tick |
@@ -995,7 +1001,8 @@ impl MinRate {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Pressure { pub high: f32, pub low: f32, pub factor: f32 }    // default 0.8, 0.6, 0.25
+pub struct Pressure { pub high: f32, pub low: f32, pub factor: f32 }
+impl Default for Pressure;                                               // 0.8, 0.6, 0.25
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SizeClass(u32);
@@ -1010,7 +1017,7 @@ impl SizeClass {
 
 The minimum rate applies per direction while that direction is active (receiving an exchange, or output pending). After `grace`, the bytes moved over the last `window` must reach `bytes_per_sec x window`, or the connection closes with `SlowPeer { direction }`. A one-byte-every-few-seconds client passes any per-read timeout; it does not pass this. Cost: one add per IO completion and one wheel timer per active connection per second [est. under 50 ns per check]. P0, Tier 2, `0.3.0`.
 
-Adaptive deadlines (`Pressure`, P2, `0.6.0`): when open connections pass `high` of `max_connections`, the handshake and idle deadlines of new and idle connections are multiplied by `factor` (floor 1 s), and restored below `low`. No cost below the threshold.
+`Pressure::default()` is high 0.8, low 0.6, factor 0.25. Adaptive deadlines (`Pressure`, P2, `0.6.0`): when open connections pass `high` of `max_connections`, the handshake and idle deadlines of new and idle connections are multiplied by `factor` (floor 1 s), and restored below `low`. No cost below the threshold.
 
 ---
 
@@ -1023,7 +1030,7 @@ pub struct TcpListener { /* owned socket, ListenerInfo */ }
 
 impl TcpListener {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<TcpListener, NetError>;
-    pub fn bind_with(addr: SocketAddr, options: &ListenOptions) -> Result<TcpListener, NetError>;
+    pub fn bind_with<A: ToSocketAddrs>(addr: A, options: ListenOptions) -> Result<TcpListener, NetError>;
     pub fn accept(&self) -> Result<(TcpConnection, ConnectionInfo), NetError>;
     pub fn accept_timeout(&self, timeout: Duration) -> Result<Option<(TcpConnection, ConnectionInfo)>, NetError>;
     pub fn info(&self) -> &ListenerInfo;
@@ -1055,8 +1062,8 @@ A listening TCP socket created by net-io (not by `std`), so options that must pr
 ```rust
 use net_io::{ListenOptions, TcpListener};
 let options = ListenOptions::new().backlog(4096).reuse_port(cfg!(target_os = "linux"));
-let listener = TcpListener::bind_with("127.0.0.1:0".parse().unwrap(), &options)?;
-println!("effective backlog {}", listener.info().backlog);
+let listener = TcpListener::bind_with("127.0.0.1:0", options)?;
+println!("effective backlog {:?}", listener.info().backlog);
 # Ok::<(), net_io::NetError>(())
 ```
 
@@ -1077,8 +1084,8 @@ pub struct TcpConnection { /* owned socket, ConnectionInfo, limits, rate counter
 
 impl TcpConnection {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<TcpConnection, NetError>;
-    pub fn connect_with(addr: SocketAddr, options: &ConnectOptions) -> Result<TcpConnection, NetError>;
-    pub fn connect_host(host: &str, port: u16, options: &ConnectOptions) -> Result<TcpConnection, NetError>;
+    pub fn connect_with<A: ToSocketAddrs>(addr: A, options: ConnectOptions) -> Result<TcpConnection, NetError>;
+    pub fn connect_host(host: &str, port: u16, options: ConnectOptions) -> Result<TcpConnection, NetError>;
 
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, NetError>;           // 0 = the peer closed its side
     pub fn recv_exact(&mut self, buf: &mut [u8]) -> Result<(), NetError>;
@@ -1099,7 +1106,7 @@ impl TcpConnection {
     pub fn peer_addr(&self) -> SocketAddr;
     pub fn local_addr(&self) -> SocketAddr;
     pub fn kill_handle(&self) -> KillHandle;
-    pub fn set_limits(&mut self, limits: &Limits);
+    pub fn set_limits(&mut self, limits: Limits);
     pub fn set_phase(&mut self, phase: Phase);
     pub fn set_exchange_deadline(&mut self, at: Option<Instant>);
     pub fn set_gate<G: Gate>(&mut self, gate: Arc<G>) -> Result<(), NetError>;
@@ -1108,24 +1115,24 @@ impl TcpConnection {
 }
 impl Read for TcpConnection;
 impl Write for TcpConnection;            // flush() is a no-op: net-io buffers nothing on this path
-impl Drop for TcpConnection;             // a connection dropped without close() closes gracefully, errors ignored
+impl Drop for TcpConnection;             // never blocks: FIN, then close without the linger; use close() for the full graceful close
 #[cfg(unix)] impl AsFd for TcpConnection; #[cfg(windows)] impl AsSocket for TcpConnection;
 ```
 
-A connected TCP socket that carries its own limits: every read honours the current phase's deadline (idle before the first byte of an exchange, read after), the exchange deadline, and the inbound minimum rate; every write honours the write deadline and the outbound minimum rate. It has one owner: there is no `Read` or `Write` for `&TcpConnection`, and other threads act on it only through its [`KillHandle`](#killhandle). `Send`, not `Sync`.
+A connected TCP socket that carries its own limits: every read honours the current phase's deadline (a connection from `accept` starts in `Idle` and waits for the first byte of an exchange under the idle timeout; a connection from `connect` starts in `Receiving` and reads under the read timeout), the exchange deadline, and the inbound minimum rate; every write honours the write deadline and the outbound minimum rate. It has one owner: there is no `Read` or `Write` for `&TcpConnection`, and other threads act on it only through its [`KillHandle`](#killhandle). `Send`, not `Sync`.
 
 | Item | Behaviour | Errors | Cost | Grade | Tier | Version |
 |---|---|---|---|---|---|---|
 | `connect` | as [`connect`](#connect) | as `connect` | | P0 | 1 | `0.3.0` |
 | `connect_with` | uses [`ConnectOptions`](#connectoptions) | as `connect` | | P0 | 2 | `0.3.0` |
-| `connect_host` | resolves through `std::net::ToSocketAddrs`, tries addresses in order, per-attempt deadline = remaining total / remaining addresses (at least 1 s); Happy Eyeballs when `ConnectOptions::happy_eyeballs(true)` | `NoAddresses`, connect errors (the last one; `attempts()` has the count) | resolution plus one round trip | P1 (Happy Eyeballs P2) | 2 | `0.3.0` (Happy Eyeballs `0.5.0`) |
+| `connect_host` | resolves through `std::net::ToSocketAddrs`, tries addresses in order, per-attempt deadline = remaining total / remaining addresses (at least 1 s); Happy Eyeballs when `ConnectOptions::happy_eyeballs(true)` | `NoAddresses`, connect errors (the last one) | resolution plus one round trip | P1 (Happy Eyeballs P2) | 2 | `0.3.0` (Happy Eyeballs `0.5.0`) |
 | `recv`, `recv_vectored` | retries `EINTR` with the remaining deadline; a zero-length `buf` returns `Ok(0)` without a system call (this is not end of stream; check `buf.len()`) | `TimedOut { kind }`, `SlowPeer { In }`, `ConnectionReset`, `Killed`, `Closed` | 1 system call; 2 when the deadline target moved by more than a tick | P0 (vectored P1) | 1 | `0.3.0` |
 | `recv_exact` | loops until `buf` is full | as `recv`, plus `Closed` when the peer closes early | | P1 | 1 | `0.3.0` |
 | `peek` | `MSG_PEEK` | as `recv` | 1 system call | P2 | 2 | `0.3.0` |
 | `send` | gate check, then one system call; may write less than `buf` | `TimedOut`, `SlowPeer { Out }`, `BrokenPipe`, `ConnectionReset`, `EgressDenied`, `Killed` | gate check + 1 system call | P0 | 1 | `0.3.0` |
 | `send_all` | loops from the exact offset until done, the deadline passes, or the gate denies; the gate check runs before every system call | as `send` | 1 system call per chunk | P0 | 1 | `0.3.0` |
 | `send_vectored`, `send_all_vectored` | up to 64 slices per system call; `send_all_vectored` advances the slices in place (no copy) | as `send` | 1 system call per 64 slices | P1 | 2 | `0.3.0` |
-| `send_file` | `sendfile` (Linux, macOS, FreeBSD) or `TransmitFile` (Windows) in chunks, a gate check before each chunk; falls back to read-and-write internally where zero copy is unavailable | as `send`; `Os` with `OsErrorClass::FileTruncated` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
+| `send_file` | `sendfile` (Linux, macOS, FreeBSD) or `TransmitFile` (Windows) in chunks, a gate check before each chunk; falls back to read-and-write internally where zero copy is unavailable | as `send`; `FileTruncated { sent }` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
 | `shutdown` | half-close: `Write` sends FIN and keeps reading; `Read` stops reading; repeated calls are no-ops | `Closed`, `Os` | 1 system call | P0 | 1 | `0.3.0` |
 | `close` | graceful: FIN, then reads and discards up to 64 KiB for up to 2 s so unread input does not cause an RST that destroys the last response, then close | `TimedOut`, `Os` | flush plus linger | P0 | 1 | `0.3.0` |
 | `abort` | `SO_LINGER {on, 0}` and close: RST, kernel resources freed at once | none surfaced | 2 system calls | P0 | 1 | `0.3.0` |
@@ -1142,7 +1149,7 @@ use net_io::{Limits, Phase};
 use std::time::{Duration, Instant};
 
 let mut conn = net_io::connect("127.0.0.1:7000")?;
-conn.set_limits(&Limits::builder().read(Duration::from_secs(5)).build()?);
+conn.set_limits(Limits::builder().read_timeout(Duration::from_secs(5)).build()?);
 conn.set_phase(Phase::Receiving);
 conn.set_exchange_deadline(Some(Instant::now() + Duration::from_secs(20)));
 let mut buf = [0u8; 1024];
@@ -1175,7 +1182,7 @@ impl ConnectOptions {
     pub fn new() -> Self;                                  // timeout 10 s, nodelay on, no local bind, Happy Eyeballs off
     pub fn timeout(self, total: Duration) -> Self;
     pub fn local_addr(self, addr: SocketAddr) -> Self;     // bind before connect
-    pub fn connection(self, options: ConnectionOptions) -> Self;
+    pub fn tcp_options(self, options: TcpOptions) -> Self;
     pub fn limits(self, limits: Limits) -> Self;
     pub fn happy_eyeballs(self, on: bool) -> Self;         // P2, 0.5.0
     pub fn attempt_delay(self, d: Duration) -> Self;       // P2, 0.5.0: 250 ms default, 100 ms to 2 s
@@ -1189,7 +1196,7 @@ P0, Tier 2, `0.3.0`. Happy Eyeballs (RFC 8305, simplified because `std` resoluti
 use net_io::{ConnectOptions, TcpConnection};
 use std::time::Duration;
 let options = ConnectOptions::new().timeout(Duration::from_secs(3)).happy_eyeballs(true);
-let conn = TcpConnection::connect_host("example.com", 443, &options)?;
+let conn = TcpConnection::connect_host("example.com", 443, options)?;
 println!("connected to {}", conn.peer_addr());
 # Ok::<(), net_io::NetError>(())
 ```
@@ -1211,44 +1218,44 @@ impl ListenOptions {
     pub fn reuse_port(self, on: bool) -> Self;            // SO_REUSEPORT
     pub fn ipv6_only(self, on: bool) -> Self;             // IPV6_V6ONLY
     pub fn send_buffer(self, bytes: u32) -> Self;
-    pub fn recv_buffer(self, bytes: u32) -> Self;
+    pub fn receive_buffer(self, bytes: u32) -> Self;
     pub fn defer_accept(self, wait: Option<Duration>) -> Self;   // P2, 0.6.0
     pub fn fast_open(self, queue: Option<u32>) -> Self;          // P2, 0.6.0
     pub fn incoming_cpu(self, cpu: Option<u32>) -> Self;         // P2, 0.6.0
-    pub fn connection(self, options: ConnectionOptions) -> Self; // applied to every accepted socket
+    pub fn tcp_options(self, options: TcpOptions) -> Self; // applied to every accepted socket
 }
 impl Default for ListenOptions;
 ```
 
 Order of application at bind: create the socket (close-on-exec; non-blocking for the reactor; `SO_NOSIGPIPE` on macOS), reuse address or exclusive address use, reuse port, IPv6-only, incoming CPU, buffer sizes (before `listen`, so window scaling is negotiated), `bind`, defer accept, fast open, `listen(backlog)`. P0, Tier 2, `0.3.0` per option row below.
 
-Options a listener passes to accepted sockets differ by OS. On Linux and Windows every option is inherited from the listener, so net-io does not set them again (one fewer system call per option per accept); on macOS and FreeBSD it applies `connection` options to each accepted socket explicitly (decision D-055; details in [`PLATFORM-NOTES.md`](./PLATFORM-NOTES.md) from `0.3.0`).
+Options a listener passes to accepted sockets differ by OS. On Linux and Windows every option is inherited from the listener, so net-io does not set them again (one fewer system call per option per accept); on macOS and FreeBSD it applies `tcp_options` to each accepted socket explicitly (decision D-055; details in `docs/PLATFORM-NOTES.md` from `0.3.0`).
 
-### `ConnectionOptions`, `Keepalive`, `Linger`
+### `TcpOptions`, `Keepalive`, `Linger`
 
 ```rust
 #[must_use]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ConnectionOptions {
+pub struct TcpOptions {
     pub nodelay: Option<bool>,
     pub keepalive: Option<Keepalive>,
     pub linger: Option<Linger>,
     pub send_buffer: Option<u32>,
-    pub recv_buffer: Option<u32>,
+    pub receive_buffer: Option<u32>,
     pub user_timeout: Option<Duration>,     // P2, 0.6.0
     pub ttl: Option<u8>,                    // P2, 0.3.0
     pub notsent_lowat: Option<u32>,         // P3
     pub quickack: Option<bool>,             // P3
     pub dscp: Option<u8>,                   // P3, a hint
 }
-impl ConnectionOptions {
+impl TcpOptions {
     pub fn new() -> Self;
     pub fn nodelay(self, on: bool) -> Self;
     pub fn keepalive(self, k: Keepalive) -> Self;
     pub fn linger(self, l: Linger) -> Self;
     pub fn send_buffer(self, bytes: u32) -> Self;
-    pub fn recv_buffer(self, bytes: u32) -> Self;
+    pub fn receive_buffer(self, bytes: u32) -> Self;
     pub fn user_timeout(self, d: Duration) -> Self;
     pub fn ttl(self, hops: u8) -> Self;
 }
@@ -1272,7 +1279,7 @@ impl SocketOptions<'_> {
     pub fn keepalive(&self) -> Result<Option<Keepalive>, NetError>; pub fn set_keepalive(&self, k: Option<Keepalive>) -> Result<(), NetError>;
     pub fn linger(&self) -> Result<Linger, NetError>;         pub fn set_linger(&self, l: Linger) -> Result<(), NetError>;
     pub fn send_buffer(&self) -> Result<u32, NetError>;       pub fn set_send_buffer(&self, bytes: u32) -> Result<u32, NetError>;
-    pub fn recv_buffer(&self) -> Result<u32, NetError>;       pub fn set_recv_buffer(&self, bytes: u32) -> Result<u32, NetError>;
+    pub fn receive_buffer(&self) -> Result<u32, NetError>;    pub fn set_receive_buffer(&self, bytes: u32) -> Result<u32, NetError>;
     pub fn ttl(&self) -> Result<u8, NetError>;                pub fn set_ttl(&self, hops: u8) -> Result<(), NetError>;
     pub fn user_timeout(&self) -> Result<Option<Duration>, NetError>; pub fn set_user_timeout(&self, d: Option<Duration>) -> Result<(), NetError>;
 }
@@ -1285,7 +1292,7 @@ use net_io::{Keepalive, Linger};
 let conn = net_io::connect("127.0.0.1:7000")?;
 conn.options().set_keepalive(Some(Keepalive::DEFAULT))?;
 conn.options().set_linger(Linger::Abortive)?;
-let effective = conn.options().set_recv_buffer(256 * 1024)?;
+let effective = conn.options().set_receive_buffer(256 * 1024)?;
 println!("receive buffer is {effective} bytes");
 # Ok::<(), net_io::NetError>(())
 ```
@@ -1302,7 +1309,7 @@ Errors: `Unsupported { feature, platform }` (never silent, except options marked
 | keepalive interval | `TCP_KEEPINTVL` | yes | yes | `TCP_KEEPINTVL` (1709+), else `SIO_KEEPALIVE_VALS` | 10 s | P1 | `0.3.0` |
 | keepalive count | `TCP_KEEPCNT` | yes | yes | `TCP_KEEPCNT` (1703+, at most 255); older: `Unsupported` | 6 | P1 | `0.3.0` |
 | `linger` | `SO_LINGER` | `SO_LINGER_SEC` (seconds) | `SO_LINGER` | `SO_LINGER` | off; abortive on kill | P0 | `0.3.0` |
-| `send_buffer`, `recv_buffer` | `SO_SNDBUF`, `SO_RCVBUF` (doubled by the kernel; effective value reported) | yes | yes | yes | OS default | P1 | `0.3.0` |
+| `send_buffer`, `receive_buffer` | `SO_SNDBUF`, `SO_RCVBUF` (doubled by the kernel; effective value reported) | yes | yes | yes | OS default | P1 | `0.3.0` |
 | `reuse_address` | `SO_REUSEADDR` | yes | yes | `SO_EXCLUSIVEADDRUSE` by default (port hijack protection); `SO_REUSEADDR` only on request | Unix on, Windows exclusive | P0 | `0.3.0` |
 | `reuse_port` | `SO_REUSEPORT` (load-balanced) | `SO_REUSEPORT` (not load-balanced) | `SO_REUSEPORT`, `SO_REUSEPORT_LB` (P3) | `Unsupported` | off | P1 | `0.3.0` |
 | `ipv6_only` | `IPV6_V6ONLY` | yes | yes | yes | on (decision D-026) | P0 | `0.3.0` |
@@ -1333,9 +1340,9 @@ pub trait Session: Send + 'static {
     fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step;
     fn on_writable(&mut self, cx: &mut SessionContext<'_>) -> Step { let _ = cx; Step::Read }
     fn on_wake(&mut self, cx: &mut SessionContext<'_>, token: u32, value: u64) -> Step { let _ = (cx, token, value); Step::Abort }
-    fn on_timeout(&mut self, cx: &mut SessionContext<'_>, which: TimeoutKind) -> Step { let _ = (cx, which); Step::Abort }
+    fn on_timeout(&mut self, cx: &mut SessionContext<'_>, which: TimeoutKind) -> Step { let _ = (cx, which); Step::Close }
     fn on_peer_closed(&mut self, cx: &mut SessionContext<'_>) -> Step { let _ = cx; Step::Close }
-    fn denial(&mut self, code: u16, output: &mut Output) { let _ = (code, output); }
+    fn on_denied(&mut self, code: u16, output: &mut Output) { let _ = (code, output); }
     fn on_close(&mut self, info: &ConnectionInfo, reason: CloseReason) { let _ = (info, reason); }
 }
 ```
@@ -1346,12 +1353,12 @@ pub trait Session: Send + 'static {
 | `on_data` | when bytes arrived; `input` holds everything not yet consumed | P0 | `0.3.0` |
 | `on_writable` | after a `Step::Write` flushed all pending output | P0 | `0.3.0` |
 | `on_wake` | when another thread posted a completion for this connection through its [`Completer`](#completer) (after `Step::Park`) | P0 | `0.3.0` (blocking), `0.5.0` (reactor) |
-| `on_timeout` | when a deadline passed that the session may handle (`Read`, `Write`, `Exchange`, `Park`, `Idle`); returning anything but `Close`/`Abort` re-arms with the same limits | P0 | `0.3.0` |
+| `on_timeout` | when a deadline passed that the session may handle (`Read`, `Write`, `Exchange`, `Park`, `Idle`). Returning `Close` or `Abort` closes with the timeout's own reason (`Idle`, `ReadTimeout`, `WriteTimeout`, `ExchangeDeadline`, `ParkDeadline`) and that reason's close style (graceful for `Idle`, abortive for the others); anything else re-arms with the same limits. The default returns `Close` | P0 | `0.3.0` |
 | `on_peer_closed` | the peer sent FIN; the session may keep writing (half-close) | P1 | `0.3.0` |
-| `denial` | the gate denied a write and no byte of the current response has left yet; write the protocol's refusal for `code` (for example a 403, a WebSocket close 1008, a database error frame) into `output`; net-io sends it with one bounded attempt and closes abortively | P0 | `0.3.0` |
+| `on_denied` | the gate denied a write and no byte of the current response has left yet; write the protocol's refusal for `code` (for example a 403, a WebSocket close 1008, a database error frame) into `output`; net-io sends it with one bounded attempt and closes abortively | P0 | `0.3.0` |
 | `on_close` | exactly once, with the one close reason | P0 | `0.3.0` |
 
-Dispatch is static (the server is generic over the factory), so a call costs a direct function call. A session that panics in an unwind build is closed with `SessionPanicked`; the worker continues.
+Dispatch is static (each worker loop is compiled for the server's factory type), so a call costs a direct function call. A session that panics in an unwind build is closed with `SessionPanicked`; the worker continues.
 
 ### `SessionFactory`
 
@@ -1408,7 +1415,9 @@ pub enum Step {
 pub enum Phase { #[default] Idle, Receiving, Sending }
 ```
 
-`Phase` chooses which deadlines run (idle in `Idle`; read deadline, inbound rate, and exchange deadline in `Receiving`; write deadline, outbound rate, and exchange deadline in `Sending`). net-io moves `Idle` to `Receiving` itself when the first byte of a new exchange arrives, so a session that never sets a phase still gets idle and read deadlines. `Park { until: None }` uses `Limits::park`. P0, Tier 3, `0.3.0`.
+After `Step::Read`, net-io calls `on_data` again at once if the input changed since the last call (the session consumed bytes, or bytes arrived while it was writing); otherwise it waits for more bytes. So a session that consumed part of its input and returned `Write` sees the rest after the flush, and a session that consumed nothing and waits for more is not called in a loop.
+
+`Phase` chooses which deadlines run (idle in `Idle`; read deadline, inbound rate, and exchange deadline in `Receiving`; write deadline, outbound rate, and exchange deadline in `Sending`). net-io moves `Idle` to `Receiving` itself when the first byte of a new exchange arrives, so a session that never sets a phase still gets idle and read deadlines. `Park { until: None }` uses the park timeout. P0, Tier 3, `0.3.0`.
 
 ### `SessionContext`
 
@@ -1431,7 +1440,7 @@ impl SessionContext<'_> {
 }
 ```
 
-Everything a session may touch, scoped to one call. `pressure` is the fraction of busy workers (blocking driver) or of `max_connections` in use (reactor); a protocol layer uses it to stop offering keep-alive above about 0.9. `grow_input` moves the unconsumed input into a larger buffer, up to `Limits::read_class_max`; above it the error is `Limit { which: ReadBuffer }`. Each method costs under 5 ns [est.]. P0 (`pressure`, `grow_input` P1), Tier 3, `0.3.0`.
+Everything a session may touch, scoped to one call. `pressure` is the fraction of busy workers (blocking driver) or of `max_connections` in use (reactor); a protocol layer uses it to stop offering keep-alive above about 0.9. `grow_input` moves the unconsumed input into a larger buffer, up to the maximum read class (`LimitsBuilder::read_class`); above it the error is `Limit { which: ReadBuffer }`. Each method costs under 5 ns [est.]. P0 (`pressure`, `grow_input` P1), Tier 3, `0.3.0`.
 
 ### `Input`
 
@@ -1455,8 +1464,8 @@ A zero-copy view of what was read. A session consumes a prefix and leaves the re
 ```rust
 use net_io::{Buffer, Input, Session, SessionContext, SizeClass, Step};
 
-// Hand a full 64 KiB block to another owner without copying.
-struct Blocks { spare: Option<Buffer> }
+// Hand each full read buffer (16 KiB by default) to another owner without copying.
+struct Blocks { spare: Option<Buffer>, ready: Vec<Buffer> }
 impl Session for Blocks {
     fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
         if !input.is_full() {
@@ -1467,14 +1476,14 @@ impl Session for Blocks {
             None => return Step::Read, // budget spent: back-pressure, try again later
         };
         if input.swap(&mut spare).is_ok() {
-            // `spare` now holds the bytes; give it to whoever processes blocks,
-            // which returns it to a pool when done.
-            cx.release(spare);
+            // `spare` now holds the bytes. Whoever processes `ready` returns each
+            // buffer to a pool when done (BufferPool::put or SessionContext::release).
+            self.ready.push(spare);
         }
         Step::Read
     }
 }
-# let _ = SizeClass::LARGE;
+# let _ = SizeClass::MEDIUM;
 ```
 
 ### `Output`
@@ -1482,11 +1491,13 @@ impl Session for Blocks {
 ```rust
 pub struct Output { /* bounded chunk queue */ }
 impl Output {
-    pub fn push(&mut self, bytes: &[u8]) -> Result<(), OutputFull>;              // copies into pool buffers
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), OutputFull>;              // all or nothing; copies into pool buffers
+    pub fn push_partial(&mut self, bytes: &[u8]) -> usize;                       // as much as the budget allows; returns the count
     pub fn push_buffer(&mut self, buffer: Buffer) -> Result<(), OutputFull>;     // moves, no copy
     pub fn push_static(&mut self, bytes: &'static [u8]) -> Result<(), OutputFull>;
     pub fn push_file(&mut self, file: Arc<File>, offset: u64, len: u64) -> Result<(), OutputFull>;   // P2, 0.6.0
-    pub fn begin_response(&mut self, tag: Option<GateTag>);   // tag reaches the gate as WriteCheck::response
+    pub fn begin_response(&mut self);
+    pub fn begin_tagged_response(&mut self, tag: GateTag);      // the tag reaches the gate as WriteCheck::response
     pub fn end_response(&mut self);
     pub fn pending(&self) -> usize;
     pub fn is_empty(&self) -> bool;
@@ -1496,9 +1507,9 @@ impl Output {
 pub struct OutputFull;
 ```
 
-What the session wants written, flushed when it returns `Step::Write` (or `Close`). Bounded by `Limits::output_budget` of pool memory per connection; `push_static` and file ranges do not count against it. On `OutputFull` the session returns `Step::Write` and continues in `on_writable`. Writes go out as vectored system calls of up to 64 chunks, each preceded by the gate check. P0, Tier 3, `0.3.0`.
+What the session wants written, flushed when it returns `Step::Write` (or `Close`). Bounded by `Limits::output_budget` of pool memory per connection; `push_static` and file ranges do not count against it. On `OutputFull` the session returns `Step::Write`; after the flush it continues in `on_writable`, or in `on_data` if it left input unconsumed (see [`Step`](#step-phase)). Writes go out as vectored system calls of up to 64 chunks, each preceded by the gate check. P0, Tier 3, `0.3.0`.
 
-`begin_response` and `end_response` mark response boundaries for the gate (the tag given to `begin_response` is cleared by `end_response`): when the gate denies a write, the session's `denial` is written only if no byte since the last `begin_response` has left; otherwise the connection is reset with no denial bytes mixed into a partial response. A session that never marks boundaries is treated as "started" after its first byte. Bytes already handed to the kernel cannot be recalled: responses that must be all-or-nothing are pushed in full before returning `Step::Write`. `wipe_all` overwrites every pending chunk net-io owns with zeroes and drops it.
+`begin_response` (or `begin_tagged_response`) and `end_response` mark response boundaries for the gate (`end_response` clears the tag): when the gate denies a write, the session's `on_denied` output is written only if no byte since the last `begin_response` has left; otherwise the connection is reset with no denial bytes mixed into a partial response. A session that never marks boundaries is treated as "started" after its first byte. Bytes already handed to the kernel cannot be recalled: responses that must be all-or-nothing are pushed in full before returning `Step::Write`. `wipe_all` overwrites every pending chunk net-io owns with zeroes and drops it.
 
 ---
 
@@ -1510,35 +1521,40 @@ A `Server` binds listeners, runs workers, and drives sessions under limits, a ga
 
 ```rust
 #[must_use]
-pub struct ServerBuilder<F = (), G = (), S = NoopSink, T = NoTls> { /* ... */ }
+pub struct ServerBuilder<W = NoWork, G = NoGate, S = NoopSink, T = NoTls> { /* ... */ }
 
 impl ServerBuilder { pub fn new() -> ServerBuilder; }
-impl<F, G, S, T> ServerBuilder<F, G, S, T> {
+impl<W, G, S, T> ServerBuilder<W, G, S, T> {
     pub fn listener(self, spec: ListenerSpec) -> Self;                   // repeatable, at most 64
     pub fn driver(self, kind: DriverKind) -> Self;                       // default Auto
     pub fn workers(self, n: u16) -> Self;                                // default: Blocking 128, Reactor = logical CPUs
     pub fn limits(self, limits: Limits) -> Self;
-    pub fn sessions<F2: SessionFactory>(self, factory: F2) -> ServerBuilder<F2, G, S, T>;
+    pub fn sessions<F: SessionFactory>(self, factory: F) -> ServerBuilder<Sessions<F>, G, S, T>;
     pub fn handler<H>(self, handler: H) -> ServerBuilder<BlockingHandler<H>, G, S, T>
         where H: Fn(&mut TcpConnection) -> Result<(), NetError> + Send + Sync + 'static;
-    pub fn gate<G2: Gate>(self, gate: G2) -> ServerBuilder<F, G2, S, T>;
-    pub fn events<S2: EventSink>(self, sink: S2) -> ServerBuilder<F, G, S2, T>;
-    pub fn tls<T2: TlsAcceptor>(self, acceptor: T2) -> ServerBuilder<F, G, S, T2>;
+    pub fn gate<G2: Gate>(self, gate: G2) -> ServerBuilder<W, G2, S, T>;
+    pub fn events<S2: EventSink>(self, sink: S2) -> ServerBuilder<W, G, S2, T>;
+    pub fn tls<T2: TlsAcceptor>(self, acceptor: T2) -> ServerBuilder<W, G, S, T2>;
     pub fn trusted_proxies(self, proxies: TrustedProxies) -> Self;
     pub fn control<C: ControlLine>(self, line: Arc<C>) -> Self;
-    pub fn placement(self, placement: Placement) -> Self;               // P2, 0.6.0
+    pub fn placement(self, placement: Placement) -> Self;               // P2, 0.6.0: Off (default), PinPerCore, Explicit(Vec<usize>)
     pub fn wipe_buffers(self, on: bool) -> Self;                         // default true
     pub fn clock<K: Clock>(self, clock: Arc<K>) -> Self;                 // tests
     pub fn build(self) -> Result<Server, NetError>
-        where F: SessionFactory, G: Gate, S: EventSink, T: TlsAcceptor;
+        where W: Workload, G: Gate, S: EventSink, T: TlsAcceptor;
 }
+
+pub struct NoWork;   pub struct NoGate;                       // the unset states: `build` does not exist for them
+pub struct Sessions<F> { /* the factory */ }                  // what `sessions` produces
+pub struct BlockingHandler<H> { /* the handler */ }           // what `handler` produces
+pub trait Workload: sealed::Sealed + Send + Sync + 'static {}  // implemented by Sessions<F> and BlockingHandler<H> only
 ```
 
-`build` validates everything before it binds anything (limits, caps against the descriptor limit, worker count, a gate and a session factory present, trusted proxies present when any listener requires PROXY, a TLS acceptor present when any listener has TLS on), then binds or adopts the listeners and starts the workers with the **door closed**. `Server` is not generic: the factory, gate, sink, and acceptor types live inside the workers, so the type a program holds stays `Server`.
+A builder without a gate or without `sessions`/`handler` has no `build` method: forgetting either is a compile error that names the missing part (`the trait Gate is not implemented for NoGate`), not a run-time surprise. `build` validates everything else before it binds anything (limits resolved for the driver, caps against the descriptor limit, worker count, trusted proxies present when any listener requires PROXY, a TLS acceptor present when any listener has TLS on), then binds or adopts the listeners and starts the workers with the **door closed**. `Server` is not generic: the factory, gate, sink, and acceptor types live inside the workers, so the type a program holds stays `Server`.
 
 | Item | Behaviour | Errors | Grade | Tier | Version |
 |---|---|---|---|---|---|
-| `new`, `listener`, `limits`, `sessions`, `handler`, `gate`, `events`, `build` | as above | `InvalidConfig` (`field` names the method; `reason` `Missing` when the gate or the session factory is not set), bind errors, `DriverSetup` | P0 | 2 | `0.3.0` |
+| `new`, `listener`, `limits`, `sessions`, `handler`, `gate`, `events`, `build` | as above | `InvalidConfig` (`field` names the method), bind errors, `DriverSetup` | P0 | 2 | `0.3.0` |
 | `driver` | `Auto` = the reactor where built and available, else blocking; an explicit kind that cannot start is an error | `DriverSetup` | P0 | 2 | `0.3.0` (reactor `0.5.0`) |
 | `workers` | | `InvalidConfig` (0, or above 4,096) | P0 | 2 | `0.3.0` |
 | `tls` | | | P0 | 2 | `0.4.0` |
@@ -1550,18 +1566,18 @@ impl<F, G, S, T> ServerBuilder<F, G, S, T> {
 
 The gate is required: "no gate" is the visible choice `.gate(AllowAll)`, never a silent default (decision D-041).
 
-`handler` and `sessions` are the two ways to say what runs per connection; the last one set wins. A blocking handler holds its worker for the whole connection, so `handler` runs on the blocking driver: `Auto` picks it, and an explicit `DriverKind::Reactor` fails `build` with `InvalidConfig { field: "driver", reason: Inconsistent }`. `BlockingHandler<H>` is the public wrapper type `handler` produces; programs never name it.
+`handler` and `sessions` are the two ways to say what runs per connection; the last one set wins. A blocking handler holds its worker for the whole connection, so `handler` runs on the blocking driver: `Auto` picks it, and an explicit `DriverKind::Reactor` fails `build` with `InvalidConfig { field: "driver", reason: Inconsistent }`. `Sessions<F>`, `BlockingHandler<H>`, `NoWork`, `NoGate`, and the sealed `Workload` trait exist only to make that compile-time check; programs never name them.
 
 ```rust,no_run
 use net_io::{AllowAll, DriverKind, Limits, ListenerSpec, ServerBuilder};
 use std::time::{Duration, Instant};
 
 let server = ServerBuilder::new()
-    .listener(ListenerSpec::tcp("0.0.0.0:8080".parse().unwrap()).name("public"))
-    .listener(ListenerSpec::tcp("127.0.0.1:9090".parse().unwrap()).name("admin").lockdown_allowed(true))
+    .listener(ListenerSpec::tcp("0.0.0.0:8080").name("public"))
+    .listener(ListenerSpec::tcp("127.0.0.1:9090").name("admin").lockdown_allowed(true))
     .driver(DriverKind::Blocking)
     .workers(64)
-    .limits(Limits::builder().idle(Duration::from_secs(5)).build()?)
+    .limits(Limits::builder().idle_timeout(Duration::from_secs(5)).build()?)
     .handler(|conn| { conn.send_all(b"hello\n")?; Ok(()) })
     .gate(AllowAll)
     .build()?;              // listeners bound, workers started, door closed
@@ -1578,8 +1594,8 @@ println!("{report:?}");
 #[must_use]
 pub struct ListenerSpec { /* source + options */ }
 impl ListenerSpec {
-    pub fn tcp(addr: SocketAddr) -> Self;
-    pub fn tcp_with(addr: SocketAddr, options: ListenOptions) -> Self;
+    pub fn tcp<A: ToSocketAddrs>(addr: A) -> Self;                                  // resolved now; a failure is reported by build
+    pub fn tcp_with<A: ToSocketAddrs>(addr: A, options: ListenOptions) -> Self;
     pub fn unix(path: impl Into<PathBuf>, options: LocalOptions) -> Self;          // P1, 0.4.0
     #[cfg(windows)] pub fn pipe(name: &str, options: PipeOptions) -> Self;          // P1, 0.5.0
     pub fn adopt(listener: ListenerHandle) -> Self;                                 // P0, 0.4.0
@@ -1596,6 +1612,7 @@ One listener of a server. P0, Tier 2, `0.3.0` unless marked. A name longer than 
 ### `Server`
 
 ```rust
+#[must_use = "dropping a Server stops it; call wait_for_stop() to run until a stop is requested"]
 pub struct Server { /* workers, listeners, door, handle */ }
 impl Server {
     pub fn open_door(&self) -> Result<(), NetError>;
@@ -1603,14 +1620,14 @@ impl Server {
     pub fn door(&self) -> DoorState;
     pub fn drain(&self, deadline: Instant) -> DrainReport;
     pub fn shutdown(self, deadline: Instant) -> DrainReport;
-    pub fn wait(self) -> DrainReport;
+    pub fn wait_for_stop(self) -> DrainReport;
     pub fn release_listeners(&self) -> Result<Vec<ListenerHandle>, NetError>;
     pub fn adopt(&self, conn: TcpConnection, spec: AdoptSpec) -> Result<ConnectionId, NetError>;
     pub fn handle(&self) -> ServerHandle;
     pub fn stats(&self) -> Stats;
     pub fn listeners(&self) -> &[ListenerInfo];
 }
-impl Drop for Server;   // shutdown with Limits::drain as the deadline
+impl Drop for Server;   // shutdown with the drain timeout as the deadline
 ```
 
 | Item | Behaviour | Errors | Cost | Grade | Tier | Version |
@@ -1620,8 +1637,8 @@ impl Drop for Server;   // shutdown with Limits::drain as the deadline
 | `door` | `Open` or `Closed` | | one atomic load | P0 | 2 | `0.3.0` |
 | `drain` | closes the door, tells every session to finish (`SessionContext::draining()`), closes idle connections at once, waits for the rest until `deadline`, then kills them with `DrainDeadline`; returns the counts | none (report) | 10,000 idle connections under 100 ms [est.] | P0 | 2 | `0.3.0` |
 | `shutdown` | `drain`, then closes the listening sockets (except released ones) and joins every worker; afterwards no net-io thread runs and every descriptor net-io opened is closed | none (report) | | P0 | 2 | `0.3.0` |
-| `wait` | blocks the calling thread until a stop is requested (`ServerHandle::stop`, or the control line moves to `Draining` or `Stopping`), then shuts down with the drain deadline (`Limits::drain` or the control line's) | none (report) | zero CPU while waiting | P0 | 1 | `0.3.0` |
-| `release_listeners` | owned duplicates of every listening socket, for [hand-off](#listener-hand-off); a later `shutdown` does not close the released sockets | `InvalidConfig { field: "door", reason: DoorOpen }` while the door is open | 1 system call per listener | P0 | 3 | `0.4.0` |
+| `wait_for_stop` | blocks the calling thread until a stop is requested (`ServerHandle::request_stop`, or the control line moves to `Draining` or `Stopping`), then shuts down with the drain deadline (the drain timeout or the control line's) | none (report) | zero CPU while waiting | P0 | 1 | `0.3.0` |
+| `release_listeners` | owned duplicates of every listening socket, for [hand-off](#listener-hand-off); works while the door is open, so the new process can start accepting before this one stops (decision D-042); a later `shutdown` does not close the released sockets | `Os` | 1 system call per listener | P0 | 3 | `0.4.0` |
 | `adopt` | registers a dialed connection exactly like an accepted one: new id, `Gate::admit` with `AdmitStage::Adopt`, the named listener's limits, sessions, kill handle, events | `Refused`, `Limit`, `ShuttingDown` | as accept | P1 | 3 | `0.4.0` |
 | `handle` | a cloneable handle for other threads | | `Arc` clone | P0 | 2 | `0.3.0` |
 | `stats` | sum of per-worker snapshots | | O(workers) | P1 | 2 | `0.3.0` |
@@ -1637,7 +1654,7 @@ pub struct ServerHandle { /* shared door, control, worker queues */ }
 impl ServerHandle {
     pub fn kill(&self, id: ConnectionId, reason: KillReason) -> bool;
     pub fn close_door(&self);
-    pub fn stop(&self);
+    pub fn request_stop(&self);
     pub fn wake_all(&self);
     pub fn completer(&self, worker: WorkerId) -> Option<Completer>;
     pub fn stats(&self) -> Stats;
@@ -1645,7 +1662,7 @@ impl ServerHandle {
 }
 ```
 
-`Send + Sync + Clone`, safe to call from any thread, including signal-handling threads. `kill` finds the owning worker from the id block, aborts the connection, and returns `false` if it was already closed or belongs to another server (under 1 µs to enqueue [est.]; the RST reaches the wire within 1 ms p99 [est.]). `stop` asks `Server::wait` to shut down. `wake_all` interrupts every worker's wait so a control-line change is seen at once. P0 (`wake_all`, `completer` P0/P1), Tier 2, `0.3.0`.
+`Send + Sync + Clone`, safe to call from any thread, including signal-handling threads. `kill` finds the owning worker from the id block, aborts the connection, and returns `false` if it was already closed or belongs to another server (under 1 µs to enqueue [est.]; the RST reaches the wire within 1 ms p99 [est.]). `request_stop` makes `Server::wait_for_stop` return after the drain; it does not block. `wake_all` interrupts every worker's wait so a control-line change is seen at once. P0 (`wake_all` P1), Tier 2, `0.3.0`.
 
 ```rust,no_run
 // Ctrl-C style stop from another thread.
@@ -1653,9 +1670,9 @@ let server = net_io::serve("127.0.0.1:7000", |conn| { conn.send_all(b"hi\n")?; O
 let handle = server.handle();
 std::thread::spawn(move || {
     // ... wait for a signal from the application's signal library ...
-    handle.stop();
+    handle.request_stop();
 });
-let report = server.wait();
+let report = server.wait_for_stop();
 println!("drained: {} graceful, {} killed in {:?}", report.graceful, report.killed, report.took);
 # Ok::<(), net_io::NetError>(())
 ```
@@ -1677,6 +1694,10 @@ pub struct Stats {
     pub bytes_in: u64, pub bytes_out: u64,
     pub egress_denied: u64, pub killed: u64, pub slow_peers: u64, pub timeouts: u64,
     pub descriptor_pressure: u64, pub stale_completions: u64, pub session_panics: u64,
+}
+impl Stats {
+    pub fn refused_for(&self, cause: RefusalCause) -> u64;     // per cause (gate codes summed)
+    pub fn closed_for(&self, reason: CloseReason) -> u64;      // per reason variant (inner values ignored)
 }
 
 #[non_exhaustive]
@@ -1731,13 +1752,14 @@ pub trait Gate: Send + Sync + 'static {
 |---|---|---|---|---|---|
 | `admit` | `Ok`: the lane and the ticket are stored, the connection proceeds. `Err(refusal)`: closed abortively without reading; `Refusal::WithBytes` first writes its bytes with one non-blocking attempt (no retry) | hook cost plus under 20 ns [est.] | P0 | 3 | `0.3.0` (`Adopt`, `Dialed` `0.4.0`) |
 | `readmit` | `Err`: closed abortively; the per-source cap moves from the proxy's address to the real client's before `readmit` runs | hook cost | P0 | 3 | `0.4.0` |
-| `check` | `Err(Denial { code })`: every pending chunk net-io owns is overwritten with zeroes and dropped; if no byte of the current response has left, the session's `denial(code, ..)` is written with one bounded attempt (the denial itself is not checked again); then abortive close with `EgressDenied(code)` | one call; with `AllowAll` it compiles to nothing; target under 2 ns with a one-atomic gate [est.] | P0 | 3 | `0.3.0` |
+| `check` | `Err(Denial { code })`: every pending chunk net-io owns is overwritten with zeroes and dropped; if no byte of the current response has left, the session's `on_denied(code, ..)` output is written with one bounded attempt (the denial itself is not checked again); then abortive close with `EgressDenied(code)` | one call; with `AllowAll` it compiles to nothing; target under 2 ns with a one-atomic gate [est.] | P0 | 3 | `0.3.0` |
 | `closed` | the ticket is given back with the reason (release counts, record strikes for `SlowPeer`, `ProxyInvalid`, `ProxyUntrusted`, `TlsFailed`, `HelloRefused`, timeouts) | hook cost | P0 | 3 | `0.3.0` |
 
 Rules:
 
+- **`readmit` has no default.** A gate that does not care about proxies writes `Ok(())` on purpose; a silent default would admit every real client behind a trusted proxy on the proxy's own verdict (decision D-060).
 - **Fail closed.** A gate method that panics (unwind builds) counts as a refusal or a denial. Refusals and denials are abortive.
-- **Static dispatch.** The server is generic over the gate, so the hooks are direct calls.
+- **Static dispatch.** Each worker loop is compiled for the server's gate type, so the hooks are direct calls.
 - **Where the checks run.** `admit` on the accepting worker (blocking driver: the accept thread) before the socket is registered for reading; `check` on the worker that writes; `closed` on the worker that closed the connection. A gate must be `Sync`.
 - **Denial text belongs to the session**, which knows the protocol and its framing state (an HTTP response boundary, a WebSocket frame, a database frame). The gate gives only a code.
 - **Ejecting idle connections** from a gate's own maintenance thread uses [`ServerHandle::kill`](#serverhandle) with the `ConnectionId` in `ConnectionInfo`.
@@ -1807,14 +1829,18 @@ pub struct WriteCheck {
     pub lane: Lane,
     pub bytes: u32,                 // size of the chunk about to be written
     pub response_started: bool,     // a byte of the current response already left
-    pub response: Option<GateTag>,  // the tag the session gave Output::begin_response
+    pub response: Option<GateTag>,  // the tag the session gave Output::begin_tagged_response
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Denial { pub code: u16 }
+
+impl WriteCheck {
+    pub fn new(id: ConnectionId, lane: Lane, bytes: u32, response_started: bool, response: Option<GateTag>) -> WriteCheck;   // for tests
+}
 ```
 
-P0, Tier 3, `0.3.0`.
+P0, Tier 3, `0.3.0`. `WriteCheck::new` and `ConnectionInfo::for_testing` let a gate be unit-tested without a socket.
 
 ### `AllowAll`
 
@@ -1853,7 +1879,7 @@ pub trait ControlLine: Send + Sync + 'static {
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControlState { Normal, Shed { lane_floor: Lane }, Lockdown, Draining, Stopping }
+pub enum ControlState { Normal, Shed { from_lane: Lane }, Lockdown, Draining, Stopping }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoControl;                       // epoch() is always 0
@@ -1872,9 +1898,9 @@ A process-wide signal that every worker reads with one atomic load at the top of
 | State | net-io's reaction |
 |---|---|
 | `Normal` | none; undoes the reactions below |
-| `Shed { lane_floor }` | refuses new connections whose lane is at or above `lane_floor` (`RefusalCause::Shed`); `SessionContext::pressure()` reports 1.0 so protocols stop keep-alive |
+| `Shed { from_lane }` | refuses new connections in `from_lane` and every less important lane (numbers at or above it; `RefusalCause::Shed`); `SessionContext::pressure()` reports 1.0 so protocols stop keep-alive |
 | `Lockdown` | refuses new connections on listeners not marked `lockdown_allowed`; existing connections are not touched |
-| `Draining` | `close_door`, then `drain` with the line's deadline (or `Limits::drain`) |
+| `Draining` | `close_door`, then `drain` with the line's deadline (or the drain timeout) |
 | `Stopping` | kills every remaining connection with `Shutdown` |
 
 `ServerHandle::wake_all` makes workers that sleep in the kernel see a change at once. Reactions are idempotent and epoch-gated: a line that moves `Normal`, `Shed`, `Normal` within one loop iteration is seen only in its final state.
@@ -1885,14 +1911,14 @@ use std::sync::Arc;
 
 let control = Arc::new(SimpleControl::new());
 let server = ServerBuilder::new()
-    .listener(ListenerSpec::tcp("0.0.0.0:8080".parse().unwrap()))
+    .listener(ListenerSpec::tcp("0.0.0.0:8080"))
     .handler(|conn| { conn.send_all(b"ok\n")?; Ok(()) })
     .gate(AllowAll)
     .control(control.clone())
     .build()?;
 server.open_door()?;
 // Under overload: refuse everything but lanes 0 and 1.
-control.set(ControlState::Shed { lane_floor: Lane(2) }, None);
+control.set(ControlState::Shed { from_lane: Lane(2) }, None);
 server.handle().wake_all();
 # Ok::<(), net_io::NetError>(())
 ```
@@ -1976,13 +2002,13 @@ pub enum Event {
     Refused { peer: Option<SocketAddr>, cause: RefusalCause },
     Admitted { id: ConnectionId, lane: Lane },
     ProxyResolved { id: ConnectionId, real_peer: SocketAddr },
-    HandshakeDone { id: ConnectionId, micros: u32 },
+    HandshakeDone { id: ConnectionId, took: Duration },
     LimitHit { id: Option<ConnectionId>, which: LimitKind },
     Killed { id: ConnectionId, reason: KillReason },
     EgressDenied { id: ConnectionId, code: u16 },
-    Closed { id: ConnectionId, reason: CloseReason, bytes_in: u64, bytes_out: u64, millis: u32 },
+    Closed { id: ConnectionId, reason: CloseReason, bytes_in: u64, bytes_out: u64, lifetime: Duration },
     AcceptError { listener: ListenerId, class: OsErrorClass },
-    DescriptorPressure { listener: ListenerId, backoff_ms: u32 },
+    DescriptorPressure { listener: ListenerId, backoff: Duration },
     ListenerFailed { listener: ListenerId, class: OsErrorClass },
     DrainStarted { open: u32 },
     DrainFinished { graceful: u32, killed: u32 },
@@ -1999,17 +2025,19 @@ pub enum CoalescedKind { Refused(RefusalCause), LimitHit(LimitKind) }
 Typed, fixed-size events (at most 64 bytes, `Copy`, borrowing nothing) for logs, metrics, and detection. The sink is a type parameter of the builder (`ServerBuilder::events`), so `NoopSink`, the default, compiles to nothing and a real sink is one static call per event. Under a flood, `Refused` and `LimitHit` events above 1,000 per second per worker are folded into one `Coalesced` event per second with the count, so the sink cannot become the bottleneck. P0, Tier 3 (Tier 2 for implementers), `0.3.0`. The sink runs on worker threads: it should copy what it needs into its own queue and return.
 
 ```rust
-use net_io::{Event, EventSink};
+use net_io::{CoalescedKind, Event, EventSink};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]
-struct Counts { closed: AtomicU64, refused: AtomicU64 }
+struct Counts { closed: AtomicU64, refused: AtomicU64, limits: AtomicU64 }
 impl EventSink for Counts {
     fn event(&self, event: &Event) {
         match event {
             Event::Closed { .. } => { self.closed.fetch_add(1, Ordering::Relaxed); }
             Event::Refused { .. } => { self.refused.fetch_add(1, Ordering::Relaxed); }
-            Event::Coalesced { count, .. } => { self.refused.fetch_add(u64::from(*count), Ordering::Relaxed); }
+            Event::LimitHit { .. } => { self.limits.fetch_add(1, Ordering::Relaxed); }
+            Event::Coalesced { kind: CoalescedKind::Refused(_), count } => { self.refused.fetch_add(u64::from(*count), Ordering::Relaxed); }
+            Event::Coalesced { kind: CoalescedKind::LimitHit(_), count } => { self.limits.fetch_add(u64::from(*count), Ordering::Relaxed); }
             _ => {}
         }
     }
@@ -2082,7 +2110,7 @@ use std::time::Duration;
 // Deterministic timeout tests: time moves only when the test says so.
 let clock = Arc::new(ManualClock::new());
 let server = ServerBuilder::new()
-    .listener(ListenerSpec::tcp("127.0.0.1:0".parse().unwrap()))
+    .listener(ListenerSpec::tcp("127.0.0.1:0"))
     .handler(|_conn| Ok(()))
     .gate(AllowAll)
     .clock(clock.clone())
@@ -2140,6 +2168,7 @@ pub trait Driver: Send {
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum OperationKind { Accept, Receive, Send, SendFile, Connect, Close, Nop }
 #[non_exhaustive] pub struct Completion { pub token: Token, pub kind: OperationKind, pub result: Result<usize, OsErrorClass>, pub buffer: Option<Buffer> }
 pub struct Completions { /* fixed capacity, 256 entries; wait never allocates */ }
+pub struct SendChunks { /* up to 64 chunks: pool buffers, &'static slices; taken from Output */ }
 pub struct Rejected { pub operation: Operation }
 #[derive(Clone)] pub struct DriverWaker { /* eventfd, EVFILT_USER, IOCP port, or parker */ }
 impl DriverWaker { pub fn wake(&self); }
@@ -2159,7 +2188,7 @@ Feature `udp`.
 pub struct UdpSocket { /* owned socket, amplification guard, source budgets */ }
 impl UdpSocket {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<UdpSocket, NetError>;
-    pub fn bind_with(addr: SocketAddr, options: &UdpOptions) -> Result<UdpSocket, NetError>;
+    pub fn bind_with<A: ToSocketAddrs>(addr: A, options: UdpOptions) -> Result<UdpSocket, NetError>;
     pub fn recv_from(&mut self, buf: &mut [u8]) -> Result<Datagram, NetError>;
     pub fn send_to(&mut self, buf: &[u8], to: SocketAddr) -> Result<usize, NetError>;
     pub fn connect(&mut self, to: SocketAddr) -> Result<(), NetError>;
@@ -2190,6 +2219,24 @@ impl UdpOptions {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpBudget { pub datagrams_per_sec: u32, pub bytes_per_sec: u32, pub burst: u32 }
+
+// P2, 0.6.0: batches and multicast
+pub struct DatagramBuffer<'a> { pub buf: &'a mut [u8], pub datagram: Option<Datagram> }   // filled by recv_batch
+pub struct OutgoingDatagram<'a> { pub bytes: &'a [u8], pub to: SocketAddr }
+#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MulticastInterface { Any, V4(Ipv4Addr), V6Index(u32) }
+
+// P2, 0.6.0: datagram sessions on the reactor
+pub trait UdpSession: Send + 'static {
+    fn on_datagram(&mut self, cx: &mut UdpContext<'_>, from: SocketAddr, bytes: &[u8]);
+}
+pub struct UdpContext<'a> { /* send_to (guarded), mark_verified, now, worker */ }
+impl UdpContext<'_> {
+    pub fn send_to(&mut self, bytes: &[u8], to: SocketAddr) -> Result<usize, NetError>;
+    pub fn mark_verified(&mut self, peer: SocketAddr);
+    pub fn now(&self) -> Instant;
+}
+// ListenerSpec::udp(addr, options) with ServerBuilder::udp_sessions(factory) runs them on the reactor workers
 ```
 
 UDP source addresses are trivially spoofed, so the socket protects others and itself by default:
@@ -2205,6 +2252,7 @@ UDP source addresses are trivially spoofed, so the socket protects others and it
 | `recv_batch`, `send_batch` | `recvmmsg` / `sendmmsg` on Linux, a loop elsewhere | | 1 system call per batch on Linux | P2 | 3 | `0.6.0` |
 | packet info (`destination`) | `IP_PKTINFO`, `IPV6_RECVPKTINFO` | `Unsupported` | ancillary data parse | P2 | 3 | `0.6.0` |
 | `join_multicast` | IPv4 and IPv6 groups | `Os` | | P2 | 2 | `0.6.0` |
+| `UdpSession`, `UdpContext`, `ListenerSpec::udp`, `ServerBuilder::udp_sessions` | datagrams driven like connections on the reactor: the same guard and budgets, the same events and drain | as `send_to` | per datagram: one dispatch | P2 | 3 | `0.6.0` |
 | GSO, GRO | `UDP_SEGMENT`, `UDP_GRO` (Linux) | `Unsupported` | | P3 | 3 | after `1.0.0` |
 
 The amplification factor defaults to 1 (decision D-034); a QUIC implementation sets 3 for its own handshake, as RFC 9000 allows.
@@ -2235,24 +2283,38 @@ Feature `local`.
 pub struct UnixListener { /* path, owned socket, inode of the created file */ }
 impl UnixListener {
     pub fn bind<P: AsRef<Path>>(path: P) -> Result<UnixListener, NetError>;
-    pub fn bind_with<P: AsRef<Path>>(path: P, options: &LocalOptions) -> Result<UnixListener, NetError>;
-    pub fn bind_in_dir<P: AsRef<Path>>(path: P, options: &LocalOptions) -> Result<UnixListener, NetError>;
+    pub fn bind_with<P: AsRef<Path>>(path: P, options: LocalOptions) -> Result<UnixListener, NetError>;
+    pub fn bind_atomic<P: AsRef<Path>>(path: P, options: LocalOptions) -> Result<UnixListener, NetError>;
     #[cfg(target_os = "linux")]
-    pub fn bind_abstract(name: &[u8], options: &LocalOptions) -> Result<UnixListener, NetError>;   // P3
+    pub fn bind_abstract(name: &[u8], options: LocalOptions) -> Result<UnixListener, NetError>;   // P3
     pub fn accept(&self) -> Result<(UnixConnection, ConnectionInfo), NetError>;
-    pub fn path(&self) -> Option<&Path>;
+    pub fn path(&self) -> Option<&Path>;                       // the final path (recorded, not read back: decision D-058)
 }
 impl Drop for UnixListener;   // removes its path only if it is still the file this listener created
 
-pub struct UnixConnection { /* as TcpConnection: recv, send, send_all, shutdown, close, abort, info, kill_handle, Read, Write */ }
+pub struct UnixConnection { /* owned socket, ConnectionInfo, limits, kill state */ }
 impl UnixConnection {
     pub fn connect<P: AsRef<Path>>(path: P) -> Result<UnixConnection, NetError>;
+    pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, NetError>;
+    pub fn recv_exact(&mut self, buf: &mut [u8]) -> Result<(), NetError>;
+    pub fn send(&mut self, buf: &[u8]) -> Result<usize, NetError>;
+    pub fn send_all(&mut self, buf: &[u8]) -> Result<(), NetError>;
+    pub fn shutdown(&mut self, how: Shutdown) -> Result<(), NetError>;
+    pub fn close(self) -> Result<(), NetError>;
+    pub fn abort(self);
+    pub fn info(&self) -> &ConnectionInfo;
+    pub fn id(&self) -> ConnectionId;
+    pub fn kill_handle(&self) -> KillHandle;
+    pub fn set_limits(&mut self, limits: Limits);
+    pub fn set_phase(&mut self, phase: Phase);
+    pub fn set_exchange_deadline(&mut self, at: Option<Instant>);
     pub fn peer_credentials(&self) -> Result<PeerCredentials, NetError>;
     #[cfg(unix)] pub fn send_descriptors(&mut self, body: &[u8], descriptors: &[BorrowedFd<'_>]) -> Result<(), NetError>;
     #[cfg(unix)] pub fn recv_descriptors(&mut self, body: &mut [u8], into: &mut Descriptors) -> Result<usize, NetError>;
 }
 #[cfg(unix)] pub struct Descriptors { /* fixed capacity 64 OwnedFd */ }
 #[cfg(unix)] impl Descriptors { pub fn new() -> Self; pub fn len(&self) -> usize; pub fn take(&mut self) -> impl Iterator<Item = OwnedFd> + '_; }
+impl Read for UnixConnection; impl Write for UnixConnection; impl Drop for UnixConnection;   // as TcpConnection
 
 #[must_use]
 #[derive(Clone, Debug)]
@@ -2261,7 +2323,8 @@ impl LocalOptions {
     pub fn new() -> Self;                       // mode 0o600, remove_stale true
     pub fn mode(self, mode: u32) -> Self;
     pub fn owner(self, uid: u32) -> Self;
-    pub fn group(self, gid: u32) -> Self;       // also sets the mode to 0o660 unless mode() is called
+    pub fn group(self, gid: u32) -> Self;       // sets the socket file's group; the mode stays 0o600
+    pub fn group_access(self, gid: u32) -> Self; // group(gid) and mode 0o660: members of that group may connect
     pub fn remove_stale(self, on: bool) -> Self;
     pub fn require_uid(self, uid: u32) -> Self; // refuse peers with another uid (checked at accept)
 }
@@ -2270,7 +2333,7 @@ impl LocalOptions {
 | Item | Behaviour | Errors | Grade | Tier | Version |
 |---|---|---|---|---|---|
 | `bind`, `bind_with` | path length checked (Linux 108 bytes, macOS and FreeBSD 104, including the terminator); a NUL byte in the path is refused; a stale socket file is removed only if `lstat` (no symlink following) says it is a socket and a connect to it is refused; `bind`, then `chmod` (and `chown` when set) | `PathTooLong`, `StaleSocketInUse`, `PermissionDenied`, `Bind` | P1 | 1 / 2 | `0.4.0` |
-| `bind_in_dir` | binds under a fresh temporary name with mode `0700` in the same directory, sets the final mode, then renames into place, so the socket is never reachable with the umask's permissions | as `bind` | P1 | 2 | `0.4.0` |
+| `bind_atomic` | binds under a fresh temporary name with mode `0700` in the same directory, sets the final mode, then renames into place, so the socket is never reachable with the umask's permissions | as `bind` | P1 | 2 | `0.4.0` |
 | `accept` | peer credentials read once and stored in `ConnectionInfo`; `require_uid` refuses a mismatched peer before any read | `Os` | P1 | 1 | `0.4.0` |
 | `Drop` | unlinks the path only if `lstat` still shows the inode this listener created, never a replacement someone else bound | none (event) | P1 | 1 | `0.4.0` |
 | `UnixConnection` IO | as `TcpConnection` | as `TcpConnection` | P1 | 1 | `0.4.0` |
@@ -2279,12 +2342,12 @@ impl LocalOptions {
 | Windows AF_UNIX | `UnixListener` and `UnixConnection` on Windows 10 1803+: stream sockets only, no descriptor passing; permissions are NTFS ACLs; the socket file is deleted with `DeleteFileW` before rebinding | `Unsupported` on older Windows | P2 | 2 | `0.5.0` |
 | `bind_abstract` | Linux abstract namespace; refused unless `require_uid` is set, because no file permission protects it | `InvalidConfig { field: "require_uid", reason: Missing }` | P3 | 3 | after `1.0.0` |
 
-The default mode is `0600` (decision D-024): only the owner can connect unless a group is named. Keep sockets in a private directory (`0750`) as well.
+The default mode is `0600` (decision D-024): only the owner can connect; `group_access` opens it to one group. Keep sockets in a private directory (`0750`) as well.
 
 ```rust,no_run
 use net_io::{LocalOptions, UnixListener};
-let options = LocalOptions::new().group(33).require_uid(1000);
-let listener = UnixListener::bind_in_dir("/run/myapp/api.sock", &options)?;
+let options = LocalOptions::new().group_access(33).require_uid(1000);
+let listener = UnixListener::bind_atomic("/run/myapp/api.sock", options)?;
 let (mut conn, info) = listener.accept()?;
 println!("uid {:?}", info.peer_credentials.and_then(|c| c.uid));
 conn.send_all(b"ready\n")?;
@@ -2297,12 +2360,14 @@ conn.send_all(b"ready\n")?;
 #[cfg(windows)] pub struct PipeListener { /* name, security descriptor, next instance */ }
 #[cfg(windows)] impl PipeListener {
     pub fn create(name: &str) -> Result<PipeListener, NetError>;                     // \\.\pipe\<name>
-    pub fn create_with(name: &str, options: &PipeOptions) -> Result<PipeListener, NetError>;
+    pub fn create_with(name: &str, options: PipeOptions) -> Result<PipeListener, NetError>;
     pub fn accept(&self) -> Result<(PipeConnection, ConnectionInfo), NetError>;
 }
-#[cfg(windows)] pub struct PipeConnection { /* recv, send, send_all, close, abort, info, kill_handle, Read, Write */ }
+#[cfg(windows)] pub struct PipeConnection { /* owned handle, ConnectionInfo, limits, kill state */ }
 #[cfg(windows)] impl PipeConnection {
     pub fn connect(name: &str, timeout: Duration) -> Result<PipeConnection, NetError>;
+    // recv, recv_exact, send, send_all, close, abort, info, id, kill_handle, set_limits, set_phase,
+    // set_exchange_deadline: the same signatures as UnixConnection; Read, Write, Drop as TcpConnection
     pub fn client_pid(&self) -> Result<u32, NetError>;
 }
 #[cfg(windows)] #[must_use] #[derive(Clone, Debug)] pub struct PipeOptions { /* ... */ }
@@ -2334,10 +2399,15 @@ impl LocalListener { pub fn accept(&self) -> Result<(LocalConnection, Connection
 pub enum LocalConnection { Unix(UnixConnection), #[cfg(windows)] Pipe(PipeConnection) }
 impl LocalConnection {
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, NetError>;
+    pub fn recv_exact(&mut self, buf: &mut [u8]) -> Result<(), NetError>;
+    pub fn send(&mut self, buf: &[u8]) -> Result<usize, NetError>;
     pub fn send_all(&mut self, buf: &[u8]) -> Result<(), NetError>;
+    pub fn shutdown(&mut self, how: Shutdown) -> Result<(), NetError>;   // Unsupported for a pipe's read side
     pub fn close(self) -> Result<(), NetError>;
     pub fn abort(self);
     pub fn info(&self) -> &ConnectionInfo;
+    pub fn kill_handle(&self) -> KillHandle;
+    pub fn set_limits(&mut self, limits: Limits);
 }
 impl Read for LocalConnection; impl Write for LocalConnection;
 ```
@@ -2379,7 +2449,7 @@ impl<'a> ProxyHeader<'a> {
     pub fn authority(&self) -> Option<&'a str>;
     pub fn unique_id(&self) -> Option<&'a [u8]>;
     pub fn ssl(&self) -> Option<ProxySsl<'a>>;
-    pub fn netns(&self) -> Option<&'a [u8]>;
+    pub fn network_namespace(&self) -> Option<&'a [u8]>;
     pub fn crc_checked(&self) -> bool;
     pub fn to_facts(&self) -> ProxyFacts;
 }
@@ -2398,6 +2468,7 @@ impl ProxyFacts { pub fn alpn(&self) -> Option<&[u8]>; pub fn authority(&self) -
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProxyError {
+    OutputTooSmall { need: usize },             // encode: `out` cannot hold the header
     NotProxy,                                   // the first bytes match no allowed signature
     V1TooLong, V1Syntax { at: u8 }, V1BadAddress, V1BadPort,
     V2BadVersion, V2BadCommand, V2BadFamily, V2LengthTooLarge { declared: u16, max: u16 },
@@ -2406,7 +2477,8 @@ pub enum ProxyError {
 }
 
 pub fn encode_v1(source: SocketAddr, destination: SocketAddr, out: &mut [u8]) -> Result<usize, ProxyError>;
-pub fn encode_v2(header: &ProxyHeader<'_>, with_crc: bool, out: &mut [u8]) -> Result<usize, ProxyError>;
+pub fn encode_v2(command: ProxyCommand, source: Option<SocketAddr>, destination: Option<SocketAddr>,
+                 tlvs: &[Tlv<'_>], with_crc: bool, out: &mut [u8]) -> Result<usize, ProxyError>;   // None = LOCAL / UNSPEC
 ```
 
 Server behaviour (`ListenerSpec::proxy`), P0, Tier 2, `0.4.0`:
@@ -2446,7 +2518,7 @@ match parser.feed(bytes)? {
 // Behind HAProxy or nginx with `proxy_protocol on`.
 use net_io::{AllowAll, ListenerSpec, ProxyMode, ProxyVersions, ServerBuilder, TrustedProxies};
 let server = ServerBuilder::new()
-    .listener(ListenerSpec::tcp("127.0.0.1:8080".parse().unwrap())
+    .listener(ListenerSpec::tcp("127.0.0.1:8080")
         .proxy(ProxyMode::Required { versions: ProxyVersions::Both }))
     .trusted_proxies(TrustedProxies::loopback())
     .handler(|conn| {
@@ -2457,7 +2529,7 @@ let server = ServerBuilder::new()
     .gate(AllowAll)
     .build()?;
 server.open_door()?;
-server.wait();
+server.wait_for_stop();
 # Ok::<(), net_io::NetError>(())
 ```
 
@@ -2482,7 +2554,7 @@ pub trait TlsSession: Send + 'static {
     /// Writes close_notify.
     fn close(&mut self, output: &mut [u8]) -> Result<usize, TlsError>;
     /// The peer's transport closed: was the TLS stream ended cleanly?
-    fn on_eof(&mut self) -> TlsCloseKind;
+    fn on_transport_closed(&mut self) -> TlsCloseKind;
     /// SNI, ALPN, version, cipher; Some after HandshakeComplete.
     fn info(&self) -> Option<TlsInfo>;
     /// The smallest input buffer the session needs now (the largest handshake message being assembled).
@@ -2510,15 +2582,21 @@ pub enum TlsCloseKind { Clean, Unclean }
 
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TlsError { pub kind: TlsFailure, pub code: u16, pub alert: Option<u8> }   // no secret material
+impl TlsError { pub const fn new(kind: TlsFailure, code: u16, alert: Option<u8>) -> TlsError; }
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TlsFailure { Handshake, HelloRefused, Capacity, Protocol, OutputFull, State }
 
 #[non_exhaustive] #[derive(Clone, Copy, Debug)]
 pub struct TlsInfo { /* SNI up to 255 bytes, ALPN up to 32 bytes, version, cipher suite: fixed arrays */ }
-impl TlsInfo { pub fn sni(&self) -> Option<&str>; pub fn alpn(&self) -> Option<&[u8]>; pub fn version(&self) -> u16; pub fn cipher_suite(&self) -> u16; }
+impl TlsInfo {
+    pub fn new(sni: Option<&str>, alpn: Option<&[u8]>, version: u16, cipher_suite: u16) -> Option<TlsInfo>;   // None if SNI > 255 or ALPN > 32 bytes
+    pub fn sni(&self) -> Option<&str>; pub fn alpn(&self) -> Option<&[u8]>; pub fn version(&self) -> u16; pub fn cipher_suite(&self) -> u16;
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoTls;                         // the builder's default; no listener may enable TLS with it
+impl TlsAcceptor for NoTls { type Session = NoTlsSession; /* session() always fails */ }
+pub enum NoTlsSession {}                  // uninhabited; impl TlsSession
 ```
 
 How the server drives it (P0, Tier 3, `0.4.0`):
@@ -2527,7 +2605,7 @@ How the server drives it (P0, Tier 3, `0.4.0`):
 2. **ClientHello inspection lives in the engine.** The engine parses the ClientHello from net-io's read buffer inside `step` and can refuse it (fingerprinting); net-io copies nothing. A refusal is `TlsError { kind: HelloRefused, .. }` and closes with `CloseReason::HelloRefused`; other errors close with `TlsFailed`. A ClientHello split into many tiny records is the engine's to bound; net-io's read buffer limit and handshake deadline bound it too.
 3. `Data` slices are plaintext inside the read buffer; net-io moves each one down to follow the previous unconsumed plaintext (one `copy_within`, no second buffer) and calls `Session::on_data` with the plaintext.
 4. Outbound: the gate check runs on the plaintext before `encrypt` and again before each ciphertext flush; a denial is encrypted like any other output and followed by `close_notify`.
-5. Graceful close sends `close_notify`; abortive close does not. The read buffer grows (up to `Limits::read_class_max`) when `input_capacity_required` exceeds it, for example for a large client certificate chain.
+5. Graceful close sends `close_notify`; abortive close does not. The read buffer grows (up to the maximum read class) when `input_capacity_required` exceeds it, for example for a large client certificate chain.
 6. The engine's minimum buffer sizes are met by the default 16 KiB class with the 64 KiB growth limit (rustls needs at least 18,437 bytes for one full record; `input_capacity_required` says more when a handshake message spans several records).
 
 | Item | Grade | Tier | Version |
@@ -2546,11 +2624,11 @@ Cost: the seam adds no copy beyond the engine's own and one `copy_within` per pl
 #   fn step<'i>(&mut self, _: &'i mut [u8], _: &mut [u8]) -> Result<TlsProgress<'i>, TlsError> { unimplemented!() }
 #   fn encrypt(&mut self, _: &[u8], _: &mut [u8]) -> Result<usize, TlsError> { unimplemented!() }
 #   fn close(&mut self, _: &mut [u8]) -> Result<usize, TlsError> { unimplemented!() }
-#   fn on_eof(&mut self) -> TlsCloseKind { TlsCloseKind::Unclean }
+#   fn on_transport_closed(&mut self) -> TlsCloseKind { TlsCloseKind::Unclean }
 #   fn info(&self) -> Option<TlsInfo> { None }
 #   fn input_capacity_required(&self) -> usize { 18_437 } }
 let server = ServerBuilder::new()
-    .listener(ListenerSpec::tcp("0.0.0.0:443".parse().unwrap()).tls(true))
+    .listener(ListenerSpec::tcp("0.0.0.0:443").tls(true))
     .tls(MyTls)
     .handler(|conn| {
         let sni = conn.info().tls.and_then(|t| t.sni().map(str::to_owned));
@@ -2588,7 +2666,7 @@ pub enum InheritError {
 | `systemd` | socket activation: reads `LISTEN_PID` (must equal this process id, otherwise the variables were meant for another process and the result is an empty list), `LISTEN_FDS` (at most 64), `LISTEN_FDNAMES` (optional), and `LISTEN_PIDFDID` where present; descriptors start at 3; each is verified (a socket, listening, a known family and type) and set close-on-exec. The variables are left in the environment (decision D-036). Not systemd (no `LISTEN_PID`): `Ok(vec![])` | P1 | 1 | `0.4.0` |
 | `systemd_named` | the one listener with that `LISTEN_FDNAMES` entry, or `None` | P1 | 1 | `0.4.0` |
 | `fastcgi_listener` | FastCGI's convention (`FCGI_LISTENSOCK_FILENO`, as `mod_fcgid` starts a FastCGI server): descriptor 0 is adopted only if it is a socket, listening, and has no peer (`getpeername` fails with `ENOTCONN`); otherwise `None` (a terminal, a file, a pipe, a connected socket) | P1 | 1 | `0.4.0` |
-| FastCGI on Windows | open decision OD-26 (a planned Windows FastCGI deployment would bring it to `0.6.0`) | P2 | 2 | after `1.0.0` unless decided |
+| FastCGI on Windows | open decision OD-26: `0.6.0` if a Windows FastCGI deployment is planned; otherwise it is regraded P3 and moves after `1.0.0` | P2 | 2 | per OD-26 |
 
 ```rust,no_run
 use net_io::{AllowAll, ListenerSpec, ServerBuilder};
@@ -2598,7 +2676,7 @@ for inherited in net_io::systemd()? {
 }
 let server = builder.handler(|conn| { conn.send_all(b"hi\n")?; Ok(()) }).gate(AllowAll).build()?;
 server.open_door()?;
-server.wait();
+server.wait_for_stop();
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -2652,10 +2730,11 @@ use net_io::{send_listeners, UnixConnection};
 use std::time::{Duration, Instant};
 # let server: net_io::Server = unimplemented!();
 let mut channel = UnixConnection::connect("/run/myapp/handoff.sock")?;
-server.close_door();
-let handles = server.release_listeners()?;
+let handles = server.release_listeners()?;           // the door stays open meanwhile
 send_listeners(&mut channel, &handles.iter().collect::<Vec<_>>())?;
-server.shutdown(Instant::now() + Duration::from_secs(30));
+let mut ready = [0u8; 1];
+channel.recv_exact(&mut ready)?;                      // the new process has opened its door
+server.shutdown(Instant::now() + Duration::from_secs(30)); // close our door, drain, exit
 # }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -2674,6 +2753,7 @@ for handle in handles {
 }
 let server = builder.handler(|conn| { conn.send_all(b"v2\n")?; Ok(()) }).gate(AllowAll).build()?;
 server.open_door()?;
+channel.send_all(b"1")?;                              // tell the old process to stop
 # }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -2705,7 +2785,7 @@ Every limit, deadline, and buffer is per connection or per worker; nothing globa
 |---|---|
 | Echo server in a few lines | [Tier 1 at a glance](#tier-1-at-a-glance) |
 | Bind first, drop privileges, then accept | `ServerBuilder::build` (door closed), drop privileges, `Server::open_door` ([Server](#serverbuilder)) |
-| Graceful shutdown on a signal | `ServerHandle::stop` from the signal thread, `Server::wait` in `main` ([ServerHandle](#serverhandle)) |
+| Graceful shutdown on a signal | `ServerHandle::request_stop` from the signal thread, `Server::wait_for_stop` in `main` ([ServerHandle](#serverhandle)) |
 | Behind a reverse proxy with the real client address | `ListenerSpec::proxy(Required)` plus `trusted_proxies` ([PROXY](#proxy-protocol)) |
 | Same-host IPC | `listen_local` / `connect_local` ([Crate root](#listen_local-connect_local)) |
 | Zero-downtime restart | `release_listeners`, `send_listeners`, `recv_listeners`, `ListenerSpec::adopt` ([Hand-off](#listener-hand-off)) |
@@ -2714,7 +2794,7 @@ Every limit, deadline, and buffer is per connection or per worker; nothing globa
 | Kill one connection from anywhere | `ServerHandle::kill(id, reason)` |
 | Slow work without holding a worker | `Step::Park`, then `Completer::post` from the other thread ([Completer](#completer)) |
 | Hand a received body to another thread without copying | `Input::swap` ([Input](#input)) |
-| Shed load by importance | `ControlState::Shed { lane_floor }` ([Control line](#control-line)) |
+| Shed load by importance | `ControlState::Shed { from_lane }` ([Control line](#control-line)) |
 | Logs and metrics | an [`EventSink`](#events) |
 | Deterministic timeout tests | `ManualClock` ([Time](#time)) |
 | UDP without becoming an amplifier | `UdpSocket` defaults ([UDP](#udp)) |
@@ -2728,7 +2808,7 @@ Every limit, deadline, and buffer is per connection or per worker; nothing globa
 | Needs | net-io item |
 |---|---|
 | admission before any byte, with a per-connection ticket | `Gate::admit`, `Gate::Ticket`, `Admitted` |
-| naming the connection and the current response to the gate from the protocol engine | `ConnectionInfo::gate`, `Output::begin_response(Some(tag))`, `WriteCheck::response` |
+| naming the connection and the current response to the gate from the protocol engine | `ConnectionInfo::gate`, `Output::begin_tagged_response(tag)`, `WriteCheck::response` |
 | real client after a trusted PROXY header | `Gate::readmit`, `ConnectionInfo::real_peer`, `client_addr`, `client_key` |
 | a check before every write without a lookup by id | `Gate::check(&mut Ticket, &WriteCheck)` |
 | release and strikes at close | `Gate::closed(Ticket, &ConnectionInfo, CloseReason)` |
@@ -2757,20 +2837,20 @@ Every limit, deadline, and buffer is per connection or per worker; nothing globa
 | drain and restarts | `close_door`, `drain`, `shutdown`, `release_listeners`, `systemd`, `fastcgi_listener` |
 | offloaded work | `Step::Park`, `Completer`, `Session::on_wake` |
 | zero-copy request bodies and WebSocket messages | `Input::swap`, `Buffer`, `BufferPool` |
-| refusal text | `Session::denial(code, &mut Output)` |
+| refusal text | `Session::on_denied(code, &mut Output)` |
 | the process-wide control signal | `ControlLine`, `ControlState` |
 
 ---
 
 ## Names changed at the design lock
 
-Names follow the rule "plain words, no abbreviations" (decision D-017). Earlier plans used the left column.
+Names follow the rule "plain words, no abbreviations" (decisions D-017, D-059). Earlier plans used the left column. Kept on purpose because they are the established word for the thing in Rust and in socket programming: `recv` and `send` (as in `std::net::UdpSocket`), `addr` (as in `SocketAddr`, `local_addr`), `nodelay`, `backlog`, `linger`, `keepalive`, `Cidr`, `Tlv`, and the door (`open_door`, `close_door`: accepting new connections, separate from binding).
 
 | Earlier | Now |
 |---|---|
 | `TcpConn`, `UnixConn`, `PipeConn`, `LocalConn` | `TcpConnection`, `UnixConnection`, `PipeConnection`, `LocalConnection` |
 | `ConnInfo` | `ConnectionInfo` |
-| `ConnOptions` | `ConnectionOptions` |
+| `ConnOptions` | `TcpOptions` |
 | `Cx` | `SessionContext` |
 | `InBuf`, `OutBuf`, `Buf`, `BufPool` | `Input`, `Output`, `Buffer`, `BufferPool` |
 | `OutFull` | `OutputFull` |
@@ -2785,4 +2865,9 @@ Names follow the rule "plain words, no abbreviations" (decision D-017). Earlier 
 | `Admission` + `Egress` traits, `AdmitVerdict`, `EgressVerdict`, `EgressContext` | one `Gate` trait with an associated `Ticket`; `Admitted`, `Denial`, `WriteCheck`; `GateTag` kept for protocol engines (D-051) |
 | `TlsEngine`, `TlsFactory`, `HelloHook`, `HelloVerdict` | `TlsSession`, `TlsAcceptor`; the hello hook belongs to the engine |
 | `Step::CloseAfterFlush` | `Step::Close` (always flushes) |
+| `Limits::{handshake, idle, read, write, park, drain}` | `handshake_timeout`, `idle_timeout`, `read_timeout`, `write_timeout`, `park_timeout`, `drain_timeout` |
+| `Session::denial`, `TlsSession::on_eof` | `Session::on_denied`, `TlsSession::on_transport_closed` |
+| `ConnInfo::peer_ip`, `Endpoint::ip`, `NetError::os_code` | `socket_peer`, `socket_addr`, `os_error_code` |
+| `UnixListener::bind_in_dir`, `ControlState::Shed { lane_floor }` | `bind_atomic`, `Shed { from_lane }` |
+| `send_buffer`/`recv_buffer` options | `send_buffer`/`receive_buffer` |
 | `Server<S: EventSink>` | `Server` (not generic) |

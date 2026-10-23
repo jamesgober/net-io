@@ -65,7 +65,7 @@ fn main() -> Result<(), net_io::NetError> {
             conn.send_all(&buf[..n])?;
         }
     })?;
-    server.wait(); // runs until server.handle().stop() is called, then drains
+    server.wait_for_stop(); // runs until server.handle().request_stop(), then drains
     Ok(())
 }
 ```
