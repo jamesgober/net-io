@@ -29,7 +29,7 @@ No hard task moved later: io_uring was "later, Linux only" in the 0.1 plan and i
 ## v0.1.0 - Scaffold (DONE, 2026-10-13)
 - [x] Manifest, README, CHANGELOG, REPS, dual license, CI, deny, clippy, rustfmt, DIRECTIVES, ROADMAP, PLAN.
 
-## v0.2.0 - Design lock (CURRENT)
+## v0.2.0 - Design lock (DONE, 2026-10-23)
 Exit: James approves `docs/API.md`; every spike has a written result; CI green.
 - [x] `docs/API.md`: every public item with signatures, behaviour, errors, cost, grade, tier, version, examples; final names (D-017); final defaults with reasons.
 - [x] `dev/SYS-SURFACE.md`: the OS functions, constants, and structs per platform, with the documentation each relies on.
@@ -38,10 +38,10 @@ Exit: James approves `docs/API.md`; every spike has a written result; CI green.
 - [x] Gate seam shape proposed to bouncer-io for both 0.2 locks (D-018).
 - [x] TLS seam condition (X-2) checked against rustls 0.23.46: holds (D-019).
 - [x] Spikes S-1 to S-6 run on Windows and Linux; results and decisions D-016, D-052 to D-058 in PLAN section 15.
-- [ ] James approves the API; open decisions O-1, O-2, OD-26 answered.
-- [ ] Release routine: 0.2.0 tagged, released, published (claims the crate name, D-048).
+- [x] James approved the API (2026-10-23). Open decisions O-1, O-2, OD-26 stay open; none blocks 0.3 or 0.4.
+- [x] Release routine: 0.2.0 tagged, released, published (claims the crate name, D-048).
 
-## v0.3.0 - Core: TCP and the blocking driver
+## v0.3.0 - Core: TCP and the blocking driver (DONE, 2026-10-23)
 Exit: a TCP echo service runs on Linux, macOS, and Windows under the blocking driver with every limit, hook, and close reason covered by socket tests; the 20-line echo example builds and runs; no allocation after warm-up on the hot path (counting allocator); the descriptor leak test passes for 100,000 connections; the layout cross-check passes; a consumer can build a server skeleton against the published 0.3.
 
 | Area | Items (`docs/API.md`) |
@@ -64,6 +64,26 @@ Exit: a TCP echo service runs on Linux, macOS, and Windows under the blocking dr
 | Benchmarks | baselines for B-2, B-7, B-8, B-13, B-14 (no competitor gate yet) |
 | Docs | `docs/PLATFORM-NOTES.md` draft; `examples/echo_blocking.rs`, `echo_sessions.rs`, `kill_and_drain.rs`, `gate.rs` |
 
+Done:
+- [x] Every 0.3 item in the table above, in `src/`, with unit tests beside the code.
+- [x] Socket integration and hostile-peer tests (`tests/server.rs`, `tests/edge.rs`): caps, `Busy`, the door, kill, drain, idle and read timeouts, slowloris, a peer that never reads, panics.
+- [x] Every close reason of the blocking driver produced on a real socket with exactly one `Closed` event (`tests/close_reasons.rs`), and the exactly-once rule over random interleavings (`tests/interleave.rs`).
+- [x] Fault injection (`tests/shim.rs`, `cfg(net_io_shim)`): accept error classes, `EMFILE` with the reserve, short and zero-byte sends, `EINTR`, spurious `EAGAIN`, keepalive `ETIMEDOUT`, system calls per round trip.
+- [x] Property tests (CIDR and prefix keys, output stream, rate check; D-076), loom models (kill guard, completer ring, id blocks), Miri on the pure modules, layout checks against `libc` and `windows-sys`.
+- [x] No allocation in steady-state echo (`tests/alloc.rs`); no descriptor leak over 100,000 connections (`tests/leak.rs`, CI runs the full count).
+- [x] Benchmark baselines B-2, B-7, B-13, B-14 in `docs/PERFORMANCE.md`; `docs/PLATFORM-NOTES.md` draft; examples `echo_blocking`, `echo_sessions`, `kill_and_drain`, `gate`.
+- [x] Appendix A cases mapped to their tests in `dev/EDGE-CASES.md`.
+- [x] Decisions D-062 to D-080 logged.
+
+Moved to a later version (anti-deferral record):
+
+| Item | To | Reason |
+|---|---|---|
+| Timing wheel; appendix A cases 53 to 60; benchmark B-8 | 0.5 | D-063: a blocking worker holds one connection with at most five deadlines, carried by `SO_RCVTIMEO` or the wait timeout; the wheel pays off on the reactor, where one worker holds thousands. Nothing in 0.3 needs it |
+| FreeBSD build, std-only fallback for other targets | 0.5 | D-064: both need the kqueue path or a second blocking path; 0.3 stops at a clear compile error on other targets |
+| Appendix A case 11 (reads pause when the buffer budget is spent) | 0.5 | the blocking driver takes each worker's buffers at warm-up and validates the budget at build, so it cannot run dry mid-connection; pausing one connection's reads is reactor behaviour |
+| Benchmark B-2 goal (1.2x the std thread-per-connection server) | 0.6 | measured under load with the `compare/` harness from 0.6, where the competitor gate starts; the 0.3 baseline (one connection, loopback) is at parity within noise |
+
 ## v0.4.0 - Extended: edges
 Exit: net-io runs behind Apache and nginx over TCP and over a Unix socket with the real client address from PROXY v1 and v2; serves TLS directly through tls-net; a listener hand-off between two processes under 1,000 connections per second refuses zero connections (Linux and macOS); systemd socket activation and FastCGI descriptor 0 work in emulated tests and on one real host each.
 
@@ -84,12 +104,12 @@ Exit: 10,000 idle connections held on each OS with bounded memory, and throughpu
 
 | Area | Items |
 |---|---|
-| Reactor | epoll (Linux), kqueue (macOS, FreeBSD), IOCP (Windows) with zero-byte receives and one `WSAPoll` accept thread per listener (D-016); `DriverKind::Reactor`, `Auto`; accept distribution; `Completer` on the reactor |
+| Reactor | epoll (Linux), kqueue (macOS, FreeBSD), IOCP (Windows) with zero-byte receives and one `WSAPoll` accept thread per listener (D-016); `DriverKind::Reactor`, `Auto`; accept distribution; `Completer` on the reactor; the timing wheel with appendix A cases 53 to 60 and B-8 (moved from 0.3, D-063); buffer-budget back-pressure (case 11) |
 | Driver API | `Driver`, `Operation`, `OperationKind`, `Completion`, `Completions`, `Token`, `Rejected`, `DriverWaker` public (Tier 3, unstable until 1.0) |
 | Windows local | AF_UNIX on Windows, `PipeListener`, `PipeConnection`, `PipeOptions`, `PipeSecurity`, `client_pid`, `listen_local` / `connect_local` on Windows, `ListenerSpec::pipe` |
 | Windows hand-off | `share_listeners`, `SharedListeners`, `receive_shared` with the single-use nonce (D-054); listeners never associated with a completion port (D-016) |
 | Outbound | Happy Eyeballs (`ConnectOptions::happy_eyeballs`, `attempt_delay`) |
-| Platform | FreeBSD in CI (D-035); ASan and TSan jobs |
+| Platform | FreeBSD in CI (D-035); the std-only fallback for other targets (D-064); ASan and TSan jobs |
 | Completeness | every P0 and P1 item shipped |
 | Docs | `docs/ARCHITECTURE.md` draft; examples `named_pipe.rs`, `offload_completer.rs` |
 

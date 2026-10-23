@@ -13,6 +13,78 @@
 
 ---
 
+## [0.3.0] - 2026-10-23
+
+TCP and the blocking driver: the first release with working code. Servers
+and clients over TCP on Linux, macOS, and Windows (x86_64 and aarch64), with
+every limit, the gate seam, sans-IO sessions, kill, and graceful drain.
+
+### Added
+
+- Tier 1: `listen`, `connect`, `serve` (a handler per connection on a pool
+  worker), `serve_sessions` (a sans-IO session per connection).
+- `TcpListener` and `TcpConnection`: every read under the current phase's
+  deadline and the minimum inbound rate, every write under the write
+  deadline and the minimum outbound rate, partial writes continued from the
+  exact offset, `Read` and `Write`, a `KillHandle` usable from any thread.
+  `ConnectOptions` with a total timeout across every resolved address.
+- `ServerBuilder` and `Server`: TCP listeners with their own limits, the
+  blocking driver (128 workers by default), the door (`open_door`,
+  `close_door`), `drain`, `shutdown`, `wait_for_stop`, `ServerHandle`
+  (`kill`, `request_stop`, `wake_all`, `completer`), and `Stats` with counts
+  per refusal cause and per close reason.
+- `Limits` and `LimitsBuilder`: global, per-listener, and per-source caps
+  (sources grouped by `PrefixPolicy`), handshake, idle, read, write, park,
+  and drain timeouts, `MinRate`, buffer and output budgets, read buffer size
+  classes; unset values take the driver's defaults, validated at build
+  against the process descriptor limit.
+- `Session`, `SessionFactory`, `Step`, `Phase`, `Input` (with the O(1)
+  `swap`), `Output`, `SessionContext`; `Completer` for work finished on
+  other threads; `BufferPool` with wipe on release.
+- The gate seam: `Gate` with admission before any byte is read and a check
+  before every write, `Refusal`, `Denial`, `WriteCheck`, `AllowAll`.
+- `ControlLine`, `SimpleControl`, `NoControl`: shed lanes, lockdown, drain,
+  and stop, read with one atomic load per check.
+- `EventSink` and `Event` with coalescing of refusal floods.
+- `Cidr`, `PrefixKey`, `normalize`, and the error types (`NetError` with
+  `class`, `is_retryable`, and `os_error_code`, `CloseReason`,
+  `RefusalCause`, and the rest).
+- Examples: `echo_blocking`, `echo_sessions`, `kill_and_drain`, `gate`.
+- `docs/PERFORMANCE.md` with the 0.3 baselines, `docs/PLATFORM-NOTES.md`.
+
+### Performance
+
+- A keep-alive round trip on Unix is 2 system calls (one `recv`, one
+  `send`) and 3 on Windows (`WSAPoll` first; see the platform notes).
+- No allocation per message after warm-up.
+- 64-byte echo on one loopback connection is within 0.1 to 0.4 µs of a
+  bare `std` echo per round trip.
+
+### Security
+
+- No byte is read before the gate admits a connection, and no byte leaves
+  without passing the gate.
+- Caps refuse before any read; a full worker pool refuses with `Busy`
+  instead of queueing without bound.
+- Out of descriptors, the acceptor sheds one pending connection with the
+  reserve descriptor and backs off instead of spinning.
+- Slowloris and slow readers are closed by the minimum transfer rate and the
+  read and write deadlines.
+- A kill never touches a descriptor the owner already closed (a guard bit
+  held across the one system call).
+- Accepted sockets are not inherited by child processes on any platform.
+
+### Testing
+
+- Socket integration tests for every limit, hook, and close reason, with
+  exactly one closed event per connection, also over random interleavings
+  of FIN, RST, kill, timeouts, and drain.
+- Fault injection through a test-only OS shim, property tests, loom models,
+  Miri, a counting allocator, and a descriptor leak test over 100,000
+  connections.
+
+---
+
 ## [0.2.0] - 2026-10-23
 
 The design lock: the public API is written down in full and the design
@@ -66,6 +138,7 @@ The scaffold and the plan. No functional code yet.
   dependencies, testing, open decisions, and the decision log.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/net-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/net-io/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/net-io/releases/tag/v0.1.0

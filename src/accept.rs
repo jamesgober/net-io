@@ -55,7 +55,7 @@ impl Acceptor {
         match sys::accept(listener) {
             Ok((stream, peer)) => {
                 self.backoff = BACKOFF_START;
-                if peer.ip().is_unspecified() || peer.port() == 0 {
+                if !usable_peer(peer) {
                     // No usable peer address: nothing to key caps or the gate on. Close quietly.
                     let _ = sys::set_linger(stream.sock(), Some(Duration::ZERO));
                     return Accepted::Skipped(OsErrorClass::Other(0));
@@ -89,6 +89,11 @@ impl Acceptor {
 
     #[cfg(windows)]
     fn shed_one(&mut self, _listener: &TcpListener) {}
+}
+
+/// Whether an accepted peer address can key caps and the gate (appendix A case 47).
+fn usable_peer(peer: SocketAddr) -> bool {
+    !peer.ip().is_unspecified() && peer.port() != 0
 }
 
 /// The spare descriptor; `None` when it cannot be opened (retried at the next `EMFILE`).
@@ -133,6 +138,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(got);
+    }
+
+    #[test]
+    fn test_unspecified_or_portless_peer_is_not_usable() {
+        assert!(usable_peer("10.0.0.1:5000".parse().unwrap()));
+        assert!(usable_peer("[2001:db8::1]:5000".parse().unwrap()));
+        assert!(!usable_peer("0.0.0.0:5000".parse().unwrap()));
+        assert!(!usable_peer("[::]:5000".parse().unwrap()));
+        assert!(!usable_peer("10.0.0.1:0".parse().unwrap()));
     }
 
     /// Edge cases 40 and 41: `EMFILE` sheds one connection and pauses; a reserve

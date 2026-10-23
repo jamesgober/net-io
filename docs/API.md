@@ -577,7 +577,7 @@ pub enum Direction { In, Out }
 pub enum OsErrorClass { Reset, Aborted, TimedOut, Refused, Unreachable, FileTruncated, Other(i32) }
 ```
 
-P0, Tier 2, `0.3.0`. `RefusalCause::Gate(code)` carries the gate's refusal code; `Session` means the session factory refused; `Busy` means the blocking driver had no free worker. `OsErrorClass` carries the OS error number, never message text, so it is `Copy` and fits in events.
+P0, Tier 2, `0.3.0`. `RefusalCause::Gate(code)` carries the gate's refusal code; `Session` means the session factory refused; `Busy` means every worker of the blocking driver had a connection or one waiting for it (D-067). `OsErrorClass` carries the OS error number, never message text, so it is `Copy` and fits in events.
 
 ### `ConfigReason`
 
@@ -753,7 +753,7 @@ impl ListenerId { pub const fn get(self) -> u16; }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerId(u16);
-impl WorkerId { pub const fn get(self) -> u16; }
+impl WorkerId { pub const fn get(self) -> u16; pub const fn first() -> WorkerId; }   // first: worker 0, for tests and `ServerHandle::completer`
 ```
 
 `ConnectionId` is issued for every accepted, adopted, dialed-and-registered, or inherited connection; it is never zero and never reused within a process. Workers take blocks of 1,024 ids from one process-wide counter, so ids are ordered within a worker, not globally; at one million connections per second the counter lasts about 584,000 years. The block also tells `ServerHandle::kill` which worker owns an id. P0, Tier 1, `0.3.0`. `ListenerId` and `WorkerId` (P0, Tier 2) count from 0 within one server; at most 65,535 of each.
@@ -1131,7 +1131,7 @@ A connected TCP socket that carries its own limits: every read honours the curre
 | `recv_exact` | loops until `buf` is full | as `recv`, plus `Closed` when the peer closes early | | P1 | 1 | `0.3.0` |
 | `peek` | `MSG_PEEK` | as `recv` | 1 system call | P2 | 2 | `0.3.0` |
 | `send` | gate check, then one system call; may write less than `buf` | `TimedOut`, `SlowPeer { Out }`, `BrokenPipe`, `ConnectionReset`, `EgressDenied`, `Killed` | gate check + 1 system call | P0 | 1 | `0.3.0` |
-| `send_all` | loops from the exact offset until done, the deadline passes, or the gate denies; the gate check runs before every system call | as `send` | 1 system call per chunk | P0 | 1 | `0.3.0` |
+| `send_all` | loops from the exact offset until done, the deadline passes, or the gate denies; the gate check runs before each write (a retry after the socket was full is not checked again, D-074) | as `send` | 1 system call per chunk | P0 | 1 | `0.3.0` |
 | `send_vectored`, `send_all_vectored` | up to 64 slices per system call; `send_all_vectored` advances the slices in place (no copy) | as `send` | 1 system call per 64 slices | P1 | 2 | `0.3.0` |
 | `send_file` | `sendfile` (Linux, macOS, FreeBSD) or `TransmitFile` (Windows) in chunks, a gate check before each chunk; falls back to read-and-write internally where zero copy is unavailable | as `send`; `FileTruncated { sent }` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
 | `shutdown` | half-close: `Write` sends FIN and keeps reading; `Read` stops reading; repeated calls are no-ops | `Closed`, `Os` | 1 system call | P0 | 1 | `0.3.0` |
@@ -1418,7 +1418,7 @@ pub enum Phase { #[default] Idle, Receiving, Sending }
 
 After `Step::Read`, net-io calls `on_data` again at once if the input changed since the last call (the session consumed bytes, or bytes arrived while it was writing); otherwise it waits for more bytes. So a session that consumed part of its input and returned `Write` sees the rest after the flush, and a session that consumed nothing and waits for more is not called in a loop.
 
-`Phase` chooses which deadlines run (idle in `Idle`; read deadline, inbound rate, and exchange deadline in `Receiving`; write deadline, outbound rate, and exchange deadline in `Sending`). net-io moves `Idle` to `Receiving` itself when the first byte of a new exchange arrives, so a session that never sets a phase still gets idle and read deadlines. `Park { until: None }` uses the park timeout. P0, Tier 3, `0.3.0`.
+`Phase` chooses which deadlines run (idle in `Idle`; read deadline, inbound rate, and exchange deadline in `Receiving`; write deadline, outbound rate, and exchange deadline in `Sending`). net-io moves `Idle` to `Receiving` itself when the first byte of a new exchange arrives, and back to `Idle` once a reply went out and no input is left over, so a session that never sets a phase still gets idle and read deadlines (D-065). Calling `set_phase` hands the phase to the session for the rest of the connection. `Park { until: None }` uses the park timeout. P0, Tier 3, `0.3.0`.
 
 ### `SessionContext`
 
@@ -1448,6 +1448,7 @@ Everything a session may touch, scoped to one call. `pressure` is the fraction o
 ```rust
 pub struct Input { /* the connection's Buffer + consumed offset */ }
 impl Input {
+    pub fn from_bytes(bytes: &[u8]) -> Input;                           // for tests of sessions (allocates)
     pub fn bytes(&self) -> &[u8];                                       // unconsumed bytes, borrowed from the read buffer
     pub fn consume(&mut self, n: usize);                                // saturates at the length
     pub fn is_full(&self) -> bool;
@@ -1492,6 +1493,7 @@ impl Session for Blocks {
 ```rust
 pub struct Output { /* bounded chunk queue */ }
 impl Output {
+    pub fn standalone(limit: u32) -> Output;                                     // for tests of sessions (allocates)
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), OutputFull>;              // all or nothing; copies into pool buffers
     pub fn push_partial(&mut self, bytes: &[u8]) -> usize;                       // as much as the budget allows; returns the count
     pub fn push_buffer(&mut self, buffer: Buffer) -> Result<(), OutputFull>;     // moves, no copy
@@ -1508,7 +1510,7 @@ impl Output {
 pub struct OutputFull;
 ```
 
-What the session wants written, flushed when it returns `Step::Write` (or `Close`). Bounded by `Limits::output_budget` of pool memory per connection; `push_static` and file ranges do not count against it. On `OutputFull` the session returns `Step::Write`; after the flush it continues in `on_writable`, or in `on_data` if it left input unconsumed (see [`Step`](#step-phase)). Writes go out as vectored system calls of up to 64 chunks, each preceded by the gate check. P0, Tier 3, `0.3.0`.
+What the session wants written, flushed when it returns `Step::Write` (or `Close`). Bounded by `Limits::output_budget` of pool memory per connection; `push_static` and file ranges do not count against it. On `OutputFull` the session returns `Step::Write`; after the flush it continues in `on_writable`, or in `on_data` if it left input unconsumed (see [`Step`](#step-phase)). Writes go out as vectored system calls of up to 64 chunks, each write preceded by the gate check (a retry after the socket was full sends only bytes the gate already approved, so a byte-counting gate counts them once; D-074). P0, Tier 3, `0.3.0`.
 
 `begin_response` (or `begin_tagged_response`) and `end_response` mark response boundaries for the gate (`end_response` clears the tag): when the gate denies a write, the session's `on_denied` output is written only if no byte since the last `begin_response` has left; otherwise the connection is reset with no denial bytes mixed into a partial response. A session that never marks boundaries is treated as "started" after its first byte. Bytes already handed to the kernel cannot be recalled: responses that must be all-or-nothing are pushed in full before returning `Step::Write`. `wipe_all` overwrites every pending chunk net-io owns with zeroes and drops it.
 
@@ -1642,7 +1644,7 @@ impl Drop for Server;   // shutdown with the drain timeout as the deadline
 | `release_listeners` | owned duplicates of every listening socket, for [hand-off](#listener-hand-off); works while the door is open, so the new process can start accepting before this one stops (decision D-042); a later `shutdown` does not close the released sockets | `Os` | 1 system call per listener | P0 | 3 | `0.4.0` |
 | `adopt` | registers a dialed connection exactly like an accepted one: new id, `Gate::admit` with `AdmitStage::Adopt`, the named listener's limits, sessions, kill handle, events | `Refused`, `Limit`, `ShuttingDown` | as accept | P1 | 3 | `0.4.0` |
 | `handle` | a cloneable handle for other threads | | `Arc` clone | P0 | 2 | `0.3.0` |
-| `stats` | sum of per-worker snapshots | | O(workers) | P1 | 2 | `0.3.0` |
+| `stats` | sum of per-worker snapshots, each consistent (a worker's counters are read under a sequence lock, D-069) | | O(workers) | P1 | 2 | `0.3.0` |
 | `listeners` | facts about each bound listener | | none | P0 | 2 | `0.3.0` |
 
 A `Server` must not be used in a process created by `fork` after it was built: the cold calls (`open_door`, `adopt`, `shutdown`) check the process id and return `ForkedChild`.
@@ -1722,7 +1724,7 @@ pub enum DoorState { Open, Closed }
 The gate decides who may connect and whether bytes may still leave. net-io defines the trait and calls it at fixed points; a connection gate crate implements it (net-io never depends on the implementer). The two guarantees:
 
 1. **No byte is read before the gate admits the connection.**
-2. **No byte is written without passing the gate**, before every write system call: each `send`, each vectored call, each file chunk, each TLS ciphertext flush. Even a handler that forgets every other checkpoint cannot send a byte on a revoked connection.
+2. **No byte is written without passing the gate**: the gate is asked before every write (each `send`, each vectored write of a flush, each file chunk, each TLS ciphertext flush), and a retry after the socket was full sends only the bytes it approved. Even a handler that forgets every other checkpoint cannot send a byte on a revoked connection.
 
 ### `Gate`
 
@@ -1899,9 +1901,9 @@ A process-wide signal that every worker reads with one atomic load at the top of
 | State | net-io's reaction |
 |---|---|
 | `Normal` | none; undoes the reactions below |
-| `Shed { from_lane }` | refuses new connections in `from_lane` and every less important lane (numbers at or above it; `RefusalCause::Shed`); `SessionContext::pressure()` reports 1.0 so protocols stop keep-alive |
+| `Shed { from_lane }` | refuses new connections in `from_lane` and every less important lane (numbers at or above it; `RefusalCause::Shed`); closes idle connections in those lanes at once and busy ones at their next idle point (`CloseReason::Shed`); `SessionContext::pressure()` reports 1.0 so protocols stop keep-alive |
 | `Lockdown` | refuses new connections on listeners not marked `lockdown_allowed`; existing connections are not touched |
-| `Draining` | `close_door`, then `drain` with the line's deadline (or the drain timeout) |
+| `Draining` | `close_door`, then `drain` with the line's deadline (or the drain timeout); the accept thread runs the drain, so it happens whether or not the program waits in `wait_for_stop` (D-075) |
 | `Stopping` | kills every remaining connection with `Shutdown` |
 
 `ServerHandle::wake_all` makes workers that sleep in the kernel see a change at once. Reactions are idempotent and epoch-gated: a line that moves `Normal`, `Shed`, `Normal` within one loop iteration is seen only in its final state.
@@ -2065,6 +2067,7 @@ impl Buffer {
 
 pub struct BufferPool { /* per worker: one free list per size class */ }
 impl BufferPool {
+    pub fn standalone(bytes: u64) -> BufferPool;                      // its own budget, for use outside a server
     pub fn take(&mut self, class: SizeClass) -> Option<Buffer>;
     pub fn put(&mut self, buffer: Buffer);
     pub fn stats(&self) -> PoolStats;
