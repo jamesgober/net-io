@@ -14,10 +14,11 @@
 //!
 //! ## Status
 //!
-//! Scaffold. The design is written down in `dev/PLAN.md` and the milestone
-//! schedule in `dev/ROADMAP.md` (both in the
-//! [repository](https://github.com/jamesgober/net-io)); the public API
-//! begins with `0.2.0`.
+//! Design lock (`0.2.0`). No functional code yet. The public API is locked in
+//! `docs/API.md`, the design and its decisions in `dev/PLAN.md`, and the
+//! milestone schedule in `dev/ROADMAP.md` (all in the
+//! [repository](https://github.com/jamesgober/net-io)). `0.3.0` brings TCP
+//! with the blocking driver.
 
 #![doc(html_root_url = "https://docs.rs/net-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
