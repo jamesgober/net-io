@@ -14,7 +14,7 @@ use std::any::TypeId;
 use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ use crate::error::{CloseReason, KillReason, NetError, OsErrorClass, RefusalCause
 use crate::events::{CoalescedKind, Coalescer, Event, EventSink, NoopSink};
 use crate::gate::{AdmitStage, AllowAll, ErasedGate, Gate, GateCell, Refusal, guarded};
 use crate::id::{ConnectionId, IdBlock, ListenerId, WorkerId};
-use crate::info::{ConnectionInfo, Origin};
+use crate::info::{ConnectionInfo, Lane, Origin};
 use crate::limits::{Effective, Limits};
 use crate::link::{ClockRef, Got, Link, WakeSource};
 use crate::opts::{ListenOptions, TcpOptions};
@@ -41,6 +41,15 @@ use crate::time::Clock;
 
 const WORKER_STACK: usize = 256 * 1024;
 const DRAIN_KILL: KillReason = KillReason(0);
+
+/// `WorkerShared::kill_cause`: a user's kill, the drain deadline, or `Stopping`.
+const CAUSE_USER: u8 = 0;
+const CAUSE_DRAIN: u8 = 1;
+const CAUSE_STOP: u8 = 2;
+
+/// `WorkerShared::idle_cause`: an idle connection closed by a drain or by shedding.
+const IDLE_DRAIN: u8 = 0;
+const IDLE_SHED: u8 = 1;
 
 /// How often a drain looks again for connections that became idle.
 const DRAIN_PASS: Duration = Duration::from_millis(10);
@@ -151,7 +160,12 @@ pub(crate) struct WorkerShared {
     slot: Arc<KillSlot>,
     wake: Arc<Wake>,
     current: AtomicU64,
-    drain_kill: AtomicBool,
+    /// The current connection's lane, for shedding.
+    lane: AtomicU8,
+    /// Why net-io itself killed the current connection (`CAUSE_*`).
+    kill_cause: AtomicU8,
+    /// Why net-io closed the current connection while idle (`IDLE_*`).
+    idle_cause: AtomicU8,
     completer: Arc<CompleterShared>,
     stats: WorkerStats,
 }
@@ -348,20 +362,15 @@ impl Shared {
             // Close every connection that waits for its next exchange; repeated each
             // pass for connections that finish an exchange during the drain.
             for w in &self.workers {
-                if w.current.load(Ordering::Acquire) != 0 {
+                if w.current.load(Ordering::Acquire) != 0 && !w.slot.drained() {
+                    w.idle_cause.store(IDLE_DRAIN, Ordering::Release);
                     w.slot.drain_idle(w.slot.generation());
                 }
             }
             let now = Instant::now();
             if now >= deadline && !killed_at_deadline {
                 killed_at_deadline = true;
-                for w in &self.workers {
-                    if w.current.load(Ordering::Acquire) != 0 {
-                        w.drain_kill.store(true, Ordering::Release);
-                        let generation = w.slot.generation();
-                        w.slot.kill(generation, DRAIN_KILL);
-                    }
-                }
+                self.kill_all(CAUSE_DRAIN);
             }
             let wait = if killed_at_deadline {
                 Duration::from_millis(50)
@@ -387,6 +396,40 @@ impl Shared {
             killed: report.killed,
         });
         report
+    }
+
+    /// Kills every open connection on net-io's own behalf (`cause` names why).
+    fn kill_all(&self, cause: u8) {
+        for w in &self.workers {
+            if w.current.load(Ordering::Acquire) != 0 {
+                // Claim the cause first (the owner reads it once it sees the kill). A
+                // concurrent drain or stop that already claimed it keeps its cause.
+                let claimed = w
+                    .kill_cause
+                    .compare_exchange(CAUSE_USER, cause, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+                if !w.slot.kill(w.slot.generation(), DRAIN_KILL) && claimed {
+                    // Already closed, or a user's kill won: that reason stands.
+                    w.kill_cause.store(CAUSE_USER, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// `ControlState::Shed`: closes the idle connections in shed lanes now; busy
+    /// ones see `pressure()` 1.0 and close at their next idle point.
+    fn shed_idle(&self, from_lane: Lane) {
+        for w in &self.workers {
+            if w.current.load(Ordering::Acquire) != 0
+                && w.lane.load(Ordering::Acquire) >= from_lane.0
+                && !w.slot.drained()
+            {
+                w.idle_cause.store(IDLE_SHED, Ordering::Release);
+                if !w.slot.drain_idle(w.slot.generation()) {
+                    w.idle_cause.store(IDLE_DRAIN, Ordering::Release);
+                }
+            }
+        }
     }
 
     pub(crate) fn stop_threads(&self) {
@@ -525,7 +568,9 @@ where
                 slot: Arc::new(KillSlot::new()),
                 wake,
                 current: AtomicU64::new(0),
-                drain_kill: AtomicBool::new(false),
+                lane: AtomicU8::new(0),
+                kill_cause: AtomicU8::new(CAUSE_USER),
+                idle_cause: AtomicU8::new(IDLE_DRAIN),
                 completer: Arc::new(CompleterShared::new(
                     queue_capacity,
                     Arc::new(WorkerTarget {
@@ -662,11 +707,19 @@ fn accept_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, li: usiz
                 ControlState::Draining => {
                     shared.close_door();
                     shared.request_stop(view.deadline());
+                    // The drain runs here: the door is closed, so this thread has
+                    // nothing else to do until it ends.
+                    let deadline = view
+                        .deadline()
+                        .unwrap_or_else(|| Instant::now() + shared.drain_timeout);
+                    shared.drain(deadline);
                 }
                 ControlState::Stopping => {
                     shared.close_door();
                     shared.request_stop(Some(Instant::now()));
+                    shared.kill_all(CAUSE_STOP);
                 }
+                ControlState::Shed { from_lane } => shared.shed_idle(from_lane),
                 _ => {}
             }
         }
@@ -981,7 +1034,9 @@ impl<G: Gate> Worker<G> {
             }
         }
         let ws = &shared.workers[self.idx];
-        ws.drain_kill.store(false, Ordering::Release);
+        ws.kill_cause.store(CAUSE_USER, Ordering::Release);
+        ws.idle_cause.store(IDLE_DRAIN, Ordering::Release);
+        ws.lane.store(info.lane.0, Ordering::Release);
         let mut link = Link::new(
             stream,
             info,
@@ -1013,11 +1068,15 @@ impl<G: Gate> Worker<G> {
         let mut link = link;
         let mut reason = reason;
         if let Some(k) = link.killed() {
-            reason = if ws.drain_kill.load(Ordering::Acquire) && k == DRAIN_KILL {
-                CloseReason::DrainDeadline
-            } else {
-                CloseReason::Killed(k)
+            reason = match (ws.kill_cause.load(Ordering::Acquire), k == DRAIN_KILL) {
+                (CAUSE_DRAIN, true) => CloseReason::DrainDeadline,
+                (CAUSE_STOP, true) => CloseReason::Shutdown,
+                _ => CloseReason::Killed(k),
             };
+        } else if reason == CloseReason::Drained
+            && ws.idle_cause.load(Ordering::Acquire) == IDLE_SHED
+        {
+            reason = CloseReason::Shed;
         } else if shared.draining.load(Ordering::Acquire) && !reason.is_abortive() {
             reason = CloseReason::Drained;
         }
@@ -1114,6 +1173,11 @@ impl<G: Gate> Worker<G> {
             ControlState::Stopping => Some(CloseReason::Shutdown),
             _ => None,
         }
+    }
+
+    /// Whether the control line sheds `lane`.
+    fn shed(&self, lane: Lane) -> bool {
+        matches!(self.view.state(), ControlState::Shed { from_lane } if lane >= from_lane)
     }
 
     fn pressure(&self) -> f32 {
@@ -1244,6 +1308,9 @@ fn drive<G: Gate, S: Session>(
                 let idle = link.phase() == Phase::Idle && input.bytes().is_empty();
                 if w.draining() && idle {
                     return CloseReason::Drained;
+                }
+                if idle && w.shed(link.info.lane) {
+                    return CloseReason::Shed;
                 }
                 if input.is_full() {
                     return CloseReason::Limit(crate::error::LimitKind::ReadBuffer);

@@ -454,12 +454,14 @@ pub(crate) fn set_recv_timeout(_stream: &TcpStream, _timeout: Option<Duration>) 
 
 /// One send on a non-blocking socket: `WouldBlock` when the buffer is full.
 pub(crate) fn send(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
-    #[cfg(any(test, net_io_shim))]
-    let buf = match super::shim::io(super::shim::Op::Send, buf.len())? {
-        Some(n) => &buf[..n],
-        None => buf,
-    };
-    retry_interrupted(|| (&mut &*stream).write(buf))
+    retry_interrupted(|| {
+        #[cfg(any(test, net_io_shim))]
+        let buf = match super::shim::io(super::shim::Op::Send, buf.len())? {
+            Some(n) => &buf[..n],
+            None => buf,
+        };
+        (&mut &*stream).write(buf)
+    })
 }
 
 /// The largest number of slices passed to one vectored send.

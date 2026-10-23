@@ -584,16 +584,23 @@ pub(crate) fn set_recv_timeout(stream: &TcpStream, timeout: Option<Duration>) ->
 
 /// One send that never blocks: `WouldBlock` when the socket buffer is full.
 pub(crate) fn send(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
-    #[cfg(target_os = "linux")]
-    let flags = c::MSG_DONTWAIT | c::MSG_NOSIGNAL;
-    #[cfg(target_os = "macos")]
-    let flags = c::MSG_DONTWAIT;
     retry_interrupted(|| {
         #[cfg(any(test, net_io_shim))]
         let buf = match super::shim::io(super::shim::Op::Send, buf.len())? {
             Some(n) => &buf[..n],
             None => buf,
         };
+        send_once(stream, buf)
+    })
+}
+
+/// One `send` system call with net-io's flags.
+fn send_once(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    let flags = c::MSG_DONTWAIT | c::MSG_NOSIGNAL;
+    #[cfg(target_os = "macos")]
+    let flags = c::MSG_DONTWAIT;
+    {
         // SAFETY: `stream` is open for the call; `buf` is a live slice of `buf.len()`
         // bytes. MSG_NOSIGNAL (Linux) and SO_NOSIGPIPE (set at creation on macOS)
         // keep a closed peer from raising SIGPIPE.
@@ -610,7 +617,7 @@ pub(crate) fn send(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
         } else {
             Ok(n.unsigned_abs())
         }
-    })
+    }
 }
 
 /// The largest number of slices passed to one vectored send (below `IOV_MAX`).
@@ -632,7 +639,8 @@ pub(crate) fn send_vectored(stream: &TcpStream, bufs: &[IoSlice<'_>]) -> io::Res
                 .iter()
                 .find(|b| !b.is_empty())
                 .map_or(&[][..], |b| &b[..]);
-            return send(stream, &first[..n.min(first.len())]);
+            // Straight to the system call: this send already took its fault.
+            return send_once(stream, &first[..n.min(first.len())]);
         }
         let msg = MsgHdr {
             msg_name: std::ptr::null_mut(),

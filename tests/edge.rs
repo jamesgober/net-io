@@ -69,6 +69,35 @@ impl Session for Signalled {
     }
 }
 
+/// `serve_sessions` with 4 workers: tests run in parallel, and on Windows every
+/// worker's wake channel holds a loopback port.
+fn small_sessions<F: net_io::SessionFactory>(factory: F) -> Result<net_io::Server, NetError> {
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .workers(4)
+        .sessions(factory)
+        .gate(AllowAll)
+        .build()?;
+    server.open_door()?;
+    Ok(server)
+}
+
+/// `serve` with 4 workers (see `small_sessions`).
+fn small_blocking<H>(handler: H) -> Result<net_io::Server, NetError>
+where
+    H: Fn(&mut TcpConnection) -> Result<(), NetError> + Send + Sync + 'static,
+{
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .workers(4)
+        .handler(handler)
+        .gate(AllowAll)
+        .build()?;
+    server.open_door()?;
+    Ok(server)
+}
+
+/// Tests run in parallel: small pools keep the process's socket count low.
 fn lines_server() -> net_io::Server {
     let server = ServerBuilder::new()
         .listener(ListenerSpec::tcp("127.0.0.1:0"))
@@ -118,7 +147,7 @@ fn edge_01_eof_in_idle_is_peer_closed() {
 #[test]
 fn edge_02_37_eof_mid_request_reaches_the_session_which_may_still_write() {
     // The peer half-closes in the middle of a line; the session answers and closes.
-    let server = net_io::serve_sessions("127.0.0.1:0", |_: &ConnectionInfo| Custom {
+    let server = small_sessions(|_: &ConnectionInfo| Custom {
         data: |cx: &mut SessionContext<'_>, input: &mut Input| {
             cx.set_phase(Phase::Receiving);
             let n = input.bytes().len();
@@ -218,7 +247,7 @@ fn edge_10_bytes_sent_while_parked_are_read_after_the_wake() {
             Step::Write
         }
     }
-    let server = net_io::serve_sessions("127.0.0.1:0", move |_: &ConnectionInfo| Parker {
+    let server = small_sessions(move |_: &ConnectionInfo| Parker {
         tx: tx.lock().ok().map(|t| t.clone()),
         waited: false,
     })
@@ -439,7 +468,7 @@ fn edge_21_22_peer_gone_mid_write_is_peer_reset_without_a_signal() {
 
 #[test]
 fn edge_34_close_with_unread_input_lingers_so_the_reply_arrives() {
-    let server = net_io::serve_sessions("127.0.0.1:0", |_: &ConnectionInfo| Custom {
+    let server = small_sessions(|_: &ConnectionInfo| Custom {
         data: |cx: &mut SessionContext<'_>, input: &mut Input| {
             // Answer the first line and close without reading the rest.
             if input.bytes().contains(&b'\n') {
@@ -463,7 +492,7 @@ fn edge_34_close_with_unread_input_lingers_so_the_reply_arrives() {
 
 #[test]
 fn edge_35_abort_sends_a_reset() {
-    let server = net_io::serve("127.0.0.1:0", |conn: &mut TcpConnection| {
+    let server = small_blocking(|conn: &mut TcpConnection| {
         let mut b = [0u8; 8];
         let _ = conn.recv(&mut b)?;
         Err(NetError::Closed)
@@ -483,7 +512,7 @@ fn edge_35_abort_sends_a_reset() {
 fn edge_36_kill_during_the_linger_closes_at_once() {
     let (tx, rx) = mpsc::channel();
     let tx = Mutex::new(tx);
-    let server = net_io::serve_sessions("127.0.0.1:0", move |_: &ConnectionInfo| {
+    let server = small_sessions(move |_: &ConnectionInfo| {
         let tx = tx.lock().ok().map(|t| t.clone());
         Custom {
             data: move |cx: &mut SessionContext<'_>, _input: &mut Input| {
@@ -658,7 +687,7 @@ fn edge_108_drain_with_nothing_open_returns_at_once() {
 #[test]
 fn edge_109_drain_deadline_in_the_past_kills_at_once() {
     let (factory, seen) = signalled_lines();
-    let server = net_io::serve_sessions("127.0.0.1:0", factory).expect("serve");
+    let server = small_sessions(factory).expect("serve");
     let mut c = client(addr(&server));
     c.write_all(b"no newline yet").expect("write");
     seen.recv_timeout(WAIT).expect("read by the session");
@@ -676,7 +705,7 @@ fn edge_109_drain_deadline_in_the_past_kills_at_once() {
 fn edge_110_request_stop_from_a_session_is_safe() {
     let handle: Arc<OnceLock<ServerHandle>> = Arc::new(OnceLock::new());
     let h = handle.clone();
-    let server = net_io::serve_sessions("127.0.0.1:0", move |_: &ConnectionInfo| {
+    let server = small_sessions(move |_: &ConnectionInfo| {
         let h = h.clone();
         Custom {
             data: move |_cx: &mut SessionContext<'_>, _input: &mut Input| {
@@ -702,7 +731,7 @@ fn edge_113_kill_with_a_foreign_or_closed_id_is_false() {
     let b = lines_server();
     let (tx, rx) = mpsc::channel();
     let tx = Mutex::new(tx);
-    let server = net_io::serve("127.0.0.1:0", move |conn: &mut TcpConnection| {
+    let server = small_blocking(move |conn: &mut TcpConnection| {
         let _ = tx.lock().map(|t| t.send(conn.id()));
         Ok(())
     })
@@ -826,7 +855,7 @@ fn edge_127_low_port_without_privileges() {
 fn edge_129_kill_from_many_threads_closes_once() {
     let (tx, rx) = mpsc::channel();
     let tx = Mutex::new(tx);
-    let server = net_io::serve("127.0.0.1:0", move |conn: &mut TcpConnection| {
+    let server = small_blocking(move |conn: &mut TcpConnection| {
         let _ = tx.lock().map(|t| t.send(conn.id()));
         let mut b = [0u8; 8];
         let _ = conn.recv(&mut b)?;
