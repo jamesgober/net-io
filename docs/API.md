@@ -35,7 +35,7 @@
   - [`AddrError`](#addrerror)
 - [Identity and connection facts](#identity-and-connection-facts)
   - [`ConnectionId`, `ListenerId`, `WorkerId`](#connectionid-listenerid-workerid)
-  - [`Lane`](#lane)
+  - [`Lane`, `GateTag`](#lane-gatetag)
   - [`ConnectionInfo`](#connectioninfo)
   - [`Transport`, `Origin`, `Endpoint`](#transport-origin-endpoint)
   - [`PeerCredentials`](#peercredentials)
@@ -752,15 +752,20 @@ impl WorkerId { pub const fn get(self) -> u16; }
 
 `ConnectionId` is issued for every accepted, adopted, dialed-and-registered, or inherited connection; it is never zero and never reused within a process. Workers take blocks of 1,024 ids from one process-wide counter, so ids are ordered within a worker, not globally; at one million connections per second the counter lasts about 584,000 years. The block also tells `ServerHandle::kill` which worker owns an id. P0, Tier 1, `0.3.0`. `ListenerId` and `WorkerId` (P0, Tier 2) count from 0 within one server; at most 65,535 of each.
 
-### `Lane`
+### `Lane`, `GateTag`
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct Lane(pub u8);
 impl Lane { pub const MOST_IMPORTANT: Lane = Lane(0); }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct GateTag(pub u64);
 ```
 
 An opaque importance class the gate assigns at admission: lower is more important. net-io uses it only to shed lanes at or above a floor under load (`ControlState::Shed`) and for per-lane connection reservations (`LimitsBuilder::lane_reserve`, `0.6.0`). What a lane means belongs to the application. P1, Tier 2, `0.3.0`.
+
+`GateTag` is an opaque value the gate returns at admission (`Admitted::tag`) and net-io stores in `ConnectionInfo::gate`. It lets a protocol engine name the connection to the gate (for example to open a per-request ticket) without being generic over the gate's type. A session can also mark the current response with a tag (`Output::begin_response(Some(tag))`), which the gate sees in `WriteCheck::response`; on HTTP/2, or behind a proxy that pools many clients on one connection, that is how a check judges the right request. net-io never interprets either value. `AllowAll` returns `GateTag(0)`. P1, Tier 2, `0.3.0` (decision D-051).
 
 ### `ConnectionInfo`
 
@@ -780,6 +785,7 @@ pub struct ConnectionInfo {
     pub peer_credentials: Option<PeerCredentials>,  // local sockets
     pub tls: Option<TlsInfo>,                    // after the handshake
     pub lane: Lane,
+    pub gate: GateTag,                           // set by the gate at admission
     pub accepted_at: Instant,
 }
 impl ConnectionInfo {
@@ -845,7 +851,7 @@ pub struct Limits { /* private fields, one per row of the defaults table */ }
 impl Limits {
     pub fn reactor_defaults() -> Limits;
     pub fn blocking_defaults() -> Limits;
-    pub fn builder() -> LimitsBuilder;                         // starts from the defaults of the server's driver
+    pub fn builder() -> LimitsBuilder;                         // starts from Limits::default()
     pub fn to_builder(&self) -> LimitsBuilder;
     pub fn validate(&self, workers: u16, descriptor_limit: Option<u64>) -> Result<(), NetError>;
     // One getter per field:
@@ -878,6 +884,8 @@ impl Default for Limits;   // reactor_defaults() where the reactor is built, els
 ```
 
 Every bound net-io enforces, in one value. A server takes one `Limits` and each listener may override it (`ListenerSpec::limits`); a client `TcpConnection` takes one through `set_limits`. Limits are checked before the resource is committed: a connection over a cap is refused before any byte is read, a header over its size before buffering, a buffer before allocation. P0, Tier 2, `0.3.0`.
+
+A server built without `ServerBuilder::limits` uses the defaults of the driver it runs (`blocking_defaults` or `reactor_defaults`). To start a custom set from the blocking defaults, use `Limits::blocking_defaults().to_builder()`.
 
 `validate` is what `ServerBuilder::build` runs (Tier 3 for code that builds limits ahead of time). `descriptor_limit` is the process's open-descriptor limit (`RLIMIT_NOFILE` soft limit on Unix, `None` on Windows, where socket handles do not come from a small table).
 
@@ -1478,7 +1486,7 @@ impl Output {
     pub fn push_buffer(&mut self, buffer: Buffer) -> Result<(), OutputFull>;     // moves, no copy
     pub fn push_static(&mut self, bytes: &'static [u8]) -> Result<(), OutputFull>;
     pub fn push_file(&mut self, file: Arc<File>, offset: u64, len: u64) -> Result<(), OutputFull>;   // P2, 0.6.0
-    pub fn begin_response(&mut self);
+    pub fn begin_response(&mut self, tag: Option<GateTag>);   // tag reaches the gate as WriteCheck::response
     pub fn end_response(&mut self);
     pub fn pending(&self) -> usize;
     pub fn is_empty(&self) -> bool;
@@ -1490,7 +1498,7 @@ pub struct OutputFull;
 
 What the session wants written, flushed when it returns `Step::Write` (or `Close`). Bounded by `Limits::output_budget` of pool memory per connection; `push_static` and file ranges do not count against it. On `OutputFull` the session returns `Step::Write` and continues in `on_writable`. Writes go out as vectored system calls of up to 64 chunks, each preceded by the gate check. P0, Tier 3, `0.3.0`.
 
-`begin_response` and `end_response` mark response boundaries for the gate: when the gate denies a write, the session's `denial` is written only if no byte since the last `begin_response` has left; otherwise the connection is reset with no denial bytes mixed into a partial response. A session that never marks boundaries is treated as "started" after its first byte. Bytes already handed to the kernel cannot be recalled: responses that must be all-or-nothing are pushed in full before returning `Step::Write`. `wipe_all` overwrites every pending chunk net-io owns with zeroes and drops it.
+`begin_response` and `end_response` mark response boundaries for the gate (the tag given to `begin_response` is cleared by `end_response`): when the gate denies a write, the session's `denial` is written only if no byte since the last `begin_response` has left; otherwise the connection is reset with no denial bytes mixed into a partial response. A session that never marks boundaries is treated as "started" after its first byte. Bytes already handed to the kernel cannot be recalled: responses that must be all-or-nothing are pushed in full before returning `Step::Write`. `wipe_all` overwrites every pending chunk net-io owns with zeroes and drops it.
 
 ---
 
@@ -1751,7 +1759,7 @@ impl Gate for Switch {
         }
         let lane = if info.client_addr().is_some_and(|a| a.ip().is_loopback()) { Lane(0) } else { Lane(3) };
         self.open.fetch_add(1, Ordering::Relaxed);
-        Ok(Admitted { lane, ticket: () })
+        Ok(Admitted { lane, ticket: (), tag: net_io::GateTag(0) })
     }
 
     fn readmit(&self, _ticket: &mut (), _info: &ConnectionInfo) -> Result<(), Refusal> {
@@ -1777,7 +1785,7 @@ impl Gate for Switch {
 pub enum AdmitStage { Accept, Adopt, Dialed }
 
 #[derive(Debug)]
-pub struct Admitted<T> { pub lane: Lane, pub ticket: T }
+pub struct Admitted<T> { pub lane: Lane, pub ticket: T, pub tag: GateTag }
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1799,6 +1807,7 @@ pub struct WriteCheck {
     pub lane: Lane,
     pub bytes: u32,                 // size of the chunk about to be written
     pub response_started: bool,     // a byte of the current response already left
+    pub response: Option<GateTag>,  // the tag the session gave Output::begin_response
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1812,7 +1821,7 @@ P0, Tier 3, `0.3.0`.
 ```rust
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AllowAll;
-impl Gate for AllowAll { type Ticket = (); /* admits every connection in Lane(0), never denies */ }
+impl Gate for AllowAll { type Ticket = (); /* admits every connection in Lane(0) with GateTag(0), never denies */ }
 ```
 
 The explicit "no gate". `ServerBuilder` requires a gate, so a server without one says `.gate(AllowAll)` in its code; the Tier 1 functions use it and their documentation says so. With `AllowAll` the checks compile to nothing. P0, Tier 2, `0.3.0`.
@@ -2719,6 +2728,7 @@ Every limit, deadline, and buffer is per connection or per worker; nothing globa
 | Needs | net-io item |
 |---|---|
 | admission before any byte, with a per-connection ticket | `Gate::admit`, `Gate::Ticket`, `Admitted` |
+| naming the connection and the current response to the gate from the protocol engine | `ConnectionInfo::gate`, `Output::begin_response(Some(tag))`, `WriteCheck::response` |
 | real client after a trusted PROXY header | `Gate::readmit`, `ConnectionInfo::real_peer`, `client_addr`, `client_key` |
 | a check before every write without a lookup by id | `Gate::check(&mut Ticket, &WriteCheck)` |
 | release and strikes at close | `Gate::closed(Ticket, &ConnectionInfo, CloseReason)` |
@@ -2772,7 +2782,7 @@ Names follow the rule "plain words, no abbreviations" (decision D-017). Earlier 
 | `FdBuf`, `send_fds`, `recv_fds` | `Descriptors`, `send_descriptors`, `recv_descriptors` |
 | `DatagramBuf`, `OutDatagram` | `DatagramBuffer`, `OutgoingDatagram` |
 | `SslTlv`, `ProxyAddr`, `Progress` (PROXY) | `ProxySsl`, `ProxyAddress`, `ProxyProgress` |
-| `Admission` + `Egress` traits, `AdmitVerdict`, `EgressVerdict`, `EgressContext`, `GateTag` | one `Gate` trait with an associated `Ticket`; `Admitted`, `Denial`, `WriteCheck`; the ticket replaces the gate tag |
+| `Admission` + `Egress` traits, `AdmitVerdict`, `EgressVerdict`, `EgressContext` | one `Gate` trait with an associated `Ticket`; `Admitted`, `Denial`, `WriteCheck`; `GateTag` kept for protocol engines (D-051) |
 | `TlsEngine`, `TlsFactory`, `HelloHook`, `HelloVerdict` | `TlsSession`, `TlsAcceptor`; the hello hook belongs to the engine |
 | `Step::CloseAfterFlush` | `Step::Close` (always flushes) |
 | `Server<S: EventSink>` | `Server` (not generic) |
