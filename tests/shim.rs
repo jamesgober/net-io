@@ -295,3 +295,39 @@ fn test_zero_byte_send_once_then_error() {
         "an error, not a clean close"
     );
 }
+
+/// Edge case 6: a receive that would block after the socket looked ready is retried.
+#[test]
+fn test_spurious_would_block_is_retried() {
+    let _shim = Shim::take();
+    let server = echo_server();
+    let mut c = client(addr(&server));
+    program(Op::Recv, 0, 3, Fault::Kind(std::io::ErrorKind::WouldBlock));
+    assert_eq!(round_trip(&mut c, b"again"), b"again");
+}
+
+/// Edge case 8: the kernel timing the connection out (keepalive) is `Io(TimedOut)`,
+/// not one of net-io's deadlines.
+#[test]
+fn test_keepalive_timeout_is_an_io_error_not_a_deadline() {
+    #[cfg(target_os = "linux")]
+    const ETIMEDOUT: i32 = 110;
+    #[cfg(target_os = "macos")]
+    const ETIMEDOUT: i32 = 60;
+    #[cfg(windows)]
+    const ETIMEDOUT: i32 = 10060;
+    let _shim = Shim::take();
+    let server = echo_server();
+    let mut c = client(addr(&server));
+    assert_eq!(round_trip(&mut c, b"1"), b"1");
+    program(Op::Recv, 0, 1, Fault::Os(ETIMEDOUT));
+    let _ = std::io::Write::write_all(&mut c, b"2");
+    assert!(eventually(WAIT, || server.stats().closed == 1));
+    let s = server.stats();
+    assert_eq!(
+        s.closed_for(CloseReason::Io(net_io::OsErrorClass::TimedOut)),
+        1,
+        "{s:?}"
+    );
+    assert_eq!(s.timeouts, 0, "not counted as a deadline");
+}

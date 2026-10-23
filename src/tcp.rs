@@ -1013,6 +1013,20 @@ mod tests {
         assert!(matches!(err, NetError::AddrInUse { .. }), "{err:?}");
     }
 
+    /// Edge cases 127 and 128: bind errors map by class, whatever the OS's number.
+    #[test]
+    fn test_bind_errors_map_by_class() {
+        #[cfg(unix)]
+        use crate::sys::errno::{EACCES as ACCESS, EADDRNOTAVAIL as NOT_AVAILABLE};
+        #[cfg(windows)]
+        use crate::sys::errno::{WSAEACCES as ACCESS, WSAEADDRNOTAVAIL as NOT_AVAILABLE};
+        let addr: SocketAddr = "[::1]:80".parse().unwrap();
+        let e = bind_error(addr, io::Error::from_raw_os_error(NOT_AVAILABLE));
+        assert!(matches!(e, NetError::AddrNotAvailable { .. }), "{e:?}");
+        let e = bind_error(addr, io::Error::from_raw_os_error(ACCESS));
+        assert!(matches!(e, NetError::PermissionDenied { .. }), "{e:?}");
+    }
+
     #[test]
     fn test_read_timeout_fires() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();

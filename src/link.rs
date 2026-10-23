@@ -373,12 +373,10 @@ impl Link {
                 self.rate_in.record(now, n);
                 Some(Ok(Got::Data(n)))
             }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
+            // `SO_RCVTIMEO` expiring reads as `WouldBlock` on Unix, and Windows sockets
+            // are non-blocking. `TimedOut` is the kernel giving up on the connection
+            // (keepalive), which is `Io(TimedOut)`, not one of our deadlines.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 self.likely_more = false;
                 None
             }
