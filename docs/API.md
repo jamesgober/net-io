@@ -577,7 +577,7 @@ pub enum Direction { In, Out }
 pub enum OsErrorClass { Reset, Aborted, TimedOut, Refused, Unreachable, FileTruncated, Other(i32) }
 ```
 
-P0, Tier 2, `0.3.0`. `RefusalCause::Gate(code)` carries the gate's refusal code; `Session` means the session factory refused; `Busy` means the blocking driver had no free worker. `OsErrorClass` carries the OS error number, never message text, so it is `Copy` and fits in events.
+P0, Tier 2, `0.3.0`. `RefusalCause::Gate(code)` carries the gate's refusal code; `Session` means the session factory refused; `Busy` means every worker of the blocking driver had a connection or one waiting for it (D-067). `OsErrorClass` carries the OS error number, never message text, so it is `Copy` and fits in events.
 
 ### `ConfigReason`
 
@@ -713,7 +713,7 @@ impl TrustedProxies {
 }
 ```
 
-The one list of proxies whose claims about the client address are believed: PROXY headers here, and `X-Forwarded-For` / `Forwarded` in the web layer, which should use the same value. Keep it minimal: a trusted proxy can claim any client address. P0, Tier 1, `0.4.0`; `contains` under 20 ns for 16 blocks [est.], no allocation. The lookup is a binary search over IPv4 and IPv6 blocks kept separately.
+The one list of proxies whose claims about the client address are believed: PROXY headers here, and `X-Forwarded-For` / `Forwarded` in the web layer, which should use the same value. Keep it minimal: a trusted proxy can claim any client address. P0, Tier 1, `0.3.0` (moved from `0.4.0`, D-081: serve-net's 0.3 takes one for `X-Forwarded-For`); `contains` under 20 ns for 16 blocks [est.], no allocation. The lookup is a binary search over IPv4 and IPv6 blocks kept separately.
 
 Errors: as `Cidr::parse`, plus `TooMany { max: 1024 }`.
 
@@ -753,7 +753,7 @@ impl ListenerId { pub const fn get(self) -> u16; }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerId(u16);
-impl WorkerId { pub const fn get(self) -> u16; }
+impl WorkerId { pub const fn get(self) -> u16; pub const fn first() -> WorkerId; }   // first: worker 0, for tests and `ServerHandle::completer`
 ```
 
 `ConnectionId` is issued for every accepted, adopted, dialed-and-registered, or inherited connection; it is never zero and never reused within a process. Workers take blocks of 1,024 ids from one process-wide counter, so ids are ordered within a worker, not globally; at one million connections per second the counter lasts about 584,000 years. The block also tells `ServerHandle::kill` which worker owns an id. P0, Tier 1, `0.3.0`. `ListenerId` and `WorkerId` (P0, Tier 2) count from 0 within one server; at most 65,535 of each.
@@ -787,9 +787,9 @@ pub struct ConnectionInfo {
     pub local: Endpoint,
     pub peer: Endpoint,                          // normalized
     pub real_peer: Option<SocketAddr>,           // from a trusted PROXY header, normalized
-    pub proxy: Option<ProxyFacts>,               // ALPN, authority, unique id, SSL flags (fixed arrays)
+    pub proxy: Option<Arc<ProxyFacts>>,          // ALPN, authority, unique id, SSL flags (fixed arrays, pooled)
     pub peer_credentials: Option<PeerCredentials>,  // local sockets
-    pub tls: Option<TlsInfo>,                    // after the handshake
+    pub tls: Option<Arc<TlsInfo>>,               // after the handshake (pooled)
     pub lane: Lane,
     pub gate: GateTag,                           // set by the gate at admission
     pub accepted_at: Instant,
@@ -802,7 +802,7 @@ impl ConnectionInfo {
 }
 ```
 
-What net-io knows about one connection, built at accept and completed as the handshake reveals more. It holds no heap memory: Unix paths, pipe names, ALPN, SNI, and PROXY TLV copies live in fixed arrays, so building one never allocates [est. about 600 bytes]. `client_addr` is what gates, logs, and rate limits should use: it returns the PROXY-reported address only when that header came from a trusted proxy. P0, Tier 1, `0.3.0` (TCP fields, `client_addr`, `client_key`), `0.4.0` (`real_peer`, `proxy`, `peer_credentials`, `tls`). `for_testing` (P1, Tier 3, `0.3.0`) builds one that is attached to no socket, so gates and sessions can be unit-tested; its id comes from the same process counter, so it never collides with a real connection.
+What net-io knows about one connection, built at accept and completed as the handshake reveals more. Building one never allocates after warm-up: Unix paths and pipe names are shared with the listener that owns them (`Arc`), and PROXY and TLS facts (fixed arrays inside) come from per-worker pools of `Arc`s that are reused when a connection closes, so the struct itself stays near 200 bytes and an idle connection fits the 512-byte target (decision D-061). `client_addr` is what gates, logs, and rate limits should use: it returns the PROXY-reported address only when that header came from a trusted proxy. P0, Tier 1, `0.3.0` (TCP fields, `client_addr`, `client_key`), `0.4.0` (`real_peer`, `proxy`, `peer_credentials`, `tls`). `for_testing` (P1, Tier 3, `0.3.0`) builds one that is attached to no socket, so gates and sessions can be unit-tested; its id comes from the same process counter, so it never collides with a real connection.
 
 ```rust,no_run
 let listener = net_io::listen("0.0.0.0:7000")?;
@@ -824,11 +824,12 @@ pub enum Origin { Accepted, Dialed, Adopted, Inherited }
 #[non_exhaustive] #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Endpoint {
     Ip(SocketAddr),
-    Unix(UnixPath),          // up to 108 bytes, fixed array
-    Pipe(PipeName),          // up to 256 UTF-16 units, fixed array
+    Unix(Arc<UnixPath>),     // up to 108 bytes, fixed array, shared with the listener
+    Pipe(Arc<PipeName>),     // up to 256 UTF-16 units, fixed array, shared with the listener
     Unnamed,                 // an unnamed Unix socket peer
 }
 impl Endpoint { pub fn socket_addr(&self) -> Option<SocketAddr>; }
+impl fmt::Display for Endpoint { /* 127.0.0.1:80, the Unix path, the pipe name, or "unnamed" */ }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)] pub struct UnixPath { /* [u8; 108] + len */ }  impl UnixPath { pub fn as_bytes(&self) -> &[u8]; #[cfg(unix)] pub fn as_path(&self) -> &Path; }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)] pub struct PipeName { /* [u16; 256] + len */ } impl PipeName { pub fn as_wide(&self) -> &[u16]; pub fn to_string_lossy(&self) -> String; }
 ```
@@ -1130,7 +1131,7 @@ A connected TCP socket that carries its own limits: every read honours the curre
 | `recv_exact` | loops until `buf` is full | as `recv`, plus `Closed` when the peer closes early | | P1 | 1 | `0.3.0` |
 | `peek` | `MSG_PEEK` | as `recv` | 1 system call | P2 | 2 | `0.3.0` |
 | `send` | gate check, then one system call; may write less than `buf` | `TimedOut`, `SlowPeer { Out }`, `BrokenPipe`, `ConnectionReset`, `EgressDenied`, `Killed` | gate check + 1 system call | P0 | 1 | `0.3.0` |
-| `send_all` | loops from the exact offset until done, the deadline passes, or the gate denies; the gate check runs before every system call | as `send` | 1 system call per chunk | P0 | 1 | `0.3.0` |
+| `send_all` | loops from the exact offset until done, the deadline passes, or the gate denies; the gate check runs before each write (a retry after the socket was full is not checked again, D-074) | as `send` | 1 system call per chunk | P0 | 1 | `0.3.0` |
 | `send_vectored`, `send_all_vectored` | up to 64 slices per system call; `send_all_vectored` advances the slices in place (no copy) | as `send` | 1 system call per 64 slices | P1 | 2 | `0.3.0` |
 | `send_file` | `sendfile` (Linux, macOS, FreeBSD) or `TransmitFile` (Windows) in chunks, a gate check before each chunk; falls back to read-and-write internally where zero copy is unavailable | as `send`; `FileTruncated { sent }` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
 | `shutdown` | half-close: `Write` sends FIN and keeps reading; `Read` stops reading; repeated calls are no-ops | `Closed`, `Os` | 1 system call | P0 | 1 | `0.3.0` |
@@ -1417,7 +1418,7 @@ pub enum Phase { #[default] Idle, Receiving, Sending }
 
 After `Step::Read`, net-io calls `on_data` again at once if the input changed since the last call (the session consumed bytes, or bytes arrived while it was writing); otherwise it waits for more bytes. So a session that consumed part of its input and returned `Write` sees the rest after the flush, and a session that consumed nothing and waits for more is not called in a loop.
 
-`Phase` chooses which deadlines run (idle in `Idle`; read deadline, inbound rate, and exchange deadline in `Receiving`; write deadline, outbound rate, and exchange deadline in `Sending`). net-io moves `Idle` to `Receiving` itself when the first byte of a new exchange arrives, so a session that never sets a phase still gets idle and read deadlines. `Park { until: None }` uses the park timeout. P0, Tier 3, `0.3.0`.
+`Phase` chooses which deadlines run (idle in `Idle`; read deadline, inbound rate, and exchange deadline in `Receiving`; write deadline, outbound rate, and exchange deadline in `Sending`). net-io moves `Idle` to `Receiving` itself when the first byte of a new exchange arrives, and back to `Idle` once a reply went out and no input is left over, so a session that never sets a phase still gets idle and read deadlines (D-065). Calling `set_phase` hands the phase to the session for the rest of the connection. `Park { until: None }` uses the park timeout. P0, Tier 3, `0.3.0`.
 
 ### `SessionContext`
 
@@ -1429,6 +1430,7 @@ impl SessionContext<'_> {
     pub fn now(&self) -> Instant;                         // the worker's clock, read once per loop iteration
     pub fn set_phase(&mut self, phase: Phase);
     pub fn set_exchange_deadline(&mut self, at: Option<Instant>);
+    pub fn set_idle_timeout(&mut self, timeout: Option<Duration>);   // this connection, from its next idle wait; None: the limit again
     pub fn draining(&self) -> bool;                        // finish the current exchange, then close
     pub fn pressure(&self) -> f32;                         // 0.0 to 1.0; 1.0 under ControlState::Shed
     pub fn kill_handle(&self) -> KillHandle;
@@ -1440,13 +1442,14 @@ impl SessionContext<'_> {
 }
 ```
 
-Everything a session may touch, scoped to one call. `pressure` is the fraction of busy workers (blocking driver) or of `max_connections` in use (reactor); a protocol layer uses it to stop offering keep-alive above about 0.9. `grow_input` moves the unconsumed input into a larger buffer, up to the maximum read class (`LimitsBuilder::read_class`); above it the error is `Limit { which: ReadBuffer }`. Each method costs under 5 ns [est.]. P0 (`pressure`, `grow_input` P1), Tier 3, `0.3.0`.
+Everything a session may touch, scoped to one call. `pressure` is the fraction of busy workers (blocking driver) or of `max_connections` in use (reactor); a protocol layer uses it to stop offering keep-alive above about 0.9. `grow_input` moves the unconsumed input into a larger buffer, up to the maximum read class (`LimitsBuilder::read_class`); above it the error is `Limit { which: ReadBuffer }`. `set_idle_timeout` overrides the idle timeout for this connection only (for example 2 s of keep-alive while the pool is over 75% busy), raised to at least one tick; `None` restores the listener's limit (D-081). Each method costs under 5 ns [est.]. P0 (`pressure`, `grow_input`, `set_idle_timeout` P1), Tier 3, `0.3.0`.
 
 ### `Input`
 
 ```rust
 pub struct Input { /* the connection's Buffer + consumed offset */ }
 impl Input {
+    pub fn from_bytes(bytes: &[u8]) -> Input;                           // for tests of sessions (allocates)
     pub fn bytes(&self) -> &[u8];                                       // unconsumed bytes, borrowed from the read buffer
     pub fn consume(&mut self, n: usize);                                // saturates at the length
     pub fn is_full(&self) -> bool;
@@ -1491,6 +1494,7 @@ impl Session for Blocks {
 ```rust
 pub struct Output { /* bounded chunk queue */ }
 impl Output {
+    pub fn standalone(limit: u32) -> Output;                                     // for tests of sessions (allocates)
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), OutputFull>;              // all or nothing; copies into pool buffers
     pub fn push_partial(&mut self, bytes: &[u8]) -> usize;                       // as much as the budget allows; returns the count
     pub fn push_buffer(&mut self, buffer: Buffer) -> Result<(), OutputFull>;     // moves, no copy
@@ -1507,7 +1511,7 @@ impl Output {
 pub struct OutputFull;
 ```
 
-What the session wants written, flushed when it returns `Step::Write` (or `Close`). Bounded by `Limits::output_budget` of pool memory per connection; `push_static` and file ranges do not count against it. On `OutputFull` the session returns `Step::Write`; after the flush it continues in `on_writable`, or in `on_data` if it left input unconsumed (see [`Step`](#step-phase)). Writes go out as vectored system calls of up to 64 chunks, each preceded by the gate check. P0, Tier 3, `0.3.0`.
+What the session wants written, flushed when it returns `Step::Write` (or `Close`). Bounded by `Limits::output_budget` of pool memory per connection; `push_static` and file ranges do not count against it. On `OutputFull` the session returns `Step::Write`; after the flush it continues in `on_writable`, or in `on_data` if it left input unconsumed (see [`Step`](#step-phase)). Writes go out as vectored system calls of up to 64 chunks, each write preceded by the gate check (a retry after the socket was full sends only bytes the gate already approved, so a byte-counting gate counts them once; D-074). P0, Tier 3, `0.3.0`.
 
 `begin_response` (or `begin_tagged_response`) and `end_response` mark response boundaries for the gate (`end_response` clears the tag): when the gate denies a write, the session's `on_denied` output is written only if no byte since the last `begin_response` has left; otherwise the connection is reset with no denial bytes mixed into a partial response. A session that never marks boundaries is treated as "started" after its first byte. Bytes already handed to the kernel cannot be recalled: responses that must be all-or-nothing are pushed in full before returning `Step::Write`. `wipe_all` overwrites every pending chunk net-io owns with zeroes and drops it.
 
@@ -1641,7 +1645,7 @@ impl Drop for Server;   // shutdown with the drain timeout as the deadline
 | `release_listeners` | owned duplicates of every listening socket, for [hand-off](#listener-hand-off); works while the door is open, so the new process can start accepting before this one stops (decision D-042); a later `shutdown` does not close the released sockets | `Os` | 1 system call per listener | P0 | 3 | `0.4.0` |
 | `adopt` | registers a dialed connection exactly like an accepted one: new id, `Gate::admit` with `AdmitStage::Adopt`, the named listener's limits, sessions, kill handle, events | `Refused`, `Limit`, `ShuttingDown` | as accept | P1 | 3 | `0.4.0` |
 | `handle` | a cloneable handle for other threads | | `Arc` clone | P0 | 2 | `0.3.0` |
-| `stats` | sum of per-worker snapshots | | O(workers) | P1 | 2 | `0.3.0` |
+| `stats` | sum of per-worker snapshots, each consistent (a worker's counters are read under a sequence lock, D-069) | | O(workers) | P1 | 2 | `0.3.0` |
 | `listeners` | facts about each bound listener | | none | P0 | 2 | `0.3.0` |
 
 A `Server` must not be used in a process created by `fork` after it was built: the cold calls (`open_door`, `adopt`, `shutdown`) check the process id and return `ForkedChild`.
@@ -1721,7 +1725,7 @@ pub enum DoorState { Open, Closed }
 The gate decides who may connect and whether bytes may still leave. net-io defines the trait and calls it at fixed points; a connection gate crate implements it (net-io never depends on the implementer). The two guarantees:
 
 1. **No byte is read before the gate admits the connection.**
-2. **No byte is written without passing the gate**, before every write system call: each `send`, each vectored call, each file chunk, each TLS ciphertext flush. Even a handler that forgets every other checkpoint cannot send a byte on a revoked connection.
+2. **No byte is written without passing the gate**: the gate is asked before every write (each `send`, each vectored write of a flush, each file chunk, each TLS ciphertext flush), and a retry after the socket was full sends only the bytes it approved. Even a handler that forgets every other checkpoint cannot send a byte on a revoked connection.
 
 ### `Gate`
 
@@ -1898,9 +1902,9 @@ A process-wide signal that every worker reads with one atomic load at the top of
 | State | net-io's reaction |
 |---|---|
 | `Normal` | none; undoes the reactions below |
-| `Shed { from_lane }` | refuses new connections in `from_lane` and every less important lane (numbers at or above it; `RefusalCause::Shed`); `SessionContext::pressure()` reports 1.0 so protocols stop keep-alive |
+| `Shed { from_lane }` | refuses new connections in `from_lane` and every less important lane (numbers at or above it; `RefusalCause::Shed`); closes idle connections in those lanes at once and busy ones at their next idle point (`CloseReason::Shed`); `SessionContext::pressure()` reports 1.0 so protocols stop keep-alive |
 | `Lockdown` | refuses new connections on listeners not marked `lockdown_allowed`; existing connections are not touched |
-| `Draining` | `close_door`, then `drain` with the line's deadline (or the drain timeout) |
+| `Draining` | `close_door`, then `drain` with the line's deadline (or the drain timeout); the accept thread runs the drain, so it happens whether or not the program waits in `wait_for_stop` (D-075) |
 | `Stopping` | kills every remaining connection with `Shutdown` |
 
 `ServerHandle::wake_all` makes workers that sleep in the kernel see a change at once. Reactions are idempotent and epoch-gated: a line that moves `Normal`, `Shed`, `Normal` within one loop iteration is seen only in its final state.
@@ -2064,6 +2068,7 @@ impl Buffer {
 
 pub struct BufferPool { /* per worker: one free list per size class */ }
 impl BufferPool {
+    pub fn standalone(bytes: u64) -> BufferPool;                      // its own budget, for use outside a server
     pub fn take(&mut self, class: SizeClass) -> Option<Buffer>;
     pub fn put(&mut self, buffer: Buffer);
     pub fn stats(&self) -> PoolStats;
@@ -2631,7 +2636,7 @@ let server = ServerBuilder::new()
     .listener(ListenerSpec::tcp("0.0.0.0:443").tls(true))
     .tls(MyTls)
     .handler(|conn| {
-        let sni = conn.info().tls.and_then(|t| t.sni().map(str::to_owned));
+        let sni = conn.info().tls.as_ref().and_then(|t| t.sni().map(str::to_owned));
         conn.send_all(format!("hello {sni:?}\n").as_bytes())?;
         Ok(())
     })
@@ -2770,7 +2775,7 @@ On Windows, net-io never associates a listening socket with an I/O completion po
 | `TcpConnection`, `UnixConnection`, `PipeConnection` | yes | no (one owner) | about 700 bytes with `ConnectionInfo` [est.] |
 | `Server` | yes | yes | |
 | `ServerHandle`, `KillHandle`, `Completer`, `DriverWaker` | yes | yes | one `Arc` plus a few words |
-| `ConnectionInfo` | yes | yes | about 600 bytes, no heap [est.] |
+| `ConnectionInfo` | yes | yes | about 200 bytes; no allocation after warm-up |
 | `ConnectionId`, `Lane`, `PrefixKey`, `Cidr`, `CloseReason`, `Event` | yes | yes | 8, 1, 18, 18, 4, at most 64 bytes |
 | `Input`, `Output`, `Buffer`, `BufferPool` | yes | no (worker-local) | |
 | `SessionContext` | no | no | borrowed for one call |

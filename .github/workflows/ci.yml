@@ -45,10 +45,78 @@ jobs:
         run: cargo test --no-default-features
       - name: Build examples
         run: cargo build --examples
+      - name: Run self-contained examples
+        run: |
+          cargo run --example kill_and_drain
+          cargo run --example gate
       - name: Doc (all features)
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  shim:
+    name: Fault injection (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      RUSTFLAGS: "-D warnings --cfg net_io_shim"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Shim tests (faults and system calls per round trip)
+        run: cargo test --test shim -- --test-threads=1 --nocapture
+
+  loom:
+    name: Loom models
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings --cfg loom"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Loom
+        run: cargo test --release --lib loom_
+
+  miri:
+    name: Miri (pure modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Miri
+        run: |
+          cargo miri test --lib -- addr:: buf:: rate:: session:: completer:: limits:: id:: control:: events:: error:: time:: info:: trusted::
+
+  leak:
+    name: Descriptor leak, 100,000 connections
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Leak test
+        run: cargo test --release --test leak
+        env:
+          NET_IO_LEAK_CONNECTIONS: "100000"
+
+  unsafe-location:
+    name: unsafe only in src/sys
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check
+        run: |
+          if grep -rnE 'unsafe[[:space:]]*(\{|fn|impl|extern|trait)' src --include='*.rs' | grep -v '^src/sys/'; then
+            echo "unsafe outside src/sys (see dev/DIRECTIVES.md section 2)"
+            exit 1
+          fi
 
   security:
     name: Security (audit + deny)
