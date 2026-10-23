@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "net-io"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -57,6 +57,31 @@ default = []
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+
+# Only for the layout tests that check net-io's own OS declarations (src/sys)
+# against the community bindings; never a runtime dependency.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock"] }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+
+# BENCHMARKS
+# #################################
+# Plain harness: baselines print their own numbers, no benchmark framework needed.
+[[bench]]
+name    = "echo"
+harness = false
+
+
+# LINTS
+# #################################
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(net_io_shim)"] }
 
 
 # RELEASE PROFILE

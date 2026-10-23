@@ -787,9 +787,9 @@ pub struct ConnectionInfo {
     pub local: Endpoint,
     pub peer: Endpoint,                          // normalized
     pub real_peer: Option<SocketAddr>,           // from a trusted PROXY header, normalized
-    pub proxy: Option<ProxyFacts>,               // ALPN, authority, unique id, SSL flags (fixed arrays)
+    pub proxy: Option<Arc<ProxyFacts>>,          // ALPN, authority, unique id, SSL flags (fixed arrays, pooled)
     pub peer_credentials: Option<PeerCredentials>,  // local sockets
-    pub tls: Option<TlsInfo>,                    // after the handshake
+    pub tls: Option<Arc<TlsInfo>>,               // after the handshake (pooled)
     pub lane: Lane,
     pub gate: GateTag,                           // set by the gate at admission
     pub accepted_at: Instant,
@@ -802,7 +802,7 @@ impl ConnectionInfo {
 }
 ```
 
-What net-io knows about one connection, built at accept and completed as the handshake reveals more. It holds no heap memory: Unix paths, pipe names, ALPN, SNI, and PROXY TLV copies live in fixed arrays, so building one never allocates [est. about 600 bytes]. `client_addr` is what gates, logs, and rate limits should use: it returns the PROXY-reported address only when that header came from a trusted proxy. P0, Tier 1, `0.3.0` (TCP fields, `client_addr`, `client_key`), `0.4.0` (`real_peer`, `proxy`, `peer_credentials`, `tls`). `for_testing` (P1, Tier 3, `0.3.0`) builds one that is attached to no socket, so gates and sessions can be unit-tested; its id comes from the same process counter, so it never collides with a real connection.
+What net-io knows about one connection, built at accept and completed as the handshake reveals more. Building one never allocates after warm-up: Unix paths and pipe names are shared with the listener that owns them (`Arc`), and PROXY and TLS facts (fixed arrays inside) come from per-worker pools of `Arc`s that are reused when a connection closes, so the struct itself stays near 200 bytes and an idle connection fits the 512-byte target (decision D-061). `client_addr` is what gates, logs, and rate limits should use: it returns the PROXY-reported address only when that header came from a trusted proxy. P0, Tier 1, `0.3.0` (TCP fields, `client_addr`, `client_key`), `0.4.0` (`real_peer`, `proxy`, `peer_credentials`, `tls`). `for_testing` (P1, Tier 3, `0.3.0`) builds one that is attached to no socket, so gates and sessions can be unit-tested; its id comes from the same process counter, so it never collides with a real connection.
 
 ```rust,no_run
 let listener = net_io::listen("0.0.0.0:7000")?;
@@ -824,11 +824,12 @@ pub enum Origin { Accepted, Dialed, Adopted, Inherited }
 #[non_exhaustive] #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Endpoint {
     Ip(SocketAddr),
-    Unix(UnixPath),          // up to 108 bytes, fixed array
-    Pipe(PipeName),          // up to 256 UTF-16 units, fixed array
+    Unix(Arc<UnixPath>),     // up to 108 bytes, fixed array, shared with the listener
+    Pipe(Arc<PipeName>),     // up to 256 UTF-16 units, fixed array, shared with the listener
     Unnamed,                 // an unnamed Unix socket peer
 }
 impl Endpoint { pub fn socket_addr(&self) -> Option<SocketAddr>; }
+impl fmt::Display for Endpoint { /* 127.0.0.1:80, the Unix path, the pipe name, or "unnamed" */ }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)] pub struct UnixPath { /* [u8; 108] + len */ }  impl UnixPath { pub fn as_bytes(&self) -> &[u8]; #[cfg(unix)] pub fn as_path(&self) -> &Path; }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)] pub struct PipeName { /* [u16; 256] + len */ } impl PipeName { pub fn as_wide(&self) -> &[u16]; pub fn to_string_lossy(&self) -> String; }
 ```
@@ -2631,7 +2632,7 @@ let server = ServerBuilder::new()
     .listener(ListenerSpec::tcp("0.0.0.0:443").tls(true))
     .tls(MyTls)
     .handler(|conn| {
-        let sni = conn.info().tls.and_then(|t| t.sni().map(str::to_owned));
+        let sni = conn.info().tls.as_ref().and_then(|t| t.sni().map(str::to_owned));
         conn.send_all(format!("hello {sni:?}\n").as_bytes())?;
         Ok(())
     })
@@ -2770,7 +2771,7 @@ On Windows, net-io never associates a listening socket with an I/O completion po
 | `TcpConnection`, `UnixConnection`, `PipeConnection` | yes | no (one owner) | about 700 bytes with `ConnectionInfo` [est.] |
 | `Server` | yes | yes | |
 | `ServerHandle`, `KillHandle`, `Completer`, `DriverWaker` | yes | yes | one `Arc` plus a few words |
-| `ConnectionInfo` | yes | yes | about 600 bytes, no heap [est.] |
+| `ConnectionInfo` | yes | yes | about 200 bytes; no allocation after warm-up |
 | `ConnectionId`, `Lane`, `PrefixKey`, `Cidr`, `CloseReason`, `Event` | yes | yes | 8, 1, 18, 18, 4, at most 64 bytes |
 | `Input`, `Output`, `Buffer`, `BufferPool` | yes | no (worker-local) | |
 | `SessionContext` | no | no | borrowed for one call |
