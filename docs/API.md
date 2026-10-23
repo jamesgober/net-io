@@ -1222,7 +1222,7 @@ impl Default for ListenOptions;
 
 Order of application at bind: create the socket (close-on-exec; non-blocking for the reactor; `SO_NOSIGPIPE` on macOS), reuse address or exclusive address use, reuse port, IPv6-only, incoming CPU, buffer sizes (before `listen`, so window scaling is negotiated), `bind`, defer accept, fast open, `listen(backlog)`. P0, Tier 2, `0.3.0` per option row below.
 
-Options a listener passes to accepted sockets differ by OS; net-io applies `connection` options to each accepted socket only where the OS does not already inherit them (measured per OS at `0.2.0`, spike S-4, recorded in [`PLATFORM-NOTES.md`](./PLATFORM-NOTES.md)).
+Options a listener passes to accepted sockets differ by OS. On Linux and Windows every option is inherited from the listener, so net-io does not set them again (one fewer system call per option per accept); on macOS and FreeBSD it applies `connection` options to each accepted socket explicitly (decision D-055; details in [`PLATFORM-NOTES.md`](./PLATFORM-NOTES.md) from `0.3.0`).
 
 ### `ConnectionOptions`, `Keepalive`, `Linger`
 
@@ -1838,7 +1838,7 @@ impl KillHandle {
 }
 ```
 
-Aborts one connection from any thread: the closing flag is set with one compare-and-swap, the owning worker is woken (blocking driver: `shutdown` of the read side wakes a blocked receive; reactor: a command on the worker's queue), and the worker closes with RST and emits the one closed event. The killing thread never closes the descriptor itself, so it can never close a reused descriptor number. A kill racing a FIN, a timeout, or another kill produces one close with the reason that won the compare-and-swap; the others return `false`. `Send + Sync + Clone`. P0, Tier 2, `0.3.0`; under 1 µs to enqueue [est.].
+Aborts one connection from any thread: the closing flag is set with one compare-and-swap, the owning worker is woken (blocking driver: on Unix `shutdown` of the read side wakes a blocked receive and the worker's wake pipe wakes a stalled send; on Windows the waiter's wake socket; reactor: a command on the worker's queue), and the worker closes with RST and emits the one closed event. The killing thread never closes the descriptor itself, so it can never close a reused descriptor number. A kill racing a FIN, a timeout, or another kill produces one close with the reason that won the compare-and-swap; the others return `false`. `Send + Sync + Clone`. P0, Tier 2, `0.3.0`; under 1 µs to enqueue [est.].
 
 ---
 
@@ -2270,7 +2270,7 @@ impl LocalOptions {
 | Item | Behaviour | Errors | Grade | Tier | Version |
 |---|---|---|---|---|---|
 | `bind`, `bind_with` | path length checked (Linux 108 bytes, macOS and FreeBSD 104, including the terminator); a NUL byte in the path is refused; a stale socket file is removed only if `lstat` (no symlink following) says it is a socket and a connect to it is refused; `bind`, then `chmod` (and `chown` when set) | `PathTooLong`, `StaleSocketInUse`, `PermissionDenied`, `Bind` | P1 | 1 / 2 | `0.4.0` |
-| `bind_in_dir` | binds under a fresh temporary name with mode `0700` in the same directory, sets the final mode, then renames into place, so the socket is never reachable with the umask's permissions | as `bind` | P1 | 2 | `0.4.0` (subject to spike S-6) |
+| `bind_in_dir` | binds under a fresh temporary name with mode `0700` in the same directory, sets the final mode, then renames into place, so the socket is never reachable with the umask's permissions | as `bind` | P1 | 2 | `0.4.0` |
 | `accept` | peer credentials read once and stored in `ConnectionInfo`; `require_uid` refuses a mismatched peer before any read | `Os` | P1 | 1 | `0.4.0` |
 | `Drop` | unlinks the path only if `lstat` still shows the inode this listener created, never a replacement someone else bound | none (event) | P1 | 1 | `0.4.0` |
 | `UnixConnection` IO | as `TcpConnection` | as `TcpConnection` | P1 | 1 | `0.4.0` |
@@ -2622,7 +2622,7 @@ impl Drop for ListenerHandle;      // closes the descriptor
 
 #[cfg(windows)] pub fn share_listeners(listeners: &[&ListenerHandle], target_pid: u32) -> Result<SharedListeners, HandoffError>;
 #[cfg(windows)] pub struct SharedListeners { /* WSAPROTOCOL_INFOW blobs + manifest */ }
-#[cfg(windows)] impl SharedListeners { pub fn write_to(&self, pipe: &mut PipeConnection) -> Result<(), HandoffError>; }
+#[cfg(windows)] impl SharedListeners { pub fn write_to(self, pipe: &mut PipeConnection) -> Result<(), HandoffError>; }   // consumed: sent once
 #[cfg(windows)] pub fn receive_shared(pipe: &mut PipeConnection, expect: &HandoffPeer, deadline: Instant) -> Result<Vec<ListenerHandle>, HandoffError>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2640,7 +2640,7 @@ pub enum HandoffError {
 |---|---|---|---|---|
 | `ListenerHandle` | owned, move-only; dropping it closes the socket | P0 | 3 | `0.4.0` |
 | `send_listeners`, `recv_listeners` | one `sendmsg` carrying up to 64 descriptors (`SCM_RIGHTS`) and a manifest: magic `NIOH`, version 1, count, per listener kind, name, local address, and an options digest, then a CRC32C. The receiver checks the sender's credentials against `expect` (default: same uid), receives close-on-exec, fails on a truncated control message, checks magic, version, checksum, and count, and verifies every descriptor (`SO_TYPE`, `SO_ACCEPTCONN`, `getsockname` equals the manifest address). Any failure closes every received descriptor and returns the error: all or nothing | P0 | 3 | `0.4.0` |
-| `share_listeners`, `receive_shared` | Windows: `WSADuplicateSocketW` per socket for one target pid (each blob works once, in that process only), sent over a named pipe with an owner-only security descriptor; the receiver checks `GetNamedPipeClientProcessId` and creates each socket with `WSASocketW(FROM_PROTOCOL_INFO, WSA_FLAG_OVERLAPPED)` | P0 | 3 | `0.5.0` |
+| `share_listeners`, `receive_shared` | Windows: `WSADuplicateSocketW` per socket for one target pid (each blob works once, in that process only), sent with a random nonce over a named pipe with an owner-only security descriptor; the receiver checks `GetNamedPipeClientProcessId`, refuses a nonce it already accepted, creates each socket with `WSASocketW(FROM_PROTOCOL_INFO, WSA_FLAG_OVERLAPPED)`, and verifies it | P0 | 3 | `0.5.0` |
 | `HandoffPeer`, `HandoffError` | | P0 | 3 | `0.4.0` |
 
 Keep the channel's socket in a private directory (`0700`). Cost: under 1 ms per hand-off [est.].
@@ -2678,7 +2678,7 @@ server.open_door()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-On Windows, a listening socket that the old process had associated with an IOCP port is handled as spike S-1 found (see `dev/PLAN.md`, decision D-016).
+On Windows, net-io never associates a listening socket with an I/O completion port, in any driver: once any process associates a listener, a process that receives it can never use it with its own port (decision D-016). Windows also does not make a `WSAPROTOCOL_INFOW` single use, so net-io does: each manifest carries a random nonce that `receive_shared` accepts once per process, and `SharedListeners::write_to` consumes the value (decision D-054).
 
 ---
 

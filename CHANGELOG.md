@@ -37,7 +37,7 @@ blocking driver.
 - `dev/PLAN.md` rewritten: requirements (FR-1 to FR-72, NFR-1 to NFR-20),
   architecture, the threat table with a test and a cost for each threat,
   performance targets, the edge-case list, platform spike results, and
-  decisions D-013 to D-050.
+  decisions D-013 to D-058.
 - `dev/ROADMAP.md` rewritten to the portfolio's version table (0.6
   optimisation, 0.7 hardening, 0.8 alpha, 0.9 beta added; hardening moved
   from 0.9 to 0.7), with the reconciliation recorded.

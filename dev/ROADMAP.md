@@ -33,11 +33,11 @@ No hard task moved later: io_uring was "later, Linux only" in the 0.1 plan and i
 Exit: James approves `docs/API.md`; every spike has a written result; CI green.
 - [x] `docs/API.md`: every public item with signatures, behaviour, errors, cost, grade, tier, version, examples; final names (D-017); final defaults with reasons.
 - [x] `dev/SYS-SURFACE.md`: the OS functions, constants, and structs per platform, with the documentation each relies on.
-- [x] `dev/PLAN.md` rewritten from the specification; decisions D-013 to D-050 logged.
+- [x] `dev/PLAN.md` rewritten from the specification; decisions D-013 to D-058 logged.
 - [x] This roadmap rewritten.
 - [x] Gate seam shape proposed to bouncer-io for both 0.2 locks (D-018).
 - [x] TLS seam condition (X-2) checked against rustls 0.23.46: holds (D-019).
-- [ ] Spikes S-1 to S-6 (PLAN section 15).
+- [x] Spikes S-1 to S-6 run on Windows and Linux; results and decisions D-016, D-052 to D-058 in PLAN section 15.
 - [ ] James approves the API; open decisions O-1, O-2, OD-26 answered.
 - [ ] Release routine: 0.2.0 tagged, released, published (claims the crate name, D-048).
 
@@ -84,10 +84,10 @@ Exit: 10,000 idle connections held on each OS with bounded memory, and throughpu
 
 | Area | Items |
 |---|---|
-| Reactor | epoll (Linux), kqueue (macOS, FreeBSD), IOCP (Windows) with zero-byte receives; `DriverKind::Reactor`, `Auto`; accept distribution; `Completer` on the reactor |
+| Reactor | epoll (Linux), kqueue (macOS, FreeBSD), IOCP (Windows) with zero-byte receives and one `WSAPoll` accept thread per listener (D-016); `DriverKind::Reactor`, `Auto`; accept distribution; `Completer` on the reactor |
 | Driver API | `Driver`, `Operation`, `OperationKind`, `Completion`, `Completions`, `Token`, `Rejected`, `DriverWaker` public (Tier 3, unstable until 1.0) |
 | Windows local | AF_UNIX on Windows, `PipeListener`, `PipeConnection`, `PipeOptions`, `PipeSecurity`, `client_pid`, `listen_local` / `connect_local` on Windows, `ListenerSpec::pipe` |
-| Windows hand-off | `share_listeners`, `SharedListeners`, `receive_shared`, the spike S-1 outcome (D-016) |
+| Windows hand-off | `share_listeners`, `SharedListeners`, `receive_shared` with the single-use nonce (D-054); listeners never associated with a completion port (D-016) |
 | Outbound | Happy Eyeballs (`ConnectOptions::happy_eyeballs`, `attempt_delay`) |
 | Platform | FreeBSD in CI (D-035); ASan and TSan jobs |
 | Completeness | every P0 and P1 item shipped |

@@ -120,7 +120,7 @@ Declared per target; values from the target's system headers, cross-checked in C
 
 ## 4. Windows
 
-Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOCP, `advapi32` for security descriptors, `bcrypt` for randomness. `AcceptEx`, `ConnectEx`, `GetAcceptExSockaddrs`, and `TransmitFile` are not linked: their pointers come from `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` with the documented GUIDs `WSAID_ACCEPTEX`, `WSAID_CONNECTEX`, `WSAID_GETACCEPTEXSOCKADDRS`, `WSAID_TRANSMITFILE`.
+Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOCP, `advapi32` for security descriptors, `bcrypt` for randomness. `ConnectEx` and `TransmitFile` are not linked: their pointers come from `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` with the documented GUIDs `WSAID_CONNECTEX` and `WSAID_TRANSMITFILE`.
 
 | Function | Library | Purpose | Reference (header) | Version |
 |---|---|---|---|---|
@@ -130,15 +130,15 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 | `setsockopt`, `getsockopt`, `ioctlsocket` (`FIONBIO`) | ws2_32 | options, non-blocking mode | winsock2 | 0.3 |
 | `recv`, `send`, `recvfrom`, `sendto` | ws2_32 | blocking driver IO | winsock2 | 0.3 (`*from`/`*to` 0.4) |
 | `WSARecv`, `WSASend`, `WSARecvFrom`, `WSASendTo` | ws2_32 | vectored and overlapped IO | winsock2 | 0.3 (overlapped 0.5) |
-| `WSAPoll`, `select` | ws2_32 | blocking accept thread; connect completion (spike S-5 decides which) | winsock2 | 0.3 |
+| `WSAPoll` | ws2_32 | every wait in the blocking driver, the accept threads, connect completion (D-052, D-056) | winsock2 | 0.3 |
 | `WSAIoctl` | ws2_32 | extension pointers, `SIO_KEEPALIVE_VALS`, `SIO_AF_UNIX_GETPEERPID`, `SIO_UDP_CONNRESET`, `SIO_BASE_HANDLE` | winsock2 | 0.3 |
 | `WSAGetLastError` | ws2_32 | error codes | winsock2 | 0.3 |
 | `WSADuplicateSocketW` | ws2_32 | hand-off | winsock2 | 0.5 |
 | `WSAEnumProtocolsW` | ws2_32 | detect providers without `XP1_IFS_HANDLES` before enabling skip-on-success | winsock2 | 0.5 |
 | `WSAGetOverlappedResult` | ws2_32 | overlapped results | winsock2 | 0.5 |
-| `AcceptEx`, `GetAcceptExSockaddrs`, `ConnectEx`, `TransmitFile` | (pointer) | IOCP accept and connect; file sends | mswsock | 0.5 (`TransmitFile` 0.6) |
+| `ConnectEx`, `TransmitFile` | (pointer) | IOCP connect; file sends. `AcceptEx` and `GetAcceptExSockaddrs` are not used: listeners are never associated with a completion port (D-016) | mswsock | 0.5 (`TransmitFile` 0.6) |
 | `CreateIoCompletionPort`, `GetQueuedCompletionStatusEx`, `PostQueuedCompletionStatus` | kernel32 | IOCP | ioapiset | 0.5 |
-| `CancelIoEx` | kernel32 | kill on IOCP; blocking-driver wake (spike S-2) | ioapiset | 0.3 |
+| `CancelIoEx` | kernel32 | kill and deadlines on IOCP | ioapiset | 0.5 |
 | `SetFileCompletionNotificationModes` | kernel32 | `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, `FILE_SKIP_SET_EVENT_ON_HANDLE` | winbase | 0.5 |
 | `SetHandleInformation` | kernel32 | clear `HANDLE_FLAG_INHERIT` on handles not created non-inheritable | handleapi | 0.3 |
 | `CloseHandle` | kernel32 | | handleapi | 0.3 |
@@ -158,11 +158,11 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 |---|---|
 | families, types, protocols | `AF_INET`, `AF_INET6`, `AF_UNIX`, `SOCK_STREAM`, `SOCK_DGRAM`, `IPPROTO_TCP`, `IPPROTO_UDP`, `IPPROTO_IP`, `IPPROTO_IPV6` |
 | creation | `WSA_FLAG_OVERLAPPED`, `WSA_FLAG_NO_HANDLE_INHERIT`, `FROM_PROTOCOL_INFO`, `INVALID_SOCKET`, `SOCKET_ERROR` |
-| socket level | `SOL_SOCKET`, `SO_REUSEADDR`, `SO_EXCLUSIVEADDRUSE`, `SO_KEEPALIVE`, `SO_LINGER`, `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_ERROR`, `SO_TYPE`, `SO_ACCEPTCONN`, `SO_PROTOCOL_INFOW`, `SO_UPDATE_ACCEPT_CONTEXT`, `SO_UPDATE_CONNECT_CONTEXT` |
+| socket level | `SOL_SOCKET`, `SO_REUSEADDR`, `SO_EXCLUSIVEADDRUSE`, `SO_KEEPALIVE`, `SO_LINGER`, `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_ERROR`, `SO_TYPE`, `SO_ACCEPTCONN`, `SO_PROTOCOL_INFOW`, `SO_UPDATE_CONNECT_CONTEXT` |
 | TCP | `TCP_NODELAY`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_FASTOPEN`, `TCP_MAXRT` |
 | IP | `IP_TTL`, `IP_TOS`, `IP_PKTINFO`, `IP_ADD_MEMBERSHIP`, `IPV6_V6ONLY`, `IPV6_UNICAST_HOPS`, `IPV6_PKTINFO`, `IPV6_ADD_MEMBERSHIP` |
 | ioctl codes | `FIONBIO`, `SIO_GET_EXTENSION_FUNCTION_POINTER`, `SIO_KEEPALIVE_VALS`, `SIO_AF_UNIX_GETPEERPID`, `SIO_UDP_CONNRESET`, `SIO_BASE_HANDLE` |
-| extension GUIDs | `WSAID_ACCEPTEX`, `WSAID_CONNECTEX`, `WSAID_GETACCEPTEXSOCKADDRS`, `WSAID_TRANSMITFILE` |
+| extension GUIDs | `WSAID_CONNECTEX`, `WSAID_TRANSMITFILE` |
 | shutdown | `SD_RECEIVE`, `SD_SEND`, `SD_BOTH` |
 | poll | `POLLRDNORM`, `POLLWRNORM`, `POLLERR`, `POLLHUP`, `POLLNVAL` |
 | messages | `MSG_PEEK`, `MSG_TRUNC`, `MSG_PARTIAL` |
@@ -179,7 +179,7 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 | `SOCKADDR`, `SOCKADDR_IN`, `SOCKADDR_IN6`, `SOCKADDR_UN` (`afunix.h`, path 108), `SOCKADDR_STORAGE`, `IN_ADDR`, `IN6_ADDR` | addresses |
 | `LINGER` (`u16` fields) | `SO_LINGER` |
 | `WSABUF`, `WSAMSG`, `WSACMSGHDR` | vectored and ancillary IO |
-| `WSAPOLLFD`, `FD_SET`, `TIMEVAL` | `WSAPoll`, `select` |
+| `WSAPOLLFD` | `WSAPoll` |
 | `WSAPROTOCOL_INFOW`, `WSAPROTOCOLCHAIN`, `GUID` | hand-off, provider enumeration, extension pointers |
 | `tcp_keepalive` | `SIO_KEEPALIVE_VALS` |
 | `OVERLAPPED`, `OVERLAPPED_ENTRY` | IOCP |
