@@ -38,6 +38,8 @@ pub(crate) mod errno {
     pub const WSAETIMEDOUT: i32 = 10060;
     pub const WSAECONNREFUSED: i32 = 10061;
     pub const WSAEHOSTUNREACH: i32 = 10065;
+    #[cfg(feature = "udp")]
+    pub const WSAEMSGSIZE: i32 = 10040;
 }
 
 /// How an `accept` failure is handled (FR-9, FR-10). Socket handles do not come
@@ -72,6 +74,12 @@ mod c {
     pub const AF_INET: i32 = 2;
     pub const AF_INET6: i32 = 23;
     pub const SOCK_STREAM: i32 = 1;
+    #[cfg(feature = "udp")]
+    pub const SOCK_DGRAM: i32 = 2;
+    #[cfg(feature = "udp")]
+    pub const IPPROTO_UDP: i32 = 17;
+    #[cfg(feature = "udp")]
+    pub const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
     pub const IPPROTO_IP: i32 = 0;
     pub const IPPROTO_TCP: i32 = 6;
     pub const IPPROTO_IPV6: i32 = 41;
@@ -171,6 +179,27 @@ unsafe extern "system" {
     fn getsockopt(s: Socket, level: i32, name: i32, value: *mut u8, len: *mut i32) -> i32;
     fn WSAPoll(fds: *mut WsaPollFd, nfds: u32, timeout: i32) -> i32;
     fn WSAGetLastError() -> i32;
+    #[cfg(feature = "udp")]
+    fn recvfrom(
+        s: Socket,
+        buf: *mut u8,
+        len: i32,
+        flags: i32,
+        from: *mut c_void,
+        from_len: *mut i32,
+    ) -> i32;
+    #[cfg(feature = "udp")]
+    fn WSAIoctl(
+        s: Socket,
+        code: u32,
+        in_buf: *const c_void,
+        in_len: u32,
+        out_buf: *mut c_void,
+        out_len: u32,
+        returned: *mut u32,
+        overlapped: *mut c_void,
+        completion: *mut c_void,
+    ) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -288,6 +317,137 @@ fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> i32 {
             out.copy_from_slice(&bytes);
             28
         }
+    }
+}
+
+/// Room for any socket address Winsock returns (`SOCKADDR_STORAGE`).
+#[cfg(feature = "udp")]
+#[repr(C, align(8))]
+struct AddrBuf([u8; 128]);
+
+/// Decodes an IPv4 or IPv6 socket address written by Winsock.
+#[cfg(feature = "udp")]
+fn decode_addr(b: &[u8; 128], len: i32) -> Option<SocketAddr> {
+    let family = i32::from(u16::from_ne_bytes([b[0], b[1]]));
+    let port = u16::from_be_bytes([b[2], b[3]]);
+    if family == c::AF_INET && len >= 16 {
+        let ip = std::net::Ipv4Addr::new(b[4], b[5], b[6], b[7]);
+        Some(SocketAddr::from((ip, port)))
+    } else if family == c::AF_INET6 && len >= 28 {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&b[8..24]);
+        let flow = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+        let scope = u32::from_ne_bytes([b[24], b[25], b[26], b[27]]);
+        Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::from(octets),
+            port,
+            flow,
+            scope,
+        )))
+    } else {
+        None
+    }
+}
+
+/// Creates and binds a UDP socket: not inheritable, `SO_EXCLUSIVEADDRUSE` so no
+/// other process can bind the port, `IPV6_V6ONLY` as asked, and ICMP "port
+/// unreachable" reports switched off (`SIO_UDP_CONNRESET`), which would
+/// otherwise fail the next receive of an unconnected socket.
+#[cfg(feature = "udp")]
+pub(crate) fn udp_bind(addr: SocketAddr, ipv6_only: bool) -> io::Result<std::net::UdpSocket> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::Socket)?;
+    startup();
+    let af = if addr.is_ipv6() {
+        c::AF_INET6
+    } else {
+        c::AF_INET
+    };
+    // SAFETY: as in `tcp_socket`.
+    let s = unsafe {
+        WSASocketW(
+            af,
+            c::SOCK_DGRAM,
+            c::IPPROTO_UDP,
+            std::ptr::null_mut(),
+            0,
+            c::WSA_FLAG_OVERLAPPED | c::WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if s == c::INVALID_SOCKET {
+        return Err(last_error());
+    }
+    // SAFETY: `s` was just created by WSASocketW, is open, and is owned by no one else.
+    let owned = unsafe { OwnedSocket::from_raw_socket(s as RawSocket) };
+    set_int(owned.as_socket(), c::SOL_SOCKET, c::SO_EXCLUSIVEADDRUSE, 1)?;
+    if addr.is_ipv6() {
+        set_int(
+            owned.as_socket(),
+            c::IPPROTO_IPV6,
+            c::IPV6_V6ONLY,
+            i32::from(ipv6_only),
+        )?;
+    }
+    let off: i32 = 0;
+    let mut returned = 0u32;
+    // SAFETY: SIO_UDP_CONNRESET takes a BOOL input and no output; `off` and
+    // `returned` are live locals; no overlapped IO.
+    cvt(unsafe {
+        WSAIoctl(
+            raw(owned.as_socket()),
+            c::SIO_UDP_CONNRESET,
+            (&raw const off).cast::<c_void>(),
+            size_of::<i32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &raw mut returned,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    bind_to(owned.as_socket(), addr)?;
+    Ok(std::net::UdpSocket::from(owned))
+}
+
+/// One datagram: its length, its source, and whether it was cut to fit `buf`
+/// (`WSAEMSGSIZE`; the length is then the bytes copied).
+#[cfg(feature = "udp")]
+pub(crate) fn udp_recv_from(
+    sock: Sock<'_>,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, bool)> {
+    #[cfg(any(test, net_io_shim))]
+    let buf = match super::shim::io(super::shim::Op::Recv, buf.len())? {
+        Some(n) => &mut buf[..n],
+        None => buf,
+    };
+    let mut addr = AddrBuf([0; 128]);
+    let mut addr_len = 128i32;
+    let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+    // SAFETY: `buf` is writable for `len` bytes and `addr` for `addr_len`; both
+    // live for the call; `sock` is open.
+    let n = unsafe {
+        recvfrom(
+            raw(sock),
+            buf.as_mut_ptr(),
+            len,
+            0,
+            addr.0.as_mut_ptr().cast::<c_void>(),
+            &raw mut addr_len,
+        )
+    };
+    let (n, truncated) = if n == c::SOCKET_ERROR {
+        let e = last_error();
+        if e.raw_os_error() != Some(errno::WSAEMSGSIZE) {
+            return Err(e);
+        }
+        (len.unsigned_abs() as usize, true)
+    } else {
+        (n.unsigned_abs() as usize, false)
+    };
+    match decode_addr(&addr.0, addr_len) {
+        Some(from) => Ok((n, from, truncated)),
+        None => Err(io::Error::from(io::ErrorKind::InvalidData)),
     }
 }
 
@@ -815,6 +975,35 @@ mod layout {
             std::mem::offset_of!(SockaddrIn6, sin6_scope_id),
             std::mem::offset_of!(ws::SOCKADDR_IN6, Anonymous)
         );
+    }
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn test_layout_udp_matches_windows_sys() {
+        assert_eq!(c::SOCK_DGRAM as i64, ws::SOCK_DGRAM as i64);
+        assert_eq!(c::IPPROTO_UDP as i64, ws::IPPROTO_UDP as i64);
+        assert_eq!(c::SIO_UDP_CONNRESET as i64, ws::SIO_UDP_CONNRESET as i64);
+        assert_eq!(errno::WSAEMSGSIZE as i64, ws::WSAEMSGSIZE as i64);
+        assert!(size_of::<AddrBuf>() >= size_of::<ws::SOCKADDR_STORAGE>());
+    }
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn test_udp_recv_reports_truncation_and_source() {
+        let a = udp_bind("127.0.0.1:0".parse().unwrap(), true).unwrap();
+        let b = udp_bind("[::1]:0".parse().unwrap(), true).unwrap();
+        let src = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        src.send_to(&[1u8; 100], a.local_addr().unwrap()).unwrap();
+        let mut small = [0u8; 10];
+        let (n, from, truncated) = udp_recv_from(a.as_socket(), &mut small).unwrap();
+        assert!(truncated);
+        assert_eq!(n, 10);
+        assert_eq!(from, src.local_addr().unwrap());
+        let src6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        src6.send_to(&[], b.local_addr().unwrap()).unwrap();
+        let (n, from, truncated) = udp_recv_from(b.as_socket(), &mut small).unwrap();
+        assert_eq!((n, truncated), (0, false));
+        assert_eq!(from, src6.local_addr().unwrap());
     }
 
     #[test]

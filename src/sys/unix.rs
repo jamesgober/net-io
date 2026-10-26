@@ -121,6 +121,10 @@ mod c {
     pub const AF_INET: c_int = 2;
     pub const AF_INET6: c_int = 10;
     pub const SOCK_STREAM: c_int = 1;
+    #[cfg(feature = "udp")]
+    pub const SOCK_DGRAM: c_int = 2;
+    #[cfg(feature = "udp")]
+    pub const MSG_TRUNC: c_int = 0x20;
     pub const SOCK_CLOEXEC: c_int = 0o2_000_000;
     pub const SOL_SOCKET: c_int = 1;
     pub const SO_REUSEADDR: c_int = 2;
@@ -170,6 +174,10 @@ mod c {
     pub const AF_INET: c_int = 2;
     pub const AF_INET6: c_int = 30;
     pub const SOCK_STREAM: c_int = 1;
+    #[cfg(feature = "udp")]
+    pub const SOCK_DGRAM: c_int = 2;
+    #[cfg(feature = "udp")]
+    pub const MSG_TRUNC: c_int = 0x10;
     pub const SOL_SOCKET: c_int = 0xffff;
     pub const SO_ACCEPTCONN: c_int = 0x2;
     pub const SO_REUSEADDR: c_int = 0x4;
@@ -342,8 +350,17 @@ unsafe extern "C" {
     fn getrlimit(resource: c_int, rlim: *mut Rlimit) -> c_int;
     #[cfg(target_os = "macos")]
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local", all(feature = "udp", target_os = "macos")))]
     fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
+    #[cfg(all(feature = "udp", target_os = "linux"))]
+    fn recvfrom(
+        fd: c_int,
+        buf: *mut c_void,
+        len: usize,
+        flags: c_int,
+        addr: *mut c_void,
+        addr_len: *mut SockLen,
+    ) -> isize;
     #[cfg(all(feature = "local", target_os = "macos"))]
     fn getpeereid(fd: c_int, euid: *mut u32, egid: *mut u32) -> c_int;
 }
@@ -448,6 +465,139 @@ fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> SockLen {
             out.copy_from_slice(&bytes);
             28
         }
+    }
+}
+
+/// Room for any socket address the kernel returns (`sockaddr_storage`).
+#[cfg(feature = "udp")]
+#[repr(C, align(8))]
+struct AddrBuf([u8; 128]);
+
+/// Decodes an IPv4 or IPv6 socket address written by the kernel.
+#[cfg(feature = "udp")]
+fn decode_addr(b: &[u8; 128], len: SockLen) -> Option<SocketAddr> {
+    #[cfg(target_os = "linux")]
+    let family = c_int::from(u16::from_ne_bytes([b[0], b[1]]));
+    #[cfg(target_os = "macos")]
+    let family = c_int::from(b[1]);
+    let port = u16::from_be_bytes([b[2], b[3]]);
+    if family == c::AF_INET && len as usize >= 16 {
+        let ip = std::net::Ipv4Addr::new(b[4], b[5], b[6], b[7]);
+        Some(SocketAddr::from((ip, port)))
+    } else if family == c::AF_INET6 && len as usize >= 28 {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&b[8..24]);
+        let flow = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+        let scope = u32::from_ne_bytes([b[24], b[25], b[26], b[27]]);
+        Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::from(octets),
+            port,
+            flow,
+            scope,
+        )))
+    } else {
+        None
+    }
+}
+
+/// A new UDP socket: close-on-exec.
+#[cfg(feature = "udp")]
+fn udp_socket(v6: bool) -> io::Result<OwnedFd> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::Socket)?;
+    let domain = if v6 { c::AF_INET6 } else { c::AF_INET };
+    #[cfg(target_os = "linux")]
+    let ty = c::SOCK_DGRAM | c::SOCK_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let ty = c::SOCK_DGRAM;
+    // SAFETY: socket(2) takes plain integers and returns a new descriptor or -1.
+    let fd = cvt(unsafe { socket(domain, ty, 0) })?;
+    // SAFETY: `fd` was just returned by socket(2), is open, and is owned by no one else.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: as in `tcp_socket`.
+        cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
+    }
+    Ok(owned)
+}
+
+/// Creates and binds a UDP socket; `IPV6_V6ONLY` as asked for IPv6 addresses.
+/// No `SO_REUSEADDR`: another socket must not share the port.
+#[cfg(feature = "udp")]
+pub(crate) fn udp_bind(addr: SocketAddr, ipv6_only: bool) -> io::Result<std::net::UdpSocket> {
+    let fd = udp_socket(addr.is_ipv6())?;
+    if addr.is_ipv6() {
+        set_int(
+            fd.as_fd(),
+            c::IPPROTO_IPV6,
+            c::IPV6_V6ONLY,
+            c_int::from(ipv6_only),
+        )?;
+    }
+    bind_to(fd.as_fd(), addr)?;
+    Ok(std::net::UdpSocket::from(fd))
+}
+
+/// One datagram: its length, its source, and whether it was cut to fit `buf`.
+/// On Linux a truncated datagram reports its real length (`MSG_TRUNC`); on macOS
+/// the length copied.
+#[cfg(feature = "udp")]
+pub(crate) fn udp_recv_from(
+    sock: Sock<'_>,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, bool)> {
+    #[cfg(any(test, net_io_shim))]
+    let buf = match super::shim::io(super::shim::Op::Recv, buf.len())? {
+        Some(n) => &mut buf[..n],
+        None => buf,
+    };
+    let mut addr = AddrBuf([0; 128]);
+    let mut addr_len = 128 as SockLen;
+    #[cfg(target_os = "linux")]
+    let (n, truncated) = {
+        // SAFETY: `buf` is writable for `buf.len()` bytes and `addr` for
+        // `addr_len`; both live for the call; `sock` is open.
+        let n = unsafe {
+            recvfrom(
+                sock.as_raw_fd(),
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf.len(),
+                c::MSG_TRUNC,
+                addr.0.as_mut_ptr().cast::<c_void>(),
+                &raw mut addr_len,
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = n.unsigned_abs();
+        (n, n > buf.len())
+    };
+    #[cfg(target_os = "macos")]
+    let (n, truncated) = {
+        let mut iov = [io::IoSliceMut::new(buf)];
+        let mut msg = MsgHdr {
+            msg_name: addr.0.as_mut_ptr().cast::<c_void>(),
+            msg_namelen: addr_len,
+            msg_iov: iov.as_mut_ptr().cast::<IoSlice<'static>>(),
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+        // SAFETY: `msg` points at `addr` (128 bytes) and one iovec over `buf`;
+        // all live for the call; `sock` is open.
+        let n = unsafe { recvmsg(sock.as_raw_fd(), &raw mut msg, 0) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        addr_len = msg.msg_namelen;
+        (n.unsigned_abs(), msg.msg_flags & c::MSG_TRUNC != 0)
+    };
+    match decode_addr(&addr.0, addr_len) {
+        Some(from) => Ok((n, from, truncated)),
+        None => Err(io::Error::from(io::ErrorKind::InvalidData)),
     }
 }
 
@@ -1718,6 +1868,37 @@ mod layout {
         assert!(encode_unix(b"").is_err());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn test_layout_udp_matches_libc() {
+        assert_eq!(c::SOCK_DGRAM, libc::SOCK_DGRAM);
+        assert_eq!(c::MSG_TRUNC, libc::MSG_TRUNC);
+        assert!(size_of::<AddrBuf>() >= size_of::<libc::sockaddr_storage>());
+    }
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn test_udp_recv_reports_truncation_and_source() {
+        let a = udp_bind("127.0.0.1:0".parse().unwrap(), true).unwrap();
+        let b = udp_bind("[::1]:0".parse().unwrap(), true).unwrap();
+        let to = a.local_addr().unwrap();
+        let src = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        src.send_to(&[1u8; 100], to).unwrap();
+        let mut small = [0u8; 10];
+        let (n, from, truncated) = udp_recv_from(a.as_fd(), &mut small).unwrap();
+        assert!(truncated);
+        assert_eq!(from, src.local_addr().unwrap());
+        #[cfg(target_os = "linux")]
+        assert_eq!(n, 100);
+        #[cfg(target_os = "macos")]
+        assert_eq!(n, 10);
+        let src6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        src6.send_to(&[], b.local_addr().unwrap()).unwrap();
+        let (n, from, truncated) = udp_recv_from(b.as_fd(), &mut small).unwrap();
+        assert_eq!((n, truncated), (0, false));
+        assert_eq!(from, src6.local_addr().unwrap());
     }
 
     #[test]

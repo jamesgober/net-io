@@ -101,6 +101,8 @@ mod testing;
 mod time;
 mod tls;
 mod trusted;
+#[cfg(feature = "udp")]
+mod udp;
 
 /// Fault injection for net-io's own tests, compiled only with `--cfg net_io_shim`.
 /// Not part of the public API and not covered by semver.
@@ -155,6 +157,8 @@ pub use tls::{
     TlsProgress, TlsSession,
 };
 pub use trusted::TrustedProxies;
+#[cfg(feature = "udp")]
+pub use udp::{Datagram, UdpBudget, UdpOptions, UdpSocket, UdpStats};
 
 /// Crate version string, populated by Cargo at build time.
 ///

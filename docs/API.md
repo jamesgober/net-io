@@ -2207,6 +2207,7 @@ impl UdpSocket {
     pub fn mark_verified(&mut self, peer: SocketAddr);
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), NetError>;
     pub fn local_addr(&self) -> Result<SocketAddr, NetError>;
+    pub fn stats(&self) -> UdpStats;
     pub fn recv_batch(&mut self, bufs: &mut [DatagramBuffer]) -> Result<usize, NetError>;      // P2, 0.6.0
     pub fn send_batch(&mut self, datagrams: &[OutgoingDatagram<'_>]) -> Result<usize, NetError>; // P2, 0.6.0
     pub fn join_multicast(&self, group: IpAddr, interface: MulticastInterface) -> Result<(), NetError>; // P2, 0.6.0
@@ -2214,6 +2215,11 @@ impl UdpSocket {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Datagram { pub len: usize, pub from: SocketAddr, pub truncated: bool, pub destination: Option<IpAddr> }
+// `len` when truncated: the real length on Linux (MSG_TRUNC), the bytes copied elsewhere
+
+#[non_exhaustive] #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UdpStats { pub received: u64, pub sent: u64, pub dropped: u64, pub refused: u64,
+                      pub truncated: u64, pub icmp_errors: u64, pub overflow: u64, pub sources: u32 }
 
 #[must_use]
 #[derive(Clone, Debug)]
@@ -2221,6 +2227,7 @@ pub struct UdpOptions { /* ... */ }
 impl UdpOptions {
     pub fn new() -> Self;
     pub fn amplification_factor(self, factor: u8) -> Self;     // 1 by default, at most 3
+    pub fn amplification_window(self, window: Duration) -> Self; // 10 s by default, at least 1 s
     pub fn source_budget(self, budget: UdpBudget) -> Self;
     pub fn global_budget(self, budget: UdpBudget) -> Self;
     pub fn source_table(self, entries: u32) -> Self;            // 65,536 by default
@@ -2229,6 +2236,7 @@ impl UdpOptions {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpBudget { pub datagrams_per_sec: u32, pub bytes_per_sec: u32, pub burst: u32 }
+impl UdpBudget { pub const SOURCE_DEFAULT: UdpBudget; }   // 1,000 datagrams/s, 1 MB/s, burst 100
 
 // P2, 0.6.0: batches and multicast
 pub struct DatagramBuffer<'a> { pub buf: &'a mut [u8], pub datagram: Option<Datagram> }   // filled by recv_batch
@@ -2253,12 +2261,13 @@ UDP source addresses are trivially spoofed, so the socket protects others and it
 
 | Item | Behaviour | Errors | Cost | Grade | Tier | Version |
 |---|---|---|---|---|---|---|
-| `bind`, `bind_with` | close-on-exec; peers normalized | bind errors | one-time | P1 | 1 / 2 | `0.4.0` |
+| `bind`, `bind_with` | close-on-exec; no `SO_REUSEADDR` (and `SO_EXCLUSIVEADDRUSE` on Windows), so no other socket shares the port; `IPV6_V6ONLY` on by default; on Windows `SIO_UDP_CONNRESET` is switched off; peers normalized; options checked (`factor` 1 to 3, window at least 1 s, non-zero budgets and table) | bind errors, `InvalidConfig` | one-time | P1 | 1 / 2 | `0.4.0` |
 | `recv_from`, `recv` | a datagram larger than `buf` is reported with `truncated: true` and its real length where the OS gives it (`MSG_TRUNC` on Linux, `WSAEMSGSIZE` on Windows), never as a silently cut datagram; a zero-length datagram is valid; datagrams from sources over their budget are read, dropped, and counted before returning; ICMP "port unreachable" reports (`ECONNREFUSED`, Windows `WSAECONNRESET`) never end the socket | `TimedOut`, `Os` | 1 system call plus the budget check [est. under 30 ns] | P1 | 1 | `0.4.0` |
-| `send_to`, `send` | **no amplification**: to a peer not marked verified, the bytes sent never exceed `factor x` the bytes received from it within the window; otherwise `Limit { which: Amplification }` and nothing is sent | `Limit`, `Os` | 1 system call plus the guard | P1 | 1 | `0.4.0` |
+| `send_to`, `send` | **no amplification**: to a peer not marked verified, the bytes sent never exceed `factor x` the bytes received from it within the window (the current and the previous window, so a reply just after the boundary passes); a peer never heard from gets nothing; otherwise `Limit { which: Amplification }` and nothing is sent. Peers are keyed by IP address, not port, since the victim of amplification is an address (decision D-096). An IPv4 destination on a dual-stack socket goes out IPv4-mapped | `Limit`, `Closed` (`send` unconnected), `Os` | 1 system call plus the guard (one hash lookup [est. under 30 ns]) | P1 | 1 | `0.4.0` |
+| `stats` | counters: returned, sent, dropped over budget, refused by the guard, truncated, ICMP reports ignored, overflow datagrams, sources tracked | | none | P1 | 2 | `0.4.0` |
 | `connect` | fixes the peer; the kernel filters other sources | `Os` | one-time | P1 | 2 | `0.4.0` |
 | `mark_verified` | the protocol proved the peer can receive (a cookie, a handshake); lifts the guard for it | | O(1) | P1 | 2 | `0.4.0` |
-| source table | bounded (default 65,536 entries) with CLOCK eviction; when full, unknown sources share one small overflow budget (strangers lose first, verified peers keep their entries) | | O(1) | P1 | 2 | `0.4.0` |
+| source table | bounded (default 65,536 entries, about 130 bytes each [est.], 8.5 MiB full) with CLOCK eviction of unverified entries (one insertion looks at most 64 entries); when nothing can be evicted, unknown sources share one overflow budget the size of a source budget and get no send allowance (strangers lose first, verified peers keep their entries) | | O(1) | P1 | 2 | `0.4.0` |
 | `recv_batch`, `send_batch` | `recvmmsg` / `sendmmsg` on Linux, a loop elsewhere | | 1 system call per batch on Linux | P2 | 3 | `0.6.0` |
 | packet info (`destination`) | `IP_PKTINFO`, `IPV6_RECVPKTINFO` | `Unsupported` | ancillary data parse | P2 | 3 | `0.6.0` |
 | `join_multicast` | IPv4 and IPv6 groups | `Os` | | P2 | 2 | `0.6.0` |

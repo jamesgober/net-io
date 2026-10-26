@@ -19,10 +19,9 @@ use std::time::Duration;
 use common::{addr, client, eventually};
 use net_io::{
     AdmitStage, Admitted, AllowAll, CloseReason, ConfigReason, ConnectionInfo, Denial, Event,
-    EventSink, Gate, GateTag, Input, Lane, Limits, ListenerSpec, NetError, ProxyMode,
-    ProxyVersions, Refusal, ServerBuilder, Session, SessionContext, Step, TcpConnection,
-    TlsAcceptor, TlsCloseKind, TlsError, TlsEvent, TlsFailure, TlsInfo, TlsProgress, TlsSession,
-    TrustedProxies, WriteCheck,
+    EventSink, Gate, GateTag, Input, Lane, Limits, ListenerSpec, NetError, Refusal, ServerBuilder,
+    Session, SessionContext, Step, TcpConnection, TlsAcceptor, TlsCloseKind, TlsError, TlsEvent,
+    TlsFailure, TlsInfo, TlsProgress, TlsSession, WriteCheck,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -393,10 +392,10 @@ fn test_proxy_then_tls_in_one_segment() {
     let server = ServerBuilder::new()
         .listener(
             ListenerSpec::tcp("127.0.0.1:0")
-                .proxy(ProxyMode::Required {
-                    versions: ProxyVersions::V1,
+                .proxy(net_io::ProxyMode::Required {
+                    versions: net_io::ProxyVersions::V1,
                 })
-                .trusted_proxies(TrustedProxies::loopback())
+                .trusted_proxies(net_io::TrustedProxies::loopback())
                 .tls(true),
         )
         .workers(2)
