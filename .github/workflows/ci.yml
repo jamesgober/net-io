@@ -113,7 +113,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Check
         run: |
-          if grep -rnE 'unsafe[[:space:]]*(\{|fn|impl|extern|trait)' src --include='*.rs' | grep -v '^src/sys/'; then
+          if grep -rnE '\bunsafe[[:space:]]*(\{|fn|impl|extern|trait)' src --include='*.rs' | grep -v '^src/sys/'; then
             echo "unsafe outside src/sys (see dev/DIRECTIVES.md section 2)"
             exit 1
           fi
