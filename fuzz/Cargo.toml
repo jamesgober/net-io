@@ -1,0 +1,54 @@
+# Fuzz targets for net-io's parsers (cargo-fuzz, nightly). Not published.
+# Run from this directory, with the corpus outside the repository:
+#   cargo +nightly fuzz run proxy ~/netio-fuzz/proxy -- -max_total_time=600
+[package]
+name = "net-io-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+net-io = { path = "..", features = ["proxy", "local"] }
+
+# Its own workspace, so the library's build never sees this crate.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "proxy"
+path = "fuzz_targets/proxy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "systemd_env"
+path = "fuzz_targets/systemd_env.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cidr"
+path = "fuzz_targets/cidr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trusted"
+path = "fuzz_targets/trusted.rs"
+test = false
+doc = false
+bench = false

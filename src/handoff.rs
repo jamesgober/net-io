@@ -375,6 +375,15 @@ fn decode(bytes: &[u8]) -> Result<Vec<Record>, HandoffError> {
     Ok(records)
 }
 
+/// The fuzz target's entry: decoding never panics, and an accepted manifest
+/// encodes back to the same bytes.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_manifest(data: &[u8]) {
+    if let Ok(records) = decode(data) {
+        assert_eq!(encode(&records), data);
+    }
+}
+
 /// Sends `listeners` over `channel` in one message: the manifest and every
 /// socket (`SCM_RIGHTS`). The listeners stay open here; the receiver gets its
 /// own copies. At most 64.

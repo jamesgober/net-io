@@ -20,7 +20,11 @@ Test locations: `tests/<file>.rs::<name>`, unit tests as `src/<file>.rs::<name>`
 | 10. Data while parked read after the wake | `edge::edge_10_bytes_sent_while_parked_are_read_after_the_wake` |
 | 11. Buffer budget exhausted: reading pauses | 0.5. The blocking driver takes each worker's buffers at warm-up and validates the budget at build, so it never runs dry mid-connection; pausing a connection's reads applies to the reactor |
 | 12. Zero-length `recv` | `edge::edge_12_zero_length_receive_returns_at_once` |
-| 13 to 17. PROXY header cases | 0.4 (the PROXY listener ships then) |
+| 13. 107 bytes without CRLF: `V1TooLong` | `src/proxy_parse.rs::test_v1_too_long` (0.4) |
+| 14. v2 signature split across 12 segments | `src/proxy_parse.rs::test_v2_split_into_segments_waits_then_succeeds`, `src/proxy_parse.rs::prop_every_split_point_agrees` (0.4) |
+| 15. Header and data in one segment: `consumed` leaves the rest | `src/proxy_parse.rs::test_v1_tcp4_and_rest_is_data`, `proxy::test_v1_header_gives_the_real_client_and_keeps_the_rest`, `tls::test_proxy_then_tls_in_one_segment` (0.4) |
+| 16. A second header is application data | `src/proxy_parse.rs::test_second_header_is_data` (0.4) |
+| 17. First byte of a header, then silence: handshake deadline | `proxy::test_missing_invalid_and_slow_headers` (0.4) |
 
 ## Writes
 
@@ -76,7 +80,36 @@ Test locations: `tests/<file>.rs::<name>`, unit tests as `src/<file>.rs::<name>`
 
 ## IOCP, io_uring, Unix sockets, named pipes, UDP, hand-off (62 to 105)
 
-Ship with those features: Unix sockets, UDP, and Unix hand-off in 0.4; IOCP, named pipes, and Windows hand-off in 0.5; io_uring after 1.0 (D-015).
+IOCP (62 to 66), named pipes (86 to 89), and the Windows hand-off (104, 105) ship in 0.5; io_uring (67 to 75) after 1.0 (D-015). Unix sockets, UDP, and the Unix hand-off ship in 0.4:
+
+| Case | Tests (0.4) |
+|---|---|
+| 76. Path exactly at the maximum; one more byte: `PathTooLong` | `src/local.rs::test_longest_path_binds_and_non_sockets_stay`, `src/local.rs::test_path_checks` |
+| 77. NUL in the path: rejected | `src/local.rs::test_path_checks` (`InvalidConfig { reason: Malformed }`, D-095) |
+| 78. Stale socket file: removed, bind succeeds | `src/local.rs::test_stale_socket_removed_live_one_refused` |
+| 79. Live listener on the path: `StaleSocketInUse`, file untouched | `src/local.rs::test_stale_socket_removed_live_one_refused`, `unix::unix_listener_on_a_live_path_fails_build` |
+| 80. Regular file, directory, symlink: not removed, error | `src/local.rs::test_stale_socket_removed_live_one_refused` (file), `src/local.rs::test_longest_path_binds_and_non_sockets_stay` (directory, symlink) |
+| 81. `MSG_CTRUNC`: every descriptor closed, `Truncated` | `src/sys/unix.rs::test_truncated_control_message_closes_every_descriptor` (Linux; macOS runs the same receive code, without this test) |
+| 82. Truncated or bad-checksum body: all closed | `src/handoff.rs::test_manifest_rejects_damage`, `src/handoff.rs::test_count_mismatch_truncation_timeout_and_peer`; fuzz target `manifest` |
+| 83. More (or fewer) descriptors than declared: `CountMismatch` | `src/handoff.rs::test_count_mismatch_truncation_timeout_and_peer` |
+| 84. Credentials unavailable: `None`, and `require_uid` refuses | `src/local.rs::test_unknown_credentials_fail_require_uid` |
+| 85. Our path replaced by someone else's socket: `Drop` leaves it | `src/local.rs::test_drop_leaves_a_replacement_alone` |
+| 90. Datagram larger than the buffer: `truncated` | `src/udp.rs::test_echo_truncation_and_zero_length`, `src/sys/unix.rs::test_udp_recv_reports_truncation_and_source`, `src/sys/windows.rs::test_udp_recv_reports_truncation_and_source` |
+| 91. Zero-length datagram: valid | `src/udp.rs::test_echo_truncation_and_zero_length` |
+| 92. ICMP port unreachable never fatal; Windows `SIO_UDP_CONNRESET` off | `src/udp.rs::test_icmp_reports_never_end_the_socket`; the constant is checked in `src/sys/windows.rs::test_layout_udp_matches_windows_sys` |
+| 93. Source table full: strangers share the overflow budget; verified peers keep entries | `src/udp.rs::test_full_table_evicts_strangers_and_keeps_verified` |
+| 94. Factor 1, 1-byte request: 2-byte reply refused until verified | `src/udp.rs::test_amplification_factor_one_until_verified` |
+| 95. `LISTEN_FDS=0`: empty list | `src/inherit.rs::test_systemd_protocol` |
+| 96. `LISTEN_FDS` non-numeric, negative, above 64 | `src/inherit.rs::test_systemd_protocol` |
+| 97. No `LISTEN_PID`: empty list | `src/inherit.rs::test_systemd_protocol` |
+| 98. Names count differs: `NamesMismatch` | `src/inherit.rs::test_systemd_protocol` |
+| 99. Descriptor closed or a regular file: `NotASocket` | `src/inherit.rs::test_systemd_protocol` |
+| 100. A connected socket: `NotListening` | `src/inherit.rs::test_systemd_takes_verified_listeners_with_names` |
+| 101. FastCGI descriptor 0 not a listener: `None` | `src/inherit.rs::test_fastcgi_descriptor_checks`, `cross_process::fastcgi_listener_is_none_for_a_pipe_or_terminal` |
+| 102. Receiver timeout: `Timeout`, nothing adopted | `src/handoff.rs::test_count_mismatch_truncation_timeout_and_peer` |
+| 103. Sender dies mid-send: nothing adopted | `src/handoff.rs::test_count_mismatch_truncation_timeout_and_peer` |
+
+End to end: `handoff::listeners_move_to_a_new_server_without_closing`, `cross_process::handoff_between_processes_refuses_nothing_under_load` (two processes, about 1,000 connections per second, zero refused), `cross_process::systemd_socket_activation_with_the_real_tool`, `cross_process::fastcgi_listener_on_descriptor_zero`.
 
 ## Server lifecycle
 
@@ -86,8 +119,8 @@ Ship with those features: Unix sockets, UDP, and Unix hand-off in 0.4; IOCP, nam
 | 108. Drain with nothing open | `edge::edge_108_drain_with_nothing_open_returns_at_once` |
 | 109. Drain deadline already passed | `edge::edge_109_drain_deadline_in_the_past_kills_at_once` |
 | 110. `request_stop` from a session | `edge::edge_110_request_stop_from_a_session_is_safe`, `server::test_request_stop_ends_wait_for_stop` |
-| 111. `adopt` while draining | 0.4 (`Server::adopt` ships then) |
-| 112. `release_listeners` with the door open | 0.4 (hand-off ships then) |
+| 111. `adopt` while draining | `adopt::adopt_while_draining_is_shutting_down` (0.4) |
+| 112. `release_listeners` with the door open | `handoff::listeners_move_to_a_new_server_without_closing`, `cross_process::handoff_between_processes_refuses_nothing_under_load` (0.4) |
 | 113. `kill` with a foreign or closed id | `edge::edge_113_kill_with_a_foreign_or_closed_id_is_false` |
 | 114. Control line changes within one iteration | `src/control.rs::test_view_sees_only_final_state` |
 | 115. `Draining` without a deadline | `edge::edge_115_draining_without_a_deadline_uses_the_drain_timeout` |

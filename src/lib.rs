@@ -45,9 +45,10 @@
 //!
 //! ## Status
 //!
-//! `0.3.0`: TCP and the blocking driver on Linux, macOS, and Windows. PROXY
-//! protocol, UDP, local sockets, the TLS server integration, inheritance, and
-//! hand-off arrive in `0.4.0`; the reactor in `0.5.0`.
+//! `0.4.0`: TCP, Unix domain sockets, and UDP on the blocking driver (Linux,
+//! macOS, Windows; Unix sockets and hand-off on Unix), the PROXY protocol, the
+//! TLS seam on listeners, systemd and FastCGI inheritance, and listener
+//! hand-off. The reactor and Windows named pipes arrive in `0.5.0`.
 
 #![doc(html_root_url = "https://docs.rs/net-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -102,6 +103,22 @@ mod tls;
 mod trusted;
 #[cfg(feature = "udp")]
 mod udp;
+
+/// Entry points for net-io's fuzz targets (`fuzz/`), compiled only under
+/// cargo-fuzz (`--cfg fuzzing`). Not part of the public API and not covered by semver.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod __fuzz {
+    /// The hand-off manifest decoder.
+    pub fn manifest(data: &[u8]) {
+        crate::handoff::fuzz_manifest(data);
+    }
+
+    /// The systemd environment reader.
+    pub fn systemd_env(data: &[u8]) {
+        crate::inherit::fuzz_systemd_env(data);
+    }
+}
 
 /// Fault injection for net-io's own tests, compiled only with `--cfg net_io_shim`.
 /// Not part of the public API and not covered by semver.

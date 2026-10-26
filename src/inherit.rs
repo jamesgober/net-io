@@ -223,6 +223,30 @@ fn from_systemd(
     Ok(out)
 }
 
+/// The fuzz target's entry: `LISTEN_FDS`, `LISTEN_FDNAMES`, and
+/// `LISTEN_PIDFDID` from `data` (split at NUL), descriptors looked for from
+/// 1,000,000 (never open), so nothing real is touched.
+#[cfg(all(fuzzing, unix))]
+pub(crate) fn fuzz_systemd_env(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    let mut parts = text.split('\0');
+    let pid = std::process::id();
+    let (fds, names, pidfd) = (parts.next(), parts.next(), parts.next());
+    let env = |k: &str| match k {
+        "LISTEN_PID" => Some(pid.to_string()),
+        "LISTEN_FDS" => fds.map(str::to_owned),
+        "LISTEN_FDNAMES" => names.map(str::to_owned),
+        "LISTEN_PIDFDID" => pidfd.map(str::to_owned),
+        _ => None,
+    };
+    if let Ok(list) = from_systemd(&env, pid, 1_000_000) {
+        assert!(list.is_empty(), "no descriptor is open up there");
+    }
+}
+
+#[cfg(all(fuzzing, not(unix)))]
+pub(crate) fn fuzz_systemd_env(_data: &[u8]) {}
+
 #[cfg(unix)]
 fn kind_error(e: KindError, fd: i32) -> InheritError {
     match e {

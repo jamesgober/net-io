@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "net-io"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -31,6 +31,9 @@ documentation = "https://docs.rs/net-io"
 
 # Authors
 authors = ["James Gober <me@jamesgober.com>"]
+
+# Kept out of the published crate
+exclude = ["fuzz/"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -78,6 +81,26 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Network
 loom = "0.7"
 
 
+# EXAMPLES
+# #################################
+# Examples that need a feature are skipped when it is off.
+[[example]]
+name              = "behind_proxy"
+required-features = ["proxy"]
+
+[[example]]
+name              = "unix_socket"
+required-features = ["local"]
+
+[[example]]
+name              = "handoff_restart"
+required-features = ["local"]
+
+[[example]]
+name              = "udp_echo"
+required-features = ["udp"]
+
+
 # BENCHMARKS
 # #################################
 # Plain harness: baselines print their own numbers, no benchmark framework needed.
@@ -89,7 +112,7 @@ harness = false
 # LINTS
 # #################################
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(net_io_loom)", "cfg(net_io_shim)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(net_io_loom)", "cfg(net_io_shim)", "cfg(fuzzing)"] }
 
 
 # RELEASE PROFILE

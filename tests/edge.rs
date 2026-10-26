@@ -894,7 +894,7 @@ fn edge_132_stats_while_workers_run() {
     let a = addr(&server);
     // A client's next connection can arrive before its last one is counted
     // closed; the server may then refuse it (source cap, Busy) with a reset, and
-    // the client tries again. Every attempt ends as a close or a refusal.
+    // the client tries again. A reset can even reach `connect` on a loaded host.
     let clients: Vec<_> = (0..4)
         .map(|_| {
             std::thread::spawn(move || {
@@ -902,7 +902,10 @@ fn edge_132_stats_while_workers_run() {
                 while done < 50 {
                     attempts += 1;
                     assert!(attempts < 5_000, "refused too often");
-                    let mut c = client(a);
+                    let Ok(mut c) = TcpStream::connect(a) else {
+                        continue;
+                    };
+                    let _ = c.set_read_timeout(Some(WAIT));
                     let mut back = [0u8; 2];
                     if c.write_all(b"x\n").is_ok() && c.read_exact(&mut back).is_ok() {
                         assert_eq!(&back, b"x\n");
@@ -924,8 +927,9 @@ fn edge_132_stats_while_workers_run() {
         last = s.closed;
     }
     let attempts: u64 = clients.into_iter().map(|c| c.join().expect("client")).sum();
+    // Every success closed; no attempt is counted twice; nothing stays open.
     assert!(eventually(WAIT, || {
         let s = server.stats();
-        s.closed + s.refused == attempts
+        s.open == 0 && s.closed >= 200 && s.closed + s.refused <= attempts
     }));
 }

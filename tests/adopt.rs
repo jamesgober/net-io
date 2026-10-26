@@ -217,3 +217,23 @@ fn allow_all_is_a_gate_for_set_gate() {
     let mut conn = net_io::connect(upstream.local_addr().expect("addr")).expect("dial");
     conn.set_gate(Arc::new(AllowAll)).expect("allow");
 }
+
+/// Edge case 111: `adopt` while the server drains is `ShuttingDown`.
+#[test]
+fn adopt_while_draining_is_shutting_down() {
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0").name("main"))
+        .workers(1)
+        .handler(origin)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let _ = server.drain(std::time::Instant::now());
+    let upstream = TcpListener::bind("127.0.0.1:0").expect("upstream");
+    let dialed = net_io::connect(upstream.local_addr().expect("addr")).expect("dial");
+    assert!(matches!(
+        server.adopt(dialed, AdoptSpec::new("main")),
+        Err(NetError::ShuttingDown)
+    ));
+}
