@@ -26,6 +26,7 @@ What differs between operating systems, what net-io does about it, and what an o
 - **Accepted sockets** inherit the listener's non-blocking flag on macOS; net-io clears it so the blocking driver's reads block under their timeout.
 - **Backlog.** Capped by `kern.ipc.somaxconn`; the effective value is not readable per listener, so `ListenerInfo::backlog` is `None`.
 - **Linger** uses `SO_LINGER_SEC` (seconds), not `SO_LINGER`.
+- **`TcpListener::from_std`** cannot ask macOS whether a socket listens (`SO_ACCEPTCONN` is not answered), so it accepts a stream socket that is bound and has no peer; a socket that was bound but never listened then fails at its first `accept`.
 - **`shutdown(SHUT_RD)`** discards data already received and any that arrives later; a drain or kill therefore never delivers more input to the session (Linux delivers what was already queued).
 
 ## Windows
