@@ -31,13 +31,17 @@ use crate::events::{CoalescedKind, Coalescer, Event, EventSink, NoopSink};
 use crate::gate::{AdmitStage, AllowAll, ErasedGate, Gate, GateCell, Refusal, guarded};
 use crate::id::{ConnectionId, IdBlock, ListenerId, WorkerId};
 use crate::info::{ConnectionInfo, Lane, Origin};
+#[cfg(feature = "proxy")]
+use crate::limits::SizeClass;
 use crate::limits::{Effective, Limits};
 use crate::link::{ClockRef, Got, Link, WakeSource};
 use crate::opts::{ListenOptions, TcpOptions};
+use crate::proxy::{ProxyFacts, ProxyMode, ProxyVersions};
 use crate::session::{Input, Output, Phase, Session, SessionContext, SessionFactory, Step};
 use crate::sys::{self, AsSock, Interest, KillSlot, Wake};
 use crate::tcp::{TcpConnection, TcpListener};
 use crate::time::Clock;
+use crate::trusted::TrustedProxies;
 
 const WORKER_STACK: usize = 256 * 1024;
 const DRAIN_KILL: KillReason = KillReason(0);
@@ -221,6 +225,9 @@ pub(crate) struct Shared {
     listener_counts: Vec<AtomicU32>,
     listener_limits: Vec<Effective>,
     listener_tcp: Vec<TcpOptions>,
+    /// PROXY settings per listener: `Some` when the listener requires a header.
+    #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
+    listener_proxy: Vec<Option<ListenerProxy>>,
     /// One per listener, sized from that listener's limits (D-085).
     sources: Vec<SourceTable>,
 }
@@ -453,6 +460,14 @@ impl Shared {
     }
 }
 
+/// A listener's PROXY requirement and whom it trusts.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "proxy"), allow(dead_code))]
+pub(crate) struct ListenerProxy {
+    versions: ProxyVersions,
+    trusted: Arc<TrustedProxies>,
+}
+
 /// An accepted, admitted connection waiting for a worker.
 pub struct Job<T> {
     stream: TcpStream,
@@ -492,6 +507,7 @@ where
     let mut infos = Vec::with_capacity(cfg.listeners.len());
     let mut listener_limits = Vec::with_capacity(cfg.listeners.len());
     let mut listener_tcp = Vec::with_capacity(cfg.listeners.len());
+    let mut listener_proxy = Vec::with_capacity(cfg.listeners.len());
     for (i, spec) in cfg.listeners.into_iter().enumerate() {
         let lim = cfg
             .limits
@@ -522,7 +538,14 @@ where
                 Err(e) => last = crate::tcp::bind_error(a, e),
             }
         }
-        let listener = bound.ok_or(last)?;
+        let mut listener = bound.ok_or(last)?;
+        listener.set_proxy_mode(spec.proxy);
+        listener_proxy.push(match (spec.proxy, spec.trusted) {
+            (ProxyMode::Required { versions }, Some(trusted)) => {
+                Some(ListenerProxy { versions, trusted })
+            }
+            _ => None,
+        });
         infos.push(listener.info().clone());
         listener_limits.push(lim);
         listener_tcp.push(*listener.tcp_options());
@@ -606,6 +629,7 @@ where
             .collect(),
         listener_limits,
         listener_tcp,
+        listener_proxy,
     });
     for (i, info) in infos.iter().enumerate() {
         shared.event(Event::ListenerOpened {
@@ -971,6 +995,8 @@ pub struct Worker<G: Gate> {
     completer: Completer,
     view: ControlView,
     clock: ClockRef,
+    /// Recycled PROXY facts (D-061): reused when no one else holds them.
+    facts_pool: Vec<Arc<ProxyFacts>>,
 }
 
 fn worker_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, idx: usize) {
@@ -999,6 +1025,7 @@ fn worker_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, idx: usi
         },
         view: ControlView::new(),
         clock: engine.clock.clone(),
+        facts_pool: Vec::new(),
     };
     while let Some(job) = engine.next_job() {
         engine.work.serve(&mut w, job);
@@ -1006,6 +1033,144 @@ fn worker_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, idx: usi
 }
 
 impl<G: Gate> Worker<G> {
+    /// Returns a closed connection's PROXY facts to the pool when nothing else
+    /// holds them.
+    fn recycle(&mut self, info: ConnectionInfo) {
+        if let Some(mut facts) = info.proxy {
+            if Arc::get_mut(&mut facts).is_some() && self.facts_pool.len() < 4 {
+                self.facts_pool.push(facts);
+            }
+        }
+    }
+
+    /// Reads and checks the PROXY header (`ListenerSpec::proxy`): trust before any
+    /// read, the header under the handshake deadline, then the real client takes
+    /// over the per-source slot and the gate readmits it. Bytes after the header
+    /// stay input for the protocol.
+    #[cfg(feature = "proxy")]
+    fn proxy_handshake(
+        &mut self,
+        link: &mut Link,
+        proxy: &ListenerProxy,
+        listener: usize,
+        source: &mut Option<PrefixKey>,
+    ) -> Result<(), CloseReason> {
+        use crate::proxy_parse::{ProxyAddress, ProxyCommand, ProxyParser, ProxyProgress};
+        let Some(peer) = link.info.peer.socket_addr() else {
+            return Err(CloseReason::ProxyUntrusted);
+        };
+        if !proxy.trusted.contains(peer.ip()) {
+            return Err(CloseReason::ProxyUntrusted);
+        }
+        let lim = link.limits;
+        // The header must fit the buffer: at most 16 fixed bytes plus the body limit.
+        let need = 16 + u32::from(lim.proxy_header_max);
+        let class = if need <= SizeClass::SMALL.bytes() {
+            SizeClass::SMALL
+        } else if need <= SizeClass::MEDIUM.bytes() {
+            SizeClass::MEDIUM
+        } else {
+            SizeClass::LARGE
+        };
+        let Some(mut buf) = self.pool.take(class) else {
+            return Err(CloseReason::Limit(crate::error::LimitKind::BufferBudget));
+        };
+        let body_max = u16::try_from(buf.capacity().saturating_sub(16))
+            .unwrap_or(u16::MAX)
+            .min(lim.proxy_header_max);
+        let mut parser = ProxyParser::new(proxy.versions, body_max);
+        link.begin_handshake(link.info.accepted_at + lim.handshake_timeout);
+        let outcome = loop {
+            match parser.feed(buf.as_slice()) {
+                Ok(ProxyProgress::Done { header, consumed }) => {
+                    let real = match (header.command, header.source) {
+                        (ProxyCommand::Proxy, Some(ProxyAddress::Ip(a))) => {
+                            Some(crate::addr::normalize_socket(a))
+                        }
+                        _ => None,
+                    };
+                    break Ok((header.to_facts(), real, consumed));
+                }
+                Ok(ProxyProgress::NeedMore { .. }) => {}
+                Err(crate::proxy::ProxyError::NotProxy) => break Err(CloseReason::ProxyMissing),
+                Err(_) => break Err(CloseReason::ProxyInvalid),
+            }
+            if buf.spare().is_empty() {
+                break Err(CloseReason::ProxyInvalid);
+            }
+            match link.read(buf.spare()) {
+                Ok(Got::Data(n)) => buf.set_len(buf.len() + n),
+                Ok(Got::Eof) => break Err(CloseReason::ProxyMissing),
+                Ok(Got::Woken) => {}
+                Err(_) => break Err(link.reason_or(CloseReason::Io(OsErrorClass::Other(0)))),
+            }
+        };
+        let (facts, real, consumed) = match outcome {
+            Ok(v) => v,
+            Err(reason) => {
+                link.end_handshake(Some((buf, usize::MAX)));
+                return Err(reason);
+            }
+        };
+        let shared = self.shared.clone();
+        let result = (|| {
+            let Some(real) = real else {
+                // LOCAL (the proxy itself) and UNKNOWN keep the socket's addresses.
+                return Ok(());
+            };
+            // The per-source slot moves from the proxy to the real client.
+            let key = PrefixKey::of(real.ip(), lim.source_policy);
+            if Some(key) != *source {
+                let table = &shared.sources[listener];
+                if !table.acquire(key) {
+                    return Err(CloseReason::Refused(RefusalCause::SourceCap));
+                }
+                if let Some(old) = source.replace(key) {
+                    table.release(old);
+                }
+            }
+            link.info.real_peer = Some(real);
+            Ok(())
+        })();
+        if let Err(reason) = result {
+            link.end_handshake(Some((buf, usize::MAX)));
+            return Err(reason);
+        }
+        let mut arc = self
+            .facts_pool
+            .pop()
+            .unwrap_or_else(|| Arc::new(ProxyFacts::default()));
+        if let Some(f) = Arc::get_mut(&mut arc) {
+            *f = facts;
+        } else {
+            arc = Arc::new(facts);
+        }
+        link.info.proxy = Some(arc);
+        link.end_handshake(Some((buf, consumed)));
+        if let Some(real) = link.info.real_peer {
+            let readmitted = match link.gate.as_mut() {
+                Some(g) => g.readmit(&link.info),
+                None => match self.gate_cell.as_mut() {
+                    Some(c) => c.readmit(&link.info),
+                    None => Ok(()),
+                },
+            };
+            if let Err(refusal) = readmitted {
+                if let Refusal::WithBytes { bytes, .. } = refusal {
+                    let max = usize::from(lim.refusal_bytes_max);
+                    if bytes.len() <= max {
+                        link.send_denial_once(bytes);
+                    }
+                }
+                return Err(CloseReason::Refused(RefusalCause::Gate(refusal.code())));
+            }
+            shared.event(Event::ProxyResolved {
+                id: link.info.id,
+                real_peer: real,
+            });
+        }
+        Ok(())
+    }
     /// Starts serving a job: options (where not inherited), the kill slot, the gate ticket.
     fn begin(&mut self, job: Job<G::Ticket>) -> Option<(Link, usize, Option<PrefixKey>)> {
         let Job {
@@ -1064,6 +1229,15 @@ impl<G: Gate> Worker<G> {
             self.end(link, reason, listener, source);
             return None;
         }
+        #[cfg(feature = "proxy")]
+        let mut source = source;
+        #[cfg(feature = "proxy")]
+        if let Some(proxy) = shared.listener_proxy[listener].clone() {
+            if let Err(reason) = self.proxy_handshake(&mut link, &proxy, listener, &mut source) {
+                self.end(link, reason, listener, source);
+                return None;
+            }
+        }
         Some((link, listener, source))
     }
 
@@ -1078,6 +1252,9 @@ impl<G: Gate> Worker<G> {
         let shared = self.shared.clone();
         let ws = &shared.workers[self.idx];
         let mut link = link;
+        if let Some(b) = link.take_pending() {
+            self.pool.put(b);
+        }
         let mut reason = reason;
         if let Some(k) = link.killed() {
             reason = match (ws.kill_cause.load(Ordering::Acquire), k == DRAIN_KILL) {
@@ -1220,7 +1397,8 @@ where
             Some(Ok(())) => link.reason_or(CloseReason::SessionClosed),
             Some(Err(_)) => link.reason_or(CloseReason::SessionError),
         };
-        w.end(link, reason, listener, source);
+        let (info, _) = w.end(link, reason, listener, source);
+        w.recycle(info);
     }
 }
 
@@ -1264,6 +1442,8 @@ impl<F: SessionFactory> Serve for Sessions<F> {
         };
         let (info, reason) = w.end(link, reason, listener, source);
         let _ = guarded(|| session.on_close(&info, reason));
+        drop(session);
+        w.recycle(info);
     }
 }
 

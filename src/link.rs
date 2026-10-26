@@ -7,6 +7,7 @@ use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::buf::Buffer;
 use crate::error::{CloseReason, Direction, KillReason, NetError, OsErrorClass, TimeoutKind};
 use crate::gate::{Denial, ErasedGate, WriteCheck};
 use crate::info::{ConnectionInfo, GateTag};
@@ -87,6 +88,12 @@ pub(crate) struct Link {
     replied: bool,
     /// The idle timeout from the limits, restored when an override is cleared.
     base_idle: Duration,
+    /// While a PROXY (or TLS) handshake runs: its deadline replaces the phase's.
+    handshake_deadline: Option<Instant>,
+    /// Bytes read past a handshake, served before the socket (the buffer returns
+    /// to the worker's pool at close).
+    pending: Option<Buffer>,
+    pending_at: usize,
 }
 
 impl Link {
@@ -131,6 +138,9 @@ impl Link {
             auto_phase: phase == Phase::Idle,
             replied: false,
             base_idle: limits.idle_timeout,
+            handshake_deadline: None,
+            pending: None,
+            pending_at: 0,
         };
         if phase == Phase::Receiving {
             link.rate_in.activate(now);
@@ -194,6 +204,49 @@ impl Link {
         if in_active {
             self.rate_in.activate(now);
         }
+    }
+
+    /// Starts a handshake: reads time out at `deadline` with `HandshakeTimeout`.
+    #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
+    pub(crate) fn begin_handshake(&mut self, deadline: Instant) {
+        self.handshake_deadline = Some(deadline);
+    }
+
+    /// Ends a handshake. `rest` holds bytes read past it (`buffer[at..]`), served
+    /// before the socket. The connection waits for its first exchange again.
+    #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
+    pub(crate) fn end_handshake(&mut self, rest: Option<(Buffer, usize)>) {
+        self.handshake_deadline = None;
+        if let Some((buffer, at)) = rest {
+            if at < buffer.len() {
+                self.pending_at = at;
+                self.pending = Some(buffer);
+            } else {
+                self.pending = Some(buffer);
+                self.pending_at = usize::MAX;
+            }
+        }
+        self.phase = Phase::Idle;
+        self.progress_at = self.now();
+        self.rate_in.deactivate();
+    }
+
+    /// The handshake buffer, for its pool.
+    pub(crate) fn take_pending(&mut self) -> Option<Buffer> {
+        self.pending_at = 0;
+        self.pending.take()
+    }
+
+    /// Copies bytes read past a handshake into `buf`; 0 when none are left.
+    fn read_pending(&mut self, buf: &mut [u8]) -> usize {
+        let Some(p) = self.pending.as_ref() else {
+            return 0;
+        };
+        let have = p.as_slice().get(self.pending_at..).unwrap_or(&[]);
+        let n = have.len().min(buf.len());
+        buf[..n].copy_from_slice(&have[..n]);
+        self.pending_at = self.pending_at.saturating_add(n);
+        n
     }
 
     /// This connection's idle timeout from its next idle wait on (`None`: the
@@ -261,21 +314,34 @@ impl Link {
             return Ok(Got::Data(0));
         }
         self.settle_phase(true);
+        let n = self.read_pending(buf);
+        if n > 0 {
+            let now = self.now();
+            self.progress_at = now;
+            if self.phase == Phase::Idle {
+                self.phase = Phase::Receiving;
+                self.rate_in.activate(now);
+            }
+            return Ok(Got::Data(n));
+        }
         loop {
             self.check_terminal()?;
             if self.peer_closed {
                 return Ok(Got::Eof);
             }
             let now = self.now();
-            let (op_deadline, op_kind) = match self.phase {
-                Phase::Idle => (
-                    self.progress_at + self.limits.idle_timeout,
-                    TimeoutKind::Idle,
-                ),
-                _ => (
-                    self.progress_at + self.limits.read_timeout,
-                    TimeoutKind::Read,
-                ),
+            let (op_deadline, op_kind) = match (self.handshake_deadline, self.phase) {
+                (Some(d), _) => (d, TimeoutKind::Handshake),
+                (None, phase) => match phase {
+                    Phase::Idle => (
+                        self.progress_at + self.limits.idle_timeout,
+                        TimeoutKind::Idle,
+                    ),
+                    _ => (
+                        self.progress_at + self.limits.read_timeout,
+                        TimeoutKind::Read,
+                    ),
+                },
             };
             if now >= op_deadline {
                 return Err(self.timed_out(op_kind));

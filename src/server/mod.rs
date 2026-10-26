@@ -17,10 +17,12 @@ use crate::gate::Gate;
 use crate::id::{ConnectionId, WorkerId};
 use crate::limits::Limits;
 use crate::opts::ListenOptions;
+use crate::proxy::ProxyMode;
 use crate::session::SessionFactory;
 use crate::tcp::{ListenerInfo, TcpConnection};
 use crate::time::Clock;
 use crate::tls::{NoTls, TlsAcceptor};
+use crate::trusted::TrustedProxies;
 
 pub(crate) use engine::Shared;
 
@@ -152,6 +154,8 @@ pub struct ListenerSpec {
     pub(crate) options: Option<ListenOptions>,
     pub(crate) name: Option<String>,
     pub(crate) limits: Limits,
+    pub(crate) proxy: ProxyMode,
+    pub(crate) trusted: Option<Arc<TrustedProxies>>,
 }
 
 impl ListenerSpec {
@@ -165,6 +169,8 @@ impl ListenerSpec {
             options: None,
             name: None,
             limits: Limits::default(),
+            proxy: ProxyMode::Off,
+            trusted: None,
         }
     }
 
@@ -185,6 +191,25 @@ impl ListenerSpec {
     /// Per-listener caps and deadlines; values set here override the server's.
     pub fn limits(mut self, limits: Limits) -> ListenerSpec {
         self.limits = limits;
+        self
+    }
+
+    /// Requires a PROXY protocol header on every connection (feature `proxy`).
+    /// Peers outside the trusted proxies are closed before any byte is read.
+    ///
+    /// ```
+    /// use net_io::{ListenerSpec, ProxyMode, ProxyVersions};
+    /// let spec = ListenerSpec::tcp("127.0.0.1:0").proxy(ProxyMode::Required { versions: ProxyVersions::Both });
+    /// # let _ = spec;
+    /// ```
+    pub fn proxy(mut self, mode: ProxyMode) -> ListenerSpec {
+        self.proxy = mode;
+        self
+    }
+
+    /// The proxies trusted on this listener, instead of the server's list.
+    pub fn trusted_proxies(mut self, proxies: TrustedProxies) -> ListenerSpec {
+        self.trusted = Some(Arc::new(proxies));
         self
     }
 }
@@ -270,6 +295,7 @@ pub struct ServerBuilder<W = NoWork, G = NoGate, S = NoopSink, T = NoTls> {
     control: Option<Arc<dyn ControlLine>>,
     wipe: bool,
     clock: Option<Arc<dyn Clock>>,
+    trusted: Option<Arc<TrustedProxies>>,
 }
 
 impl ServerBuilder {
@@ -287,6 +313,7 @@ impl ServerBuilder {
             control: None,
             wipe: true,
             clock: None,
+            trusted: None,
         }
     }
 }
@@ -314,6 +341,7 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
             control,
             wipe,
             clock,
+            trusted,
         } = self;
         let (work, gate, sink, tls) = f(work, gate, sink, tls);
         ServerBuilder {
@@ -328,7 +356,15 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
             control,
             wipe,
             clock,
+            trusted,
         }
+    }
+
+    /// The proxies whose PROXY headers are believed, for every listener that
+    /// requires one and has no list of its own.
+    pub fn trusted_proxies(mut self, proxies: TrustedProxies) -> Self {
+        self.trusted = Some(Arc::new(proxies));
+        self
     }
 
     /// Adds a listener (at most 64).
@@ -437,8 +473,25 @@ where
         if workers > 4096 {
             return Err(invalid("workers", ConfigReason::TooLarge { max: 4096 }));
         }
+        let mut listeners = self.listeners;
+        for spec in &mut listeners {
+            if spec.proxy != ProxyMode::Off {
+                if !cfg!(feature = "proxy") {
+                    return Err(NetError::Unsupported {
+                        feature: "PROXY protocol (the `proxy` feature)",
+                        platform: std::env::consts::OS,
+                    });
+                }
+                let trusted = spec.trusted.clone().or_else(|| self.trusted.clone());
+                match trusted {
+                    Some(t) if !t.is_empty() => spec.trusted = Some(t),
+                    // Required without anyone to trust would refuse every connection.
+                    _ => return Err(invalid("trusted_proxies", ConfigReason::Missing)),
+                }
+            }
+        }
         let mut names = Vec::new();
-        for spec in &self.listeners {
+        for spec in &listeners {
             if let Some(n) = &spec.name {
                 if n.len() > 64 {
                     return Err(invalid("name", ConfigReason::TooLarge { max: 64 }));
@@ -459,12 +512,12 @@ where
             self.limits.clone()
         };
         limits.validate(workers, crate::sys::descriptor_limit())?;
-        for spec in &self.listeners {
+        for spec in &listeners {
             limits.overlay(&spec.limits).validate(workers, None)?;
         }
         let _ = &self.tls;
         engine::start(engine::Config {
-            listeners: self.listeners,
+            listeners,
             driver,
             workers,
             limits,

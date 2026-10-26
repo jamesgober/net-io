@@ -269,6 +269,11 @@ impl TcpListener {
         &self.inner
     }
 
+    /// Records the listener's PROXY requirement in its facts.
+    pub(crate) fn set_proxy_mode(&mut self, mode: crate::proxy::ProxyMode) {
+        self.info.proxy = mode;
+    }
+
     pub(crate) fn tcp_options(&self) -> &TcpOptions {
         &self.tcp
     }
