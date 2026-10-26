@@ -569,8 +569,13 @@ pub(crate) fn accept(listener: &TcpListener) -> io::Result<(TcpStream, SocketAdd
     let (stream, peer) = listener.accept()?;
     #[cfg(target_os = "macos")]
     {
-        set_int(stream.as_fd(), c::SOL_SOCKET, c::SO_NOSIGPIPE, 1)?;
-        stream.set_nonblocking(true)?;
+        // A connection the peer already reset makes these fail (`EINVAL` on
+        // macOS); that is this connection's failure, never the listener's.
+        let setup = set_int(stream.as_fd(), c::SOL_SOCKET, c::SO_NOSIGPIPE, 1)
+            .and_then(|()| stream.set_nonblocking(true));
+        if setup.is_err() {
+            return Err(io::Error::from_raw_os_error(errno::ECONNABORTED));
+        }
     }
     Ok((stream, peer))
 }

@@ -1021,16 +1021,20 @@ impl<G: Gate> Worker<G> {
             })
         });
         cell.ticket = Some(ticket);
+        // Where accepted sockets do not inherit the listener's options (macOS), set
+        // them now. A peer that already reset makes this fail (macOS: `EINVAL`); the
+        // connection then closes through `end` like any other, with one event.
+        let mut failed = None;
         if !cfg!(any(target_os = "linux", windows)) {
             let tcp = shared.listener_tcp[listener];
             let v6 = info.local.socket_addr().is_some_and(|a| a.is_ipv6());
-            if !tcp.is_empty() && tcp.apply(&stream, v6).is_err() {
-                cell.close(&info, CloseReason::Io(OsErrorClass::Other(0)));
-                self.gate_cell = Some(cell);
-                shared.release(listener, source);
-                shared.busy.fetch_sub(1, Ordering::AcqRel);
-                shared.notify_progress();
-                return None;
+            if !tcp.is_empty() {
+                if let Err(e) = tcp.apply(&stream, v6) {
+                    failed = Some(match e.os_error_code() {
+                        Some(code) => CloseReason::Io(OsErrorClass::Other(code)),
+                        None => CloseReason::Io(OsErrorClass::Other(0)),
+                    });
+                }
             }
         }
         let ws = &shared.workers[self.idx];
@@ -1051,6 +1055,10 @@ impl<G: Gate> Worker<G> {
             link.gate = Some(cell as Box<dyn ErasedGate>);
         } else {
             self.gate_cell = Some(cell);
+        }
+        if let Some(reason) = failed {
+            self.end(link, reason, listener, source);
+            return None;
         }
         Some((link, listener, source))
     }

@@ -579,7 +579,9 @@ fn edge_48_burst_in_the_backlog_does_not_stall_open_connections() {
     server.close_door();
     let a = addr(&server);
     let started = Instant::now();
-    let burst: Vec<_> = (0..200)
+    // Below macOS's default `kern.ipc.somaxconn` (128): connects beyond the backlog
+    // stall in SYN retries instead of queueing.
+    let burst: Vec<_> = (0..100)
         .filter_map(|_| TcpStream::connect(a).ok())
         .collect();
     eprintln!(
