@@ -44,12 +44,26 @@ fn echo(conn: &mut TcpConnection) -> Result<(), NetError> {
     }
 }
 
+/// One receive on a net-io client connection from this thread.
+fn warm_thread_wake() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let mut c = net_io::connect(l.local_addr().expect("addr")).expect("connect");
+    let (mut s, _) = l.accept().expect("accept");
+    std::io::Write::write_all(&mut s, b"x").expect("write");
+    let mut b = [0u8; 1];
+    c.recv_exact(&mut b).expect("recv");
+}
+
 #[test]
 fn test_no_descriptor_leaks() {
     let n: u64 = std::env::var("NET_IO_LEAK_CONNECTIONS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1000);
+    // A net-io client that waits (macOS, Windows) creates its thread's wake channel
+    // on the first wait and keeps it for the thread's life: create it before
+    // counting, so the counts compare connections only.
+    warm_thread_wake();
     let before_servers = open_descriptors();
     {
         let sessions =
