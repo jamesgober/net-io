@@ -2,8 +2,8 @@
 //! deadlines per phase, the minimum transfer rate, the gate check before every
 //! send, kill detection, and graceful or abortive close.
 
-use std::io::{self, IoSlice, Read};
-use std::net::{Shutdown, TcpStream};
+use std::io::{self, IoSlice};
+use std::net::Shutdown;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -63,7 +63,7 @@ pub(crate) enum Got {
 }
 
 pub(crate) struct Link {
-    pub(crate) stream: TcpStream,
+    pub(crate) stream: sys::Stream,
     pub(crate) info: ConnectionInfo,
     pub(crate) limits: Effective,
     clock: ClockRef,
@@ -144,7 +144,7 @@ const TLS_OVERHEAD: usize = 2 * 1024;
 
 impl Link {
     pub(crate) fn new(
-        stream: TcpStream,
+        stream: sys::Stream,
         info: ConnectionInfo,
         limits: Effective,
         clock: ClockRef,
@@ -666,6 +666,14 @@ impl Link {
     /// One read from the socket (or from the bytes left after a handshake),
     /// under the phase's or the handshake's deadline.
     fn read_raw(&mut self, buf: &mut [u8]) -> Result<Got, NetError> {
+        self.read_raw_with(buf, sys::recv)
+    }
+
+    /// As `read_raw`, with `recv` as the receive call.
+    fn read_raw_with<R>(&mut self, buf: &mut [u8], mut recv: R) -> Result<Got, NetError>
+    where
+        R: FnMut(&sys::Stream, &mut [u8]) -> io::Result<usize>,
+    {
         self.settle_phase(true);
         let n = self.read_pending(buf);
         if n > 0 {
@@ -728,7 +736,7 @@ impl Link {
             if idle {
                 self.slot.set_idle(true);
             }
-            let got = self.wait_and_recv(buf, timeout);
+            let got = self.wait_and_recv(buf, timeout, &mut recv);
             if idle {
                 self.slot.set_idle(false);
             }
@@ -741,11 +749,15 @@ impl Link {
     /// One wait where the OS needs it (Windows and macOS: every receive; D-052,
     /// D-083) and one receive. Linux receives block under `SO_RCVTIMEO`, so an
     /// exchange costs one receive and one send. `None` means try again (timed out or would block).
-    fn wait_and_recv(
+    fn wait_and_recv<R>(
         &mut self,
         buf: &mut [u8],
         timeout: Duration,
-    ) -> Option<Result<Got, NetError>> {
+        recv: &mut R,
+    ) -> Option<Result<Got, NetError>>
+    where
+        R: FnMut(&sys::Stream, &mut [u8]) -> io::Result<usize>,
+    {
         if sys::WAIT_BEFORE_RECV {
             if !self.likely_more {
                 match self.wait(Interest::Read, timeout) {
@@ -777,7 +789,7 @@ impl Link {
                 self.recv_timeout_set = want;
             }
         }
-        match sys::recv(&self.stream, buf) {
+        match recv(&self.stream, buf) {
             Ok(0) => {
                 // A kill or a drain shuts the read side, which also reads as 0.
                 if let Err(e) = self.check_terminal() {
@@ -932,6 +944,106 @@ impl Link {
                 Err(e) => break Err(self.os_error("send", e)),
             }
         }
+    }
+
+    /// One read that also takes descriptors passed with the bytes (`SCM_RIGHTS`),
+    /// stored into `into` from index 0. Returns what was read and how many
+    /// descriptors came with it.
+    #[cfg(all(unix, feature = "local"))]
+    pub(crate) fn read_with_fds(
+        &mut self,
+        buf: &mut [u8],
+        into: &mut [Option<std::os::fd::OwnedFd>; sys::MAX_FDS],
+    ) -> Result<(Got, usize), NetError> {
+        if self.tls.is_some() {
+            return Err(NetError::Unsupported {
+                feature: "descriptor passing on a TLS connection",
+                platform: std::env::consts::OS,
+            });
+        }
+        if buf.is_empty() {
+            return Ok((Got::Data(0), 0));
+        }
+        let mut fds = 0;
+        let mut truncated = false;
+        let got = self.read_raw_with(buf, |s, b| {
+            let r = sys::recv_with_fds(s, b, into)?;
+            fds = r.fds;
+            truncated = r.truncated;
+            Ok(r.bytes)
+        })?;
+        if truncated {
+            // Every descriptor of the message was closed. The bytes came with
+            // them, so the stream can no longer be framed: the connection fails.
+            return Err(self.fail(
+                CloseReason::SessionError,
+                NetError::Handoff(crate::handoff::HandoffError::Truncated),
+            ));
+        }
+        Ok((got, fds))
+    }
+
+    /// Sends all of `body` with `fds` attached to its first byte (`SCM_RIGHTS`).
+    /// One gate check for the whole body.
+    #[cfg(all(unix, feature = "local"))]
+    pub(crate) fn write_with_fds(
+        &mut self,
+        body: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<(), NetError> {
+        if self.tls.is_some() {
+            return Err(NetError::Unsupported {
+                feature: "descriptor passing on a TLS connection",
+                platform: std::env::consts::OS,
+            });
+        }
+        if body.is_empty() {
+            return Err(NetError::InvalidConfig {
+                field: "body",
+                reason: crate::error::ConfigReason::Zero,
+            });
+        }
+        if fds.len() > sys::MAX_FDS {
+            return Err(NetError::InvalidConfig {
+                field: "descriptors",
+                reason: crate::error::ConfigReason::TooLarge {
+                    max: sys::MAX_FDS as u64,
+                },
+            });
+        }
+        let now = self.now();
+        self.rate_out.activate(now);
+        self.check_terminal()?;
+        self.gate_check(body.len())?;
+        self.approved = 0;
+        let mut zero_writes = 0u8;
+        let first = loop {
+            self.check_terminal()?;
+            match sys::send_with_fds(&self.stream, body, fds) {
+                Ok(0) => {
+                    zero_writes += 1;
+                    if zero_writes > 1 {
+                        return Err(
+                            self.os_error("sendmsg", io::Error::from(io::ErrorKind::WriteZero))
+                        );
+                    }
+                    self.wait_writable()?;
+                }
+                Ok(n) => {
+                    self.sent(n);
+                    break n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.wait_writable()?,
+                Err(e) => return Err(self.os_error("sendmsg", e)),
+            }
+        };
+        let mut rest = &body[first..];
+        while !rest.is_empty() {
+            let n = self.send_raw(rest)?;
+            rest = &rest[n..];
+        }
+        self.rate_out.deactivate();
+        Ok(())
     }
 
     /// Sends all of `buf`, continuing partial writes from the exact offset.
@@ -1132,7 +1244,7 @@ impl Link {
                 _ => break,
             }
             let take = left.min(scratch.len());
-            match (&self.stream).read(&mut scratch[..take]) {
+            match self.stream.read(&mut scratch[..take]) {
                 Ok(0) => break,
                 Ok(n) => left -= n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,

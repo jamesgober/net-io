@@ -11,7 +11,7 @@
 //! timed out is documented as being in an indeterminate state (decision D-052).
 
 use std::ffi::c_void;
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, IoSlice};
 use std::mem::size_of;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::windows::io::{
@@ -436,31 +436,34 @@ pub(crate) fn prepare_dialed(_stream: &TcpStream) -> io::Result<()> {
 pub(crate) const WAIT_BEFORE_RECV: bool = true;
 
 /// One receive on a non-blocking socket: `WouldBlock` when nothing is there.
-pub(crate) fn recv(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn recv(stream: &super::Stream, buf: &mut [u8]) -> io::Result<usize> {
     retry_interrupted(|| {
         #[cfg(any(test, net_io_shim))]
         let buf = match super::shim::io(super::shim::Op::Recv, buf.len())? {
             Some(n) => &mut buf[..n],
             None => &mut *buf,
         };
-        (&mut &*stream).read(buf)
+        stream.read(buf)
     })
 }
 
 /// Not used on Windows: waits carry the timeout instead.
-pub(crate) fn set_recv_timeout(_stream: &TcpStream, _timeout: Option<Duration>) -> io::Result<()> {
+pub(crate) fn set_recv_timeout(
+    _stream: &super::Stream,
+    _timeout: Option<Duration>,
+) -> io::Result<()> {
     Ok(())
 }
 
 /// One send on a non-blocking socket: `WouldBlock` when the buffer is full.
-pub(crate) fn send(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
+pub(crate) fn send(stream: &super::Stream, buf: &[u8]) -> io::Result<usize> {
     retry_interrupted(|| {
         #[cfg(any(test, net_io_shim))]
         let buf = match super::shim::io(super::shim::Op::Send, buf.len())? {
             Some(n) => &buf[..n],
             None => buf,
         };
-        (&mut &*stream).write(buf)
+        stream.write(buf)
     })
 }
 
@@ -468,7 +471,7 @@ pub(crate) fn send(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
 pub(crate) const MAX_SLICES: usize = 64;
 
 /// One vectored send on a non-blocking socket (`WSASend` through std).
-pub(crate) fn send_vectored(stream: &TcpStream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
     let bufs = &bufs[..bufs.len().min(MAX_SLICES)];
     retry_interrupted(|| {
         #[cfg(any(test, net_io_shim))]
@@ -478,9 +481,9 @@ pub(crate) fn send_vectored(stream: &TcpStream, bufs: &[IoSlice<'_>]) -> io::Res
                 .iter()
                 .find(|b| !b.is_empty())
                 .map_or(&[][..], |b| &b[..]);
-            return (&mut &*stream).write(&first[..n.min(first.len())]);
+            return stream.write(&first[..n.min(first.len())]);
         }
-        (&mut &*stream).write_vectored(bufs)
+        stream.write_vectored(bufs)
     })
 }
 

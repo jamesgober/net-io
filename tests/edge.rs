@@ -892,13 +892,24 @@ fn edge_132_stats_while_workers_run() {
         .expect("build");
     server.open_door().expect("open");
     let a = addr(&server);
+    // A client's next connection can arrive before its last one is counted
+    // closed; the server may then refuse it (source cap, Busy) with a reset, and
+    // the client tries again. Every attempt ends as a close or a refusal.
     let clients: Vec<_> = (0..4)
         .map(|_| {
             std::thread::spawn(move || {
-                for _ in 0..50 {
+                let (mut done, mut attempts) = (0u64, 0u64);
+                while done < 50 {
+                    attempts += 1;
+                    assert!(attempts < 5_000, "refused too often");
                     let mut c = client(a);
-                    assert_eq!(round_trip(&mut c, b"x\n"), b"x\n");
+                    let mut back = [0u8; 2];
+                    if c.write_all(b"x\n").is_ok() && c.read_exact(&mut back).is_ok() {
+                        assert_eq!(&back, b"x\n");
+                        done += 1;
+                    }
                 }
+                attempts
             })
         })
         .collect();
@@ -912,8 +923,9 @@ fn edge_132_stats_while_workers_run() {
         );
         last = s.closed;
     }
-    for c in clients {
-        c.join().expect("client");
-    }
-    assert!(eventually(WAIT, || server.stats().closed == 200));
+    let attempts: u64 = clients.into_iter().map(|c| c.join().expect("client")).sum();
+    assert!(eventually(WAIT, || {
+        let s = server.stats();
+        s.closed + s.refused == attempts
+    }));
 }

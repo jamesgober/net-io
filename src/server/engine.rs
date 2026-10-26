@@ -30,11 +30,15 @@ use crate::error::{CloseReason, KillReason, NetError, OsErrorClass, RefusalCause
 use crate::events::{CoalescedKind, Coalescer, Event, EventSink, NoopSink};
 use crate::gate::{AdmitStage, AllowAll, ErasedGate, Gate, GateCell, Refusal, guarded};
 use crate::id::{ConnectionId, IdBlock, ListenerId, WorkerId};
+#[cfg(all(unix, feature = "local"))]
+use crate::info::Endpoint;
 use crate::info::{ConnectionInfo, Lane, Origin};
 #[cfg(any(feature = "proxy", feature = "tls"))]
 use crate::limits::SizeClass;
 use crate::limits::{Effective, Limits};
 use crate::link::{ClockRef, Got, Link, WakeSource};
+#[cfg(all(unix, feature = "local"))]
+use crate::local::UnixListener;
 use crate::opts::{ListenOptions, TcpOptions};
 use crate::proxy::{ProxyFacts, ProxyMode, ProxyVersions};
 use crate::session::{Input, Output, Phase, Session, SessionContext, SessionFactory, Step};
@@ -473,20 +477,33 @@ impl Shared {
 #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
 pub(crate) struct ListenerProxy {
     versions: ProxyVersions,
-    trusted: Arc<TrustedProxies>,
+    /// `None` on a Unix socket listener: every peer that can connect is trusted.
+    trusted: Option<Arc<TrustedProxies>>,
 }
 
 /// An accepted, admitted connection waiting for a worker.
 pub struct Job<T> {
-    stream: TcpStream,
+    stream: sys::Stream,
     info: ConnectionInfo,
     ticket: T,
     listener: usize,
     source: Option<PrefixKey>,
 }
 
-struct ListenerRuntime {
-    listener: TcpListener,
+enum ListenerRuntime {
+    Tcp(TcpListener),
+    #[cfg(all(unix, feature = "local"))]
+    Unix(UnixListener),
+}
+
+impl ListenerRuntime {
+    fn sock(&self) -> sys::Sock<'_> {
+        match self {
+            ListenerRuntime::Tcp(l) => l.std().sock(),
+            #[cfg(all(unix, feature = "local"))]
+            ListenerRuntime::Unix(l) => std::os::fd::AsFd::as_fd(l.std()),
+        }
+    }
 }
 
 struct Engine<W, G: Gate> {
@@ -522,6 +539,27 @@ where
             .limits
             .overlay(&spec.limits)
             .effective(DriverKind::Blocking);
+        let id = ListenerId(u16::try_from(i).unwrap_or(u16::MAX));
+        #[cfg(all(unix, feature = "local"))]
+        if let Some((path, options)) = spec.unix {
+            let mut listener = UnixListener::bind_with(&path, options)?;
+            listener.set_identity(id, spec.name.clone());
+            listener.set_proxy_mode(spec.proxy);
+            listener.set_tls(spec.tls);
+            listener_tls.push(spec.tls);
+            listener_proxy.push(match spec.proxy {
+                ProxyMode::Required { versions } => Some(ListenerProxy {
+                    versions,
+                    trusted: None,
+                }),
+                _ => None,
+            });
+            infos.push(listener.info().clone());
+            listener_limits.push(lim);
+            listener_tcp.push(TcpOptions::default());
+            runtimes.push(ListenerRuntime::Unix(listener));
+            continue;
+        }
         let addrs = match spec.addrs {
             Ok(a) if !a.is_empty() => a,
             Ok(_) => return Err(NetError::NoAddresses),
@@ -535,7 +573,6 @@ where
         let options = spec
             .options
             .unwrap_or_else(|| ListenOptions::new().backlog(lim.backlog));
-        let id = ListenerId(u16::try_from(i).unwrap_or(u16::MAX));
         let mut bound = None;
         let mut last = NetError::NoAddresses;
         for a in addrs {
@@ -552,15 +589,16 @@ where
         listener.set_tls(spec.tls);
         listener_tls.push(spec.tls);
         listener_proxy.push(match (spec.proxy, spec.trusted) {
-            (ProxyMode::Required { versions }, Some(trusted)) => {
-                Some(ListenerProxy { versions, trusted })
-            }
+            (ProxyMode::Required { versions }, Some(trusted)) => Some(ListenerProxy {
+                versions,
+                trusted: Some(trusted),
+            }),
             _ => None,
         });
         infos.push(listener.info().clone());
         listener_limits.push(lim);
         listener_tcp.push(*listener.tcp_options());
-        runtimes.push(ListenerRuntime { listener });
+        runtimes.push(ListenerRuntime::Tcp(listener));
     }
 
     let sink: Option<Arc<dyn EventSink>> = if TypeId::of::<S>() == TypeId::of::<NoopSink>() {
@@ -779,16 +817,31 @@ fn accept_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, li: usiz
             pause_until = None;
         }
         for _ in 0..batch {
-            match acceptor.accept(rt.listener.std()) {
-                Accepted::Conn(stream, peer) => {
-                    engine.admit_one(stream, peer, li, &mut ids, &view, &mut coalescer)
-                }
+            let outcome = match rt {
+                ListenerRuntime::Tcp(l) => match acceptor.accept(l.std()) {
+                    Accepted::Conn((stream, peer)) => {
+                        engine.admit_tcp(stream, peer, li, &mut ids, &view, &mut coalescer);
+                        continue;
+                    }
+                    other => other.without_conn(),
+                },
+                #[cfg(all(unix, feature = "local"))]
+                ListenerRuntime::Unix(l) => match acceptor.accept_unix(l.std()) {
+                    Accepted::Conn(stream) => {
+                        engine.admit_unix(l, stream, li, &mut ids, &view, &mut coalescer);
+                        continue;
+                    }
+                    other => other.without_conn(),
+                },
+            };
+            match outcome {
+                Accepted::Conn(()) => {}
                 Accepted::Skipped(class) => shared.event(Event::AcceptError {
                     listener: ListenerId(li as u16),
                     class,
                 }),
                 Accepted::Again => {
-                    let _ = sys::wait(rt.listener.std().sock(), Interest::Read, Some(&wake), None);
+                    let _ = sys::wait(rt.sock(), Interest::Read, Some(&wake), None);
                     break;
                 }
                 Accepted::Pause(backoff) => {
@@ -815,8 +868,8 @@ fn accept_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, li: usiz
 impl<W: super::Workload, G: Gate> Engine<W, G> {
     fn refuse(
         &self,
-        stream: TcpStream,
-        peer: SocketAddr,
+        stream: sys::Stream,
+        peer: Option<SocketAddr>,
         cause: RefusalCause,
         bytes: Option<&[u8]>,
         co: &mut Coalescer,
@@ -837,15 +890,12 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
                 sink.as_ref(),
                 self.clock.now(),
                 CoalescedKind::Refused(cause),
-                Event::Refused {
-                    peer: Some(peer),
-                    cause,
-                },
+                Event::Refused { peer, cause },
             );
         }
     }
 
-    fn admit_one(
+    fn admit_tcp(
         &self,
         stream: TcpStream,
         peer: SocketAddr,
@@ -853,6 +903,73 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
         ids: &mut IdBlock,
         view: &ControlView,
         co: &mut Coalescer,
+    ) {
+        let source = PrefixKey::of(peer.ip(), self.shared.listener_limits[li].source_policy);
+        self.admit_one(
+            sys::Stream::Tcp(stream),
+            Some(peer),
+            Some(source),
+            li,
+            ids,
+            view,
+            co,
+            |stream, id, at| {
+                let local = stream.tcp()?.local_addr().ok()?;
+                Some(ConnectionInfo::new_tcp(
+                    id,
+                    Some(ListenerId(li as u16)),
+                    WorkerId(0),
+                    Origin::Accepted,
+                    local,
+                    peer,
+                    at,
+                ))
+            },
+        );
+    }
+
+    /// A Unix socket connection: credentials read once, `require_uid` before
+    /// anything else, and no per-source cap (there is no source address).
+    #[cfg(all(unix, feature = "local"))]
+    fn admit_unix(
+        &self,
+        listener: &UnixListener,
+        stream: std::os::unix::net::UnixStream,
+        li: usize,
+        ids: &mut IdBlock,
+        view: &ControlView,
+        co: &mut Coalescer,
+    ) {
+        let credentials = crate::local::credentials_of(&stream);
+        let stream = sys::Stream::Unix(stream);
+        if !listener.permits(credentials) {
+            return self.refuse(stream, None, RefusalCause::Credentials, None, co);
+        }
+        let path = listener.shared_path().clone();
+        self.admit_one(stream, None, None, li, ids, view, co, |_, id, at| {
+            Some(ConnectionInfo::new_unix(
+                id,
+                Some(ListenerId(li as u16)),
+                Origin::Accepted,
+                Endpoint::Unix(path),
+                Endpoint::Unnamed,
+                credentials,
+                at,
+            ))
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_one(
+        &self,
+        stream: sys::Stream,
+        peer: Option<SocketAddr>,
+        source: Option<PrefixKey>,
+        li: usize,
+        ids: &mut IdBlock,
+        view: &ControlView,
+        co: &mut Coalescer,
+        make_info: impl FnOnce(&sys::Stream, ConnectionId, Instant) -> Option<ConnectionInfo>,
     ) {
         let shared = &self.shared;
         let lim = &shared.listener_limits[li];
@@ -865,35 +982,24 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
             shared.open.fetch_sub(1, Ordering::AcqRel);
             return self.refuse(stream, peer, RefusalCause::ListenerCap, None, co);
         }
-        let source = PrefixKey::of(peer.ip(), lim.source_policy);
-        if !shared.sources[li].acquire(source) {
-            shared.open.fetch_sub(1, Ordering::AcqRel);
-            count.fetch_sub(1, Ordering::AcqRel);
-            return self.refuse(stream, peer, RefusalCause::SourceCap, None, co);
+        if let Some(source) = source {
+            if !shared.sources[li].acquire(source) {
+                shared.open.fetch_sub(1, Ordering::AcqRel);
+                count.fetch_sub(1, Ordering::AcqRel);
+                return self.refuse(stream, peer, RefusalCause::SourceCap, None, co);
+            }
         }
-        let release = |s: &Self| s.shared.release(li, Some(source));
+        let release = |s: &Self| s.shared.release(li, source);
         if matches!(view.state(), ControlState::Lockdown) {
             release(self);
             return self.refuse(stream, peer, RefusalCause::Lockdown, None, co);
         }
-        let local = match stream.local_addr() {
-            Ok(a) => a,
-            Err(_) => {
-                release(self);
-                drop(stream);
-                return;
-            }
-        };
         let id = ids.issue();
-        let mut info = ConnectionInfo::new_tcp(
-            id,
-            Some(ListenerId(li as u16)),
-            WorkerId(0),
-            Origin::Accepted,
-            local,
-            peer,
-            self.clock.now(),
-        );
+        let Some(mut info) = make_info(&stream, id, self.clock.now()) else {
+            release(self);
+            drop(stream);
+            return;
+        };
         let admitted = match guarded(|| self.gate.admit(&info, AdmitStage::Accept)) {
             Some(Ok(a)) => a,
             Some(Err(refusal)) => {
@@ -932,7 +1038,7 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
             info,
             ticket,
             listener: li,
-            source: Some(source),
+            source,
         };
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         let busy = shared.busy.load(Ordering::Acquire) as usize;
@@ -959,7 +1065,7 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
         shared.accepted.fetch_add(1, Ordering::Relaxed);
         shared.event(Event::Accepted {
             id: event_id,
-            peer: Some(peer),
+            peer,
             listener: ListenerId(li as u16),
         });
         shared.event(Event::Admitted {
@@ -1102,10 +1208,14 @@ impl<G: Gate> Worker<G> {
         source: &mut Option<PrefixKey>,
     ) -> Result<(), CloseReason> {
         use crate::proxy_parse::{ProxyAddress, ProxyCommand, ProxyParser, ProxyProgress};
-        let Some(peer) = link.info.peer.socket_addr() else {
-            return Err(CloseReason::ProxyUntrusted);
+        // A TCP peer must be a trusted proxy; on a Unix socket listener the file's
+        // permissions already decided who may connect (`trusted` is `None`).
+        let trusted = match (&proxy.trusted, link.info.peer.socket_addr()) {
+            (Some(list), Some(peer)) => list.contains(peer.ip()),
+            (None, None) => link.info.transport == crate::info::Transport::Unix,
+            _ => false,
         };
-        if !proxy.trusted.contains(peer.ip()) {
+        if !trusted {
             return Err(CloseReason::ProxyUntrusted);
         }
         let lim = link.limits;
@@ -1243,8 +1353,8 @@ impl<G: Gate> Worker<G> {
         if !cfg!(any(target_os = "linux", windows)) {
             let tcp = shared.listener_tcp[listener];
             let v6 = info.local.socket_addr().is_some_and(|a| a.is_ipv6());
-            if !tcp.is_empty() {
-                if let Err(e) = tcp.apply(&stream, v6) {
+            if let (false, Some(stream)) = (tcp.is_empty(), stream.tcp()) {
+                if let Err(e) = tcp.apply(stream, v6) {
                     failed = Some(match e.os_error_code() {
                         Some(code) => CloseReason::Io(OsErrorClass::Other(code)),
                         None => CloseReason::Io(OsErrorClass::Other(0)),

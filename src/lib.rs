@@ -85,6 +85,8 @@ mod info;
 mod inherit;
 mod limits;
 mod link;
+#[cfg(feature = "local")]
+mod local;
 mod opts;
 mod proxy;
 #[cfg(feature = "proxy")]
@@ -128,7 +130,11 @@ pub use info::{
 };
 pub use inherit::InheritError;
 pub use limits::{Limits, LimitsBuilder, MinRate, Pressure, SizeClass};
-pub use opts::{Keepalive, Linger, ListenOptions, SocketOptions, TcpOptions};
+#[cfg(all(unix, feature = "local"))]
+pub use local::{Descriptors, UnixConnection, UnixListener};
+#[cfg(feature = "local")]
+pub use local::{LocalConnection, LocalListener};
+pub use opts::{Keepalive, Linger, ListenOptions, LocalOptions, SocketOptions, TcpOptions};
 pub use proxy::{ProxyError, ProxyFacts, ProxyMode, ProxyVersions};
 #[cfg(feature = "proxy")]
 pub use proxy_parse::{
@@ -278,6 +284,46 @@ where
         .build()?;
     server.open_door()?;
     Ok(server)
+}
+
+/// Opens a local IPC listener: on Unix, a Unix domain socket at the path `name`
+/// with mode `0600` (only the owner may connect; [`LocalOptions`] and
+/// [`UnixListener::bind_with`] for more). On Windows, named pipes arrive in
+/// `0.5.0`; until then this returns `Unsupported`.
+///
+/// # Errors
+///
+/// `PathTooLong`, `StaleSocketInUse` (a live listener owns the path, or it is
+/// not a socket), `PermissionDenied`, `NotFound`, `Unsupported`, `Os`.
+///
+/// ```no_run
+/// let listener = net_io::listen_local("/run/myapp/control.sock")?;
+/// let (mut conn, info) = listener.accept()?;
+/// println!("peer process {:?}", info.peer_credentials.and_then(|c| c.pid));
+/// conn.send_all(b"ok\n")?;
+/// # Ok::<(), net_io::NetError>(())
+/// ```
+#[cfg(feature = "local")]
+pub fn listen_local(name: &str) -> Result<LocalListener, NetError> {
+    local::listen(name)
+}
+
+/// Connects to a local IPC listener (see [`listen_local`]); waits up to 10 s
+/// when its backlog is full.
+///
+/// # Errors
+///
+/// `NotFound` (no socket, or nobody listening), `PermissionDenied`,
+/// `TimedOut { kind: Connect }`, `PathTooLong`, `Unsupported`, `Os`.
+///
+/// ```no_run
+/// let mut conn = net_io::connect_local("/run/myapp/control.sock")?;
+/// conn.send_all(b"status\n")?;
+/// # Ok::<(), net_io::NetError>(())
+/// ```
+#[cfg(feature = "local")]
+pub fn connect_local(name: &str) -> Result<LocalConnection, NetError> {
+    local::connect(name)
 }
 
 #[cfg(test)]

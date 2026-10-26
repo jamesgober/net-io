@@ -6,6 +6,7 @@ mod source;
 use std::any::TypeId;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use crate::events::{EventSink, NoopSink};
 use crate::gate::Gate;
 use crate::id::{ConnectionId, WorkerId};
 use crate::limits::Limits;
-use crate::opts::ListenOptions;
+use crate::opts::{ListenOptions, LocalOptions};
 use crate::proxy::ProxyMode;
 use crate::session::SessionFactory;
 use crate::tcp::{ListenerInfo, TcpConnection};
@@ -159,6 +160,7 @@ pub struct ListenerSpec {
     pub(crate) proxy: ProxyMode,
     pub(crate) trusted: Option<Arc<TrustedProxies>>,
     pub(crate) tls: bool,
+    pub(crate) unix: Option<(PathBuf, LocalOptions)>,
 }
 
 impl ListenerSpec {
@@ -175,6 +177,7 @@ impl ListenerSpec {
             proxy: ProxyMode::Off,
             trusted: None,
             tls: false,
+            unix: None,
         }
     }
 
@@ -183,6 +186,33 @@ impl ListenerSpec {
         ListenerSpec {
             options: Some(options),
             ..ListenerSpec::tcp(addr)
+        }
+    }
+
+    /// A Unix domain socket listener at `path` (feature `local`, Unix; Windows
+    /// AF_UNIX arrives in `0.5.0`). The socket file gets `options`' mode and
+    /// owner before it listens, and is removed at shutdown if it is still the
+    /// file this server created. Connections carry `Transport::Unix`, the peer's
+    /// credentials, and no IP address: the per-source cap does not apply, and a
+    /// `BlockingHandler` receives them as a `TcpConnection` whose `peer_addr` is
+    /// unspecified. With `proxy`, every peer is trusted: the socket file's
+    /// permissions decide who may connect.
+    ///
+    /// ```
+    /// use net_io::{ListenerSpec, LocalOptions};
+    /// let spec = ListenerSpec::unix("/run/myapp/api.sock", LocalOptions::new().group_access(33));
+    /// # let _ = spec;
+    /// ```
+    pub fn unix(path: impl Into<PathBuf>, options: LocalOptions) -> ListenerSpec {
+        ListenerSpec {
+            addrs: Ok(Vec::new()),
+            options: None,
+            name: None,
+            limits: Limits::default(),
+            proxy: ProxyMode::Off,
+            trusted: None,
+            tls: false,
+            unix: Some((path.into(), options)),
         }
     }
 
@@ -492,6 +522,16 @@ where
         let mut listeners = self.listeners;
         let has_tls = TypeId::of::<T>() != TypeId::of::<NoTls>();
         for spec in &mut listeners {
+            if spec.unix.is_some() && !cfg!(all(unix, feature = "local")) {
+                return Err(NetError::Unsupported {
+                    feature: if cfg!(unix) {
+                        "Unix domain sockets (the `local` feature)"
+                    } else {
+                        "Unix domain sockets on Windows (0.5.0)"
+                    },
+                    platform: std::env::consts::OS,
+                });
+            }
             if spec.tls {
                 if !cfg!(feature = "tls") {
                     return Err(NetError::Unsupported {
@@ -510,11 +550,14 @@ where
                         platform: std::env::consts::OS,
                     });
                 }
-                let trusted = spec.trusted.clone().or_else(|| self.trusted.clone());
-                match trusted {
-                    Some(t) if !t.is_empty() => spec.trusted = Some(t),
-                    // Required without anyone to trust would refuse every connection.
-                    _ => return Err(invalid("trusted_proxies", ConfigReason::Missing)),
+                // On a Unix socket the file's permissions decide who may connect.
+                if spec.unix.is_none() {
+                    let trusted = spec.trusted.clone().or_else(|| self.trusted.clone());
+                    match trusted {
+                        Some(t) if !t.is_empty() => spec.trusted = Some(t),
+                        // Required without anyone to trust would refuse every connection.
+                        _ => return Err(invalid("trusted_proxies", ConfigReason::Missing)),
+                    }
                 }
             }
         }

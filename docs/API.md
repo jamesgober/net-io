@@ -556,7 +556,7 @@ Close style per reason (decision D-032): **graceful** (flush within the write de
 
 ```rust
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RefusalCause { GlobalCap, ListenerCap, SourceCap, LaneReserve, Gate(u16), Session, Busy, DoorClosed, Shed, Lockdown }
+pub enum RefusalCause { GlobalCap, ListenerCap, SourceCap, LaneReserve, Gate(u16), Session, Busy, DoorClosed, Shed, Lockdown, Credentials }
 
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LimitKind {
@@ -596,6 +596,7 @@ pub enum ConfigReason {
     Missing,                                // a required part is not set (gate, trusted proxies, session factory)
     NotListening,                           // an adopted socket is not a listening socket
     Inconsistent,                           // values that contradict each other (for example pressure.high <= pressure.low)
+    Malformed,                              // a byte or character the value cannot hold (a NUL in a socket path)
 }
 ```
 
@@ -1600,7 +1601,7 @@ pub struct ListenerSpec { /* source + options */ }
 impl ListenerSpec {
     pub fn tcp<A: ToSocketAddrs>(addr: A) -> Self;                                  // resolved now; a failure is reported by build
     pub fn tcp_with<A: ToSocketAddrs>(addr: A, options: ListenOptions) -> Self;
-    pub fn unix(path: impl Into<PathBuf>, options: LocalOptions) -> Self;          // P1, 0.4.0
+    pub fn unix(path: impl Into<PathBuf>, options: LocalOptions) -> Self;          // P1, 0.4.0: see below
     #[cfg(windows)] pub fn pipe(name: &str, options: PipeOptions) -> Self;          // P1, 0.5.0
     pub fn adopt(listener: ListenerHandle) -> Self;                                 // P0, 0.4.0
     pub fn name(self, name: &str) -> Self;                                          // up to 64 bytes; events and hand-off
@@ -1611,7 +1612,9 @@ impl ListenerSpec {
 }
 ```
 
-One listener of a server. P0, Tier 2, `0.3.0` unless marked. A name longer than 64 bytes, or a repeated name, fails `build` with `InvalidConfig { field: "name" }`.
+One listener of a server. P0, Tier 2, `0.3.0` unless marked.
+
+`unix` (feature `local`, Unix; Windows AF_UNIX in `0.5.0`, `Unsupported` until then) binds as `UnixListener::bind_with` at `build` and removes its file at shutdown only if it is still the one it created. Its connections carry `Transport::Unix`, the peer's credentials, and no IP address, so the per-source cap does not apply; `require_uid` refusals count as `RefusalCause::Credentials`. A `BlockingHandler` receives them as a `TcpConnection` (`info().transport` is `Unix`, `peer_addr` is unspecified, socket options fail). With `proxy`, every peer is trusted and no trusted list is needed: the socket file's mode decides who may connect (decision D-093). A name longer than 64 bytes, or a repeated name, fails `build` with `InvalidConfig { field: "name" }`.
 
 ### `Server`
 
@@ -2295,6 +2298,8 @@ impl UnixListener {
     #[cfg(target_os = "linux")]
     pub fn bind_abstract(name: &[u8], options: LocalOptions) -> Result<UnixListener, NetError>;   // P3
     pub fn accept(&self) -> Result<(UnixConnection, ConnectionInfo), NetError>;
+    pub fn accept_timeout(&self, timeout: Duration) -> Result<Option<(UnixConnection, ConnectionInfo)>, NetError>;
+    pub fn info(&self) -> &ListenerInfo;
     pub fn path(&self) -> Option<&Path>;                       // the final path (recorded, not read back: decision D-058)
 }
 impl Drop for UnixListener;   // removes its path only if it is still the file this listener created
@@ -2320,7 +2325,7 @@ impl UnixConnection {
     #[cfg(unix)] pub fn recv_descriptors(&mut self, body: &mut [u8], into: &mut Descriptors) -> Result<usize, NetError>;
 }
 #[cfg(unix)] pub struct Descriptors { /* fixed capacity 64 OwnedFd */ }
-#[cfg(unix)] impl Descriptors { pub fn new() -> Self; pub fn len(&self) -> usize; pub fn take(&mut self) -> impl Iterator<Item = OwnedFd> + '_; }
+#[cfg(unix)] impl Descriptors { pub fn new() -> Self; pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool; pub fn take(&mut self) -> impl Iterator<Item = OwnedFd> + '_; }
 impl Read for UnixConnection; impl Write for UnixConnection; impl Drop for UnixConnection;   // as TcpConnection
 
 #[must_use]
@@ -2334,18 +2339,20 @@ impl LocalOptions {
     pub fn group_access(self, gid: u32) -> Self; // group(gid) and mode 0o660: members of that group may connect
     pub fn remove_stale(self, on: bool) -> Self;
     pub fn require_uid(self, uid: u32) -> Self; // refuse peers with another uid (checked at accept)
+    pub fn backlog(self, backlog: u32) -> Self; // default 1,024, capped by the OS
 }
 ```
 
 | Item | Behaviour | Errors | Grade | Tier | Version |
 |---|---|---|---|---|---|
-| `bind`, `bind_with` | path length checked (Linux 108 bytes, macOS and FreeBSD 104, including the terminator); a NUL byte in the path is refused; a stale socket file is removed only if `lstat` (no symlink following) says it is a socket and a connect to it is refused; `bind`, then `chmod` (and `chown` when set) | `PathTooLong`, `StaleSocketInUse`, `PermissionDenied`, `Bind` | P1 | 1 / 2 | `0.4.0` |
-| `bind_atomic` | binds under a fresh temporary name with mode `0700` in the same directory, sets the final mode, then renames into place, so the socket is never reachable with the umask's permissions | as `bind` | P1 | 2 | `0.4.0` |
-| `accept` | peer credentials read once and stored in `ConnectionInfo`; `require_uid` refuses a mismatched peer before any read | `Os` | P1 | 1 | `0.4.0` |
+| `bind`, `bind_with` | path length checked (Linux 108 bytes, macOS and FreeBSD 104, including the terminator); a NUL byte in the path is refused (`InvalidConfig { field: "path", reason: Malformed }`); a stale socket file is removed only if `lstat` (no symlink following) says it is a socket and a connect to it is refused, while a live socket, a regular file, a directory, or a symbolic link is left alone and fails with `StaleSocketInUse`; then `bind`, `chmod` and `lchown` (when set) on the file the bind created (its device and inode checked before and after), and only then `listen`, so no connection is ever accepted under the umask's permissions (decision D-091). Cost [est.]: two to three `lstat`, one probe connect when a file exists, and the `chmod`, once per bind | `PathTooLong`, `StaleSocketInUse`, `PermissionDenied`, `NotFound` (no such directory), `InvalidConfig`, `Os` | P1 | 1 / 2 | `0.4.0` |
+| `bind_atomic` | as `bind_with`, but bound under `.<name>.<pid>.<n>` in the same directory and renamed into place after `listen`, so the path never names a socket that refuses or has the wrong mode | as `bind` | P1 | 2 | `0.4.0` |
+| `accept`, `accept_timeout` | the accept discipline of `TcpListener` (reserve descriptor, backoff); peer credentials read once (one `getsockopt`, under 1 µs [est.]) and stored in `ConnectionInfo`; `require_uid` closes a mismatched peer, or one whose uid the OS did not report, before any read, and accepting continues | `Limit { which: Descriptors }`, `Os` | P1 | 1 | `0.4.0` |
 | `Drop` | unlinks the path only if `lstat` still shows the inode this listener created, never a replacement someone else bound | none (event) | P1 | 1 | `0.4.0` |
-| `UnixConnection` IO | as `TcpConnection` | as `TcpConnection` | P1 | 1 | `0.4.0` |
+| `UnixConnection` IO | as `TcpConnection`: the same connection core, limits, deadlines, kill handle, and close behaviour (decision D-093) | as `TcpConnection` | P1 | 1 | `0.4.0` |
+| `UnixConnection::connect` | blocking connect; a full backlog waits up to 10 s (`SO_SNDTIMEO`); no socket at the path and a socket nobody listens on are both `NotFound` (decision D-092) | `NotFound`, `PermissionDenied`, `TimedOut { kind: Connect }`, `PathTooLong` | P1 | 1 | `0.4.0` |
 | `peer_credentials` | see [`PeerCredentials`](#peercredentials) | `Unsupported` | P1 | 2 | `0.4.0` (Windows `0.5.0`) |
-| `send_descriptors`, `recv_descriptors` | `SCM_RIGHTS`, at most 64 descriptors per message, received close-on-exec (`MSG_CMSG_CLOEXEC` where it exists); a truncated control message (`MSG_CTRUNC`) closes every descriptor received and fails | `Handoff(Truncated)`, `Os` | P0 | 3 | `0.4.0` |
+| `send_descriptors`, `recv_descriptors` | `SCM_RIGHTS`, at most 64 descriptors per message, attached to the first byte of a non-empty body that is sent in full (one gate check for the body); received through the connection's normal read path (deadlines, kill, drain), close-on-exec (`MSG_CMSG_CLOEXEC` on Linux; on macOS `FD_CLOEXEC` right after the receive, so a `fork` plus `exec` on another thread in between can inherit one); a truncated control message (`MSG_CTRUNC`) closes every descriptor received and fails the connection, since its bytes can no longer be framed (decision D-094); on a TLS connection both are `Unsupported` | `Handoff(Truncated)`, `InvalidConfig` (empty body, more than 64), `Unsupported`, `Os` | P0 | 3 | `0.4.0` |
 | Windows AF_UNIX | `UnixListener` and `UnixConnection` on Windows 10 1803+: stream sockets only, no descriptor passing; permissions are NTFS ACLs; the socket file is deleted with `DeleteFileW` before rebinding | `Unsupported` on older Windows | P2 | 2 | `0.5.0` |
 | `bind_abstract` | Linux abstract namespace; refused unless `require_uid` is set, because no file permission protects it | `InvalidConfig { field: "require_uid", reason: Missing }` | P3 | 3 | after `1.0.0` |
 

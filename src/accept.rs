@@ -12,9 +12,9 @@ const BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// What one accept attempt produced.
 #[derive(Debug)]
-pub(crate) enum Accepted {
+pub(crate) enum Accepted<C> {
     /// A connection.
-    Conn(TcpStream, SocketAddr),
+    Conn(C),
     /// Nothing pending.
     Again,
     /// One connection failed before it was ours (counted, accepting continues).
@@ -23,6 +23,19 @@ pub(crate) enum Accepted {
     Pause(Duration),
     /// The listener is broken.
     Failed(io::Error),
+}
+
+impl<C> Accepted<C> {
+    /// The outcome without its connection (for an outcome that has none).
+    pub(crate) fn without_conn(self) -> Accepted<()> {
+        match self {
+            Accepted::Conn(_) => Accepted::Conn(()),
+            Accepted::Again => Accepted::Again,
+            Accepted::Skipped(c) => Accepted::Skipped(c),
+            Accepted::Pause(d) => Accepted::Pause(d),
+            Accepted::Failed(e) => Accepted::Failed(e),
+        }
+    }
 }
 
 /// Per-acceptor state: a spare descriptor held for the `EMFILE` routine, and the backoff.
@@ -51,7 +64,7 @@ impl Acceptor {
     /// One accept. On descriptor exhaustion (Unix) the spare descriptor is released,
     /// one pending connection is accepted and reset so its client is not left
     /// waiting in the backlog, the spare is reopened, and accepting pauses.
-    pub(crate) fn accept(&mut self, listener: &TcpListener) -> Accepted {
+    pub(crate) fn accept(&mut self, listener: &TcpListener) -> Accepted<(TcpStream, SocketAddr)> {
         match sys::accept(listener) {
             Ok((stream, peer)) => {
                 self.backoff = BACKOFF_START;
@@ -60,19 +73,46 @@ impl Acceptor {
                     let _ = sys::set_linger(stream.sock(), Some(Duration::ZERO));
                     return Accepted::Skipped(OsErrorClass::Other(0));
                 }
-                Accepted::Conn(stream, crate::addr::normalize_socket(peer))
+                Accepted::Conn((stream, crate::addr::normalize_socket(peer)))
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Accepted::Again,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => Accepted::Again,
-            Err(e) => match sys::classify_accept(&e) {
-                AcceptFailure::PerConnection => Accepted::Skipped(OsErrorClass::from_io(&e)),
-                AcceptFailure::ListenerFailed => Accepted::Failed(e),
-                AcceptFailure::Pressure => Accepted::Pause(self.next_backoff()),
-                AcceptFailure::Descriptors => {
-                    self.shed_one(listener);
-                    Accepted::Pause(self.next_backoff())
-                }
-            },
+            Err(e) => self.failed(e, |a| a.shed_one(listener)),
+        }
+    }
+
+    /// One accept on a Unix listener, with the same discipline as TCP.
+    #[cfg(all(unix, feature = "local"))]
+    pub(crate) fn accept_unix(
+        &mut self,
+        listener: &std::os::unix::net::UnixListener,
+    ) -> Accepted<std::os::unix::net::UnixStream> {
+        match sys::accept_unix(listener) {
+            Ok(stream) => {
+                self.backoff = BACKOFF_START;
+                Accepted::Conn(stream)
+            }
+            Err(e) => self.failed(e, |a| {
+                a.reserve = None;
+                drop(listener.accept());
+                a.reserve = open_reserve();
+            }),
+        }
+    }
+
+    fn failed<C>(&mut self, e: io::Error, shed: impl FnOnce(&mut Acceptor)) -> Accepted<C> {
+        if matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            return Accepted::Again;
+        }
+        match sys::classify_accept(&e) {
+            AcceptFailure::PerConnection => Accepted::Skipped(OsErrorClass::from_io(&e)),
+            AcceptFailure::ListenerFailed => Accepted::Failed(e),
+            AcceptFailure::Pressure => Accepted::Pause(self.next_backoff()),
+            AcceptFailure::Descriptors => {
+                shed(self);
+                Accepted::Pause(self.next_backoff())
+            }
         }
     }
 

@@ -724,6 +724,9 @@ pub enum RefusalCause {
     Shed,
     /// The control line is in lockdown and the listener does not allow it.
     Lockdown,
+    /// A local socket peer's user id is not the one the listener requires
+    /// (`LocalOptions::require_uid`).
+    Credentials,
 }
 
 impl RefusalCause {
@@ -739,6 +742,7 @@ impl RefusalCause {
         RefusalCause::DoorClosed,
         RefusalCause::Shed,
         RefusalCause::Lockdown,
+        RefusalCause::Credentials,
     ];
 
     /// A stable snake_case name for logs.
@@ -755,6 +759,7 @@ impl RefusalCause {
             RefusalCause::DoorClosed => "door_closed",
             RefusalCause::Shed => "shed",
             RefusalCause::Lockdown => "lockdown",
+            RefusalCause::Credentials => "credentials",
         }
     }
 
@@ -770,10 +775,11 @@ impl RefusalCause {
             RefusalCause::DoorClosed => 7,
             RefusalCause::Shed => 8,
             RefusalCause::Lockdown => 9,
+            RefusalCause::Credentials => 10,
         }
     }
 
-    pub(crate) const COUNT: usize = 10;
+    pub(crate) const COUNT: usize = 11;
 }
 
 /// Which configured bound was hit.
@@ -995,6 +1001,8 @@ pub enum ConfigReason {
     NotListening,
     /// Values that contradict each other.
     Inconsistent,
+    /// A byte or character the value cannot contain (a NUL in a socket path).
+    Malformed,
 }
 
 impl fmt::Display for ConfigReason {
@@ -1021,6 +1029,7 @@ impl fmt::Display for ConfigReason {
                 f.write_str("the socket is not a listening stream socket")
             }
             ConfigReason::Inconsistent => f.write_str("values contradict each other"),
+            ConfigReason::Malformed => f.write_str("contains a byte or character it cannot"),
         }
     }
 }

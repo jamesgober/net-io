@@ -45,7 +45,7 @@ pub struct ListenerInfo {
 }
 
 /// Linux silently caps the backlog at `net.core.somaxconn`; read it once.
-fn effective_backlog(requested: u32) -> Option<u32> {
+pub(crate) fn effective_backlog(requested: u32) -> Option<u32> {
     if cfg!(target_os = "linux") {
         let cap = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
             .ok()
@@ -228,7 +228,7 @@ impl TcpListener {
                 .unwrap_or_else(PoisonError::into_inner)
                 .accept(&self.inner);
             match outcome {
-                Accepted::Conn(stream, peer) => {
+                Accepted::Conn((stream, peer)) => {
                     let conn = TcpConnection::accepted(stream, peer, &self.tcp, self.info.id)?;
                     let info = conn.info().clone();
                     return Ok(Some((conn, info)));
@@ -587,7 +587,7 @@ impl TcpConnection {
         );
         let limits = Limits::default().effective(DriverKind::Blocking);
         Ok(TcpConnection::from_link(Link::new(
-            stream,
+            sys::Stream::Tcp(stream),
             info,
             limits,
             ClockRef::Monotonic,
@@ -605,11 +605,11 @@ impl TcpConnection {
         self.link.take()
     }
 
-    fn link(&mut self) -> Result<&mut Link, NetError> {
+    pub(crate) fn link(&mut self) -> Result<&mut Link, NetError> {
         self.link.as_mut().ok_or(NetError::Closed)
     }
 
-    fn link_ref(&self) -> &Link {
+    pub(crate) fn link_ref(&self) -> &Link {
         match &self.link {
             Some(l) => l,
             // Only `take_link` (crate-internal, at the end of a handler) empties it.
@@ -837,7 +837,7 @@ impl TcpConnection {
     pub fn options(&self) -> SocketOptions<'_> {
         let link = self.link_ref();
         SocketOptions {
-            stream: &link.stream,
+            sock: link.stream.sock(),
             v6: link.info.local.socket_addr().is_some_and(|a| a.is_ipv6()),
         }
     }
@@ -910,7 +910,7 @@ fn connect_one(
         Instant::now(),
     );
     Ok(TcpConnection::from_link(Link::new(
-        stream,
+        sys::Stream::Tcp(stream),
         info,
         options.limits.effective(DriverKind::Blocking),
         ClockRef::Monotonic,
