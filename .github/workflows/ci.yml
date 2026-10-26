@@ -38,11 +38,11 @@ jobs:
       - name: Clippy (no default features)
         run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Test (default features)
-        run: cargo test
+        run: cargo test --no-fail-fast
       - name: Test (all features)
-        run: cargo test --all-features
+        run: cargo test --all-features --no-fail-fast
       - name: Test (no default features)
-        run: cargo test --no-default-features
+        run: cargo test --no-default-features --no-fail-fast
       - name: Build examples
         run: cargo build --examples
       - name: Run self-contained examples

@@ -150,6 +150,9 @@ fn reason_read_timeout() {
 #[test]
 fn reason_write_timeout() {
     static BLOCK: [u8; 1 << 20] = [b'w'; 1 << 20];
+    /// Megabytes handed to the kernel so far: if this keeps growing while the peer
+    /// never reads, the OS is absorbing the flood instead of stalling the sender.
+    static FLUSHED_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct Flood;
     impl Session for Flood {
         fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
@@ -159,6 +162,7 @@ fn reason_write_timeout() {
             Step::Write
         }
         fn on_writable(&mut self, cx: &mut SessionContext<'_>) -> Step {
+            FLUSHED_MB.fetch_add(64, std::sync::atomic::Ordering::Relaxed);
             while cx.output().push_static(&BLOCK).is_ok() {}
             Step::Write
         }
@@ -185,11 +189,16 @@ fn reason_write_timeout() {
     let mut c = client(addr(&s));
     c.write_all(b"go").expect("write");
     let rec2 = rec.clone();
-    assert!(eventually(Duration::from_secs(10), || rec2
-        .0
-        .lock()
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)));
+    let start = Instant::now();
+    let closed = eventually(Duration::from_secs(10), || {
+        rec2.0.lock().map(|v| !v.is_empty()).unwrap_or(false)
+    });
+    assert!(
+        closed,
+        "no close after {:?}; about {} MB flushed to a peer that never reads",
+        start.elapsed(),
+        FLUSHED_MB.load(std::sync::atomic::Ordering::Relaxed)
+    );
     rec.expect_one(CloseReason::WriteTimeout);
 }
 
