@@ -11,6 +11,17 @@ Documentation references:
 - **macOS:** the system's own `man <n> <name>` pages (xnu, BSD-derived); where macOS differs from FreeBSD the row says so.
 - **Windows:** Microsoft Learn, `https://learn.microsoft.com/en-us/windows/win32/api/<header>/nf-<header>-<name in lowercase>` for functions and `.../ns-<header>-<name>` for structs; socket options at `https://learn.microsoft.com/en-us/windows/win32/winsock/sol-socket-socket-options`, `.../ipproto-tcp-socket-options`, `.../ipproto-ip-socket-options`, `.../ipproto-ipv6-socket-options`.
 
+## 0.3.0 as built
+
+The 0.3 blocking driver declares less than the lists below allow: `std` already makes most socket calls safely, so net-io declares only what `std` cannot do. Everything else on the lists keeps its version and arrives when a feature needs it (rule 5).
+
+| Platform | Declared in `src/sys/` (0.3) | Done through `std` instead |
+|---|---|---|
+| Linux, macOS | `socket`, `bind`, `listen`, `connect` (options before bind and a non-blocking connect), `setsockopt`, `getsockopt`, `send` (as `c_send`, for `MSG_DONTWAIT \| MSG_NOSIGNAL`), `sendmsg` (vectored sends with the same flags), `poll`, `shutdown` (the kill and drain wake, D-053, D-073), `getrlimit`, `fcntl` (macOS only, to clear `O_NONBLOCK` after `accept`) | `accept` (`accept4` with `SOCK_CLOEXEC` on Linux), `recv`, `getsockname`, `getpeername`, `close`, `SO_RCVTIMEO` (`set_read_timeout`); the wake channel is a `UnixDatagram` pair instead of `pipe`; the reserve descriptor is `File::open("/dev/null")` |
+| Windows | `WSAStartup`, `WSASocketW` (overlapped, not inheritable), `bind`, `listen`, `connect`, `setsockopt`, `getsockopt`, `WSAPoll`, `WSAGetLastError`, `SetHandleInformation` (accepted sockets, D-078) | `accept`, `recv`, `send`, `WSASend` (`write_vectored`), `ioctlsocket` (`set_nonblocking`), `closesocket`; the wake channel is a loopback UDP socket connected to itself |
+
+Not in 0.3: `getrandom`, `getentropy`, `BCryptGenRandom` (the per-source table keys std's `RandomState`, D-062), `pipe`/`pipe2`, `open`, `getpid`, `WSAIoctl`, `GetCurrentProcessId`. The layout checks of rule 2 to 4 live next to the declarations (`src/sys/unix.rs` and `src/sys/windows.rs`, `#[cfg(test)]`), not in `tests/layout.rs`, because the declarations are private to the crate.
+
 ---
 
 ## 1. Unix (Linux, macOS, FreeBSD)

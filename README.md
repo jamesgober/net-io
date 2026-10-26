@@ -29,14 +29,24 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). No dependencies: OS calls the standard library does not expose go through the crate's own fenced FFI layer.
     </p>
     <blockquote>
-        <strong>Status: design lock (<code>0.2.0</code>).</strong> No functional code yet. The public API is locked in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. <code>0.3.0</code> brings TCP with the blocking driver.
+        <strong>Status: <code>0.3.0</code>, TCP and the blocking driver.</strong> Servers and clients over TCP on Linux, macOS, and Windows, with every limit, the gate seam, kill, and graceful drain. Pre-1.0: the API in <a href="./docs/API.md"><code>docs/API.md</code></a> is locked, and each item says the version that ships it. Unix sockets, UDP, and the PROXY protocol arrive in <code>0.4.0</code>; the reactor in <code>0.5.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
 <hr>
 <br>
 
-## What it will do
+## What it does
+
+| Area | In `0.3.0` | Later |
+|---|---|---|
+| Transports | TCP listeners and connections | UDP, Unix domain sockets (`0.4.0`), Windows named pipes (`0.5.0`) |
+| Drivers | a bounded blocking worker pool: 2 system calls per keep-alive round trip on Linux (3 on macOS and Windows), no allocation after warm-up | its own reactor on epoll, kqueue, and IOCP (`0.5.0`) |
+| Limits | global, per-listener, and per-source caps; idle, read, write, exchange, and park deadlines; a minimum transfer rate against slowloris and slow readers; bounded buffers | adaptive deadlines and lane reservations (`0.6.0`) |
+| Lifecycle | the door, graceful drain with a deadline, kill from any thread, one `CloseReason` and one closed event per connection, a control line (shed, lockdown, drain, stop) | listener hand-off, systemd activation (`0.4.0`) |
+| Seams | the gate (admission before any byte is read, a check before every write), sans-IO sessions, an event sink, a completion queue for offloaded work | PROXY protocol, the TLS seam wired to listeners (`0.4.0`) |
+
+The full plan:
 
 | Area | Planned |
 |---|---|
@@ -50,7 +60,14 @@
 | Restarts | a door that opens last and closes first, graceful drain, systemd socket activation, FastCGI descriptor 0, listener hand-off between processes |
 | Seams | a gate (admission before any byte is read, a check before every write, kill from any thread), a sans-IO TLS seam, an event sink, a control line, a completion queue for offloaded work |
 
-The planned simplest use (from `0.3.0`; the full API is in [`docs/API.md`](./docs/API.md)):
+## Use
+
+```toml
+[dependencies]
+net-io = "0.3"
+```
+
+The simplest server (the full API is in [`docs/API.md`](./docs/API.md); `examples/` has a sans-IO session, kill and drain, and a gate):
 
 ```rust
 fn main() -> Result<(), net_io::NetError> {
