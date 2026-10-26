@@ -113,6 +113,10 @@ fn test_many_clients_concurrently() {
         // Headroom over the 8 clients (4x): a closing connection holds its slot until
         // the worker finishes it, and the next one from the same client may arrive first.
         .workers(32)
+        // 8 clients connect back to back: on a slow runner a client's earlier
+        // connections may not be counted closed yet, so raise the per-source cap
+        // (16 by default) to the global cap; this test is about concurrency, not caps.
+        .limits(limits(|b| b.max_per_source(32, PrefixPolicy::HOST)))
         .sessions(|_: &ConnectionInfo| Echo)
         .gate(AllowAll)
         .build()

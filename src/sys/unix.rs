@@ -63,6 +63,7 @@ pub(crate) mod errno {
     pub const EMFILE: i32 = 24;
     pub const ENOTSOCK: i32 = 38;
     pub const ENOPROTOOPT: i32 = 42;
+    pub const ENOTCONN: i32 = 57;
     pub const EADDRINUSE: i32 = 48;
     pub const EADDRNOTAVAIL: i32 = 49;
     pub const ENETUNREACH: i32 = 51;
@@ -529,10 +530,34 @@ pub(crate) fn take_error(sock: Sock<'_>) -> io::Result<Option<io::Error>> {
 }
 
 /// Whether `sock` is a listening stream socket.
+///
+/// macOS answers `SO_ACCEPTCONN` with `ENOPROTOOPT`; there a socket counts as
+/// listening when it has no peer (`getpeername` gives `ENOTCONN`) and is bound to
+/// a port. A bound socket that never called `listen` passes too; its first
+/// `accept` then fails with `EINVAL`, which is a listener failure.
 pub(crate) fn is_listening_stream(sock: Sock<'_>) -> io::Result<bool> {
-    let listening = get_int(sock, c::SOL_SOCKET, c::SO_ACCEPTCONN)? != 0;
     let stream = get_int(sock, c::SOL_SOCKET, c::SO_TYPE)? == c::SOCK_STREAM;
+    let listening = match get_int(sock, c::SOL_SOCKET, c::SO_ACCEPTCONN) {
+        Ok(v) => v != 0,
+        #[cfg(target_os = "macos")]
+        Err(e) if e.raw_os_error() == Some(errno::ENOPROTOOPT) => bound_without_peer(sock)?,
+        Err(e) => return Err(e),
+    };
     Ok(listening && stream)
+}
+
+/// Whether `sock` is bound to a port and has no peer (the macOS listener check).
+#[cfg(target_os = "macos")]
+fn bound_without_peer(sock: Sock<'_>) -> io::Result<bool> {
+    // SAFETY: `sock` is open for the call; `ManuallyDrop` keeps this temporary
+    // `TcpStream` from closing a descriptor it does not own.
+    let s = std::mem::ManuallyDrop::new(unsafe { TcpStream::from_raw_fd(sock.as_raw_fd()) });
+    match s.peer_addr() {
+        Ok(_) => return Ok(false),
+        Err(e) if e.raw_os_error() == Some(errno::ENOTCONN) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(s.local_addr()?.port() != 0)
 }
 
 /// Accepts one connection. On Linux `std` uses `accept4(SOCK_CLOEXEC)`; on macOS
@@ -1012,6 +1037,8 @@ mod layout {
         assert_eq!(EPROTO, libc::EPROTO);
         assert_eq!(ENOTSOCK, libc::ENOTSOCK);
         assert_eq!(ENOPROTOOPT, libc::ENOPROTOOPT);
+        #[cfg(target_os = "macos")]
+        assert_eq!(ENOTCONN, libc::ENOTCONN);
         assert_eq!(EOPNOTSUPP, libc::EOPNOTSUPP);
         assert_eq!(EADDRINUSE, libc::EADDRINUSE);
         assert_eq!(EADDRNOTAVAIL, libc::EADDRNOTAVAIL);

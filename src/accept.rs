@@ -163,13 +163,14 @@ mod tests {
         let mut a = Acceptor::new();
         assert!(a.reserve.is_some());
         let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        // Before the reset: macOS refuses setsockopt on a socket that was reset.
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         program_here(Op::Accept, 0, 2, Fault::Os(sys::errno::EMFILE));
         program_here(Op::Reserve, 0, 1, Fault::Os(sys::errno::EMFILE));
         assert!(matches!(a.accept(&l), Accepted::Pause(d) if d == BACKOFF_START));
         assert!(a.reserve.is_none(), "the reopen failed");
         // The shed connection was reset, not left in the backlog.
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut b = [0u8; 1];
         match std::io::Read::read(&mut c, &mut b) {
             Ok(0) => {}
