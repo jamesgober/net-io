@@ -41,7 +41,7 @@ Exit: James approves `docs/API.md`; every spike has a written result; CI green.
 - [x] James approved the API (2026-10-23). Open decisions O-1, O-2, OD-26 stay open; none blocks 0.3 or 0.4.
 - [x] Release routine: 0.2.0 tagged, released, published (claims the crate name, D-048).
 
-## v0.3.0 - Core: TCP and the blocking driver (DONE, 2026-10-23)
+## v0.3.0 - Core: TCP and the blocking driver (DONE, 2026-10-26)
 Exit: a TCP echo service runs on Linux, macOS, and Windows under the blocking driver with every limit, hook, and close reason covered by socket tests; the 20-line echo example builds and runs; no allocation after warm-up on the hot path (counting allocator); the descriptor leak test passes for 100,000 connections; the layout cross-check passes; a consumer can build a server skeleton against the published 0.3.
 
 | Area | Items (`docs/API.md`) |

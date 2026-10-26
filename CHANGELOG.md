@@ -13,7 +13,7 @@
 
 ---
 
-## [0.3.0] - 2026-10-23
+## [0.3.0] - 2026-10-26
 
 TCP and the blocking driver: the first release with working code. Servers
 and clients over TCP on Linux, macOS, and Windows (x86_64 and aarch64), with
