@@ -463,7 +463,10 @@ impl Limits {
     pub fn max_per_listener(&self) -> Option<u32> {
         self.max_per_listener
     }
-    /// The per-source concurrency cap and how sources are grouped.
+    /// The per-source concurrency cap and how sources are grouped. Each listener
+    /// applies its own value to its own connections. Every open connection counts,
+    /// including one finishing a graceful close, so a client at the cap that
+    /// reconnects at once can be refused until its last connection is closed.
     #[must_use]
     pub fn max_per_source(&self) -> Option<(u32, PrefixPolicy)> {
         self.max_per_source

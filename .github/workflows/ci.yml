@@ -74,7 +74,7 @@ jobs:
     name: Loom models
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: "-D warnings --cfg loom"
+      RUSTFLAGS: "-D warnings --cfg net_io_loom"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

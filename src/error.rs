@@ -550,6 +550,39 @@ pub enum CloseReason {
 }
 
 impl CloseReason {
+    /// One value per counter slot, inner values at their first or zero value, in
+    /// `index` order (for iterating counters).
+    pub(crate) const BY_INDEX: [CloseReason; CloseReason::COUNT] = [
+        CloseReason::PeerClosed,
+        CloseReason::PeerReset,
+        CloseReason::Idle,
+        CloseReason::HandshakeTimeout,
+        CloseReason::ReadTimeout,
+        CloseReason::WriteTimeout,
+        CloseReason::ExchangeDeadline,
+        CloseReason::ParkDeadline,
+        CloseReason::SlowPeer {
+            direction: Direction::In,
+        },
+        CloseReason::Refused(RefusalCause::GlobalCap),
+        CloseReason::ProxyUntrusted,
+        CloseReason::ProxyMissing,
+        CloseReason::ProxyInvalid,
+        CloseReason::TlsFailed,
+        CloseReason::HelloRefused,
+        CloseReason::Killed(KillReason(0)),
+        CloseReason::EgressDenied(0),
+        CloseReason::Drained,
+        CloseReason::DrainDeadline,
+        CloseReason::Shed,
+        CloseReason::Shutdown,
+        CloseReason::SessionClosed,
+        CloseReason::SessionError,
+        CloseReason::SessionPanicked,
+        CloseReason::Limit(LimitKind::Connections),
+        CloseReason::Io(OsErrorClass::Other(0)),
+    ];
+
     /// A stable snake_case name for logs.
     ///
     /// ```
@@ -694,6 +727,20 @@ pub enum RefusalCause {
 }
 
 impl RefusalCause {
+    /// One value per counter slot in `index` order (`Gate` carries code 0).
+    pub(crate) const BY_INDEX: [RefusalCause; RefusalCause::COUNT] = [
+        RefusalCause::GlobalCap,
+        RefusalCause::ListenerCap,
+        RefusalCause::SourceCap,
+        RefusalCause::LaneReserve,
+        RefusalCause::Gate(0),
+        RefusalCause::Session,
+        RefusalCause::Busy,
+        RefusalCause::DoorClosed,
+        RefusalCause::Shed,
+        RefusalCause::Lockdown,
+    ];
+
     /// A stable snake_case name for logs.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
@@ -981,6 +1028,16 @@ impl fmt::Display for ConfigReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_by_index_tables_match_index() {
+        for (i, r) in CloseReason::BY_INDEX.iter().enumerate() {
+            assert_eq!(r.index(), i, "{r:?}");
+        }
+        for (i, c) in RefusalCause::BY_INDEX.iter().enumerate() {
+            assert_eq!(c.index(), i, "{c:?}");
+        }
+    }
 
     #[test]
     fn test_close_reason_index_covers_every_variant_once() {

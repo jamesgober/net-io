@@ -9,10 +9,10 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-#[cfg(not(loom))]
+#[cfg(not(net_io_loom))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(loom)]
+#[cfg(net_io_loom)]
 use loom::sync::atomic::{AtomicU64, Ordering};
 
 use super::{RawSock, Sock, Wake};
@@ -222,17 +222,17 @@ impl KillSlot {
     }
 }
 
-#[cfg(not(loom))]
+#[cfg(not(net_io_loom))]
 fn yield_now() {
     std::thread::yield_now();
 }
 
-#[cfg(loom)]
+#[cfg(net_io_loom)]
 fn yield_now() {
     loom::thread::yield_now();
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, not(net_io_loom)))]
 mod tests {
     use super::*;
     use std::net::TcpListener;
@@ -305,7 +305,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, loom))]
+#[cfg(all(test, net_io_loom))]
 mod loom_tests {
     use super::*;
     use loom::sync::atomic::AtomicBool;

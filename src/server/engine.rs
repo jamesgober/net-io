@@ -221,7 +221,8 @@ pub(crate) struct Shared {
     listener_counts: Vec<AtomicU32>,
     listener_limits: Vec<Effective>,
     listener_tcp: Vec<TcpOptions>,
-    sources: SourceTable,
+    /// One per listener, sized from that listener's limits (D-085).
+    sources: Vec<SourceTable>,
 }
 
 impl Shared {
@@ -446,8 +447,8 @@ impl Shared {
         if let Some(c) = self.listener_counts.get(listener) {
             c.fetch_sub(1, Ordering::AcqRel);
         }
-        if let Some(k) = source {
-            self.sources.release(k);
+        if let (Some(k), Some(table)) = (source, self.sources.get(listener)) {
+            table.release(k);
         }
     }
 }
@@ -599,9 +600,12 @@ where
         listener_counts: (0..listener_limits.len())
             .map(|_| AtomicU32::new(0))
             .collect(),
+        sources: listener_limits
+            .iter()
+            .map(|l| SourceTable::new(l.max_per_listener, l.max_per_source))
+            .collect(),
         listener_limits,
         listener_tcp,
-        sources: SourceTable::new(limits.max_connections, limits.max_per_source),
     });
     for (i, info) in infos.iter().enumerate() {
         shared.event(Event::ListenerOpened {
@@ -825,7 +829,7 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
             return self.refuse(stream, peer, RefusalCause::ListenerCap, None, co);
         }
         let source = PrefixKey::of(peer.ip(), lim.source_policy);
-        if !shared.sources.acquire(source) {
+        if !shared.sources[li].acquire(source) {
             shared.open.fetch_sub(1, Ordering::AcqRel);
             count.fetch_sub(1, Ordering::AcqRel);
             return self.refuse(stream, peer, RefusalCause::SourceCap, None, co);

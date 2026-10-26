@@ -106,6 +106,33 @@ impl Stats {
     pub fn closed_for(&self, reason: CloseReason) -> u64 {
         self.closed_by[reason.index()]
     }
+
+    /// Every close reason with a non-zero count, one entry per variant (inner
+    /// values are not kept: `Killed` carries reason 0, `Io` class `Other(0)`).
+    ///
+    /// ```no_run
+    /// let server = net_io::serve("127.0.0.1:0", |_c| Ok(()))?;
+    /// for (reason, n) in server.stats().closes() {
+    ///     println!("{}: {n}", reason.as_str());
+    /// }
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn closes(&self) -> impl Iterator<Item = (CloseReason, u64)> + '_ {
+        CloseReason::BY_INDEX
+            .iter()
+            .zip(self.closed_by.iter())
+            .filter(|(_, n)| **n > 0)
+            .map(|(r, n)| (*r, *n))
+    }
+
+    /// Every refusal cause with a non-zero count (gate codes summed under `Gate(0)`).
+    pub fn refusals(&self) -> impl Iterator<Item = (RefusalCause, u64)> + '_ {
+        RefusalCause::BY_INDEX
+            .iter()
+            .zip(self.refused_by.iter())
+            .filter(|(_, n)| **n > 0)
+            .map(|(r, n)| (*r, *n))
+    }
 }
 
 /// One listener of a server.

@@ -753,7 +753,7 @@ impl ListenerId { pub const fn get(self) -> u16; }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerId(u16);
-impl WorkerId { pub const fn get(self) -> u16; pub const fn first() -> WorkerId; }   // first: worker 0, for tests and `ServerHandle::completer`
+impl WorkerId { pub const fn get(self) -> u16; pub const fn first() -> WorkerId; pub const fn for_testing(index: u16) -> WorkerId; }   // first: worker 0; for_testing: tests of per-worker state
 ```
 
 `ConnectionId` is issued for every accepted, adopted, dialed-and-registered, or inherited connection; it is never zero and never reused within a process. Workers take blocks of 1,024 ids from one process-wide counter, so ids are ordered within a worker, not globally; at one million connections per second the counter lasts about 584,000 years. The block also tells `ServerHandle::kill` which worker owns an id. P0, Tier 1, `0.3.0`. `ListenerId` and `WorkerId` (P0, Tier 2) count from 0 within one server; at most 65,535 of each.
@@ -969,7 +969,7 @@ assert!(Limits::builder().max_connections(100).build().is_ok()); // max_per_sour
 |---|---|---|---|---|
 | `max_connections` | 10,000 | `workers` (128) | descriptor and memory exhaustion | fits the default `RLIMIT_NOFILE` of many servers (65,536 hard) with room for files; blocking: one connection per worker |
 | `max_per_listener` | follows `max_connections` | same | one listener starving others | equal by default; lower it for admin listeners |
-| `max_per_source` | 256 per IPv4 /32 or IPv6 /64, at most `max_connections` | 16, at most `max_connections` | one host taking every slot | browsers open 6 to 10 connections per host; 256 leaves room for NAT; blocking pools are small |
+| `max_per_source` | 256 per IPv4 /32 or IPv6 /64, at most `max_connections` | 16, at most `max_connections` | one host taking every slot | browsers open 6 to 10 connections per host; 256 leaves room for NAT; blocking pools are small. Counted per listener (each listener applies its own value, D-085), over every open connection including one finishing a graceful close, so a client at the cap that reconnects at once can be refused until its last connection is closed; a load test from one host needs a higher cap |
 | `backlog` | 1,024 | 1,024 | SYN bursts overflowing the accept queue | Linux caps it at `somaxconn` (4,096 since 5.4, 128 before) |
 | `accept_batch` | 64 | 16 | one listener starving other work | bounds accept work per wake-up |
 | `handshake_timeout` | 10 s | 10 s | PROXY or TLS that never finishes | a TLS handshake over a slow mobile link takes under 2 s; 10 s is generous |
@@ -1405,7 +1405,7 @@ impl SessionFactory for OnlyLoopback {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
-    Read,                                   // wait for more input
+    Read,                                   // wait for more input; queued output is NOT sent (return Write first)
     Write,                                  // flush pending output, then on_writable
     Park { until: Option<Instant> },        // no reads, no idle timer, until a completion or the park deadline
     Close,                                  // graceful: flush, FIN, bounded linger
@@ -1702,6 +1702,8 @@ pub struct Stats {
 impl Stats {
     pub fn refused_for(&self, cause: RefusalCause) -> u64;     // per cause (gate codes summed)
     pub fn closed_for(&self, reason: CloseReason) -> u64;      // per reason variant (inner values ignored)
+    pub fn closes(&self) -> impl Iterator<Item = (CloseReason, u64)> + '_;      // non-zero counts, one per variant
+    pub fn refusals(&self) -> impl Iterator<Item = (RefusalCause, u64)> + '_;
 }
 
 #[non_exhaustive]
