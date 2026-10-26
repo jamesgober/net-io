@@ -44,7 +44,15 @@ path = "src/lib.rs"
 # FEATURE FLAGS
 # #################################
 [features]
-default = []
+default = ["proxy", "udp", "local", "tls"]
+# PROXY protocol parser and server integration.
+proxy = []
+# UDP socket, amplification guard, source budgets.
+udp = []
+# Unix domain sockets, descriptor passing, listener hand-off (Windows named pipes from 0.5).
+local = []
+# The TLS seam's server integration (no TLS code; an engine plugs in).
+tls = []
 
 
 # DEPENDENCIES

@@ -73,6 +73,8 @@ mod addr;
 mod buf;
 mod completer;
 mod control;
+#[cfg(feature = "proxy")]
+mod crc32c;
 mod driver;
 mod error;
 mod events;
@@ -85,6 +87,8 @@ mod limits;
 mod link;
 mod opts;
 mod proxy;
+#[cfg(feature = "proxy")]
+mod proxy_parse;
 mod rate;
 mod server;
 mod session;
@@ -126,6 +130,11 @@ pub use inherit::InheritError;
 pub use limits::{Limits, LimitsBuilder, MinRate, Pressure, SizeClass};
 pub use opts::{Keepalive, Linger, ListenOptions, SocketOptions, TcpOptions};
 pub use proxy::{ProxyError, ProxyFacts, ProxyMode, ProxyVersions};
+#[cfg(feature = "proxy")]
+pub use proxy_parse::{
+    ProxyAddress, ProxyCommand, ProxyHeader, ProxyParser, ProxyProgress, ProxySsl, ProxyTransport,
+    Tlv, Tlvs,
+};
 pub use server::{
     BlockingHandler, DoorState, DrainReport, ListenerSpec, NoGate, NoWork, Server, ServerBuilder,
     ServerHandle, Sessions, Stats, Workload,
