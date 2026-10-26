@@ -104,13 +104,18 @@ fn test_receive_error_closes_only_that_connection() {
 }
 
 /// B-13: system calls per echo round trip on an established connection, counted
-/// at net-io's own call sites: at most 2 on Unix (receive, send) and 3 on Windows
-/// (wait, receive, send; decision D-052).
+/// at net-io's own call sites: at most 2 on Linux (receive, send) and 3 on Windows
+/// and macOS (wait, receive, send; decisions D-052, D-083).
 #[test]
 fn test_system_calls_per_echo_round_trip() {
     use net_io::__shim::{counted, start_counting, stop_counting};
     let _shim = Shim::take();
-    let budget = if cfg!(windows) { 3.0 } else { 2.0 };
+    // Linux: recv, send. Windows and macOS wait first (D-052, D-083).
+    let budget = if cfg!(any(windows, target_os = "macos")) {
+        3.0
+    } else {
+        2.0
+    };
     let blocking = net_io::serve("127.0.0.1:0", |conn: &mut net_io::TcpConnection| {
         let mut buf = [0u8; 512];
         loop {

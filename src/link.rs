@@ -319,9 +319,9 @@ impl Link {
         }
     }
 
-    /// One wait where the OS needs it (Windows: every receive; D-052) and one
-    /// receive. Unix receives block under `SO_RCVTIMEO`, so an exchange costs one
-    /// receive and one send. `None` means try again (timed out or would block).
+    /// One wait where the OS needs it (Windows and macOS: every receive; D-052,
+    /// D-083) and one receive. Linux receives block under `SO_RCVTIMEO`, so an
+    /// exchange costs one receive and one send. `None` means try again (timed out or would block).
     fn wait_and_recv(
         &mut self,
         buf: &mut [u8],
@@ -383,8 +383,8 @@ impl Link {
                 self.rate_in.record(now, n);
                 Some(Ok(Got::Data(n)))
             }
-            // `SO_RCVTIMEO` expiring reads as `WouldBlock` on Unix, and Windows sockets
-            // are non-blocking. `TimedOut` is the kernel giving up on the connection
+            // `SO_RCVTIMEO` expiring reads as `WouldBlock` on Linux, and Windows and
+            // macOS sockets are non-blocking. `TimedOut` is the kernel giving up on the connection
             // (keepalive), which is `Io(TimedOut)`, not one of our deadlines.
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 self.likely_more = false;

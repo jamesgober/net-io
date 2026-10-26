@@ -560,9 +560,9 @@ fn bound_without_peer(sock: Sock<'_>) -> io::Result<bool> {
     Ok(s.local_addr()?.port() != 0)
 }
 
-/// Accepts one connection. On Linux `std` uses `accept4(SOCK_CLOEXEC)`; on macOS
-/// it sets close-on-exec after `accept`, and this adds `SO_NOSIGPIPE` and blocking
-/// mode (macOS sockets inherit non-blocking mode from the listener).
+/// Accepts one connection. On Linux `std` uses `accept4(SOCK_CLOEXEC)` and the
+/// socket is blocking; on macOS `std` sets close-on-exec after `accept`, this adds
+/// `SO_NOSIGPIPE`, and the socket stays non-blocking (D-083).
 pub(crate) fn accept(listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
     #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::Accept)?;
@@ -570,24 +570,32 @@ pub(crate) fn accept(listener: &TcpListener) -> io::Result<(TcpStream, SocketAdd
     #[cfg(target_os = "macos")]
     {
         set_int(stream.as_fd(), c::SOL_SOCKET, c::SO_NOSIGPIPE, 1)?;
-        stream.set_nonblocking(false)?;
+        stream.set_nonblocking(true)?;
     }
     Ok((stream, peer))
 }
 
 /// Configures a dialed stream (created non-blocking for the connect) for
-/// net-io's Unix IO model: blocking reads with a receive timeout, sends that
-/// never block (`MSG_DONTWAIT`).
+/// net-io's IO model on this OS: on Linux, blocking reads with a receive timeout
+/// and sends that never block (`MSG_DONTWAIT`); on macOS it stays non-blocking.
 pub(crate) fn prepare_dialed(stream: &TcpStream) -> io::Result<()> {
-    stream.set_nonblocking(false)
+    if WAIT_BEFORE_RECV {
+        Ok(())
+    } else {
+        stream.set_nonblocking(false)
+    }
 }
 
-/// Whether reads wait in `poll` first (Windows) or block in `recv` with a
-/// receive timeout (Unix).
-pub(crate) const WAIT_BEFORE_RECV: bool = false;
+/// Whether reads wait in `poll` first on a non-blocking socket, or block in `recv`
+/// with a receive timeout. Linux blocks (2 system calls per exchange). macOS
+/// waits first, like Windows (D-083): a send there blocked on a full buffer
+/// despite `MSG_DONTWAIT`, and `setsockopt` fails with `EINVAL` once the
+/// connection has ended, so per-read `SO_RCVTIMEO` updates are not usable.
+pub(crate) const WAIT_BEFORE_RECV: bool = cfg!(target_os = "macos");
 
-/// One receive. Blocks until bytes arrive, the receive timeout passes
-/// (`WouldBlock`/`TimedOut`), the peer closes (0), or a kill shuts the read side (0).
+/// One receive. On Linux it blocks until bytes arrive, the receive timeout passes
+/// (`WouldBlock`), the peer closes (0), or a kill shuts the read side (0); on
+/// macOS the socket is non-blocking and the caller waited first.
 pub(crate) fn recv(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
     retry_interrupted(|| {
         #[cfg(any(test, net_io_shim))]

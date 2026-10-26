@@ -59,8 +59,8 @@ every limit, the gate seam, sans-IO sessions, kill, and graceful drain.
 
 ### Performance
 
-- A keep-alive round trip on Unix is 2 system calls (one `recv`, one
-  `send`) and 3 on Windows (`WSAPoll` first; see the platform notes).
+- A keep-alive round trip on Linux is 2 system calls (one `recv`, one
+  `send`) and 3 on macOS and Windows (a wait first; see the platform notes).
 - No allocation per message after warm-up.
 - 64-byte echo on one loopback connection is within 0.1 to 0.4 µs of a
   bare `std` echo per round trip.

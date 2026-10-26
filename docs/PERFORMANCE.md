@@ -37,6 +37,7 @@ Counted at net-io's own call sites by the fault-injection shim (`tests/shim.rs::
 |---|---|---|
 | Linux (WSL2) | 2 | 2.00, 2.00 (one `recv`, one `send`) |
 | Windows 11 | 3 | 3.00, 3.00 (`WSAPoll`, `recv`, `send`; D-052) |
+| macOS (CI) | 3 | asserted at most 3 (`poll`, `recv`, `send`; D-083) |
 
 ### B-14: allocations per connection after warm-up
 
