@@ -1347,6 +1347,9 @@ pub(crate) fn recv_with_fds(
             Ok(n.unsigned_abs())
         }
     })?;
+    #[cfg(target_os = "linux")]
+    let used = msg.msg_controllen.min(control.0.len());
+    #[cfg(target_os = "macos")]
     let used = (msg.msg_controllen as usize).min(control.0.len());
     let truncated = msg.msg_flags & c::MSG_CTRUNC != 0;
     let hdr = cmsg_align(size_of::<CmsgHdr>());

@@ -292,7 +292,7 @@ where
 
 /// Opens a local IPC listener: on Unix, a Unix domain socket at the path `name`
 /// with mode `0600` (only the owner may connect; [`LocalOptions`] and
-/// [`UnixListener::bind_with`] for more). On Windows, named pipes arrive in
+/// `UnixListener::bind_with` for more). On Windows, named pipes arrive in
 /// `0.5.0`; until then this returns `Unsupported`.
 ///
 /// # Errors
