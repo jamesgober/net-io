@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::buf::Buffer;
-use crate::error::{CloseReason, Direction, KillReason, NetError, OsErrorClass, TimeoutKind};
+use crate::error::{
+    CloseReason, Direction, KillReason, LimitKind, NetError, OsErrorClass, TimeoutKind,
+};
 use crate::gate::{Denial, ErasedGate, WriteCheck};
 use crate::info::{ConnectionInfo, GateTag};
 use crate::limits::Effective;
@@ -16,6 +18,7 @@ use crate::rate::Rate;
 use crate::session::Phase;
 use crate::sys::{self, AsSock, Interest, KillSlot, Ready, Wake};
 use crate::time::Clock;
+use crate::tls::{TlsError, TlsEvent, TlsFailure, TlsSession};
 
 /// Where time comes from.
 #[derive(Clone)]
@@ -94,7 +97,50 @@ pub(crate) struct Link {
     /// to the worker's pool at close).
     pending: Option<Buffer>,
     pending_at: usize,
+    /// Bytes at the head of the next send that the gate already approved (the
+    /// unsent tail of a partial send), so a byte-counting gate counts each once.
+    approved: usize,
+    /// TLS on this connection (feature `tls`).
+    tls: Option<TlsLayer>,
 }
+
+/// TLS on a connection: the engine's session and its two buffers.
+pub(crate) struct TlsLayer {
+    session: Box<dyn TlsSession>,
+    /// Ciphertext in; `[start, len)` is not yet consumed by the engine.
+    cin: Buffer,
+    start: usize,
+    /// Decrypted plaintext not yet delivered: `[plain_at, plain_end)` inside `cin`.
+    plain_at: usize,
+    plain_end: usize,
+    /// Ciphertext out: scratch, flushed within each call.
+    cout: Buffer,
+    done: bool,
+    eof: bool,
+}
+
+/// What one round of the TLS engine produced.
+enum Pump {
+    Plain,
+    Handshaken,
+    Eof,
+    Woken,
+}
+
+/// The engine's event, without the borrow of the input.
+enum Ev {
+    NeedInput,
+    Transmit,
+    Handshaken,
+    Data(usize, usize),
+    OutputFull,
+    Closed,
+}
+
+/// The largest plaintext encrypted into one record.
+const TLS_RECORD: usize = 16 * 1024;
+/// Room kept per record for the TLS header, padding, and tag.
+const TLS_OVERHEAD: usize = 2 * 1024;
 
 impl Link {
     pub(crate) fn new(
@@ -141,6 +187,8 @@ impl Link {
             handshake_deadline: None,
             pending: None,
             pending_at: 0,
+            approved: 0,
+            tls: None,
         };
         if phase == Phase::Receiving {
             link.rate_in.activate(now);
@@ -204,6 +252,299 @@ impl Link {
         if in_active {
             self.rate_in.activate(now);
         }
+    }
+
+    /// Puts TLS on this connection: from now on reads return plaintext and
+    /// writes encrypt. `cin` must hold the largest record the engine needs.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub(crate) fn attach_tls(
+        &mut self,
+        session: Box<dyn TlsSession>,
+        mut cin: Buffer,
+        mut cout: Buffer,
+    ) {
+        cin.set_len(0);
+        cout.set_len(0);
+        self.tls = Some(TlsLayer {
+            session,
+            cin,
+            start: 0,
+            plain_at: 0,
+            plain_end: 0,
+            cout,
+            done: false,
+            eof: false,
+        });
+    }
+
+    /// Whether TLS is on this connection.
+    pub(crate) fn has_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    /// The TLS buffers, for their pool.
+    pub(crate) fn take_tls_buffers(&mut self) -> Option<(Buffer, Buffer)> {
+        self.tls.take().map(|t| (t.cin, t.cout))
+    }
+
+    /// Runs the TLS handshake to completion (under the handshake deadline set by
+    /// `begin_handshake`); the engine's facts land in `info.tls`.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub(crate) fn tls_handshake(&mut self) -> Result<(), NetError> {
+        let Some(mut t) = self.tls.take() else {
+            return Ok(());
+        };
+        let r = loop {
+            match self.tls_pump(&mut t) {
+                Ok(Pump::Handshaken) => break Ok(()),
+                // Plaintext before the handshake completed is not something net-io accepts.
+                Ok(Pump::Plain) if !t.done => {
+                    break Err(self.tls_error(TlsError::new(TlsFailure::State, 0, None)));
+                }
+                Ok(Pump::Plain) => break Ok(()),
+                Ok(Pump::Eof) => break Err(self.fail(CloseReason::TlsFailed, NetError::Closed)),
+                Ok(Pump::Woken) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        self.tls = Some(t);
+        r
+    }
+
+    /// Plaintext for a reader.
+    fn read_tls(&mut self, t: &mut TlsLayer, buf: &mut [u8]) -> Result<Got, NetError> {
+        loop {
+            match self.tls_pump(t)? {
+                Pump::Plain => {
+                    let have = &t.cin.as_slice()[t.plain_at..t.plain_end];
+                    let n = have.len().min(buf.len());
+                    buf[..n].copy_from_slice(&have[..n]);
+                    t.plain_at += n;
+                    let now = self.now();
+                    self.progress_at = now;
+                    if self.phase == Phase::Idle {
+                        self.phase = Phase::Receiving;
+                        self.rate_in.activate(now);
+                    }
+                    return Ok(Got::Data(n));
+                }
+                Pump::Handshaken => {}
+                Pump::Eof => {
+                    self.peer_closed = true;
+                    return Ok(Got::Eof);
+                }
+                Pump::Woken => return Ok(Got::Woken),
+            }
+        }
+    }
+
+    /// Drives the engine until it has plaintext to deliver, finished the
+    /// handshake, or the transport ended. Records the engine writes (handshake,
+    /// alerts, tickets) go out at once.
+    fn tls_pump(&mut self, t: &mut TlsLayer) -> Result<Pump, NetError> {
+        loop {
+            if t.plain_at < t.plain_end {
+                return Ok(Pump::Plain);
+            }
+            if t.eof {
+                return Ok(Pump::Eof);
+            }
+            let start = t.start;
+            let end = t.cin.len();
+            let base = t.cin.as_slice().as_ptr() as usize;
+            let TlsLayer {
+                session, cin, cout, ..
+            } = &mut *t;
+            cout.set_len(0);
+            let stepped = session
+                .step(&mut cin.as_mut_slice()[start..end], cout.spare())
+                .map(|p| {
+                    let ev = match p.event {
+                        TlsEvent::NeedInput => Ev::NeedInput,
+                        TlsEvent::Transmit => Ev::Transmit,
+                        TlsEvent::HandshakeComplete => Ev::Handshaken,
+                        TlsEvent::Data(d) => match (d.as_ptr() as usize).checked_sub(base) {
+                            Some(off) if !d.is_empty() => Ev::Data(off, d.len()),
+                            Some(_) => Ev::Transmit,
+                            None => Ev::Data(usize::MAX, 0),
+                        },
+                        TlsEvent::OutputFull => Ev::OutputFull,
+                        TlsEvent::PeerClosed | TlsEvent::Closed => Ev::Closed,
+                    };
+                    (p.consumed, p.written, ev)
+                });
+            let (consumed, written, ev) = match stepped {
+                Ok(v) => v,
+                Err(e) => return Err(self.tls_error(e)),
+            };
+            t.start = (start + consumed).min(end);
+            if written > 0 {
+                t.cout.set_len(written.min(t.cout.capacity()));
+                self.send_raw_all(t.cout.as_slice())?;
+            }
+            match ev {
+                Ev::NeedInput => {
+                    if let Some(p) = self.tls_fill(t)? {
+                        return Ok(p);
+                    }
+                }
+                Ev::Transmit => {}
+                Ev::Handshaken => {
+                    t.done = true;
+                    if let Some(info) = t.session.info() {
+                        self.info.tls = Some(Arc::new(info));
+                    }
+                    return Ok(Pump::Handshaken);
+                }
+                Ev::Data(off, len) => {
+                    // The plaintext must lie inside the input the engine was given.
+                    if off < start || off.saturating_add(len) > end {
+                        return Err(self.tls_error(TlsError::new(TlsFailure::State, 0, None)));
+                    }
+                    t.plain_at = off;
+                    t.plain_end = off + len;
+                }
+                Ev::OutputFull if written == 0 => {
+                    return Err(self.tls_error(TlsError::new(TlsFailure::OutputFull, 0, None)));
+                }
+                Ev::OutputFull => {}
+                Ev::Closed => {
+                    t.eof = true;
+                    return Ok(Pump::Eof);
+                }
+            }
+        }
+    }
+
+    /// Reads more ciphertext after compacting the input. `Some` ends the pump.
+    fn tls_fill(&mut self, t: &mut TlsLayer) -> Result<Option<Pump>, NetError> {
+        if t.start > 0 {
+            let len = t.cin.len();
+            t.cin.as_mut_slice().copy_within(t.start..len, 0);
+            t.cin.set_len(len - t.start);
+            t.start = 0;
+            t.plain_at = 0;
+            t.plain_end = 0;
+        }
+        let need = t.session.input_capacity_required();
+        if need > t.cin.capacity() || t.cin.spare().is_empty() {
+            return Err(self.fail(
+                CloseReason::Limit(LimitKind::ReadBuffer),
+                NetError::Limit {
+                    which: LimitKind::ReadBuffer,
+                },
+            ));
+        }
+        let len = t.cin.len();
+        match self.read_raw(t.cin.spare())? {
+            Got::Data(n) => {
+                t.cin.set_len(len + n);
+                Ok(None)
+            }
+            Got::Eof => {
+                // An unclean end (no close_notify) still ends the stream; the
+                // protocol above decides whether its message was complete.
+                let _ = t.session.on_transport_closed();
+                t.eof = true;
+                Ok(Some(Pump::Eof))
+            }
+            Got::Woken => Ok(Some(Pump::Woken)),
+        }
+    }
+
+    /// The plaintext one vectored TLS write takes: whole records that fit the
+    /// output buffer.
+    fn tls_budget(&self) -> usize {
+        self.tls.as_ref().map_or(0, |t| {
+            (t.cout.capacity() / (TLS_RECORD + TLS_OVERHEAD)).max(1) * TLS_RECORD
+        })
+    }
+
+    /// Encrypts `plain` (at most one record) and sends all of it.
+    fn write_tls(&mut self, plain: &[u8]) -> Result<usize, NetError> {
+        let Some(mut t) = self.tls.take() else {
+            return Ok(0);
+        };
+        t.cout.set_len(0);
+        let r = match t.session.encrypt(plain, t.cout.spare()) {
+            Ok(n) => {
+                t.cout.set_len(n.min(t.cout.capacity()));
+                self.send_raw_all(t.cout.as_slice()).map(|()| plain.len())
+            }
+            Err(e) => Err(self.tls_error(e)),
+        };
+        self.tls = Some(t);
+        r
+    }
+
+    /// Encrypts up to `take` plaintext bytes from `bufs` and sends all of it.
+    fn write_vectored_tls(&mut self, bufs: &[IoSlice<'_>], take: usize) -> Result<usize, NetError> {
+        let Some(mut t) = self.tls.take() else {
+            return Ok(0);
+        };
+        t.cout.set_len(0);
+        let mut taken = 0;
+        let mut failed = None;
+        'slices: for b in bufs.iter().take(sys::MAX_SLICES) {
+            let mut s: &[u8] = b;
+            while !s.is_empty() && taken < take {
+                let chunk = s.len().min(TLS_RECORD).min(take - taken);
+                if t.cout.spare().len() < chunk + TLS_OVERHEAD {
+                    break 'slices;
+                }
+                let used = t.cout.len();
+                match t.session.encrypt(&s[..chunk], t.cout.spare()) {
+                    Ok(n) => t.cout.set_len(used + n),
+                    Err(e) => {
+                        failed = Some(e);
+                        break 'slices;
+                    }
+                }
+                taken += chunk;
+                s = &s[chunk..];
+            }
+        }
+        let r = match failed {
+            Some(e) => Err(self.tls_error(e)),
+            None => self.send_raw_all(t.cout.as_slice()).map(|()| taken),
+        };
+        self.tls = Some(t);
+        r
+    }
+
+    /// Sends `close_notify` once, without waiting (a graceful close).
+    pub(crate) fn tls_close_notify(&mut self) {
+        let Some(mut t) = self.tls.take() else {
+            return;
+        };
+        if t.done && !t.eof {
+            t.cout.set_len(0);
+            if let Ok(n) = t.session.close(t.cout.spare()) {
+                t.cout.set_len(n.min(t.cout.capacity()));
+                if let Ok(sent) = sys::send(&self.stream, t.cout.as_slice()) {
+                    self.bytes_out += sent as u64;
+                }
+            }
+        }
+        self.tls = Some(t);
+    }
+
+    /// Sends all of `bytes` without the gate check (TLS records the engine wrote).
+    fn send_raw_all(&mut self, mut bytes: &[u8]) -> Result<(), NetError> {
+        while !bytes.is_empty() {
+            let n = self.send_raw(bytes)?;
+            bytes = &bytes[n..];
+        }
+        Ok(())
+    }
+
+    fn tls_error(&mut self, e: TlsError) -> NetError {
+        let reason = if e.kind == TlsFailure::HelloRefused {
+            CloseReason::HelloRefused
+        } else {
+            CloseReason::TlsFailed
+        };
+        self.fail(reason, NetError::Tls(e))
     }
 
     /// Starts a handshake: reads time out at `deadline` with `HandshakeTimeout`.
@@ -313,6 +654,18 @@ impl Link {
         if buf.is_empty() {
             return Ok(Got::Data(0));
         }
+        if let Some(mut t) = self.tls.take() {
+            self.settle_phase(true);
+            let r = self.read_tls(&mut t, buf);
+            self.tls = Some(t);
+            return r;
+        }
+        self.read_raw(buf)
+    }
+
+    /// One read from the socket (or from the bytes left after a handshake),
+    /// under the phase's or the handshake's deadline.
+    fn read_raw(&mut self, buf: &mut [u8]) -> Result<Got, NetError> {
         self.settle_phase(true);
         let n = self.read_pending(buf);
         if n > 0 {
@@ -542,10 +895,23 @@ impl Link {
         if self.phase == Phase::Idle {
             self.progress_at = now;
         }
-        // One gate check per write: a retry after `WouldBlock` sends the same bytes,
-        // which the gate already approved (a byte-counting gate counts them once).
+        // One gate check per write, for the bytes the gate has not approved yet:
+        // a retry after `WouldBlock`, or the tail of a partial send offered again,
+        // is not counted twice by a byte-counting gate.
         self.check_terminal()?;
-        self.gate_check(buf.len())?;
+        if self.tls.is_some() {
+            let chunk = buf.len().min(TLS_RECORD);
+            self.gate_check(chunk)?;
+            return self.write_tls(&buf[..chunk]);
+        }
+        self.gate_check(buf.len().saturating_sub(self.approved))?;
+        let n = self.send_raw(buf)?;
+        self.approved = buf.len() - n;
+        Ok(n)
+    }
+
+    /// One send without the gate check (waits while the socket is full).
+    fn send_raw(&mut self, buf: &[u8]) -> Result<usize, NetError> {
         let mut zero_writes = 0u8;
         loop {
             self.check_terminal()?;
@@ -589,13 +955,19 @@ impl Link {
         let now = self.now();
         self.rate_out.activate(now);
         self.check_terminal()?;
-        self.gate_check(total)?;
+        if self.tls.is_some() {
+            let take = total.min(self.tls_budget());
+            self.gate_check(take)?;
+            return self.write_vectored_tls(bufs, take);
+        }
+        self.gate_check(total.saturating_sub(self.approved))?;
         let mut zero_writes = 0u8;
         loop {
             self.check_terminal()?;
             match sys::send_vectored(&self.stream, bufs) {
                 Ok(n) if n > 0 => {
                     self.sent(n);
+                    self.approved = total - n;
                     return Ok(n);
                 }
                 Ok(_) => {
@@ -654,6 +1026,9 @@ impl Link {
     /// that reads and discards) or abortively (RST), and gives the gate its ticket back.
     pub(crate) fn finish(mut self, reason: CloseReason) -> CloseReason {
         let mut reason = reason;
+        if !reason.is_abortive() {
+            self.tls_close_notify();
+        }
         if !reason.is_abortive() && self.linger_gracefully() {
             // A kill arrived during the linger: close abortively at once.
             if let Some(k) = self.killed() {

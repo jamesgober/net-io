@@ -3,6 +3,7 @@
 mod engine;
 mod source;
 
+use std::any::TypeId;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use crate::proxy::ProxyMode;
 use crate::session::SessionFactory;
 use crate::tcp::{ListenerInfo, TcpConnection};
 use crate::time::Clock;
+use crate::tls::ErasedAcceptor;
 use crate::tls::{NoTls, TlsAcceptor};
 use crate::trusted::TrustedProxies;
 
@@ -156,6 +158,7 @@ pub struct ListenerSpec {
     pub(crate) limits: Limits,
     pub(crate) proxy: ProxyMode,
     pub(crate) trusted: Option<Arc<TrustedProxies>>,
+    pub(crate) tls: bool,
 }
 
 impl ListenerSpec {
@@ -171,6 +174,7 @@ impl ListenerSpec {
             limits: Limits::default(),
             proxy: ProxyMode::Off,
             trusted: None,
+            tls: false,
         }
     }
 
@@ -204,6 +208,13 @@ impl ListenerSpec {
     /// ```
     pub fn proxy(mut self, mode: ProxyMode) -> ListenerSpec {
         self.proxy = mode;
+        self
+    }
+
+    /// Serves TLS on this listener through the builder's acceptor
+    /// ([`ServerBuilder::tls`], feature `tls`).
+    pub fn tls(mut self, on: bool) -> ListenerSpec {
+        self.tls = on;
         self
     }
 
@@ -404,6 +415,11 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
         self.map(|_, g, s, t| (BlockingHandler { handler }, g, s, t))
     }
 
+    /// The TLS engine for listeners with `ListenerSpec::tls(true)` (feature `tls`).
+    pub fn tls<T2: TlsAcceptor>(self, acceptor: T2) -> ServerBuilder<W, G, S, T2> {
+        self.map(|w, g, s, _| (w, g, s, acceptor))
+    }
+
     /// The connection gate (required; `AllowAll` for none).
     pub fn gate<G2: Gate>(self, gate: G2) -> ServerBuilder<W, G2, S, T> {
         self.map(|w, _, s, t| (w, gate, s, t))
@@ -474,7 +490,19 @@ where
             return Err(invalid("workers", ConfigReason::TooLarge { max: 4096 }));
         }
         let mut listeners = self.listeners;
+        let has_tls = TypeId::of::<T>() != TypeId::of::<NoTls>();
         for spec in &mut listeners {
+            if spec.tls {
+                if !cfg!(feature = "tls") {
+                    return Err(NetError::Unsupported {
+                        feature: "TLS (the `tls` feature)",
+                        platform: std::env::consts::OS,
+                    });
+                }
+                if !has_tls {
+                    return Err(invalid("tls", ConfigReason::Missing));
+                }
+            }
             if spec.proxy != ProxyMode::Off {
                 if !cfg!(feature = "proxy") {
                     return Err(NetError::Unsupported {
@@ -515,8 +543,13 @@ where
         for spec in &listeners {
             limits.overlay(&spec.limits).validate(workers, None)?;
         }
-        let _ = &self.tls;
+        let tls: Option<Arc<dyn ErasedAcceptor>> = if has_tls {
+            Some(Arc::new(self.tls))
+        } else {
+            None
+        };
         engine::start(engine::Config {
+            tls,
             listeners,
             driver,
             workers,

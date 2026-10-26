@@ -269,6 +269,11 @@ impl TcpListener {
         &self.inner
     }
 
+    /// Records whether the listener serves TLS in its facts.
+    pub(crate) fn set_tls(&mut self, on: bool) {
+        self.info.tls = on;
+    }
+
     /// Records the listener's PROXY requirement in its facts.
     pub(crate) fn set_proxy_mode(&mut self, mode: crate::proxy::ProxyMode) {
         self.info.proxy = mode;
@@ -661,11 +666,18 @@ impl TcpConnection {
     ///
     /// # Errors
     ///
-    /// As [`TcpConnection::recv`].
+    /// As [`TcpConnection::recv`]; `Unsupported` on a TLS connection.
     pub fn peek(&self, buf: &mut [u8]) -> Result<usize, NetError> {
         let link = self.link_ref();
         if buf.is_empty() {
             return Ok(0);
+        }
+        if link.has_tls() {
+            // The socket holds ciphertext; peeking at it would mean nothing here.
+            return Err(NetError::Unsupported {
+                feature: "peek on a TLS connection",
+                platform: std::env::consts::OS,
+            });
         }
         let timeout = link.limits.read_timeout;
         match sys::wait(link.stream.sock(), Interest::Read, None, Some(timeout)) {

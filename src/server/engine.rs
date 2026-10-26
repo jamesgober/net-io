@@ -31,7 +31,7 @@ use crate::events::{CoalescedKind, Coalescer, Event, EventSink, NoopSink};
 use crate::gate::{AdmitStage, AllowAll, ErasedGate, Gate, GateCell, Refusal, guarded};
 use crate::id::{ConnectionId, IdBlock, ListenerId, WorkerId};
 use crate::info::{ConnectionInfo, Lane, Origin};
-#[cfg(feature = "proxy")]
+#[cfg(any(feature = "proxy", feature = "tls"))]
 use crate::limits::SizeClass;
 use crate::limits::{Effective, Limits};
 use crate::link::{ClockRef, Got, Link, WakeSource};
@@ -41,6 +41,7 @@ use crate::session::{Input, Output, Phase, Session, SessionContext, SessionFacto
 use crate::sys::{self, AsSock, Interest, KillSlot, Wake};
 use crate::tcp::{TcpConnection, TcpListener};
 use crate::time::Clock;
+use crate::tls::ErasedAcceptor;
 use crate::trusted::TrustedProxies;
 
 const WORKER_STACK: usize = 256 * 1024;
@@ -72,6 +73,7 @@ fn take_slot(counter: &AtomicU32, cap: u32) -> bool {
 }
 
 pub(crate) struct Config<W, G, S> {
+    pub tls: Option<Arc<dyn ErasedAcceptor>>,
     pub listeners: Vec<ListenerSpec>,
     pub driver: DriverKind,
     pub workers: u16,
@@ -228,6 +230,12 @@ pub(crate) struct Shared {
     /// PROXY settings per listener: `Some` when the listener requires a header.
     #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
     listener_proxy: Vec<Option<ListenerProxy>>,
+    /// Whether each listener serves TLS.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    listener_tls: Vec<bool>,
+    /// The TLS engine, when any listener serves TLS.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    tls: Option<Arc<dyn ErasedAcceptor>>,
     /// One per listener, sized from that listener's limits (D-085).
     sources: Vec<SourceTable>,
 }
@@ -508,6 +516,7 @@ where
     let mut listener_limits = Vec::with_capacity(cfg.listeners.len());
     let mut listener_tcp = Vec::with_capacity(cfg.listeners.len());
     let mut listener_proxy = Vec::with_capacity(cfg.listeners.len());
+    let mut listener_tls = Vec::with_capacity(cfg.listeners.len());
     for (i, spec) in cfg.listeners.into_iter().enumerate() {
         let lim = cfg
             .limits
@@ -540,6 +549,8 @@ where
         }
         let mut listener = bound.ok_or(last)?;
         listener.set_proxy_mode(spec.proxy);
+        listener.set_tls(spec.tls);
+        listener_tls.push(spec.tls);
         listener_proxy.push(match (spec.proxy, spec.trusted) {
             (ProxyMode::Required { versions }, Some(trusted)) => {
                 Some(ListenerProxy { versions, trusted })
@@ -630,6 +641,8 @@ where
         listener_limits,
         listener_tcp,
         listener_proxy,
+        listener_tls,
+        tls: cfg.tls,
     });
     for (i, info) in infos.iter().enumerate() {
         shared.event(Event::ListenerOpened {
@@ -1043,6 +1056,39 @@ impl<G: Gate> Worker<G> {
         }
     }
 
+    /// Starts TLS on the connection (`ListenerSpec::tls`): the engine's session,
+    /// a read buffer of the largest read class and a write buffer, then the
+    /// handshake under the handshake deadline.
+    #[cfg(feature = "tls")]
+    fn tls_handshake(&mut self, link: &mut Link) -> Result<(), CloseReason> {
+        let Some(acceptor) = self.shared.tls.clone() else {
+            return Err(CloseReason::TlsFailed);
+        };
+        let session = match acceptor.session_boxed(&link.info) {
+            Ok(s) => s,
+            Err(e) if e.kind == crate::tls::TlsFailure::HelloRefused => {
+                return Err(CloseReason::HelloRefused);
+            }
+            Err(_) => return Err(CloseReason::TlsFailed),
+        };
+        let lim = link.limits;
+        let Some(cin) = self.pool.take(lim.read_class_max) else {
+            return Err(CloseReason::Limit(crate::error::LimitKind::BufferBudget));
+        };
+        let Some(cout) = self.pool.take(SizeClass::LARGE) else {
+            self.pool.put(cin);
+            return Err(CloseReason::Limit(crate::error::LimitKind::BufferBudget));
+        };
+        link.attach_tls(session, cin, cout);
+        link.begin_handshake(link.info.accepted_at + lim.handshake_timeout);
+        let r = link.tls_handshake();
+        link.end_handshake(None);
+        match r {
+            Ok(()) => Ok(()),
+            Err(_) => Err(link.reason_or(CloseReason::TlsFailed)),
+        }
+    }
+
     /// Reads and checks the PROXY header (`ListenerSpec::proxy`): trust before any
     /// read, the header under the handshake deadline, then the real client takes
     /// over the per-source slot and the gate readmits it. Bytes after the header
@@ -1238,6 +1284,13 @@ impl<G: Gate> Worker<G> {
                 return None;
             }
         }
+        #[cfg(feature = "tls")]
+        if shared.listener_tls[listener] {
+            if let Err(reason) = self.tls_handshake(&mut link) {
+                self.end(link, reason, listener, source);
+                return None;
+            }
+        }
         Some((link, listener, source))
     }
 
@@ -1273,6 +1326,14 @@ impl<G: Gate> Worker<G> {
         let (bytes_in, bytes_out) = (link.bytes_in, link.bytes_out);
         let erased = link.gate.take();
         let lifetime = self.clock.now().saturating_duration_since(info.accepted_at);
+        // close_notify on a graceful close, then the TLS buffers go back to the pool.
+        if !reason.is_abortive() {
+            link.tls_close_notify();
+        }
+        if let Some((cin, cout)) = link.take_tls_buffers() {
+            self.pool.put(cin);
+            self.pool.put(cout);
+        }
         let reason = link.finish(reason);
         // Give the gate its ticket back with the reason; keep the cell for the next connection.
         match erased {

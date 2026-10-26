@@ -2610,8 +2610,8 @@ How the server drives it (P0, Tier 3, `0.4.0`):
 
 1. Order: accept, `Gate::admit`, PROXY header, `Gate::readmit`, `TlsAcceptor::session` (an acceptor at capacity refuses here, before reading), then `step` under the handshake deadline until `HandshakeComplete`; `info()` is copied into `ConnectionInfo::tls`.
 2. **ClientHello inspection lives in the engine.** The engine parses the ClientHello from net-io's read buffer inside `step` and can refuse it (fingerprinting); net-io copies nothing. A refusal is `TlsError { kind: HelloRefused, .. }` and closes with `CloseReason::HelloRefused`; other errors close with `TlsFailed`. A ClientHello split into many tiny records is the engine's to bound; net-io's read buffer limit and handshake deadline bound it too.
-3. `Data` slices are plaintext inside the read buffer; net-io moves each one down to follow the previous unconsumed plaintext (one `copy_within`, no second buffer) and calls `Session::on_data` with the plaintext.
-4. Outbound: the gate check runs on the plaintext before `encrypt` and again before each ciphertext flush; a denial is encrypted like any other output and followed by `close_notify`.
+3. `Data` slices are plaintext inside net-io's ciphertext buffer; net-io copies each one once into the reader's buffer (the session's input or a handler's `recv` buffer), so blocking handlers and sessions share one TLS path (D-089).
+4. Outbound: the gate check runs once on the plaintext before `encrypt`, for exactly the bytes encrypted, and the ciphertext is sent within the same call; a denial is encrypted like any other output and followed by `close_notify`. `TcpConnection::peek` is `Unsupported` on a TLS connection.
 5. Graceful close sends `close_notify`; abortive close does not. The read buffer grows (up to the maximum read class) when `input_capacity_required` exceeds it, for example for a large client certificate chain.
 6. The engine's minimum buffer sizes are met by the default 16 KiB class with the 64 KiB growth limit (rustls needs at least 18,437 bytes for one full record; `input_capacity_required` says more when a handshake message spans several records).
 

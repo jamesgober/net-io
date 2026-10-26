@@ -270,6 +270,19 @@ impl fmt::Debug for TlsInfo {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoTls;
 
+/// An acceptor behind a pointer: sessions come back boxed.
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+pub(crate) trait ErasedAcceptor: Send + Sync {
+    fn session_boxed(&self, info: &ConnectionInfo) -> Result<Box<dyn TlsSession>, TlsError>;
+}
+
+impl<A: TlsAcceptor> ErasedAcceptor for A {
+    fn session_boxed(&self, info: &ConnectionInfo) -> Result<Box<dyn TlsSession>, TlsError> {
+        self.session(info)
+            .map(|s| Box::new(s) as Box<dyn TlsSession>)
+    }
+}
+
 /// The session type of [`NoTls`]; it has no values.
 #[derive(Debug)]
 pub enum NoTlsSession {}
