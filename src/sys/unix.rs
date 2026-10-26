@@ -120,6 +120,12 @@ mod c {
     pub const AF_UNIX: c_int = 1;
     pub const AF_INET: c_int = 2;
     pub const AF_INET6: c_int = 10;
+    pub const AF_UNIX_FAMILY: c_int = 1;
+    pub const F_GETFD: c_int = 1;
+    pub const F_SETFD: c_int = 2;
+    pub const FD_CLOEXEC: c_int = 1;
+    pub const CLOCK_MONOTONIC: c_int = 1;
+    pub const SYS_PIDFD_OPEN: std::ffi::c_long = 434;
     pub const SOCK_STREAM: c_int = 1;
     #[cfg(feature = "udp")]
     pub const SOCK_DGRAM: c_int = 2;
@@ -173,6 +179,9 @@ mod c {
     pub const AF_UNIX: c_int = 1;
     pub const AF_INET: c_int = 2;
     pub const AF_INET6: c_int = 30;
+    pub const AF_UNIX_FAMILY: c_int = 1;
+    pub const F_GETFD: c_int = 1;
+    pub const CLOCK_MONOTONIC: c_int = 6;
     pub const SOCK_STREAM: c_int = 1;
     #[cfg(feature = "udp")]
     pub const SOCK_DGRAM: c_int = 2;
@@ -306,6 +315,14 @@ struct PollFd {
     revents: c_short,
 }
 
+/// `struct timespec` (64-bit targets: both fields 64 bits).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Rlimit {
@@ -348,8 +365,14 @@ unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: Nfds, timeout: c_int) -> c_int;
     fn shutdown(fd: c_int, how: c_int) -> c_int;
     fn getrlimit(resource: c_int, rlim: *mut Rlimit) -> c_int;
-    #[cfg(target_os = "macos")]
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    fn getsockname(fd: c_int, addr: *mut c_void, len: *mut SockLen) -> c_int;
+    fn getpeername(fd: c_int, addr: *mut c_void, len: *mut SockLen) -> c_int;
+    #[cfg(feature = "local")]
+    fn geteuid() -> u32;
+    fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn syscall(num: std::ffi::c_long, ...) -> std::ffi::c_long;
     #[cfg(any(feature = "local", all(feature = "udp", target_os = "macos")))]
     fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
     #[cfg(all(feature = "udp", target_os = "linux"))]
@@ -369,6 +392,8 @@ unsafe extern "C" {
 pub(crate) type Sock<'a> = BorrowedFd<'a>;
 /// A raw socket handle (used only inside the kill guard).
 pub(crate) type RawSock = RawFd;
+/// An owned socket handle.
+pub(crate) type OwnedSock = OwnedFd;
 
 /// Types whose socket handle this layer can borrow.
 pub(crate) trait AsSock {
@@ -469,12 +494,10 @@ fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> SockLen {
 }
 
 /// Room for any socket address the kernel returns (`sockaddr_storage`).
-#[cfg(feature = "udp")]
 #[repr(C, align(8))]
 struct AddrBuf([u8; 128]);
 
 /// Decodes an IPv4 or IPv6 socket address written by the kernel.
-#[cfg(feature = "udp")]
 fn decode_addr(b: &[u8; 128], len: SockLen) -> Option<SocketAddr> {
     #[cfg(target_os = "linux")]
     let family = c_int::from(u16::from_ne_bytes([b[0], b[1]]));
@@ -732,6 +755,165 @@ fn bound_without_peer(sock: Sock<'_>) -> io::Result<bool> {
         Err(e) => return Err(e),
     }
     Ok(s.local_addr()?.port() != 0)
+}
+
+/// Identifies a socket handed to this process: a listening stream socket, TCP
+/// (IPv4 or IPv6) or Unix, and the address it is bound to.
+pub(crate) fn listener_kind(sock: Sock<'_>) -> Result<super::SockKind, super::KindError> {
+    use super::{KindError, SockKind};
+    let ty = match get_int(sock, c::SOL_SOCKET, c::SO_TYPE) {
+        Ok(t) => t,
+        Err(e) if matches!(e.raw_os_error(), Some(errno::ENOTSOCK | errno::EBADF)) => {
+            return Err(KindError::NotASocket);
+        }
+        Err(e) => return Err(KindError::Os(e)),
+    };
+    if ty != c::SOCK_STREAM {
+        return Err(KindError::WrongKind);
+    }
+    let mut addr = AddrBuf([0; 128]);
+    let mut len = 128 as SockLen;
+    // SAFETY: `addr` is writable for `len` bytes and lives for the call; `sock` is open.
+    cvt(unsafe {
+        getsockname(
+            sock.as_raw_fd(),
+            addr.0.as_mut_ptr().cast::<c_void>(),
+            &raw mut len,
+        )
+    })
+    .map_err(KindError::Os)?;
+    #[cfg(target_os = "linux")]
+    let family = c_int::from(u16::from_ne_bytes([addr.0[0], addr.0[1]]));
+    #[cfg(target_os = "macos")]
+    let family = c_int::from(addr.0[1]);
+    let kind = if family == c::AF_UNIX_FAMILY {
+        let end = (len as usize).min(addr.0.len());
+        let path = addr.0.get(2..end).unwrap_or(&[]);
+        // Up to the terminator; an abstract name (leading NUL) counts as unnamed.
+        let path = path.split(|&b| b == 0).next().unwrap_or(&[]);
+        SockKind::Unix(path.to_vec())
+    } else {
+        match decode_addr(&addr.0, len) {
+            Some(a) => SockKind::Tcp(a),
+            None => return Err(KindError::WrongKind),
+        }
+    };
+    let listening = match get_int(sock, c::SOL_SOCKET, c::SO_ACCEPTCONN) {
+        Ok(v) => v != 0,
+        // macOS: no SO_ACCEPTCONN; a bound socket without a peer counts (as in
+        // `is_listening_stream`).
+        Err(e) if e.raw_os_error() == Some(errno::ENOPROTOOPT) => {
+            let bound = match &kind {
+                SockKind::Tcp(a) => a.port() != 0,
+                SockKind::Unix(p) => !p.is_empty(),
+            };
+            bound && !has_peer(sock).map_err(KindError::Os)?
+        }
+        Err(e) => return Err(KindError::Os(e)),
+    };
+    if !listening {
+        return Err(KindError::NotListening);
+    }
+    Ok(kind)
+}
+
+/// Whether `sock` is connected (`getpeername` succeeds; `ENOTCONN` means no peer).
+pub(crate) fn has_peer(sock: Sock<'_>) -> io::Result<bool> {
+    let mut addr = AddrBuf([0; 128]);
+    let mut len = 128 as SockLen;
+    // SAFETY: as in `listener_kind`.
+    let ret = unsafe {
+        getpeername(
+            sock.as_raw_fd(),
+            addr.0.as_mut_ptr().cast::<c_void>(),
+            &raw mut len,
+        )
+    };
+    if ret == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    if e.kind() == io::ErrorKind::NotConnected {
+        Ok(false)
+    } else {
+        Err(e)
+    }
+}
+
+/// Identifies a descriptor this process was given by number (systemd, FastCGI):
+/// checks it is open first, then as [`listener_kind`].
+pub(crate) fn inherited_kind(fd: RawFd) -> Result<super::SockKind, super::KindError> {
+    // SAFETY: F_GETFD only reads the descriptor's flags; on a closed number it
+    // fails with EBADF and touches nothing.
+    if unsafe { fcntl(fd, c::F_GETFD) } == -1 {
+        return Err(super::KindError::NotASocket);
+    }
+    // SAFETY: the descriptor is open (checked above) and stays open for this
+    // call: only `claim_inherited` takes ownership of inherited descriptors.
+    listener_kind(unsafe { BorrowedFd::borrow_raw(fd) })
+}
+
+/// Takes ownership of an inherited descriptor and sets close-on-exec. The caller
+/// (`inherit`) does this once per descriptor per process, under its lock, after
+/// `inherited_kind` verified it; nothing else in net-io owns these numbers.
+pub(crate) fn claim_inherited(fd: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: see above: the descriptor is open and has no other owner in net-io.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `owned` is open; F_SETFD with FD_CLOEXEC is fcntl(2)'s documented use.
+    cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
+    Ok(owned)
+}
+
+/// `CLOCK_MONOTONIC` in microseconds.
+pub(crate) fn monotonic_micros() -> u64 {
+    let mut ts = Timespec::default();
+    // SAFETY: `ts` is a live, correctly sized timespec; CLOCK_MONOTONIC always exists.
+    let _ = unsafe { clock_gettime(c::CLOCK_MONOTONIC, &raw mut ts) };
+    (ts.tv_sec.max(0) as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add((ts.tv_nsec.max(0) as u64) / 1_000)
+}
+
+/// This process's effective user id.
+#[cfg(feature = "local")]
+pub(crate) fn effective_uid() -> u32 {
+    // SAFETY: geteuid(2) takes no arguments and cannot fail.
+    unsafe { geteuid() }
+}
+
+/// The inode of this process's pidfd, which systemd passes as `LISTEN_PIDFDID`
+/// (Linux 6.9 and later).
+#[cfg(target_os = "linux")]
+pub(crate) fn pidfd_inode() -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let pid = std::ffi::c_long::from(std::process::id() as i32);
+    // SAFETY: pidfd_open(2) takes a pid and flags (0) and returns a new descriptor or -1.
+    let fd = unsafe { syscall(c::SYS_PIDFD_OPEN, pid, 0 as std::ffi::c_long) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = RawFd::try_from(fd).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    // SAFETY: `fd` was just returned by pidfd_open, is open, and is owned by no one else.
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    Ok(file.metadata()?.ino())
+}
+
+/// Places a duplicate of `sock` at descriptor number `target` (tests only).
+#[cfg(test)]
+pub(crate) fn dup_to(sock: Sock<'_>, target: RawFd) -> io::Result<()> {
+    unsafe extern "C" {
+        fn dup2(old: c_int, new: c_int) -> c_int;
+    }
+    // SAFETY: dup2 takes two descriptor numbers; `sock` is open, `target` is a
+    // number the test reserved.
+    cvt(unsafe { dup2(sock.as_raw_fd(), target) }).map(drop)
+}
+
+/// Closes descriptor number `fd` (tests only).
+#[cfg(test)]
+pub(crate) fn close_number(fd: RawFd) {
+    // SAFETY: `fd` was placed by `dup_to` and has no owner.
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
 }
 
 /// Accepts one connection. On Linux `std` uses `accept4(SOCK_CLOEXEC)` and the
@@ -1902,6 +2084,88 @@ mod layout {
         let (n, from, truncated) = udp_recv_from(b.as_fd(), &mut small).unwrap();
         assert_eq!((n, truncated), (0, false));
         assert_eq!(from, src6.local_addr().unwrap());
+    }
+
+    #[test]
+    fn test_monotonic_micros_matches_libc() {
+        assert_eq!(i64::from(c::CLOCK_MONOTONIC), libc::CLOCK_MONOTONIC as i64);
+        assert_eq!(size_of::<Timespec>(), size_of::<libc::timespec>());
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let ours = monotonic_micros();
+        // SAFETY: a live timespec.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+        let theirs = ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000;
+        assert!(theirs >= ours && theirs - ours < 1_000_000);
+    }
+
+    #[test]
+    fn test_layout_inherit_matches_libc() {
+        assert_eq!(c::AF_UNIX_FAMILY, libc::AF_UNIX);
+        assert_eq!(c::F_GETFD, libc::F_GETFD);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(c::F_SETFD, libc::F_SETFD);
+            assert_eq!(c::FD_CLOEXEC, libc::FD_CLOEXEC);
+            assert_eq!(c::SYS_PIDFD_OPEN, libc::SYS_pidfd_open);
+        }
+        let _: unsafe extern "C" fn(c_int, *mut c_void, *mut SockLen) -> c_int = getsockname;
+        #[cfg(feature = "local")]
+        {
+            let _: unsafe extern "C" fn() -> u32 = geteuid;
+            // SAFETY: geteuid cannot fail.
+            assert_eq!(effective_uid(), unsafe { libc::geteuid() });
+        }
+    }
+
+    #[test]
+    fn test_listener_kind_tells_listeners_apart() {
+        use super::super::{KindError, SockKind};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert_eq!(
+            listener_kind(l.as_fd()).unwrap(),
+            SockKind::Tcp(l.local_addr().unwrap())
+        );
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        assert!(matches!(
+            listener_kind(c.as_fd()),
+            Err(KindError::NotListening)
+        ));
+        let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(matches!(
+            listener_kind(u.as_fd()),
+            Err(KindError::WrongKind)
+        ));
+        let f = std::fs::File::open("/dev/null").unwrap();
+        assert!(matches!(
+            listener_kind(f.as_fd()),
+            Err(KindError::NotASocket)
+        ));
+        let dir = std::env::temp_dir().join(format!("nio-kind-{}", std::process::id()));
+        let _ = std::fs::create_dir(&dir);
+        let path = dir.join("k.sock");
+        let _ = std::fs::remove_file(&path);
+        let ul = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(
+            listener_kind(ul.as_fd()).unwrap(),
+            SockKind::Unix(path.as_os_str().as_encoded_bytes().to_vec())
+        );
+        drop(ul);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+        assert!(matches!(inherited_kind(-1), Err(KindError::NotASocket)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pidfd_inode_is_stable() {
+        match pidfd_inode() {
+            Ok(a) => assert_eq!(a, pidfd_inode().unwrap()),
+            // Kernels before 5.3 have no pidfd_open.
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOSYS)),
+        }
     }
 
     #[test]

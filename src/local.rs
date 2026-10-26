@@ -196,6 +196,8 @@ pub struct UnixListener {
     inner: std::os::unix::net::UnixListener,
     path: PathBuf,
     created: Option<FileId>,
+    /// Set when the socket was released for a hand-off: the file stays.
+    keep: std::sync::atomic::AtomicBool,
     shared_path: Arc<UnixPath>,
     info: ListenerInfo,
     require_uid: Option<u32>,
@@ -315,6 +317,7 @@ impl UnixListener {
             inner,
             path: path.to_path_buf(),
             created: Some(created),
+            keep: std::sync::atomic::AtomicBool::new(false),
             info: ListenerInfo {
                 id: ListenerId(0),
                 name: None,
@@ -423,6 +426,53 @@ impl UnixListener {
         }
     }
 
+    /// A listening Unix socket this process was given (inherited, received in a
+    /// hand-off). Its file is never removed by this listener.
+    pub(crate) fn adopt(sock: OwnedFd) -> Result<UnixListener, NetError> {
+        let inner = std::os::unix::net::UnixListener::from(sock);
+        inner
+            .set_nonblocking(true)
+            .map_err(|e| NetError::from_os("ioctl", e))?;
+        let path = inner
+            .local_addr()
+            .ok()
+            .and_then(|a| a.as_pathname().map(Path::to_path_buf))
+            .unwrap_or_default();
+        let shared_path = Arc::new(UnixPath::new(path.as_os_str().as_encoded_bytes()).ok_or(
+            NetError::PathTooLong {
+                max: sys::UNIX_PATH_MAX,
+            },
+        )?);
+        let local = if path.as_os_str().is_empty() {
+            Endpoint::Unnamed
+        } else {
+            Endpoint::Unix(shared_path.clone())
+        };
+        Ok(UnixListener {
+            inner,
+            path,
+            created: None,
+            keep: std::sync::atomic::AtomicBool::new(true),
+            info: ListenerInfo {
+                id: ListenerId(0),
+                name: None,
+                local,
+                backlog: None,
+                transport: Transport::Unix,
+                proxy: ProxyMode::Off,
+                tls: false,
+            },
+            shared_path,
+            require_uid: None,
+            acceptor: Mutex::new(Acceptor::new()),
+        })
+    }
+
+    /// Leaves the socket file in place when this listener is dropped.
+    pub(crate) fn keep_file(&self) {
+        self.keep.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Whether a peer with these credentials may stay (`require_uid`).
     pub(crate) fn permits(&self, credentials: Option<PeerCredentials>) -> bool {
         match self.require_uid {
@@ -458,10 +508,11 @@ impl UnixListener {
         &self.info
     }
 
-    /// The path this listener was bound to (recorded at bind, not read back: decision D-058).
+    /// The path this listener was bound to (recorded at bind, not read back:
+    /// decision D-058); for an adopted socket, the path the OS reports.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
-        Some(&self.path)
+        (!self.path.as_os_str().is_empty()).then_some(self.path.as_path())
     }
 }
 
@@ -470,6 +521,9 @@ impl Drop for UnixListener {
     /// Removes the socket file only if the path still names the file this
     /// listener created, never a replacement someone else bound.
     fn drop(&mut self) {
+        if self.keep.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         if let Some(created) = self.created {
             if file_id(&self.path) == Some((created, true)) {
                 let _ = std::fs::remove_file(&self.path);

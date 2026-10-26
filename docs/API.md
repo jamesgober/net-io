@@ -2113,7 +2113,11 @@ impl ManualClock {
     pub fn set(&self, at: Instant);         // never earlier than the current value
 }
 impl Clock for ManualClock;
+
+pub fn monotonic_micros() -> u64;           // CLOCK_MONOTONIC (Linux, macOS), the performance counter (Windows)
 ```
+
+`monotonic_micros` is the raw monotonic clock in microseconds, the value systemd's `MONOTONIC_USEC` expects in `sd_notify` reload and watchdog messages (decision D-101). It is not related to `Instant` or to an injected `Clock`. P1, Tier 2, `0.4.0`; one system call (vDSO on Linux) [est. under 50 ns].
 
 All deadlines run on one hierarchical timing wheel per worker: 6 levels of 64 slots, tick `Limits::tick` (1 ms by default), covering about 2.2 years at 1 ms; later deadlines go to an overflow list re-examined when the top level wraps. Timer slots are part of each connection's record, so inserting and cancelling allocate nothing. Extending a deadline (every read resets the idle timer) only stores the new time; the wheel entry is moved only when it fires early. A timer never fires before its deadline; a clock that jumps forward (a resumed VM) fires every expired timer once, in order, at most 1,024 per loop iteration so IO is not starved. With no IO and no timer due, every net-io thread sleeps in the kernel: no periodic tick. P1 (`Clock`, `ManualClock`), Tier 3, `0.3.0`; insert and cancel under 20 ns, extend under 2 ns [est.].
 
@@ -2691,9 +2695,10 @@ pub enum InheritError {
 
 | Item | Behaviour | Grade | Tier | Version |
 |---|---|---|---|---|
-| `systemd` | socket activation: reads `LISTEN_PID` (must equal this process id, otherwise the variables were meant for another process and the result is an empty list), `LISTEN_FDS` (at most 64), `LISTEN_FDNAMES` (optional), and `LISTEN_PIDFDID` where present; descriptors start at 3; each is verified (a socket, listening, a known family and type) and set close-on-exec. The variables are left in the environment (decision D-036). Not systemd (no `LISTEN_PID`): `Ok(vec![])` | P1 | 1 | `0.4.0` |
+| `InheritedListener` | a verified listener with its `LISTEN_FDNAMES` name (an empty name is `None`) | P1 | 1 | `0.4.0` |
+| `systemd` | socket activation: reads `LISTEN_PID` (must equal this process id, otherwise the variables were meant for another process and the result is an empty list), `LISTEN_FDS` (at most 64), `LISTEN_FDNAMES` (optional), and `LISTEN_PIDFDID` where present; descriptors start at 3; each is verified (a socket, listening, a known family and type) and set close-on-exec. The variables are left in the environment (decision D-036). Not systemd (no `LISTEN_PID`, or one that is not a number): `Ok(vec![])`. Every descriptor is verified before any is taken, so an error takes nothing. Taken once per process: a second call (or `systemd_named`) gets what is left, never a second owner of the same number. A Unix socket needs the `local` feature (otherwise `WrongKind`); a UDP socket is `WrongKind` until datagram sessions (`0.6.0`) (decision D-098) | P1 | 1 | `0.4.0` |
 | `systemd_named` | the one listener with that `LISTEN_FDNAMES` entry, or `None` | P1 | 1 | `0.4.0` |
-| `fastcgi_listener` | FastCGI's convention (`FCGI_LISTENSOCK_FILENO`, as `mod_fcgid` starts a FastCGI server): descriptor 0 is adopted only if it is a socket, listening, and has no peer (`getpeername` fails with `ENOTCONN`); otherwise `None` (a terminal, a file, a pipe, a connected socket) | P1 | 1 | `0.4.0` |
+| `fastcgi_listener` | FastCGI's convention (`FCGI_LISTENSOCK_FILENO`, as `mod_fcgid` starts a FastCGI server): descriptor 0 is adopted only if it is a socket, listening, and has no peer (`getpeername` fails with `ENOTCONN`); otherwise `None` (a terminal, a file, a pipe, a connected socket) and descriptor 0 is left untouched; taken once per process | P1 | 1 | `0.4.0` |
 | FastCGI on Windows | open decision OD-26: `0.6.0` if a Windows FastCGI deployment is planned; otherwise it is regraded P3 and moves after `1.0.0` | P2 | 2 | per OD-26 |
 
 ```rust,no_run
@@ -2745,7 +2750,7 @@ pub enum HandoffError {
 | Item | Behaviour | Grade | Tier | Version |
 |---|---|---|---|---|
 | `ListenerHandle` | owned, move-only; dropping it closes the socket | P0 | 3 | `0.4.0` |
-| `send_listeners`, `recv_listeners` | one `sendmsg` carrying up to 64 descriptors (`SCM_RIGHTS`) and a manifest: magic `NIOH`, version 1, count, per listener kind, name, local address, and an options digest, then a CRC32C. The receiver checks the sender's credentials against `expect` (default: same uid), receives close-on-exec, fails on a truncated control message, checks magic, version, checksum, and count, and verifies every descriptor (`SO_TYPE`, `SO_ACCEPTCONN`, `getsockname` equals the manifest address). Any failure closes every received descriptor and returns the error: all or nothing | P0 | 3 | `0.4.0` |
+| `send_listeners`, `recv_listeners` | one message carrying up to 64 descriptors (`SCM_RIGHTS`, attached to its first byte) and a manifest: magic `NIOH`, version 1, count, total length, per listener its kind, name (at most 64 bytes, cut at a character boundary), and local address, then a CRC32C of everything before it. The receiver checks the sender's credentials against `expect` (default: same uid) before reading, reads under `deadline`, receives close-on-exec, fails on a truncated control message or a sender that closes mid-message, refuses descriptors on any later read, checks magic, version, checksum, and count, and verifies every descriptor (`SO_TYPE`, `SO_ACCEPTCONN`, `getsockname` equals the manifest address). Any failure closes every received descriptor and returns the error: all or nothing (decision D-099) | P0 | 3 | `0.4.0` |
 | `share_listeners`, `receive_shared` | Windows: `WSADuplicateSocketW` per socket for one target pid (each blob works once, in that process only), sent with a random nonce over a named pipe with an owner-only security descriptor; the receiver checks `GetNamedPipeClientProcessId`, refuses a nonce it already accepted, creates each socket with `WSASocketW(FROM_PROTOCOL_INFO, WSA_FLAG_OVERLAPPED)`, and verifies it | P0 | 3 | `0.5.0` |
 | `HandoffPeer`, `HandoffError` | | P0 | 3 | `0.4.0` |
 

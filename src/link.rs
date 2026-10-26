@@ -1136,6 +1136,22 @@ impl Link {
 
     /// Closes the connection with `reason`, gracefully (FIN, then a bounded linger
     /// that reads and discards) or abortively (RST), and gives the gate its ticket back.
+    /// Gives the socket up for `Server::adopt`: nothing is written, and a gate
+    /// registered with `set_gate` gets its close with `reason`. `None` (and the
+    /// connection closes) when TLS runs on it or bytes were read ahead.
+    pub(crate) fn into_stream(mut self, reason: CloseReason) -> Option<sys::Stream> {
+        if self.tls.is_some() || self.pending.is_some() {
+            self.finish(CloseReason::SessionError);
+            return None;
+        }
+        self.slot.begin_close();
+        if let Some(mut gate) = self.gate.take() {
+            gate.close(&self.info, reason);
+        }
+        let Link { stream, .. } = self;
+        Some(stream)
+    }
+
     pub(crate) fn finish(mut self, reason: CloseReason) -> CloseReason {
         let mut reason = reason;
         if !reason.is_abortive() {

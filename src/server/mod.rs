@@ -16,6 +16,7 @@ use crate::driver::DriverKind;
 use crate::error::{CloseReason, ConfigReason, KillReason, NetError, RefusalCause};
 use crate::events::{EventSink, NoopSink};
 use crate::gate::Gate;
+use crate::handoff::ListenerHandle;
 use crate::id::{ConnectionId, ListenerId, WorkerId};
 use crate::limits::Limits;
 use crate::opts::{ListenOptions, LocalOptions};
@@ -161,6 +162,7 @@ pub struct ListenerSpec {
     pub(crate) trusted: Option<Arc<TrustedProxies>>,
     pub(crate) tls: bool,
     pub(crate) unix: Option<(PathBuf, LocalOptions)>,
+    pub(crate) adopt: Option<ListenerHandle>,
 }
 
 impl ListenerSpec {
@@ -178,6 +180,7 @@ impl ListenerSpec {
             trusted: None,
             tls: false,
             unix: None,
+            adopt: None,
         }
     }
 
@@ -213,6 +216,36 @@ impl ListenerSpec {
             trusted: None,
             tls: false,
             unix: Some((path.into(), options)),
+            adopt: None,
+        }
+    }
+
+    /// A listener this process was given: inherited from systemd or a FastCGI
+    /// manager, received in a hand-off, or released by another server. Its name
+    /// is the handle's unless [`ListenerSpec::name`] sets one. The socket is not
+    /// bound again; options set at bind time stay as they are, and the backlog is
+    /// reported as unknown. An adopted Unix socket's file is left in place at
+    /// shutdown (the next bind removes it as stale).
+    ///
+    /// ```no_run
+    /// use net_io::ListenerSpec;
+    /// for inherited in net_io::systemd()? {
+    ///     let spec = ListenerSpec::adopt(inherited.handle);
+    ///     # let _ = spec;
+    /// }
+    /// # Ok::<(), net_io::InheritError>(())
+    /// ```
+    pub fn adopt(handle: ListenerHandle) -> ListenerSpec {
+        ListenerSpec {
+            addrs: Ok(Vec::new()),
+            options: None,
+            name: None,
+            limits: Limits::default(),
+            proxy: ProxyMode::Off,
+            trusted: None,
+            tls: false,
+            unix: None,
+            adopt: Some(handle),
         }
     }
 
@@ -567,6 +600,36 @@ fn invalid(field: &'static str, reason: ConfigReason) -> NetError {
     NetError::InvalidConfig { field, reason }
 }
 
+/// Where `Server::adopt` registers a connection: the listener (by name) whose
+/// limits and caps apply, and an optional starting lane (the gate may change it).
+///
+/// ```
+/// let spec = net_io::AdoptSpec::new("main").lane(net_io::Lane(1));
+/// # let _ = spec;
+/// ```
+#[must_use]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptSpec {
+    listener: String,
+    lane: Option<crate::info::Lane>,
+}
+
+impl AdoptSpec {
+    /// Registers on the listener named `listener`.
+    pub fn new(listener: &str) -> AdoptSpec {
+        AdoptSpec {
+            listener: listener.to_owned(),
+            lane: None,
+        }
+    }
+
+    /// The lane the connection starts in, before the gate's admission.
+    pub fn lane(mut self, lane: crate::info::Lane) -> AdoptSpec {
+        self.lane = Some(lane);
+        self
+    }
+}
+
 /// The checks `build` and `add_listener` run on one listener: the features it
 /// needs, a TLS engine, trusted proxies (resolved into the spec), and its name.
 fn check_spec(
@@ -575,7 +638,19 @@ fn check_spec(
     has_tls: bool,
     taken: &[String],
 ) -> Result<(), NetError> {
-    if spec.unix.is_some() && !cfg!(all(unix, feature = "local")) {
+    if spec.name.is_none() {
+        spec.name = spec
+            .adopt
+            .as_ref()
+            .and_then(|h| h.name())
+            .map(str::to_owned);
+    }
+    let unix = spec.unix.is_some()
+        || spec
+            .adopt
+            .as_ref()
+            .is_some_and(|h| h.kind() == crate::info::Transport::Unix);
+    if unix && !cfg!(all(unix, feature = "local")) {
         return Err(NetError::Unsupported {
             feature: if cfg!(unix) {
                 "Unix domain sockets (the `local` feature)"
@@ -604,7 +679,7 @@ fn check_spec(
             });
         }
         // On a Unix socket the file's permissions decide who may connect.
-        if spec.unix.is_none() {
+        if !unix {
             let trusted = spec.trusted.clone().or_else(|| server_trusted.cloned());
             match trusted {
                 Some(t) if !t.is_empty() => spec.trusted = Some(t),
@@ -689,6 +764,61 @@ impl Server {
         }
         self.shared.join_listeners();
         report
+    }
+
+    /// Registers a dialed connection exactly like an accepted one on the
+    /// listener named in `spec`: a new id, the caps, `Gate::admit` with
+    /// `AdmitStage::Adopt`, that listener's limits, the server's handler or
+    /// sessions, its kill handle, and its events. For back-channels and outbound
+    /// connections a server should run and revoke like its own. A gate the
+    /// connection had from `set_gate` is closed (`SessionClosed`) first.
+    ///
+    /// # Errors
+    ///
+    /// `Refused { cause }` (caps, the gate, `Busy`; the connection was reset),
+    /// `InvalidConfig { field: "listener" }` (no listener with that name),
+    /// `InvalidConfig { field: "connection" }` (a TLS connection, or bytes read
+    /// ahead), `ShuttingDown`, `ForkedChild`, `Closed`.
+    ///
+    /// ```no_run
+    /// use net_io::{AdoptSpec, AllowAll, ListenerSpec, ServerBuilder};
+    /// let server = ServerBuilder::new()
+    ///     .listener(ListenerSpec::tcp("127.0.0.1:7000").name("main"))
+    ///     .handler(|conn| { conn.send_all(b"hello, upstream\n")?; Ok(()) })
+    ///     .gate(AllowAll)
+    ///     .build()?;
+    /// let upstream = net_io::connect("10.0.0.9:9000")?;
+    /// let id = server.adopt(upstream, AdoptSpec::new("main"))?;
+    /// # let _ = id;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn adopt(&self, conn: TcpConnection, spec: AdoptSpec) -> Result<ConnectionId, NetError> {
+        let mut conn = conn;
+        let link = conn.take_link().ok_or(NetError::Closed)?;
+        let (Some(peer), Some(local)) =
+            (link.info.peer.socket_addr(), link.info.local.socket_addr())
+        else {
+            return Err(invalid("connection", ConfigReason::Inconsistent));
+        };
+        let stream = link
+            .into_stream(CloseReason::SessionClosed)
+            .and_then(crate::sys::Stream::into_tcp)
+            .ok_or(invalid("connection", ConfigReason::Inconsistent))?;
+        self.shared
+            .adopt(stream, peer, local, &spec.listener, spec.lane)
+    }
+
+    /// Owned duplicates of every listening socket, for a hand-off to the next
+    /// process (`send_listeners`, Unix). This server keeps
+    /// accepting meanwhile, so the new process can start before this one stops
+    /// (decision D-042); a later `shutdown` closes only this server's copies, and
+    /// a Unix socket file stays in place for the new process.
+    ///
+    /// # Errors
+    ///
+    /// `Os` when a socket cannot be duplicated, `ForkedChild`.
+    pub fn release_listeners(&self) -> Result<Vec<ListenerHandle>, NetError> {
+        self.shared.release_listeners()
     }
 
     /// Binds one more listener on the running server and starts its accept

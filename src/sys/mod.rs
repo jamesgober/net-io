@@ -95,6 +95,15 @@ impl Stream {
         }
     }
 
+    /// The owned TCP stream, when this is one.
+    pub(crate) fn into_tcp(self) -> Option<TcpStream> {
+        match self {
+            Stream::Tcp(s) => Some(s),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(_) => None,
+        }
+    }
+
     /// The TCP stream, when this is one.
     pub(crate) fn tcp(&self) -> Option<&TcpStream> {
         match self {
@@ -156,6 +165,31 @@ pub(crate) enum Ready {
     Woken,
     /// The timeout passed.
     TimedOut,
+}
+
+/// What a listening socket handed to this process is (inheritance, hand-off,
+/// adoption).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SockKind {
+    /// A TCP listener bound to this address.
+    Tcp(std::net::SocketAddr),
+    /// A Unix stream listener bound to this path (empty when unnamed or abstract).
+    #[cfg(unix)]
+    Unix(Vec<u8>),
+}
+
+/// Why a socket handed to this process cannot be a listener.
+#[derive(Debug)]
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) enum KindError {
+    /// Not a socket (or not an open descriptor).
+    NotASocket,
+    /// A socket, but not listening.
+    NotListening,
+    /// Not a stream socket of a family net-io serves.
+    WrongKind,
+    /// An OS call failed.
+    Os(io::Error),
 }
 
 /// How an `accept` failure is handled.

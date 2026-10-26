@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::accept::{Accepted, Acceptor};
 use crate::driver::DriverKind;
-use crate::error::{CloseReason, ConfigReason, LimitKind, NetError, TimeoutKind};
-use crate::gate::KillHandle;
+use crate::error::{CloseReason, ConfigReason, LimitKind, NetError, RefusalCause, TimeoutKind};
+use crate::gate::{AdmitStage, Gate, GateCell, KillHandle, guarded};
 use crate::id::{ConnectionId, ListenerId, WorkerId};
 use crate::info::{ConnectionInfo, Endpoint, Origin, Transport};
 use crate::limits::{Effective, Limits};
@@ -267,6 +267,12 @@ impl TcpListener {
 
     pub(crate) fn std(&self) -> &std::net::TcpListener {
         &self.inner
+    }
+
+    /// Records the listener's id and name in its facts (adopted listeners).
+    pub(crate) fn set_identity(&mut self, id: ListenerId, name: Option<String>) {
+        self.info.id = id;
+        self.info.name = name;
     }
 
     /// Records whether the listener serves TLS in its facts.
@@ -830,6 +836,52 @@ impl TcpConnection {
         if let Ok(link) = self.link() {
             link.set_exchange_deadline(at);
         }
+    }
+
+    /// Registers this dialed connection with `gate` (`Gate::admit` with
+    /// `AdmitStage::Dialed`): from then on `Gate::check` runs before every write
+    /// and `Gate::closed` runs once at close, so a back-channel or outbound
+    /// connection can be revoked like an accepted one.
+    ///
+    /// # Errors
+    ///
+    /// `Refused { cause: Gate(code) }` when the gate refuses (the connection is
+    /// then aborted and later calls return `Closed`); `InvalidConfig { field:
+    /// "gate" }` when a gate is already set; `Closed`.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// let mut upstream = net_io::connect("10.0.0.9:9000")?;
+    /// upstream.set_gate(Arc::new(net_io::AllowAll))?;
+    /// upstream.send_all(b"PING\r\n")?;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn set_gate<G: Gate>(&mut self, gate: Arc<G>) -> Result<(), NetError> {
+        let link = self.link()?;
+        if link.gate.is_some() {
+            return Err(NetError::InvalidConfig {
+                field: "gate",
+                reason: ConfigReason::Inconsistent,
+            });
+        }
+        let code = match guarded(|| gate.admit(&link.info, AdmitStage::Dialed)) {
+            Some(Ok(admitted)) => {
+                link.info.lane = admitted.lane;
+                link.info.gate = admitted.tag;
+                link.gate = Some(Box::new(GateCell {
+                    gate,
+                    ticket: Some(admitted.ticket),
+                }));
+                return Ok(());
+            }
+            Some(Err(refusal)) => refusal.code(),
+            None => 0,
+        };
+        let cause = RefusalCause::Gate(code);
+        if let Some(link) = self.link.take() {
+            link.finish(CloseReason::Refused(cause));
+        }
+        Err(NetError::Refused { cause })
     }
 
     /// Live socket options.

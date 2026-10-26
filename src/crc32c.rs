@@ -1,5 +1,5 @@
 //! CRC32C (Castagnoli, reflected polynomial 0x82F63B78), table-driven, for the
-//! PROXY v2 checksum TLV.
+//! PROXY v2 checksum TLV and the listener hand-off manifest.
 
 const fn table() -> [u32; 256] {
     let mut t = [0u32; 256];
@@ -24,9 +24,12 @@ const fn table() -> [u32; 256] {
 static TABLE: [u32; 256] = table();
 
 /// The running state: start with [`Crc32c::new`], feed with [`Crc32c::update`].
+/// (Unused in a build with neither PROXY nor local sockets.)
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(any(feature = "proxy", feature = "local")), allow(dead_code))]
 pub(crate) struct Crc32c(u32);
 
+#[cfg_attr(not(any(feature = "proxy", feature = "local")), allow(dead_code))]
 impl Crc32c {
     pub(crate) const fn new() -> Crc32c {
         Crc32c(!0)

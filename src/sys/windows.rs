@@ -205,12 +205,29 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    fn QueryPerformanceCounter(count: *mut i64) -> i32;
+    fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
+}
+
+/// The performance counter in microseconds.
+pub(crate) fn monotonic_micros() -> u64 {
+    let (mut count, mut freq) = (0i64, 0i64);
+    // SAFETY: both calls write one i64 through a live pointer; neither fails on
+    // Windows XP and later.
+    unsafe {
+        QueryPerformanceCounter(&raw mut count);
+        QueryPerformanceFrequency(&raw mut freq);
+    }
+    let (count, freq) = (count.max(0) as u128, freq.max(1) as u128);
+    (count * 1_000_000 / freq) as u64
 }
 
 /// A borrowed socket handle.
 pub(crate) type Sock<'a> = BorrowedSocket<'a>;
 /// A raw socket handle.
 pub(crate) type RawSock = RawSocket;
+/// An owned socket handle.
+pub(crate) type OwnedSock = OwnedSocket;
 
 /// Types whose socket handle this layer can borrow.
 pub(crate) trait AsSock {
@@ -563,6 +580,34 @@ pub(crate) fn is_listening_stream(sock: Sock<'_>) -> io::Result<bool> {
     let listening = get_int(sock, c::SOL_SOCKET, c::SO_ACCEPTCONN)? != 0;
     let stream = get_int(sock, c::SOL_SOCKET, c::SO_TYPE)? == c::SOCK_STREAM;
     Ok(listening && stream)
+}
+
+/// Identifies a socket handed to this process: a listening TCP stream socket
+/// and the address it is bound to.
+pub(crate) fn listener_kind(sock: Sock<'_>) -> Result<super::SockKind, super::KindError> {
+    use super::{KindError, SockKind};
+    let ty = match get_int(sock, c::SOL_SOCKET, c::SO_TYPE) {
+        Ok(t) => t,
+        Err(e) if e.raw_os_error() == Some(errno::WSAENOTSOCK) => {
+            return Err(KindError::NotASocket);
+        }
+        Err(e) => return Err(KindError::Os(e)),
+    };
+    if ty != c::SOCK_STREAM {
+        return Err(KindError::WrongKind);
+    }
+    if get_int(sock, c::SOL_SOCKET, c::SO_ACCEPTCONN).map_err(KindError::Os)? == 0 {
+        return Err(KindError::NotListening);
+    }
+    // SAFETY: the socket is open for the call; `ManuallyDrop` keeps this
+    // temporary `TcpListener` from closing a socket it does not own.
+    let view =
+        std::mem::ManuallyDrop::new(unsafe { TcpListener::from_raw_socket(sock.as_raw_socket()) });
+    match view.local_addr() {
+        Ok(a) => Ok(SockKind::Tcp(a)),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Err(KindError::WrongKind),
+        Err(e) => Err(KindError::Os(e)),
+    }
 }
 
 /// Accepts one connection and makes it non-inheritable (std's `accept` does not).

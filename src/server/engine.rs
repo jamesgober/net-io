@@ -30,10 +30,11 @@ use crate::driver::DriverKind;
 use crate::error::{CloseReason, KillReason, NetError, OsErrorClass, RefusalCause, TimeoutKind};
 use crate::events::{CoalescedKind, Coalescer, Event, EventSink, NoopSink};
 use crate::gate::{AdmitStage, AllowAll, ErasedGate, Gate, GateCell, Refusal, guarded};
+use crate::handoff::ListenerHandle;
 use crate::id::{ConnectionId, IdBlock, ListenerId, WorkerId};
 #[cfg(all(unix, feature = "local"))]
 use crate::info::Endpoint;
-use crate::info::{ConnectionInfo, Lane, Origin};
+use crate::info::{ConnectionInfo, Lane, Origin, Transport};
 #[cfg(any(feature = "proxy", feature = "tls"))]
 use crate::limits::SizeClass;
 use crate::limits::{Effective, Limits};
@@ -229,6 +230,8 @@ pub(crate) struct Shared {
     next_listener: AtomicU32,
     /// Starts an accept thread for a listener (holds the engine weakly).
     spawn_accept: OnceLock<SpawnAccept>,
+    /// Admits an adopted connection (holds the engine weakly).
+    adopt: OnceLock<AdoptFn>,
     /// The server's limits, for listeners added later.
     pub(crate) base_limits: Limits,
     /// The server's trusted proxies, for listeners added later.
@@ -250,6 +253,19 @@ pub(crate) struct Shared {
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub(crate) tls: Option<Arc<dyn ErasedAcceptor>>,
 }
+
+/// Admits an adopted connection on a listener.
+type AdoptFn = Box<
+    dyn Fn(
+            TcpStream,
+            SocketAddr,
+            SocketAddr,
+            &Arc<ListenerConf>,
+            Option<Lane>,
+        ) -> Result<ConnectionId, NetError>
+        + Send
+        + Sync,
+>;
 
 /// Starts the accept thread of one listener.
 type SpawnAccept = Box<
@@ -332,6 +348,52 @@ impl Shared {
                 let _ = t.join();
             }
         }
+    }
+
+    /// `Server::adopt`: finds the listener by name and admits the connection.
+    pub(crate) fn adopt(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        local: SocketAddr,
+        listener: &str,
+        lane: Option<Lane>,
+    ) -> Result<ConnectionId, NetError> {
+        let conf = self
+            .lock_listeners()
+            .iter()
+            .find(|e| e.runtime.info().name.as_deref() == Some(listener))
+            .map(|e| e.conf.clone())
+            .ok_or(NetError::InvalidConfig {
+                field: "listener",
+                reason: crate::error::ConfigReason::Missing,
+            })?;
+        match self.adopt.get() {
+            Some(f) => f(stream, peer, local, &conf, lane),
+            None => Err(NetError::ShuttingDown),
+        }
+    }
+
+    pub(crate) fn release_listeners(&self) -> Result<Vec<ListenerHandle>, NetError> {
+        if self.forked() {
+            return Err(NetError::ForkedChild);
+        }
+        let list = self.lock_listeners();
+        let mut out = Vec::with_capacity(list.len());
+        for e in list.iter() {
+            let info = e.runtime.info();
+            let sock = e
+                .runtime
+                .duplicate()
+                .map_err(|err| NetError::from_os("dup", err))?;
+            out.push(ListenerHandle::new(
+                info.transport,
+                info.name.clone(),
+                info.local.clone(),
+                sock,
+            ));
+        }
+        Ok(out)
     }
 
     /// Binds a listener for a running server and starts its accept thread; its
@@ -715,9 +777,37 @@ fn bind_listener(
         }),
         _ => None,
     };
-    // Without Unix sockets nothing breaks out early.
-    #[cfg_attr(not(all(unix, feature = "local")), allow(unused_labels))]
     let (runtime, info, tcp) = 'bound: {
+        if let Some(handle) = spec.adopt {
+            let name = spec.name.clone();
+            match handle.kind() {
+                Transport::Tcp => {
+                    let std = std::net::TcpListener::from(handle.into_sock());
+                    let mut listener = TcpListener::from_std(std)?;
+                    listener.set_identity(id, name);
+                    listener.set_proxy_mode(spec.proxy);
+                    listener.set_tls(spec.tls);
+                    let info = listener.info().clone();
+                    let tcp = *listener.tcp_options();
+                    break 'bound (ListenerRuntime::Tcp(listener), info, tcp);
+                }
+                #[cfg(all(unix, feature = "local"))]
+                Transport::Unix => {
+                    let mut listener = UnixListener::adopt(handle.into_sock())?;
+                    listener.set_identity(id, name);
+                    listener.set_proxy_mode(spec.proxy);
+                    listener.set_tls(spec.tls);
+                    let info = listener.info().clone();
+                    break 'bound (ListenerRuntime::Unix(listener), info, TcpOptions::default());
+                }
+                _ => {
+                    return Err(NetError::InvalidConfig {
+                        field: "socket",
+                        reason: crate::error::ConfigReason::NotListening,
+                    });
+                }
+            }
+        }
         #[cfg(all(unix, feature = "local"))]
         if let Some((path, options)) = spec.unix {
             let mut listener = UnixListener::bind_with(&path, options)?;
@@ -809,6 +899,28 @@ impl ListenerRuntime {
             ListenerRuntime::Unix(l) => std::os::fd::AsFd::as_fd(l.std()),
         }
     }
+
+    fn info(&self) -> &ListenerInfo {
+        match self {
+            ListenerRuntime::Tcp(l) => l.info(),
+            #[cfg(all(unix, feature = "local"))]
+            ListenerRuntime::Unix(l) => l.info(),
+        }
+    }
+
+    /// An owned duplicate of the socket (close-on-exec), for a hand-off.
+    fn duplicate(&self) -> std::io::Result<sys::OwnedSock> {
+        match self {
+            ListenerRuntime::Tcp(l) => l.std().try_clone().map(sys::OwnedSock::from),
+            #[cfg(all(unix, feature = "local"))]
+            ListenerRuntime::Unix(l) => {
+                let dup = l.std().try_clone().map(sys::OwnedSock::from)?;
+                // The next process serves this path now: never remove its file.
+                l.keep_file();
+                Ok(dup)
+            }
+        }
+    }
 }
 
 struct Engine<W, G: Gate> {
@@ -893,6 +1005,7 @@ where
         listeners: Mutex::new(entries),
         next_listener: AtomicU32::new(next_listener),
         spawn_accept: OnceLock::new(),
+        adopt: OnceLock::new(),
         base_limits: cfg.limits.clone(),
         trusted: cfg.trusted.clone(),
         queue_notify: OnceLock::new(),
@@ -937,6 +1050,13 @@ where
             e.queue_cv.notify_all();
         }
     }));
+    let weak = Arc::downgrade(&engine);
+    let _ = shared.adopt.set(Box::new(
+        move |stream, peer, local, conf, lane| match weak.upgrade() {
+            Some(e) => e.adopt(stream, peer, local, conf, lane),
+            None => Err(NetError::ShuttingDown),
+        },
+    ));
     let weak = Arc::downgrade(&engine);
     let _ = shared.spawn_accept.set(Box::new(move |conf, rt| {
         let Some(e) = weak.upgrade() else {
@@ -1137,14 +1257,15 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
     ) {
         let source = PrefixKey::of(peer.ip(), conf.limits.source_policy);
         let id = conf.id;
-        self.admit_one(
+        let _ = self.admit_one(
             sys::Stream::Tcp(stream),
             Some(peer),
             Some(source),
             conf,
-            ids,
+            &mut || ids.issue(),
             view,
             co,
+            AdmitStage::Accept,
             |stream, cid, at| {
                 let local = stream.tcp()?.local_addr().ok()?;
                 Some(ConnectionInfo::new_tcp(
@@ -1179,17 +1300,29 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
         }
         let path = listener.shared_path().clone();
         let id = conf.id;
-        self.admit_one(stream, None, None, conf, ids, view, co, |_, cid, at| {
-            Some(ConnectionInfo::new_unix(
-                cid,
-                Some(id),
-                Origin::Accepted,
-                Endpoint::Unix(path),
-                Endpoint::Unnamed,
-                credentials,
-                at,
-            ))
-        });
+        let next = &mut || ids.issue();
+        let stage = AdmitStage::Accept;
+        let _ = self.admit_one(
+            stream,
+            None,
+            None,
+            conf,
+            next,
+            view,
+            co,
+            stage,
+            |_, cid, at| {
+                Some(ConnectionInfo::new_unix(
+                    cid,
+                    Some(id),
+                    Origin::Accepted,
+                    Endpoint::Unix(path),
+                    Endpoint::Unnamed,
+                    credentials,
+                    at,
+                ))
+            },
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1199,41 +1332,54 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
         peer: Option<SocketAddr>,
         source: Option<PrefixKey>,
         conf: &Arc<ListenerConf>,
-        ids: &mut IdBlock,
+        next_id: &mut dyn FnMut() -> ConnectionId,
         view: &ControlView,
         co: &mut Coalescer,
+        stage: AdmitStage,
         make_info: impl FnOnce(&sys::Stream, ConnectionId, Instant) -> Option<ConnectionInfo>,
-    ) {
+    ) -> Result<ConnectionId, Option<RefusalCause>> {
         let shared = &self.shared;
         let lim = &conf.limits;
         let count = &conf.count;
         // Caps before any byte is read.
         if !take_slot(&shared.open, lim.max_connections) {
-            return self.refuse(stream, peer, RefusalCause::GlobalCap, None, co);
+            {
+                self.refuse(stream, peer, RefusalCause::GlobalCap, None, co);
+                return Err(Some(RefusalCause::GlobalCap));
+            }
         }
         if !take_slot(count, lim.max_per_listener) {
             shared.open.fetch_sub(1, Ordering::AcqRel);
-            return self.refuse(stream, peer, RefusalCause::ListenerCap, None, co);
+            {
+                self.refuse(stream, peer, RefusalCause::ListenerCap, None, co);
+                return Err(Some(RefusalCause::ListenerCap));
+            }
         }
         if let Some(source) = source {
             if !conf.sources.acquire(source) {
                 shared.open.fetch_sub(1, Ordering::AcqRel);
                 count.fetch_sub(1, Ordering::AcqRel);
-                return self.refuse(stream, peer, RefusalCause::SourceCap, None, co);
+                {
+                    self.refuse(stream, peer, RefusalCause::SourceCap, None, co);
+                    return Err(Some(RefusalCause::SourceCap));
+                }
             }
         }
         let release = |s: &Self| s.shared.release(conf, source);
         if matches!(view.state(), ControlState::Lockdown) {
             release(self);
-            return self.refuse(stream, peer, RefusalCause::Lockdown, None, co);
+            {
+                self.refuse(stream, peer, RefusalCause::Lockdown, None, co);
+                return Err(Some(RefusalCause::Lockdown));
+            }
         }
-        let id = ids.issue();
+        let id = next_id();
         let Some(mut info) = make_info(&stream, id, self.clock.now()) else {
             release(self);
             drop(stream);
-            return;
+            return Err(None);
         };
-        let admitted = match guarded(|| self.gate.admit(&info, AdmitStage::Accept)) {
+        let admitted = match guarded(|| self.gate.admit(&info, stage)) {
             Some(Ok(a)) => a,
             Some(Err(refusal)) => {
                 release(self);
@@ -1243,11 +1389,17 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
                     #[allow(unreachable_patterns)]
                     _ => (refusal.code(), None),
                 };
-                return self.refuse(stream, peer, RefusalCause::Gate(code), bytes, co);
+                {
+                    self.refuse(stream, peer, RefusalCause::Gate(code), bytes, co);
+                    return Err(Some(RefusalCause::Gate(code)));
+                }
             }
             None => {
                 release(self);
-                return self.refuse(stream, peer, RefusalCause::Gate(0), None, co);
+                {
+                    self.refuse(stream, peer, RefusalCause::Gate(0), None, co);
+                    return Err(Some(RefusalCause::Gate(0)));
+                }
             }
         };
         info.lane = admitted.lane;
@@ -1260,7 +1412,10 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
                         .closed(ticket, &info, CloseReason::Refused(RefusalCause::Shed))
                 });
                 release(self);
-                return self.refuse(stream, peer, RefusalCause::Shed, None, co);
+                {
+                    self.refuse(stream, peer, RefusalCause::Shed, None, co);
+                    return Err(Some(RefusalCause::Shed));
+                }
             }
         }
         // Hand over; refuse with Busy when every worker has a connection or one waiting.
@@ -1288,7 +1443,10 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
                     .closed(ticket, &info, CloseReason::Refused(RefusalCause::Busy))
             });
             release(self);
-            return self.refuse(stream, peer, RefusalCause::Busy, None, co);
+            {
+                self.refuse(stream, peer, RefusalCause::Busy, None, co);
+                return Err(Some(RefusalCause::Busy));
+            }
         }
         let (event_id, event_lane) = (job.info.id, job.info.lane);
         queue.push_back(job);
@@ -1305,6 +1463,62 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
             id: event_id,
             lane: event_lane,
         });
+        Ok(event_id)
+    }
+
+    /// `Server::adopt`: a dialed connection admitted like an accepted one on
+    /// `conf`'s listener (`AdmitStage::Adopt`).
+    fn adopt(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        local: SocketAddr,
+        conf: &Arc<ListenerConf>,
+        lane: Option<Lane>,
+    ) -> Result<ConnectionId, NetError> {
+        let shared = &self.shared;
+        if shared.forked() {
+            return Err(NetError::ForkedChild);
+        }
+        if shared.draining.load(Ordering::Acquire) || shared.stopping.load(Ordering::Acquire) {
+            return Err(NetError::ShuttingDown);
+        }
+        let mut view = ControlView::new();
+        view.refresh(shared.control.as_ref());
+        let mut co = Coalescer::new();
+        let peer = crate::addr::normalize_socket(peer);
+        let source = PrefixKey::of(peer.ip(), conf.limits.source_policy);
+        let listener = conf.id;
+        let result = self.admit_one(
+            sys::Stream::Tcp(stream),
+            Some(peer),
+            Some(source),
+            conf,
+            &mut crate::id::issue_single,
+            &view,
+            &mut co,
+            AdmitStage::Adopt,
+            |_, cid, at| {
+                let mut info = ConnectionInfo::new_tcp(
+                    cid,
+                    Some(listener),
+                    WorkerId(0),
+                    Origin::Adopted,
+                    local,
+                    peer,
+                    at,
+                );
+                if let Some(l) = lane {
+                    info.lane = l;
+                }
+                Some(info)
+            },
+        );
+        match result {
+            Ok(id) => Ok(id),
+            Err(Some(cause)) => Err(NetError::Refused { cause }),
+            Err(None) => Err(NetError::Closed),
+        }
     }
 
     fn next_job(&self) -> Option<Job<G::Ticket>> {
@@ -1445,7 +1659,7 @@ impl<G: Gate> Worker<G> {
         // permissions already decided who may connect (`trusted` is `None`).
         let trusted = match (&proxy.trusted, link.info.peer.socket_addr()) {
             (Some(list), Some(peer)) => list.contains(peer.ip()),
-            (None, None) => link.info.transport == crate::info::Transport::Unix,
+            (None, None) => link.info.transport == Transport::Unix,
             _ => false,
         };
         if !trusted {

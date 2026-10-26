@@ -27,6 +27,21 @@ pub trait Clock: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MonotonicClock;
 
+/// The raw monotonic clock in microseconds: `CLOCK_MONOTONIC` on Linux and
+/// macOS, the performance counter on Windows. This is the value systemd's
+/// `MONOTONIC_USEC` expects (`sd_notify` reload and watchdog messages); it is
+/// not related to [`Instant`] values or to [`Clock`].
+///
+/// ```
+/// let a = net_io::monotonic_micros();
+/// let b = net_io::monotonic_micros();
+/// assert!(b >= a);
+/// ```
+#[must_use]
+pub fn monotonic_micros() -> u64 {
+    crate::sys::monotonic_micros()
+}
+
 impl Clock for MonotonicClock {
     #[inline]
     fn now(&self) -> Instant {

@@ -73,7 +73,6 @@ mod addr;
 mod buf;
 mod completer;
 mod control;
-#[cfg(feature = "proxy")]
 mod crc32c;
 mod driver;
 mod error;
@@ -125,12 +124,16 @@ pub use error::{
 };
 pub use events::{CoalescedKind, Event, EventSink, NoopSink};
 pub use gate::{AdmitStage, Admitted, AllowAll, Denial, Gate, KillHandle, Refusal, WriteCheck};
-pub use handoff::HandoffError;
+pub use handoff::{HandoffError, HandoffPeer, ListenerHandle};
+#[cfg(all(unix, feature = "local"))]
+pub use handoff::{recv_listeners, send_listeners};
 pub use id::{ConnectionId, ListenerId, WorkerId};
 pub use info::{
     ConnectionInfo, Endpoint, GateTag, Lane, Origin, PeerCredentials, PipeName, Transport, UnixPath,
 };
-pub use inherit::InheritError;
+#[cfg(unix)]
+pub use inherit::fastcgi_listener;
+pub use inherit::{InheritError, InheritedListener, systemd, systemd_named};
 pub use limits::{Limits, LimitsBuilder, MinRate, Pressure, SizeClass};
 #[cfg(all(unix, feature = "local"))]
 pub use local::{Descriptors, UnixConnection, UnixListener};
@@ -144,14 +147,14 @@ pub use proxy_parse::{
     Tlv, Tlvs,
 };
 pub use server::{
-    BlockingHandler, DoorState, DrainReport, ListenerSpec, NoGate, NoWork, Server, ServerBuilder,
-    ServerHandle, Sessions, Stats, Workload,
+    AdoptSpec, BlockingHandler, DoorState, DrainReport, ListenerSpec, NoGate, NoWork, Server,
+    ServerBuilder, ServerHandle, Sessions, Stats, Workload,
 };
 pub use session::{
     Input, Output, OutputFull, Phase, Session, SessionContext, SessionFactory, Step, SwapError,
 };
 pub use tcp::{ConnectOptions, ListenerInfo, TcpConnection, TcpListener};
-pub use time::{Clock, ManualClock, MonotonicClock};
+pub use time::{Clock, ManualClock, MonotonicClock, monotonic_micros};
 pub use tls::{
     NoTls, NoTlsSession, TlsAcceptor, TlsCloseKind, TlsError, TlsEvent, TlsFailure, TlsInfo,
     TlsProgress, TlsSession,
