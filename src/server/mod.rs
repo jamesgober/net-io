@@ -16,7 +16,7 @@ use crate::driver::DriverKind;
 use crate::error::{CloseReason, ConfigReason, KillReason, NetError, RefusalCause};
 use crate::events::{EventSink, NoopSink};
 use crate::gate::Gate;
-use crate::id::{ConnectionId, WorkerId};
+use crate::id::{ConnectionId, ListenerId, WorkerId};
 use crate::limits::Limits;
 use crate::opts::{ListenOptions, LocalOptions};
 use crate::proxy::ProxyMode;
@@ -521,55 +521,10 @@ where
         }
         let mut listeners = self.listeners;
         let has_tls = TypeId::of::<T>() != TypeId::of::<NoTls>();
-        for spec in &mut listeners {
-            if spec.unix.is_some() && !cfg!(all(unix, feature = "local")) {
-                return Err(NetError::Unsupported {
-                    feature: if cfg!(unix) {
-                        "Unix domain sockets (the `local` feature)"
-                    } else {
-                        "Unix domain sockets on Windows (0.5.0)"
-                    },
-                    platform: std::env::consts::OS,
-                });
-            }
-            if spec.tls {
-                if !cfg!(feature = "tls") {
-                    return Err(NetError::Unsupported {
-                        feature: "TLS (the `tls` feature)",
-                        platform: std::env::consts::OS,
-                    });
-                }
-                if !has_tls {
-                    return Err(invalid("tls", ConfigReason::Missing));
-                }
-            }
-            if spec.proxy != ProxyMode::Off {
-                if !cfg!(feature = "proxy") {
-                    return Err(NetError::Unsupported {
-                        feature: "PROXY protocol (the `proxy` feature)",
-                        platform: std::env::consts::OS,
-                    });
-                }
-                // On a Unix socket the file's permissions decide who may connect.
-                if spec.unix.is_none() {
-                    let trusted = spec.trusted.clone().or_else(|| self.trusted.clone());
-                    match trusted {
-                        Some(t) if !t.is_empty() => spec.trusted = Some(t),
-                        // Required without anyone to trust would refuse every connection.
-                        _ => return Err(invalid("trusted_proxies", ConfigReason::Missing)),
-                    }
-                }
-            }
-        }
         let mut names = Vec::new();
-        for spec in &listeners {
+        for spec in &mut listeners {
+            check_spec(spec, self.trusted.as_ref(), has_tls, &names)?;
             if let Some(n) = &spec.name {
-                if n.len() > 64 {
-                    return Err(invalid("name", ConfigReason::TooLarge { max: 64 }));
-                }
-                if names.contains(n) {
-                    return Err(invalid("name", ConfigReason::Inconsistent));
-                }
                 names.push(n.clone());
             }
         }
@@ -593,6 +548,7 @@ where
         };
         engine::start(engine::Config {
             tls,
+            trusted: self.trusted,
             listeners,
             driver,
             workers,
@@ -609,6 +565,63 @@ where
 
 fn invalid(field: &'static str, reason: ConfigReason) -> NetError {
     NetError::InvalidConfig { field, reason }
+}
+
+/// The checks `build` and `add_listener` run on one listener: the features it
+/// needs, a TLS engine, trusted proxies (resolved into the spec), and its name.
+fn check_spec(
+    spec: &mut ListenerSpec,
+    server_trusted: Option<&Arc<TrustedProxies>>,
+    has_tls: bool,
+    taken: &[String],
+) -> Result<(), NetError> {
+    if spec.unix.is_some() && !cfg!(all(unix, feature = "local")) {
+        return Err(NetError::Unsupported {
+            feature: if cfg!(unix) {
+                "Unix domain sockets (the `local` feature)"
+            } else {
+                "Unix domain sockets on Windows (0.5.0)"
+            },
+            platform: std::env::consts::OS,
+        });
+    }
+    if spec.tls {
+        if !cfg!(feature = "tls") {
+            return Err(NetError::Unsupported {
+                feature: "TLS (the `tls` feature)",
+                platform: std::env::consts::OS,
+            });
+        }
+        if !has_tls {
+            return Err(invalid("tls", ConfigReason::Missing));
+        }
+    }
+    if spec.proxy != ProxyMode::Off {
+        if !cfg!(feature = "proxy") {
+            return Err(NetError::Unsupported {
+                feature: "PROXY protocol (the `proxy` feature)",
+                platform: std::env::consts::OS,
+            });
+        }
+        // On a Unix socket the file's permissions decide who may connect.
+        if spec.unix.is_none() {
+            let trusted = spec.trusted.clone().or_else(|| server_trusted.cloned());
+            match trusted {
+                Some(t) if !t.is_empty() => spec.trusted = Some(t),
+                // Required without anyone to trust would refuse every connection.
+                _ => return Err(invalid("trusted_proxies", ConfigReason::Missing)),
+            }
+        }
+    }
+    if let Some(n) = &spec.name {
+        if n.len() > 64 {
+            return Err(invalid("name", ConfigReason::TooLarge { max: 64 }));
+        }
+        if taken.contains(n) {
+            return Err(invalid("name", ConfigReason::Inconsistent));
+        }
+    }
+    Ok(())
 }
 
 /// A running server. Dropping it stops it (with a drain), so keep it and call
@@ -674,7 +687,77 @@ impl Server {
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
+        self.shared.join_listeners();
         report
+    }
+
+    /// Binds one more listener on the running server and starts its accept
+    /// thread. Its door is closed until the next [`Server::open_door`] (which
+    /// opens every listener's door); the same checks as `build` apply. The id is
+    /// new: ids of removed listeners are never reused.
+    ///
+    /// # Errors
+    ///
+    /// As `build` for the listener; `InvalidConfig { field: "listener" }` past 64
+    /// listeners, `ShuttingDown`, `ForkedChild`.
+    ///
+    /// ```no_run
+    /// use net_io::{AllowAll, ListenerSpec, ServerBuilder};
+    /// let mut server = ServerBuilder::new()
+    ///     .listener(ListenerSpec::tcp("127.0.0.1:8080"))
+    ///     .handler(|conn| { conn.send_all(b"hi\n")?; Ok(()) })
+    ///     .gate(AllowAll)
+    ///     .build()?;
+    /// server.open_door()?;
+    /// let added = server.add_listener(ListenerSpec::tcp("127.0.0.1:8081").name("extra"))?;
+    /// server.open_door()?; // opens the new listener's door
+    /// # let _ = added;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn add_listener(&mut self, spec: ListenerSpec) -> Result<ListenerId, NetError> {
+        let mut spec = spec;
+        if self.listeners.len() >= 64 {
+            return Err(invalid("listener", ConfigReason::TooLarge { max: 64 }));
+        }
+        let names: Vec<String> = self
+            .listeners
+            .iter()
+            .filter_map(|l| l.name.clone())
+            .collect();
+        check_spec(
+            &mut spec,
+            self.shared.trusted.as_ref(),
+            self.shared.tls.is_some(),
+            &names,
+        )?;
+        let workers = u16::try_from(self.shared.worker_count()).unwrap_or(u16::MAX);
+        self.shared
+            .base_limits
+            .overlay(&spec.limits)
+            .validate(workers, None)?;
+        let info = self.shared.add_listener(spec)?;
+        let id = info.id;
+        self.listeners.push(info);
+        Ok(id)
+    }
+
+    /// Closes one listener's socket at once (its connections keep running),
+    /// then drains them: idle ones close now, the rest may finish until
+    /// `deadline` and are then killed (`DrainDeadline`). Other listeners and
+    /// their connections are not touched.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidConfig { field: "listener", reason: Missing }` for an unknown id,
+    /// `ForkedChild`.
+    pub fn remove_listener(
+        &mut self,
+        id: ListenerId,
+        deadline: Instant,
+    ) -> Result<DrainReport, NetError> {
+        let report = self.shared.remove_listener(id, deadline)?;
+        self.listeners.retain(|l| l.id != id);
+        Ok(report)
     }
 
     /// A cloneable handle for other threads.

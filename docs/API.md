@@ -1629,6 +1629,8 @@ impl Server {
     pub fn shutdown(self, deadline: Instant) -> DrainReport;
     pub fn wait_for_stop(self) -> DrainReport;
     pub fn release_listeners(&self) -> Result<Vec<ListenerHandle>, NetError>;
+    pub fn add_listener(&mut self, spec: ListenerSpec) -> Result<ListenerId, NetError>;      // P1, 0.4.0
+    pub fn remove_listener(&mut self, id: ListenerId, deadline: Instant) -> Result<DrainReport, NetError>; // P1, 0.4.0
     pub fn adopt(&self, conn: TcpConnection, spec: AdoptSpec) -> Result<ConnectionId, NetError>;
     pub fn handle(&self) -> ServerHandle;
     pub fn stats(&self) -> Stats;
@@ -1645,6 +1647,8 @@ impl Drop for Server;   // shutdown with the drain timeout as the deadline
 | `drain` | closes the door, tells every session to finish (`SessionContext::draining()`), closes idle connections at once, waits for the rest until `deadline`, then kills them with `DrainDeadline`; returns the counts | none (report) | 10,000 idle connections under 100 ms [est.] | P0 | 2 | `0.3.0` |
 | `shutdown` | `drain`, then closes the listening sockets (except released ones) and joins every worker; afterwards no net-io thread runs and every descriptor net-io opened is closed | none (report) | | P0 | 2 | `0.3.0` |
 | `wait_for_stop` | blocks the calling thread until a stop is requested (`ServerHandle::request_stop`, or the control line moves to `Draining` or `Stopping`), then shuts down with the drain deadline (the drain timeout or the control line's) | none (report) | zero CPU while waiting | P0 | 1 | `0.3.0` |
+| `add_listener` | binds one more listener on a running server with the same checks as `build` (features, TLS engine, trusted proxies, unique name, limits) and starts its accept thread; its door stays closed until the next `open_door`, which opens every listener's door; ids are never reused; at most 64 listeners at a time (decision D-097) | as `build`, `ShuttingDown`, `ForkedChild` | one bind and one thread | P1 | 2 | `0.4.0` |
+| `remove_listener` | closes that listener's socket at once (a Unix socket file it created is removed) and emits `ListenerClosed`, then drains only its connections: idle ones close now (`Drained`), queued ones close unread, the rest may finish until `deadline` and are then killed (`DrainDeadline`); other listeners are not touched | `InvalidConfig { field: "listener", reason: Missing }`, `ForkedChild` | as `drain`, for one listener | P1 | 2 | `0.4.0` |
 | `release_listeners` | owned duplicates of every listening socket, for [hand-off](#listener-hand-off); works while the door is open, so the new process can start accepting before this one stops (decision D-042); a later `shutdown` does not close the released sockets | `Os` | 1 system call per listener | P0 | 3 | `0.4.0` |
 | `adopt` | registers a dialed connection exactly like an accepted one: new id, `Gate::admit` with `AdmitStage::Adopt`, the named listener's limits, sessions, kill handle, events | `Refused`, `Limit`, `ShuttingDown` | as accept | P1 | 3 | `0.4.0` |
 | `handle` | a cloneable handle for other threads | | `Arc` clone | P0 | 2 | `0.3.0` |
@@ -2005,6 +2009,7 @@ impl EventSink for NoopSink { #[inline(always)] fn event(&self, _: &Event) {} }
 #[derive(Clone, Copy, Debug)]
 pub enum Event {
     ListenerOpened { listener: ListenerId, local: Option<SocketAddr>, backlog: Option<u32> },
+    ListenerClosed { listener: ListenerId },                       // remove_listener, 0.4.0
     DoorOpened,
     DoorClosed,
     Accepted { id: ConnectionId, peer: Option<SocketAddr>, listener: ListenerId },

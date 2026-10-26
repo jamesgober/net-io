@@ -16,6 +16,7 @@ use std::io::IoSlice;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::source::SourceTable;
@@ -43,7 +44,7 @@ use crate::opts::{ListenOptions, TcpOptions};
 use crate::proxy::{ProxyFacts, ProxyMode, ProxyVersions};
 use crate::session::{Input, Output, Phase, Session, SessionContext, SessionFactory, Step};
 use crate::sys::{self, AsSock, Interest, KillSlot, Wake};
-use crate::tcp::{TcpConnection, TcpListener};
+use crate::tcp::{ListenerInfo, TcpConnection, TcpListener};
 use crate::time::Clock;
 use crate::tls::ErasedAcceptor;
 use crate::trusted::TrustedProxies;
@@ -59,6 +60,9 @@ const CAUSE_STOP: u8 = 2;
 /// `WorkerShared::idle_cause`: an idle connection closed by a drain or by shedding.
 const IDLE_DRAIN: u8 = 0;
 const IDLE_SHED: u8 = 1;
+
+/// `WorkerShared::listener` when the worker has no connection.
+const NO_LISTENER: u32 = u32::MAX;
 
 /// How often a drain looks again for connections that became idle.
 const DRAIN_PASS: Duration = Duration::from_millis(10);
@@ -78,6 +82,7 @@ fn take_slot(counter: &AtomicU32, cap: u32) -> bool {
 
 pub(crate) struct Config<W, G, S> {
     pub tls: Option<Arc<dyn ErasedAcceptor>>,
+    pub trusted: Option<Arc<TrustedProxies>>,
     pub listeners: Vec<ListenerSpec>,
     pub driver: DriverKind,
     pub workers: u16,
@@ -170,6 +175,9 @@ pub(crate) struct WorkerShared {
     slot: Arc<KillSlot>,
     wake: Arc<Wake>,
     current: AtomicU64,
+    /// The current connection's listener id (`NO_LISTENER` when none), for
+    /// `remove_listener`'s drain.
+    listener: AtomicU32,
     /// The current connection's lane, for shedding.
     lane: AtomicU8,
     /// Why net-io itself killed the current connection (`CAUSE_*`).
@@ -214,7 +222,17 @@ pub(crate) struct Shared {
     progress: Mutex<()>,
     progress_cv: Condvar,
     workers: Vec<WorkerShared>,
-    accept_wakes: Vec<Arc<Wake>>,
+    /// The listeners and their accept threads (D-097). Locked only on cold paths
+    /// (doors, wake-ups, adding, removing, releasing, shutdown).
+    listeners: Mutex<Vec<ListenerEntry>>,
+    /// The next listener id; ids are never reused.
+    next_listener: AtomicU32,
+    /// Starts an accept thread for a listener (holds the engine weakly).
+    spawn_accept: OnceLock<SpawnAccept>,
+    /// The server's limits, for listeners added later.
+    pub(crate) base_limits: Limits,
+    /// The server's trusted proxies, for listeners added later.
+    pub(crate) trusted: Option<Arc<TrustedProxies>>,
     queue_notify: OnceLock<Box<dyn Fn() + Send + Sync>>,
     queue_len: AtomicUsize,
     control: Arc<dyn ControlLine>,
@@ -228,21 +246,17 @@ pub(crate) struct Shared {
     drained_graceful: AtomicU32,
     drained_killed: AtomicU32,
     pub(crate) drain_timeout: Duration,
-    listener_counts: Vec<AtomicU32>,
-    listener_limits: Vec<Effective>,
-    listener_tcp: Vec<TcpOptions>,
-    /// PROXY settings per listener: `Some` when the listener requires a header.
-    #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
-    listener_proxy: Vec<Option<ListenerProxy>>,
-    /// Whether each listener serves TLS.
-    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
-    listener_tls: Vec<bool>,
     /// The TLS engine, when any listener serves TLS.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
-    tls: Option<Arc<dyn ErasedAcceptor>>,
-    /// One per listener, sized from that listener's limits (D-085).
-    sources: Vec<SourceTable>,
+    pub(crate) tls: Option<Arc<dyn ErasedAcceptor>>,
 }
+
+/// Starts the accept thread of one listener.
+type SpawnAccept = Box<
+    dyn Fn(Arc<ListenerConf>, Arc<ListenerRuntime>) -> std::io::Result<JoinHandle<()>>
+        + Send
+        + Sync,
+>;
 
 impl Shared {
     fn event(&self, e: Event) {
@@ -262,21 +276,193 @@ impl Shared {
         if self.draining.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire) {
             return Err(NetError::ShuttingDown);
         }
-        if !self.door.swap(true, Ordering::AcqRel) {
-            self.event(Event::DoorOpened);
-            for w in &self.accept_wakes {
-                w.wake();
+        let opened = !self.door.swap(true, Ordering::AcqRel);
+        // Every listener's door opens, including listeners added since the last call.
+        for e in self.lock_listeners().iter() {
+            if !e.conf.door.swap(true, Ordering::AcqRel) {
+                e.conf.wake.wake();
             }
+        }
+        if opened {
+            self.event(Event::DoorOpened);
         }
         Ok(())
     }
 
     pub(crate) fn close_door(&self) {
-        if self.door.swap(false, Ordering::AcqRel) {
-            self.event(Event::DoorClosed);
-            for w in &self.accept_wakes {
-                w.wake();
+        let closed = self.door.swap(false, Ordering::AcqRel);
+        for e in self.lock_listeners().iter() {
+            if e.conf.door.swap(false, Ordering::AcqRel) {
+                e.conf.wake.wake();
             }
+        }
+        if closed {
+            self.event(Event::DoorClosed);
+        }
+    }
+
+    fn lock_listeners(&self) -> std::sync::MutexGuard<'_, Vec<ListenerEntry>> {
+        self.listeners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Starts the accept thread of every listener that has none.
+    fn spawn_listener_threads(&self) -> std::io::Result<()> {
+        let Some(spawn) = self.spawn_accept.get() else {
+            return Ok(());
+        };
+        for e in self.lock_listeners().iter_mut() {
+            if e.thread.is_none() {
+                e.thread = Some(spawn(e.conf.clone(), e.runtime.clone())?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends every accept thread, joins it, and closes the listening sockets.
+    pub(crate) fn join_listeners(&self) {
+        let entries = std::mem::take(&mut *self.lock_listeners());
+        for e in &entries {
+            e.conf.removed.store(true, Ordering::Release);
+            e.conf.wake.wake();
+        }
+        for mut e in entries {
+            if let Some(t) = e.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Binds a listener for a running server and starts its accept thread; its
+    /// door stays closed until the next `open_door`.
+    pub(crate) fn add_listener(&self, spec: ListenerSpec) -> Result<ListenerInfo, NetError> {
+        if self.forked() {
+            return Err(NetError::ForkedChild);
+        }
+        if self.draining.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire) {
+            return Err(NetError::ShuttingDown);
+        }
+        let n = self.next_listener.fetch_add(1, Ordering::AcqRel);
+        let id = ListenerId(u16::try_from(n).map_err(|_| NetError::InvalidConfig {
+            field: "listener",
+            reason: crate::error::ConfigReason::TooLarge {
+                max: u64::from(u16::MAX),
+            },
+        })?);
+        let (mut entry, info) = bind_listener(spec, id, &self.base_limits)?;
+        let Some(spawn) = self.spawn_accept.get() else {
+            return Err(NetError::ShuttingDown);
+        };
+        entry.thread = Some(
+            spawn(entry.conf.clone(), entry.runtime.clone()).map_err(|e| {
+                NetError::DriverSetup {
+                    driver: DriverKind::Blocking,
+                    source: e,
+                }
+            })?,
+        );
+        self.lock_listeners().push(entry);
+        self.event(Event::ListenerOpened {
+            listener: id,
+            local: info.local.socket_addr(),
+            backlog: info.backlog,
+        });
+        Ok(info)
+    }
+
+    /// Closes one listener (its socket at once) and drains its connections:
+    /// idle ones close now, the rest finish until `deadline` and are then killed.
+    pub(crate) fn remove_listener(
+        &self,
+        id: ListenerId,
+        deadline: Instant,
+    ) -> Result<DrainReport, NetError> {
+        if self.forked() {
+            return Err(NetError::ForkedChild);
+        }
+        let entry = {
+            let mut list = self.lock_listeners();
+            let Some(i) = list.iter().position(|e| e.conf.id == id) else {
+                return Err(NetError::InvalidConfig {
+                    field: "listener",
+                    reason: crate::error::ConfigReason::Missing,
+                });
+            };
+            list.remove(i)
+        };
+        let ListenerEntry {
+            conf,
+            runtime,
+            thread,
+        } = entry;
+        conf.door.store(false, Ordering::Release);
+        conf.removed.store(true, Ordering::Release);
+        conf.wake.wake();
+        if let Some(t) = thread {
+            let _ = t.join();
+        }
+        drop(runtime);
+        self.event(Event::ListenerClosed { listener: id });
+        Ok(self.drain_listener(&conf, deadline))
+    }
+
+    /// The drain of one listener's connections (see `remove_listener`).
+    fn drain_listener(&self, conf: &ListenerConf, deadline: Instant) -> DrainReport {
+        let start = Instant::now();
+        let id = u32::from(conf.id.0);
+        let initial = conf.count.load(Ordering::Acquire);
+        let mut killed = 0u32;
+        let mut killed_at_deadline = false;
+        let mut guard = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        while conf.count.load(Ordering::Acquire) > 0 {
+            let mine = |w: &&WorkerShared| {
+                w.listener.load(Ordering::Acquire) == id && w.current.load(Ordering::Acquire) != 0
+            };
+            for w in self.workers.iter().filter(mine) {
+                if !w.slot.drained() {
+                    w.idle_cause.store(IDLE_DRAIN, Ordering::Release);
+                    w.slot.drain_idle(w.slot.generation());
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline && !killed_at_deadline {
+                killed_at_deadline = true;
+                for w in self.workers.iter().filter(mine) {
+                    let claimed = w
+                        .kill_cause
+                        .compare_exchange(
+                            CAUSE_USER,
+                            CAUSE_DRAIN,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok();
+                    if w.slot.kill(w.slot.generation(), DRAIN_KILL) {
+                        killed += 1;
+                    } else if claimed {
+                        w.kill_cause.store(CAUSE_USER, Ordering::Release);
+                    }
+                }
+            }
+            let wait = if killed_at_deadline {
+                Duration::from_millis(50)
+            } else {
+                deadline
+                    .saturating_duration_since(now)
+                    .clamp(Duration::from_millis(1), DRAIN_PASS)
+            };
+            guard = self
+                .progress_cv
+                .wait_timeout(guard, wait)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        drop(guard);
+        DrainReport {
+            graceful: initial.saturating_sub(killed),
+            killed,
+            took: start.elapsed(),
         }
     }
 
@@ -308,9 +494,13 @@ impl Shared {
             .unwrap_or_else(|| Instant::now() + self.drain_timeout)
     }
 
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
     pub(crate) fn wake_all(&self) {
-        for w in &self.accept_wakes {
-            w.wake();
+        for e in self.lock_listeners().iter() {
+            e.conf.wake.wake();
         }
         for w in &self.workers {
             w.wake.wake();
@@ -461,13 +651,11 @@ impl Shared {
         self.wake_all();
     }
 
-    fn release(&self, listener: usize, source: Option<PrefixKey>) {
+    fn release(&self, listener: &ListenerConf, source: Option<PrefixKey>) {
         self.open.fetch_sub(1, Ordering::AcqRel);
-        if let Some(c) = self.listener_counts.get(listener) {
-            c.fetch_sub(1, Ordering::AcqRel);
-        }
-        if let (Some(k), Some(table)) = (source, self.sources.get(listener)) {
-            table.release(k);
+        listener.count.fetch_sub(1, Ordering::AcqRel);
+        if let Some(k) = source {
+            listener.sources.release(k);
         }
     }
 }
@@ -481,84 +669,63 @@ pub(crate) struct ListenerProxy {
     trusted: Option<Arc<TrustedProxies>>,
 }
 
-/// An accepted, admitted connection waiting for a worker.
-pub struct Job<T> {
-    stream: sys::Stream,
-    info: ConnectionInfo,
-    ticket: T,
-    listener: usize,
-    source: Option<PrefixKey>,
-}
-
-enum ListenerRuntime {
-    Tcp(TcpListener),
-    #[cfg(all(unix, feature = "local"))]
-    Unix(UnixListener),
-}
-
-impl ListenerRuntime {
-    fn sock(&self) -> sys::Sock<'_> {
-        match self {
-            ListenerRuntime::Tcp(l) => l.std().sock(),
-            #[cfg(all(unix, feature = "local"))]
-            ListenerRuntime::Unix(l) => std::os::fd::AsFd::as_fd(l.std()),
-        }
-    }
-}
-
-struct Engine<W, G: Gate> {
-    shared: Arc<Shared>,
-    work: W,
-    gate: Arc<G>,
-    gated: bool,
-    queue: Mutex<VecDeque<Job<G::Ticket>>>,
-    queue_cv: Condvar,
-    listeners: Vec<ListenerRuntime>,
-    clock: ClockRef,
-    wipe: bool,
-    budget: Arc<AtomicU64>,
+/// One listener's settings and counters (D-097). Its accept thread and every
+/// connection it admitted hold it, so a removed listener's connections keep
+/// their limits and give their cap slots back where they took them.
+pub(crate) struct ListenerConf {
+    id: ListenerId,
     limits: Effective,
+    tcp: TcpOptions,
+    /// `Some` when the listener requires a PROXY header.
+    #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
+    proxy: Option<ListenerProxy>,
+    /// Whether the listener serves TLS.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    tls: bool,
+    /// Connections admitted and not yet closed (the per-listener cap).
+    count: AtomicU32,
+    /// The per-source cap's table, sized from this listener's limits (D-085).
+    sources: SourceTable,
+    /// This listener's door: `open_door` and `close_door` set every one.
+    door: AtomicBool,
+    /// Set by `remove_listener` and at shutdown: the accept thread ends and
+    /// queued connections close with `Drained`.
+    removed: AtomicBool,
+    wake: Arc<Wake>,
 }
 
-pub(crate) fn start<W, G, S>(cfg: Config<W, G, S>) -> Result<Server, NetError>
-where
-    W: super::Workload,
-    G: Gate,
-    S: EventSink,
-{
-    let _ = cfg.driver;
-    let limits = cfg.limits.effective(DriverKind::Blocking);
-    let mut runtimes = Vec::with_capacity(cfg.listeners.len());
-    let mut infos = Vec::with_capacity(cfg.listeners.len());
-    let mut listener_limits = Vec::with_capacity(cfg.listeners.len());
-    let mut listener_tcp = Vec::with_capacity(cfg.listeners.len());
-    let mut listener_proxy = Vec::with_capacity(cfg.listeners.len());
-    let mut listener_tls = Vec::with_capacity(cfg.listeners.len());
-    for (i, spec) in cfg.listeners.into_iter().enumerate() {
-        let lim = cfg
-            .limits
-            .overlay(&spec.limits)
-            .effective(DriverKind::Blocking);
-        let id = ListenerId(u16::try_from(i).unwrap_or(u16::MAX));
+/// A listener the server owns: settings, socket, accept thread.
+struct ListenerEntry {
+    conf: Arc<ListenerConf>,
+    runtime: Arc<ListenerRuntime>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Binds (or adopts) the socket of `spec` and builds its settings.
+fn bind_listener(
+    spec: ListenerSpec,
+    id: ListenerId,
+    base: &Limits,
+) -> Result<(ListenerEntry, ListenerInfo), NetError> {
+    let lim = base.overlay(&spec.limits).effective(DriverKind::Blocking);
+    let proxy = match spec.proxy {
+        ProxyMode::Required { versions } => Some(ListenerProxy {
+            versions,
+            trusted: spec.trusted.clone(),
+        }),
+        _ => None,
+    };
+    // Without Unix sockets nothing breaks out early.
+    #[cfg_attr(not(all(unix, feature = "local")), allow(unused_labels))]
+    let (runtime, info, tcp) = 'bound: {
         #[cfg(all(unix, feature = "local"))]
         if let Some((path, options)) = spec.unix {
             let mut listener = UnixListener::bind_with(&path, options)?;
             listener.set_identity(id, spec.name.clone());
             listener.set_proxy_mode(spec.proxy);
             listener.set_tls(spec.tls);
-            listener_tls.push(spec.tls);
-            listener_proxy.push(match spec.proxy {
-                ProxyMode::Required { versions } => Some(ListenerProxy {
-                    versions,
-                    trusted: None,
-                }),
-                _ => None,
-            });
-            infos.push(listener.info().clone());
-            listener_limits.push(lim);
-            listener_tcp.push(TcpOptions::default());
-            runtimes.push(ListenerRuntime::Unix(listener));
-            continue;
+            let info = listener.info().clone();
+            break 'bound (ListenerRuntime::Unix(listener), info, TcpOptions::default());
         }
         let addrs = match spec.addrs {
             Ok(a) if !a.is_empty() => a,
@@ -587,18 +754,91 @@ where
         let mut listener = bound.ok_or(last)?;
         listener.set_proxy_mode(spec.proxy);
         listener.set_tls(spec.tls);
-        listener_tls.push(spec.tls);
-        listener_proxy.push(match (spec.proxy, spec.trusted) {
-            (ProxyMode::Required { versions }, Some(trusted)) => Some(ListenerProxy {
-                versions,
-                trusted: Some(trusted),
-            }),
-            _ => None,
-        });
-        infos.push(listener.info().clone());
-        listener_limits.push(lim);
-        listener_tcp.push(*listener.tcp_options());
-        runtimes.push(ListenerRuntime::Tcp(listener));
+        let info = listener.info().clone();
+        let tcp = *listener.tcp_options();
+        (ListenerRuntime::Tcp(listener), info, tcp)
+    };
+    let wake = Wake::new()
+        .map(Arc::new)
+        .map_err(|e| NetError::DriverSetup {
+            driver: DriverKind::Blocking,
+            source: e,
+        })?;
+    let conf = Arc::new(ListenerConf {
+        id,
+        limits: lim,
+        tcp,
+        proxy,
+        tls: spec.tls,
+        count: AtomicU32::new(0),
+        sources: SourceTable::new(lim.max_per_listener, lim.max_per_source),
+        door: AtomicBool::new(false),
+        removed: AtomicBool::new(false),
+        wake,
+    });
+    Ok((
+        ListenerEntry {
+            conf,
+            runtime: Arc::new(runtime),
+            thread: None,
+        },
+        info,
+    ))
+}
+
+/// An accepted, admitted connection waiting for a worker.
+pub struct Job<T> {
+    stream: sys::Stream,
+    info: ConnectionInfo,
+    ticket: T,
+    listener: Arc<ListenerConf>,
+    source: Option<PrefixKey>,
+}
+
+enum ListenerRuntime {
+    Tcp(TcpListener),
+    #[cfg(all(unix, feature = "local"))]
+    Unix(UnixListener),
+}
+
+impl ListenerRuntime {
+    fn sock(&self) -> sys::Sock<'_> {
+        match self {
+            ListenerRuntime::Tcp(l) => l.std().sock(),
+            #[cfg(all(unix, feature = "local"))]
+            ListenerRuntime::Unix(l) => std::os::fd::AsFd::as_fd(l.std()),
+        }
+    }
+}
+
+struct Engine<W, G: Gate> {
+    shared: Arc<Shared>,
+    work: W,
+    gate: Arc<G>,
+    gated: bool,
+    queue: Mutex<VecDeque<Job<G::Ticket>>>,
+    queue_cv: Condvar,
+    clock: ClockRef,
+    wipe: bool,
+    budget: Arc<AtomicU64>,
+    limits: Effective,
+}
+
+pub(crate) fn start<W, G, S>(cfg: Config<W, G, S>) -> Result<Server, NetError>
+where
+    W: super::Workload,
+    G: Gate,
+    S: EventSink,
+{
+    let _ = cfg.driver;
+    let limits = cfg.limits.effective(DriverKind::Blocking);
+    let mut entries = Vec::with_capacity(cfg.listeners.len());
+    let mut infos = Vec::with_capacity(cfg.listeners.len());
+    for (i, spec) in cfg.listeners.into_iter().enumerate() {
+        let id = ListenerId(u16::try_from(i).unwrap_or(u16::MAX));
+        let (entry, info) = bind_listener(spec, id, &cfg.limits)?;
+        entries.push(entry);
+        infos.push(info);
     }
 
     let sink: Option<Arc<dyn EventSink>> = if TypeId::of::<S>() == TypeId::of::<NoopSink>() {
@@ -606,13 +846,6 @@ where
     } else {
         Some(Arc::new(cfg.sink))
     };
-    let accept_wakes = (0..runtimes.len())
-        .map(|_| Wake::new().map(Arc::new))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| NetError::DriverSetup {
-            driver: DriverKind::Blocking,
-            source: e,
-        })?;
     let mut worker_wakes = Vec::with_capacity(usize::from(cfg.workers));
     for _ in 0..cfg.workers {
         worker_wakes.push(
@@ -625,6 +858,7 @@ where
         );
     }
     let queue_capacity = limits.completion_queue as usize;
+    let next_listener = u32::try_from(infos.len()).unwrap_or(u32::MAX);
     let shared = Arc::new_cyclic(|weak: &Weak<Shared>| Shared {
         pid: std::process::id(),
         door: AtomicBool::new(false),
@@ -641,6 +875,7 @@ where
                 slot: Arc::new(KillSlot::new()),
                 wake,
                 current: AtomicU64::new(0),
+                listener: AtomicU32::new(NO_LISTENER),
                 lane: AtomicU8::new(0),
                 kill_cause: AtomicU8::new(CAUSE_USER),
                 idle_cause: AtomicU8::new(IDLE_DRAIN),
@@ -655,7 +890,11 @@ where
                 stats: WorkerStats::default(),
             })
             .collect(),
-        accept_wakes,
+        listeners: Mutex::new(entries),
+        next_listener: AtomicU32::new(next_listener),
+        spawn_accept: OnceLock::new(),
+        base_limits: cfg.limits.clone(),
+        trusted: cfg.trusted.clone(),
         queue_notify: OnceLock::new(),
         queue_len: AtomicUsize::new(0),
         control: cfg.control.unwrap_or_else(|| Arc::new(NoControl)),
@@ -669,22 +908,11 @@ where
         drained_graceful: AtomicU32::new(0),
         drained_killed: AtomicU32::new(0),
         drain_timeout: limits.drain_timeout,
-        listener_counts: (0..listener_limits.len())
-            .map(|_| AtomicU32::new(0))
-            .collect(),
-        sources: listener_limits
-            .iter()
-            .map(|l| SourceTable::new(l.max_per_listener, l.max_per_source))
-            .collect(),
-        listener_limits,
-        listener_tcp,
-        listener_proxy,
-        listener_tls,
         tls: cfg.tls,
     });
-    for (i, info) in infos.iter().enumerate() {
+    for info in &infos {
         shared.event(Event::ListenerOpened {
-            listener: ListenerId(u16::try_from(i).unwrap_or(u16::MAX)),
+            listener: info.id,
             local: info.local.socket_addr(),
             backlog: info.backlog,
         });
@@ -697,7 +925,6 @@ where
         gate: Arc::new(cfg.gate),
         queue: Mutex::new(VecDeque::with_capacity(usize::from(cfg.workers))),
         queue_cv: Condvar::new(),
-        listeners: runtimes,
         clock: cfg.clock.map_or(ClockRef::Monotonic, ClockRef::Custom),
         wipe: cfg.wipe,
         budget: Arc::new(AtomicU64::new(limits.buffer_budget)),
@@ -710,8 +937,17 @@ where
             e.queue_cv.notify_all();
         }
     }));
+    let weak = Arc::downgrade(&engine);
+    let _ = shared.spawn_accept.set(Box::new(move |conf, rt| {
+        let Some(e) = weak.upgrade() else {
+            return Err(std::io::Error::other("the server stopped"));
+        };
+        std::thread::Builder::new()
+            .name(format!("net-io-accept-{}", conf.id.0))
+            .spawn(move || accept_loop(&e, &conf, &rt))
+    }));
 
-    let mut threads = Vec::with_capacity(usize::from(cfg.workers) + engine.listeners.len());
+    let mut threads = Vec::with_capacity(usize::from(cfg.workers));
     let spawn_error = |e: std::io::Error| NetError::DriverSetup {
         driver: DriverKind::Blocking,
         source: e,
@@ -732,18 +968,8 @@ where
         }
     }
     if failure.is_none() {
-        for li in 0..engine.listeners.len() {
-            let e = engine.clone();
-            match std::thread::Builder::new()
-                .name(format!("net-io-accept-{li}"))
-                .spawn(move || accept_loop(&e, li))
-            {
-                Ok(t) => threads.push(t),
-                Err(err) => {
-                    failure = Some(spawn_error(err));
-                    break;
-                }
-            }
+        if let Err(err) = shared.spawn_listener_threads() {
+            failure = Some(spawn_error(err));
         }
     }
     drop(engine);
@@ -752,6 +978,7 @@ where
         for t in threads {
             let _ = t.join();
         }
+        shared.join_listeners();
         return Err(err);
     }
     Ok(Server {
@@ -764,18 +991,21 @@ where
 
 // ---- accept ---------------------------------------------------------------
 
-fn accept_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, li: usize) {
+fn accept_loop<W: super::Workload, G: Gate>(
+    engine: &Arc<Engine<W, G>>,
+    conf: &Arc<ListenerConf>,
+    rt: &ListenerRuntime,
+) {
     let shared = &engine.shared;
-    let wake = shared.accept_wakes[li].clone();
-    let rt = &engine.listeners[li];
-    let batch = shared.listener_limits[li].accept_batch;
+    let wake = conf.wake.clone();
+    let batch = conf.limits.accept_batch;
     let mut acceptor = Acceptor::new();
     let mut ids = IdBlock::new();
     let mut view = ControlView::new();
     let mut coalescer = Coalescer::new();
     let mut pause_until: Option<Instant> = None;
     loop {
-        if shared.stopping.load(Ordering::Acquire) {
+        if shared.stopping.load(Ordering::Acquire) || conf.removed.load(Ordering::Acquire) {
             return;
         }
         if view.refresh(shared.control.as_ref()) {
@@ -802,8 +1032,9 @@ fn accept_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, li: usiz
                 _ => {}
             }
         }
-        let accepting =
-            shared.door.load(Ordering::Acquire) && !shared.draining.load(Ordering::Acquire);
+        let accepting = shared.door.load(Ordering::Acquire)
+            && conf.door.load(Ordering::Acquire)
+            && !shared.draining.load(Ordering::Acquire);
         let now = engine.clock.now();
         if !accepting {
             let _ = sys::wait_wake(&wake, None);
@@ -820,7 +1051,7 @@ fn accept_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, li: usiz
             let outcome = match rt {
                 ListenerRuntime::Tcp(l) => match acceptor.accept(l.std()) {
                     Accepted::Conn((stream, peer)) => {
-                        engine.admit_tcp(stream, peer, li, &mut ids, &view, &mut coalescer);
+                        engine.admit_tcp(stream, peer, conf, &mut ids, &view, &mut coalescer);
                         continue;
                     }
                     other => other.without_conn(),
@@ -828,7 +1059,7 @@ fn accept_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, li: usiz
                 #[cfg(all(unix, feature = "local"))]
                 ListenerRuntime::Unix(l) => match acceptor.accept_unix(l.std()) {
                     Accepted::Conn(stream) => {
-                        engine.admit_unix(l, stream, li, &mut ids, &view, &mut coalescer);
+                        engine.admit_unix(l, stream, conf, &mut ids, &view, &mut coalescer);
                         continue;
                     }
                     other => other.without_conn(),
@@ -837,7 +1068,7 @@ fn accept_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, li: usiz
             match outcome {
                 Accepted::Conn(()) => {}
                 Accepted::Skipped(class) => shared.event(Event::AcceptError {
-                    listener: ListenerId(li as u16),
+                    listener: conf.id,
                     class,
                 }),
                 Accepted::Again => {
@@ -847,7 +1078,7 @@ fn accept_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, li: usiz
                 Accepted::Pause(backoff) => {
                     shared.descriptor_pressure.fetch_add(1, Ordering::Relaxed);
                     shared.event(Event::DescriptorPressure {
-                        listener: ListenerId(li as u16),
+                        listener: conf.id,
                         backoff,
                     });
                     pause_until = Some(engine.clock.now() + backoff);
@@ -855,7 +1086,7 @@ fn accept_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, li: usiz
                 }
                 Accepted::Failed(e) => {
                     shared.event(Event::ListenerFailed {
-                        listener: ListenerId(li as u16),
+                        listener: conf.id,
                         class: OsErrorClass::from_io(&e),
                     });
                     return;
@@ -899,25 +1130,26 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
         &self,
         stream: TcpStream,
         peer: SocketAddr,
-        li: usize,
+        conf: &Arc<ListenerConf>,
         ids: &mut IdBlock,
         view: &ControlView,
         co: &mut Coalescer,
     ) {
-        let source = PrefixKey::of(peer.ip(), self.shared.listener_limits[li].source_policy);
+        let source = PrefixKey::of(peer.ip(), conf.limits.source_policy);
+        let id = conf.id;
         self.admit_one(
             sys::Stream::Tcp(stream),
             Some(peer),
             Some(source),
-            li,
+            conf,
             ids,
             view,
             co,
-            |stream, id, at| {
+            |stream, cid, at| {
                 let local = stream.tcp()?.local_addr().ok()?;
                 Some(ConnectionInfo::new_tcp(
-                    id,
-                    Some(ListenerId(li as u16)),
+                    cid,
+                    Some(id),
                     WorkerId(0),
                     Origin::Accepted,
                     local,
@@ -935,7 +1167,7 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
         &self,
         listener: &UnixListener,
         stream: std::os::unix::net::UnixStream,
-        li: usize,
+        conf: &Arc<ListenerConf>,
         ids: &mut IdBlock,
         view: &ControlView,
         co: &mut Coalescer,
@@ -946,10 +1178,11 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
             return self.refuse(stream, None, RefusalCause::Credentials, None, co);
         }
         let path = listener.shared_path().clone();
-        self.admit_one(stream, None, None, li, ids, view, co, |_, id, at| {
+        let id = conf.id;
+        self.admit_one(stream, None, None, conf, ids, view, co, |_, cid, at| {
             Some(ConnectionInfo::new_unix(
-                id,
-                Some(ListenerId(li as u16)),
+                cid,
+                Some(id),
                 Origin::Accepted,
                 Endpoint::Unix(path),
                 Endpoint::Unnamed,
@@ -965,15 +1198,15 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
         stream: sys::Stream,
         peer: Option<SocketAddr>,
         source: Option<PrefixKey>,
-        li: usize,
+        conf: &Arc<ListenerConf>,
         ids: &mut IdBlock,
         view: &ControlView,
         co: &mut Coalescer,
         make_info: impl FnOnce(&sys::Stream, ConnectionId, Instant) -> Option<ConnectionInfo>,
     ) {
         let shared = &self.shared;
-        let lim = &shared.listener_limits[li];
-        let count = &shared.listener_counts[li];
+        let lim = &conf.limits;
+        let count = &conf.count;
         // Caps before any byte is read.
         if !take_slot(&shared.open, lim.max_connections) {
             return self.refuse(stream, peer, RefusalCause::GlobalCap, None, co);
@@ -983,13 +1216,13 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
             return self.refuse(stream, peer, RefusalCause::ListenerCap, None, co);
         }
         if let Some(source) = source {
-            if !shared.sources[li].acquire(source) {
+            if !conf.sources.acquire(source) {
                 shared.open.fetch_sub(1, Ordering::AcqRel);
                 count.fetch_sub(1, Ordering::AcqRel);
                 return self.refuse(stream, peer, RefusalCause::SourceCap, None, co);
             }
         }
-        let release = |s: &Self| s.shared.release(li, source);
+        let release = |s: &Self| s.shared.release(conf, source);
         if matches!(view.state(), ControlState::Lockdown) {
             release(self);
             return self.refuse(stream, peer, RefusalCause::Lockdown, None, co);
@@ -1037,7 +1270,7 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
             stream,
             info,
             ticket,
-            listener: li,
+            listener: conf.clone(),
             source,
         };
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1066,7 +1299,7 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
         shared.event(Event::Accepted {
             id: event_id,
             peer,
-            listener: ListenerId(li as u16),
+            listener: conf.id,
         });
         shared.event(Event::Admitted {
             id: event_id,
@@ -1204,7 +1437,7 @@ impl<G: Gate> Worker<G> {
         &mut self,
         link: &mut Link,
         proxy: &ListenerProxy,
-        listener: usize,
+        listener: &ListenerConf,
         source: &mut Option<PrefixKey>,
     ) -> Result<(), CloseReason> {
         use crate::proxy_parse::{ProxyAddress, ProxyCommand, ProxyParser, ProxyProgress};
@@ -1277,7 +1510,7 @@ impl<G: Gate> Worker<G> {
             // The per-source slot moves from the proxy to the real client.
             let key = PrefixKey::of(real.ip(), lim.source_policy);
             if Some(key) != *source {
-                let table = &shared.sources[listener];
+                let table = &listener.sources;
                 if !table.acquire(key) {
                     return Err(CloseReason::Refused(RefusalCause::SourceCap));
                 }
@@ -1328,7 +1561,11 @@ impl<G: Gate> Worker<G> {
         Ok(())
     }
     /// Starts serving a job: options (where not inherited), the kill slot, the gate ticket.
-    fn begin(&mut self, job: Job<G::Ticket>) -> Option<(Link, usize, Option<PrefixKey>)> {
+    #[allow(clippy::type_complexity)]
+    fn begin(
+        &mut self,
+        job: Job<G::Ticket>,
+    ) -> Option<(Link, Arc<ListenerConf>, Option<PrefixKey>)> {
         let Job {
             stream,
             mut info,
@@ -1337,7 +1574,7 @@ impl<G: Gate> Worker<G> {
             source,
         } = job;
         let shared = self.shared.clone();
-        let limits = shared.listener_limits[listener];
+        let limits = listener.limits;
         info.worker = WorkerId(self.idx as u16);
         let mut cell = self.gate_cell.take().unwrap_or_else(|| {
             Box::new(GateCell {
@@ -1351,7 +1588,7 @@ impl<G: Gate> Worker<G> {
         // connection then closes through `end` like any other, with one event.
         let mut failed = None;
         if !cfg!(any(target_os = "linux", windows)) {
-            let tcp = shared.listener_tcp[listener];
+            let tcp = listener.tcp;
             let v6 = info.local.socket_addr().is_some_and(|a| a.is_ipv6());
             if let (false, Some(stream)) = (tcp.is_empty(), stream.tcp()) {
                 if let Err(e) = tcp.apply(stream, v6) {
@@ -1366,6 +1603,8 @@ impl<G: Gate> Worker<G> {
         ws.kill_cause.store(CAUSE_USER, Ordering::Release);
         ws.idle_cause.store(IDLE_DRAIN, Ordering::Release);
         ws.lane.store(info.lane.0, Ordering::Release);
+        ws.listener
+            .store(u32::from(listener.id.0), Ordering::Release);
         let mut link = Link::new(
             stream,
             info,
@@ -1381,6 +1620,12 @@ impl<G: Gate> Worker<G> {
         } else {
             self.gate_cell = Some(cell);
         }
+        // Queued before its listener was removed: close it unread.
+        let failed = if listener.removed.load(Ordering::Acquire) {
+            Some(CloseReason::Drained)
+        } else {
+            failed
+        };
         if let Some(reason) = failed {
             self.end(link, reason, listener, source);
             return None;
@@ -1388,14 +1633,14 @@ impl<G: Gate> Worker<G> {
         #[cfg(feature = "proxy")]
         let mut source = source;
         #[cfg(feature = "proxy")]
-        if let Some(proxy) = shared.listener_proxy[listener].clone() {
-            if let Err(reason) = self.proxy_handshake(&mut link, &proxy, listener, &mut source) {
+        if let Some(proxy) = listener.proxy.clone() {
+            if let Err(reason) = self.proxy_handshake(&mut link, &proxy, &listener, &mut source) {
                 self.end(link, reason, listener, source);
                 return None;
             }
         }
         #[cfg(feature = "tls")]
-        if shared.listener_tls[listener] {
+        if listener.tls {
             if let Err(reason) = self.tls_handshake(&mut link) {
                 self.end(link, reason, listener, source);
                 return None;
@@ -1409,7 +1654,7 @@ impl<G: Gate> Worker<G> {
         &mut self,
         link: Link,
         reason: CloseReason,
-        listener: usize,
+        listener: Arc<ListenerConf>,
         source: Option<PrefixKey>,
     ) -> (ConnectionInfo, CloseReason) {
         let shared = self.shared.clone();
@@ -1461,7 +1706,8 @@ impl<G: Gate> Worker<G> {
         }
         self.output.reset();
         ws.current.store(0, Ordering::Release);
-        shared.release(listener, source);
+        ws.listener.store(NO_LISTENER, Ordering::Release);
+        shared.release(&listener, source);
         // Single writer: plain load and store, inside the sequence lock.
         let st = &ws.stats;
         let bump =
