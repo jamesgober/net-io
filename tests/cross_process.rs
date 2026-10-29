@@ -225,19 +225,58 @@ fn systemd_socket_activation_with_the_real_tool() {
         eprintln!("systemd-socket-activate is not installed; skipped");
         return;
     };
-    let addr = free_port();
     let exe = std::env::current_exe().expect("test binary");
-    let c = Command::new(tool)
-        .arg(format!("--listen={addr}"))
-        .arg("--fdname=web")
-        .arg("--setenv=NET_IO_CHILD=systemd")
-        .arg(exe)
-        .args(["--exact", "child_systemd", "--ignored", "--nocapture"])
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn");
-    assert_eq!(fetch(addr), b"systemd web");
-    wait_ok(c);
+    // The port is chosen by binding port 0 and releasing it, so another test
+    // running in parallel can take it before the tool binds. Connect only after
+    // the tool says it listens; if its bind failed, try another port.
+    for _ in 0..5 {
+        let addr = free_port();
+        let mut c = Command::new(tool)
+            .arg(format!("--listen={addr}"))
+            .arg("--fdname=web")
+            .arg("--setenv=NET_IO_CHILD=systemd")
+            .arg(&exe)
+            .args(["--exact", "child_systemd", "--ignored", "--nocapture"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        if !listening(&mut c) {
+            let _ = c.kill();
+            let _ = c.wait();
+            continue;
+        }
+        assert_eq!(fetch(addr), b"systemd web");
+        wait_ok(c);
+        return;
+    }
+    panic!("systemd-socket-activate never listened");
+}
+
+/// Waits for `systemd-socket-activate` to report "Listening on" on its stderr
+/// (false when it exits or reports anything else first). Its stderr, which the
+/// child shares, keeps being copied to this test's stderr afterwards.
+fn listening(c: &mut Child) -> bool {
+    use std::io::BufRead;
+    let Some(stderr) = c.stderr.take() else {
+        return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut told = false;
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            eprintln!("{line}");
+            if !told {
+                let _ = tx.send(line.starts_with("Listening on"));
+                told = true;
+            }
+        }
+        if !told {
+            let _ = tx.send(false);
+        }
+    });
+    rx.recv_timeout(WAIT).unwrap_or(false)
 }
 
 #[test]
