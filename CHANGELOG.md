@@ -13,7 +13,7 @@
 
 ---
 
-## [0.4.0] - 2026-10-26
+## [0.4.0] - 2026-10-29
 
 Edges: everything around the TCP core that a real deployment meets. Behind a
 proxy, on a Unix socket, over UDP, started by systemd or a FastCGI manager,

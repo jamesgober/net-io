@@ -84,7 +84,7 @@ Moved to a later version (anti-deferral record):
 | Appendix A case 11 (reads pause when the buffer budget is spent) | 0.5 | the blocking driver takes each worker's buffers at warm-up and validates the budget at build, so it cannot run dry mid-connection; pausing one connection's reads is reactor behaviour |
 | Benchmark B-2 goal (1.2x the std thread-per-connection server) | 0.6 | measured under load with the `compare/` harness from 0.6, where the competitor gate starts; the 0.3 baseline (one connection, loopback) is at parity within noise |
 
-## v0.4.0 - Extended: edges (DONE, 2026-10-26)
+## v0.4.0 - Extended: edges (DONE, 2026-10-29)
 Exit: net-io runs behind Apache and nginx over TCP and over a Unix socket with the real client address from PROXY v1 and v2; serves TLS directly through tls-net; a listener hand-off between two processes under 1,000 connections per second refuses zero connections (Linux and macOS); systemd socket activation and FastCGI descriptor 0 work in emulated tests and on one real host each.
 
 | Area | Items |
