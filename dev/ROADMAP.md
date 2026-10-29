@@ -6,6 +6,8 @@
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 >
 > **After every version:** the release routine (section "Release routine" below), then the next version starts.
+>
+> **Nothing accepted mid-series becomes final silently.** Every accepted gap, deferred item, known issue, platform caveat, and missed target goes into the register at the end of this file when it is accepted. The pre-1.0 polish milestone (0.9.x) works through all of it, and whatever is still open goes into the 1.0 readiness note for James (D-102).
 
 ## Reconciliation with the 0.1 roadmap (recorded 2026-10-23, D-013)
 
@@ -161,8 +163,20 @@ Exit: no API change requested by consumers for the final release candidate; the 
 
 Items: API freeze candidate; 72-hour soak; external review of every `sys` `unsafe` block against its `// SAFETY:` comment; all documentation final; `0.9.x` release candidates for consumers.
 
+## v0.9.x - Pre-1.0 polish (before any 1.0 release candidate)
+Exit: every entry in the register below is closed (fixed, measured and accepted with a reason, or moved after 1.0 with a reason); a fresh performance pass and a fresh security and edge-case review are recorded; the 1.0 readiness note for James is written. No `1.0.0-rc` is cut before this exit.
+
+Standing rule from James: "make sure to go back and fix any issues / perf tune / etc before we get close to release."
+
+Items:
+- **Revisit the register.** Every accepted gap, deferred item, known issue, platform note, and missed target, one by one: fix it, or measure it and record why it stays (with the cost of fixing it), or move it after 1.0 with a reason. Nothing stays open by default.
+- **Performance tuning pass.** Re-run every benchmark in `docs/PERFORMANCE.md` (B-1 to B-14) against the competitor harness on Linux, macOS, and Windows; profile the hot paths (accept, read, write, close, the gate check, the timing wheel); try to remove the extra system call per round trip on macOS and Windows; publish before and after numbers. A missed target is either met or written into the readiness note with its gap.
+- **Security and edge-case review.** Re-run the threat table in `docs/SECURITY.md` (every attack test), every case in `dev/EDGE-CASES.md`, extended fuzzing of every target, and an adversarial read of every change since 0.7's review; findings fixed test-first.
+- **Platform notes.** Every caveat in `docs/PLATFORM-NOTES.md` is checked again on current OS versions: still true, still needed, still the best available behaviour.
+- **1.0 readiness note** (`docs/STABILITY-1.0.md`, section "Open at 1.0"): in plain English, every item still open, what it costs a user, and a recommendation, for James's go/no-go.
+
 ## v1.0.0 - Stable
-Exit: DIRECTIVES done item 10 (the web stack and one non-HTTP service used the API end to end); the full audit passed and recorded in `docs/STABILITY-1.0.md`; **James's go/no-go** before the tag.
+Exit: DIRECTIVES done item 10 (the web stack and one non-HTTP service used the API end to end); the 0.9.x polish milestone done and its readiness note written; the full audit passed and recorded in `docs/STABILITY-1.0.md`; **James's go/no-go** before the tag.
 
 Items: API frozen until 2.0; MSRV frozen (a raise is a major change).
 
@@ -182,3 +196,29 @@ io_uring driver (feature `uring`, D-015), NUMA-aware pools, UDP GSO/GRO, kTLS ha
 7. `cargo doc --no-deps` with default and all features under `RUSTDOCFLAGS=-D warnings`.
 8. `cargo publish --dry-run`, then `cargo publish`.
 9. Verify the version on crates.io and the docs.rs build.
+
+---
+
+## Register: accepted gaps, deferrals, known issues, missed targets
+
+Every entry is revisited in the 0.9.x polish milestone. Add an entry in the same change that accepts the gap. Close an entry only with the change that fixes it, or with a measured reason in this table.
+
+| # | Since | Kind | Item | Current state | Revisit |
+|---|---|---|---|---|---|
+| R-1 | 0.3 | missed target | macOS: 3 system calls per keep-alive round trip, against 2 on Linux (a `poll` before every receive, D-083) | measured; the Linux model does not hold on macOS | reactor (0.5) and the 0.9.x performance pass |
+| R-2 | 0.3 | missed target | Windows: 3 system calls per round trip (`WSAPoll` before every receive, D-052) | measured; required by Microsoft's documented timeout semantics | IOCP reactor (0.5) and the 0.9.x performance pass |
+| R-3 | 0.3 | missed target | B-2 goal of 1.2x the std thread-per-connection server | 0.3 baseline at parity within noise; goal moved to 0.6 | 0.6 harness, then 0.9.x |
+| R-4 | 0.3 | platform note | Windows send-buffer autotuning lets a peer that never reads absorb tens of MiB before the write timeout; operators must set `ListenOptions::send_buffer` | documented in `docs/PLATFORM-NOTES.md` | consider a bounded default for internet-facing listeners |
+| R-5 | 0.3 | platform note | Windows: each worker's wake channel holds one loopback UDP port; many servers in one process can hit `WSAENOBUFS` | documented | reactor (0.5) wake mechanism |
+| R-6 | 0.3 | deferred | timing wheel, appendix A cases 53 to 60, benchmark B-8, case 11 (reads pause on an empty budget), FreeBSD and the std-only fallback | moved to 0.5 (D-063, D-064) | 0.5 |
+| R-7 | 0.4 | platform note | macOS has no atomic close-on-exec for accepted, received, or inherited descriptors (a fork plus exec on another thread can inherit one) | documented | check current macOS for a race-free option |
+| R-8 | 0.4 | platform note | a refusal that writes bytes is followed by RST; Windows discards unread bytes on RST, so a Windows peer may not see the refusal | documented; the RST is deliberate (threat T-44) | measure a FIN close under refusal floods; decide |
+| R-9 | 0.4 | platform note | UDP truncation reports the copied length on macOS and Windows (the real length only on Linux) | documented | check `recvmsg` options on current OS versions |
+| R-10 | 0.4 | accepted gap | a `BlockingHandler` receives Unix connections as a `TcpConnection` (`peer_addr` unspecified, socket options fail) (D-093) | documented | a connection type shared by every transport with the reactor API (0.5) |
+| R-11 | 0.4 | accepted gap | an adopted Unix socket's file is never removed by the adopting process (D-098) | documented | find a safe identity check, or keep with the reason |
+| R-12 | 0.4 | accepted gap | the hand-off manifest carries no options digest (D-099) | address check against `getsockname` instead | re-check during the security review |
+| R-13 | 0.4 | missed criterion | "behind Apache": Apache's `mod_proxy` does not send the PROXY protocol; HAProxy and nginx are tested instead | recorded in the 0.4 exit table | confirm the Apache deployment shape with serve-net |
+| R-14 | 0.4 | missed criterion | TLS served through tls-net was not built against 0.4 here; net-io's side is tested with a test engine | tls-net's release step | integration test with the published tls-net |
+| R-15 | 0.4 | missed criterion | FastCGI descriptor 0 tested by emulating `mod_fcgid`, not under a real FastCGI manager | no manager on the build host | run under `mod_fcgid` or `spawn-fcgi` once |
+| R-16 | 0.4 | deferred | hash-flooding chain test for the per-source tables (threat T-22) | `std` keyed SipHash in use | 0.7 hardening |
+| R-17 | 0.4 | deferred | Windows hand-off, edge cases 104 and 105 | scheduled | 0.5 |
