@@ -582,3 +582,33 @@ fn test_exchange_timeout_can_answer_then_close_gracefully() {
         == 1));
     assert_eq!(server.stats().closed_for(CloseReason::ExchangeDeadline), 0);
 }
+
+#[test]
+fn test_per_source_cap_per_listener() {
+    // Listener 0 allows one connection per source; listener 1 keeps the default.
+    let server = ServerBuilder::new()
+        .listener(
+            ListenerSpec::tcp("127.0.0.1:0")
+                .limits(limits(|b| b.max_per_source(1, PrefixPolicy::HOST))),
+        )
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .workers(8)
+        .handler(echo_handler)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let a = server.listeners()[0].local.socket_addr().expect("ip");
+    let b = server.listeners()[1].local.socket_addr().expect("ip");
+    let mut first = client(a);
+    assert_eq!(round_trip(&mut first, b"x"), b"x");
+    assert!(
+        refused(a),
+        "the second connection to the capped listener is refused"
+    );
+    let mut others: Vec<_> = (0..3).map(|_| client(b)).collect();
+    for c in &mut others {
+        assert_eq!(round_trip(c, b"y"), b"y");
+    }
+    assert_eq!(server.stats().refused_for(RefusalCause::SourceCap), 1);
+}

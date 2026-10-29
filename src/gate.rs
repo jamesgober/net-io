@@ -247,6 +247,9 @@ pub(crate) fn guarded<R>(f: impl FnOnce() -> R) -> Option<R> {
 /// A gate and one connection's ticket, type-erased for `TcpConnection`.
 pub(crate) trait ErasedGate: Send {
     fn check(&mut self, write: &WriteCheck) -> Result<(), Denial>;
+    /// `Gate::readmit` with the current ticket (a panic refuses).
+    #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
+    fn readmit(&mut self, info: &ConnectionInfo) -> Result<(), Refusal>;
     fn close(&mut self, info: &ConnectionInfo, reason: CloseReason);
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send>;
 }
@@ -265,6 +268,16 @@ impl<G: Gate> ErasedGate for GateCell<G> {
                 guarded(|| gate.check(ticket, write)).unwrap_or(Err(Denial { code: 0 }))
             }
             None => Err(Denial { code: 0 }),
+        }
+    }
+
+    fn readmit(&mut self, info: &ConnectionInfo) -> Result<(), Refusal> {
+        let gate = &self.gate;
+        match self.ticket.as_mut() {
+            Some(ticket) => {
+                guarded(|| gate.readmit(ticket, info)).unwrap_or(Err(Refusal::Reset { code: 0 }))
+            }
+            None => Err(Refusal::Reset { code: 0 }),
         }
     }
 

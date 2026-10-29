@@ -149,7 +149,8 @@ where
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
-    /// Wait for more input.
+    /// Wait for more input. Output pushed in this call is not sent: return
+    /// `Write` (or `Close`) to flush it first.
     Read,
     /// Flush pending output, then `on_writable`.
     Write,

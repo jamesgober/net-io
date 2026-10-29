@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "net-io"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -32,6 +32,9 @@ documentation = "https://docs.rs/net-io"
 # Authors
 authors = ["James Gober <me@jamesgober.com>"]
 
+# Kept out of the published crate
+exclude = ["fuzz/"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
@@ -44,7 +47,15 @@ path = "src/lib.rs"
 # FEATURE FLAGS
 # #################################
 [features]
-default = []
+default = ["proxy", "udp", "local", "tls"]
+# PROXY protocol parser and server integration.
+proxy = []
+# UDP socket, amplification guard, source budgets.
+udp = []
+# Unix domain sockets, descriptor passing, listener hand-off (Windows named pipes from 0.5).
+local = []
+# The TLS seam's server integration (no TLS code; an engine plugs in).
+tls = []
 
 
 # DEPENDENCIES
@@ -66,8 +77,28 @@ libc = "0.2"
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock"] }
 
-[target.'cfg(loom)'.dev-dependencies]
+[target.'cfg(net_io_loom)'.dev-dependencies]
 loom = "0.7"
+
+
+# EXAMPLES
+# #################################
+# Examples that need a feature are skipped when it is off.
+[[example]]
+name              = "behind_proxy"
+required-features = ["proxy"]
+
+[[example]]
+name              = "unix_socket"
+required-features = ["local"]
+
+[[example]]
+name              = "handoff_restart"
+required-features = ["local"]
+
+[[example]]
+name              = "udp_echo"
+required-features = ["udp"]
 
 
 # BENCHMARKS
@@ -81,7 +112,7 @@ harness = false
 # LINTS
 # #################################
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(net_io_shim)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(net_io_loom)", "cfg(net_io_shim)", "cfg(fuzzing)"] }
 
 
 # RELEASE PROFILE

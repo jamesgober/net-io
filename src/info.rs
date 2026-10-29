@@ -350,6 +350,35 @@ impl ConnectionInfo {
         )
     }
 
+    /// A connection on a Unix domain socket.
+    #[cfg(all(unix, feature = "local"))]
+    pub(crate) fn new_unix(
+        id: ConnectionId,
+        listener: Option<ListenerId>,
+        origin: Origin,
+        local: Endpoint,
+        peer: Endpoint,
+        credentials: Option<PeerCredentials>,
+        at: Instant,
+    ) -> ConnectionInfo {
+        ConnectionInfo {
+            id,
+            listener,
+            worker: WorkerId(0),
+            transport: Transport::Unix,
+            origin,
+            local,
+            peer,
+            real_peer: None,
+            proxy: None,
+            peer_credentials: credentials,
+            tls: None,
+            lane: Lane::MOST_IMPORTANT,
+            gate: GateTag(0),
+            accepted_at: at,
+        }
+    }
+
     pub(crate) fn new_tcp(
         id: ConnectionId,
         listener: Option<ListenerId>,

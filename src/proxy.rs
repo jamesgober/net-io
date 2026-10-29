@@ -1,6 +1,6 @@
 //! PROXY protocol vocabulary.
 //!
-//! The parser and the server integration arrive in `0.4.0` behind the `proxy`
+//! The parser (`proxy_parse`) and the server integration are behind the `proxy`
 //! feature; the types the rest of the crate refers to exist in every build.
 
 use std::fmt;
@@ -77,6 +77,33 @@ impl Default for ProxyFacts {
 }
 
 impl ProxyFacts {
+    /// Copies the facts into fixed arrays; a value longer than its array is left out.
+    #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
+    pub(crate) fn from_parts(
+        alpn: Option<&[u8]>,
+        authority: Option<&str>,
+        unique_id: Option<&[u8]>,
+        ssl_client: Option<u8>,
+    ) -> ProxyFacts {
+        let mut f = ProxyFacts {
+            ssl_client,
+            ..ProxyFacts::default()
+        };
+        if let Some(a) = alpn.filter(|a| a.len() <= f.alpn.len()) {
+            f.alpn[..a.len()].copy_from_slice(a);
+            f.alpn_len = a.len() as u8;
+        }
+        if let Some(a) = authority.filter(|a| a.len() <= f.authority.len()) {
+            f.authority[..a.len()].copy_from_slice(a.as_bytes());
+            f.authority_len = a.len() as u8;
+        }
+        if let Some(u) = unique_id.filter(|u| u.len() <= f.unique_id.len()) {
+            f.unique_id[..u.len()].copy_from_slice(u);
+            f.unique_id_len = u.len() as u8;
+        }
+        f
+    }
+
     /// The ALPN protocol the proxy negotiated with the client.
     #[must_use]
     pub fn alpn(&self) -> Option<&[u8]> {

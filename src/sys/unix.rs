@@ -7,7 +7,7 @@
 //! `getrlimit(2)`, `fcntl(2)`) and the macOS man pages of the same names.
 
 use std::ffi::{c_int, c_short, c_void};
-use std::io::{self, IoSlice, Read};
+use std::io::{self, IoSlice};
 use std::mem::size_of;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -116,9 +116,21 @@ pub(crate) fn classify_addr_error(e: &io::Error) -> super::AddrFailure {
 #[cfg(target_os = "linux")]
 mod c {
     use std::ffi::{c_int, c_short};
+    #[cfg(feature = "local")]
+    pub const AF_UNIX: c_int = 1;
     pub const AF_INET: c_int = 2;
     pub const AF_INET6: c_int = 10;
+    pub const AF_UNIX_FAMILY: c_int = 1;
+    pub const F_GETFD: c_int = 1;
+    pub const F_SETFD: c_int = 2;
+    pub const FD_CLOEXEC: c_int = 1;
+    pub const CLOCK_MONOTONIC: c_int = 1;
+    pub const SYS_PIDFD_OPEN: std::ffi::c_long = 434;
     pub const SOCK_STREAM: c_int = 1;
+    #[cfg(feature = "udp")]
+    pub const SOCK_DGRAM: c_int = 2;
+    #[cfg(feature = "udp")]
+    pub const MSG_TRUNC: c_int = 0x20;
     pub const SOCK_CLOEXEC: c_int = 0o2_000_000;
     pub const SOL_SOCKET: c_int = 1;
     pub const SO_REUSEADDR: c_int = 2;
@@ -150,14 +162,31 @@ mod c {
     pub const SHUT_RD: c_int = 0;
     pub const RLIMIT_NOFILE: c_int = 7;
     pub const EINPROGRESS: c_int = 115;
+    #[cfg(feature = "local")]
+    pub const SO_PEERCRED: c_int = 17;
+    #[cfg(feature = "local")]
+    pub const SCM_RIGHTS: c_int = 1;
+    #[cfg(feature = "local")]
+    pub const MSG_CTRUNC: c_int = 0x8;
+    #[cfg(feature = "local")]
+    pub const MSG_CMSG_CLOEXEC: c_int = 0x4000_0000;
 }
 
 #[cfg(target_os = "macos")]
 mod c {
     use std::ffi::{c_int, c_short};
+    #[cfg(feature = "local")]
+    pub const AF_UNIX: c_int = 1;
     pub const AF_INET: c_int = 2;
     pub const AF_INET6: c_int = 30;
+    pub const AF_UNIX_FAMILY: c_int = 1;
+    pub const F_GETFD: c_int = 1;
+    pub const CLOCK_MONOTONIC: c_int = 6;
     pub const SOCK_STREAM: c_int = 1;
+    #[cfg(feature = "udp")]
+    pub const SOCK_DGRAM: c_int = 2;
+    #[cfg(feature = "udp")]
+    pub const MSG_TRUNC: c_int = 0x10;
     pub const SOL_SOCKET: c_int = 0xffff;
     pub const SO_ACCEPTCONN: c_int = 0x2;
     pub const SO_REUSEADDR: c_int = 0x4;
@@ -190,6 +219,14 @@ mod c {
     pub const F_SETFD: c_int = 2;
     pub const FD_CLOEXEC: c_int = 1;
     pub const EINPROGRESS: c_int = 36;
+    #[cfg(feature = "local")]
+    pub const SCM_RIGHTS: c_int = 1;
+    #[cfg(feature = "local")]
+    pub const MSG_CTRUNC: c_int = 0x20;
+    #[cfg(feature = "local")]
+    pub const SOL_LOCAL: c_int = 0;
+    #[cfg(feature = "local")]
+    pub const LOCAL_PEERPID: c_int = 0x002;
 }
 
 // ---- structs ---------------------------------------------------------------
@@ -278,6 +315,14 @@ struct PollFd {
     revents: c_short,
 }
 
+/// `struct timespec` (64-bit targets: both fields 64 bits).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Rlimit {
@@ -320,14 +365,35 @@ unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: Nfds, timeout: c_int) -> c_int;
     fn shutdown(fd: c_int, how: c_int) -> c_int;
     fn getrlimit(resource: c_int, rlim: *mut Rlimit) -> c_int;
-    #[cfg(target_os = "macos")]
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    fn getsockname(fd: c_int, addr: *mut c_void, len: *mut SockLen) -> c_int;
+    fn getpeername(fd: c_int, addr: *mut c_void, len: *mut SockLen) -> c_int;
+    #[cfg(feature = "local")]
+    fn geteuid() -> u32;
+    fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn syscall(num: std::ffi::c_long, ...) -> std::ffi::c_long;
+    #[cfg(any(feature = "local", all(feature = "udp", target_os = "macos")))]
+    fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
+    #[cfg(all(feature = "udp", target_os = "linux"))]
+    fn recvfrom(
+        fd: c_int,
+        buf: *mut c_void,
+        len: usize,
+        flags: c_int,
+        addr: *mut c_void,
+        addr_len: *mut SockLen,
+    ) -> isize;
+    #[cfg(all(feature = "local", target_os = "macos"))]
+    fn getpeereid(fd: c_int, euid: *mut u32, egid: *mut u32) -> c_int;
 }
 
 /// A borrowed socket handle.
 pub(crate) type Sock<'a> = BorrowedFd<'a>;
 /// A raw socket handle (used only inside the kill guard).
 pub(crate) type RawSock = RawFd;
+/// An owned socket handle.
+pub(crate) type OwnedSock = OwnedFd;
 
 /// Types whose socket handle this layer can borrow.
 pub(crate) trait AsSock {
@@ -424,6 +490,137 @@ fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> SockLen {
             out.copy_from_slice(&bytes);
             28
         }
+    }
+}
+
+/// Room for any socket address the kernel returns (`sockaddr_storage`).
+#[repr(C, align(8))]
+struct AddrBuf([u8; 128]);
+
+/// Decodes an IPv4 or IPv6 socket address written by the kernel.
+fn decode_addr(b: &[u8; 128], len: SockLen) -> Option<SocketAddr> {
+    #[cfg(target_os = "linux")]
+    let family = c_int::from(u16::from_ne_bytes([b[0], b[1]]));
+    #[cfg(target_os = "macos")]
+    let family = c_int::from(b[1]);
+    let port = u16::from_be_bytes([b[2], b[3]]);
+    if family == c::AF_INET && len as usize >= 16 {
+        let ip = std::net::Ipv4Addr::new(b[4], b[5], b[6], b[7]);
+        Some(SocketAddr::from((ip, port)))
+    } else if family == c::AF_INET6 && len as usize >= 28 {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&b[8..24]);
+        let flow = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+        let scope = u32::from_ne_bytes([b[24], b[25], b[26], b[27]]);
+        Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::from(octets),
+            port,
+            flow,
+            scope,
+        )))
+    } else {
+        None
+    }
+}
+
+/// A new UDP socket: close-on-exec.
+#[cfg(feature = "udp")]
+fn udp_socket(v6: bool) -> io::Result<OwnedFd> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::Socket)?;
+    let domain = if v6 { c::AF_INET6 } else { c::AF_INET };
+    #[cfg(target_os = "linux")]
+    let ty = c::SOCK_DGRAM | c::SOCK_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let ty = c::SOCK_DGRAM;
+    // SAFETY: socket(2) takes plain integers and returns a new descriptor or -1.
+    let fd = cvt(unsafe { socket(domain, ty, 0) })?;
+    // SAFETY: `fd` was just returned by socket(2), is open, and is owned by no one else.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: as in `tcp_socket`.
+        cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
+    }
+    Ok(owned)
+}
+
+/// Creates and binds a UDP socket; `IPV6_V6ONLY` as asked for IPv6 addresses.
+/// No `SO_REUSEADDR`: another socket must not share the port.
+#[cfg(feature = "udp")]
+pub(crate) fn udp_bind(addr: SocketAddr, ipv6_only: bool) -> io::Result<std::net::UdpSocket> {
+    let fd = udp_socket(addr.is_ipv6())?;
+    if addr.is_ipv6() {
+        set_int(
+            fd.as_fd(),
+            c::IPPROTO_IPV6,
+            c::IPV6_V6ONLY,
+            c_int::from(ipv6_only),
+        )?;
+    }
+    bind_to(fd.as_fd(), addr)?;
+    Ok(std::net::UdpSocket::from(fd))
+}
+
+/// One datagram: its length, its source, and whether it was cut to fit `buf`.
+/// On Linux a truncated datagram reports its real length (`MSG_TRUNC`); on macOS
+/// the length copied.
+#[cfg(feature = "udp")]
+pub(crate) fn udp_recv_from(
+    sock: Sock<'_>,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, bool)> {
+    #[cfg(any(test, net_io_shim))]
+    let buf = match super::shim::io(super::shim::Op::Recv, buf.len())? {
+        Some(n) => &mut buf[..n],
+        None => buf,
+    };
+    let mut addr = AddrBuf([0; 128]);
+    let mut addr_len = 128 as SockLen;
+    #[cfg(target_os = "linux")]
+    let (n, truncated) = {
+        // SAFETY: `buf` is writable for `buf.len()` bytes and `addr` for
+        // `addr_len`; both live for the call; `sock` is open.
+        let n = unsafe {
+            recvfrom(
+                sock.as_raw_fd(),
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf.len(),
+                c::MSG_TRUNC,
+                addr.0.as_mut_ptr().cast::<c_void>(),
+                &raw mut addr_len,
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = n.unsigned_abs();
+        (n, n > buf.len())
+    };
+    #[cfg(target_os = "macos")]
+    let (n, truncated) = {
+        let mut iov = [io::IoSliceMut::new(buf)];
+        let mut msg = MsgHdr {
+            msg_name: addr.0.as_mut_ptr().cast::<c_void>(),
+            msg_namelen: addr_len,
+            msg_iov: iov.as_mut_ptr().cast::<IoSlice<'static>>(),
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+        // SAFETY: `msg` points at `addr` (128 bytes) and one iovec over `buf`;
+        // all live for the call; `sock` is open.
+        let n = unsafe { recvmsg(sock.as_raw_fd(), &raw mut msg, 0) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        addr_len = msg.msg_namelen;
+        (n.unsigned_abs(), msg.msg_flags & c::MSG_TRUNC != 0)
+    };
+    match decode_addr(&addr.0, addr_len) {
+        Some(from) => Ok((n, from, truncated)),
+        None => Err(io::Error::from(io::ErrorKind::InvalidData)),
     }
 }
 
@@ -560,6 +757,165 @@ fn bound_without_peer(sock: Sock<'_>) -> io::Result<bool> {
     Ok(s.local_addr()?.port() != 0)
 }
 
+/// Identifies a socket handed to this process: a listening stream socket, TCP
+/// (IPv4 or IPv6) or Unix, and the address it is bound to.
+pub(crate) fn listener_kind(sock: Sock<'_>) -> Result<super::SockKind, super::KindError> {
+    use super::{KindError, SockKind};
+    let ty = match get_int(sock, c::SOL_SOCKET, c::SO_TYPE) {
+        Ok(t) => t,
+        Err(e) if matches!(e.raw_os_error(), Some(errno::ENOTSOCK | errno::EBADF)) => {
+            return Err(KindError::NotASocket);
+        }
+        Err(e) => return Err(KindError::Os(e)),
+    };
+    if ty != c::SOCK_STREAM {
+        return Err(KindError::WrongKind);
+    }
+    let mut addr = AddrBuf([0; 128]);
+    let mut len = 128 as SockLen;
+    // SAFETY: `addr` is writable for `len` bytes and lives for the call; `sock` is open.
+    cvt(unsafe {
+        getsockname(
+            sock.as_raw_fd(),
+            addr.0.as_mut_ptr().cast::<c_void>(),
+            &raw mut len,
+        )
+    })
+    .map_err(KindError::Os)?;
+    #[cfg(target_os = "linux")]
+    let family = c_int::from(u16::from_ne_bytes([addr.0[0], addr.0[1]]));
+    #[cfg(target_os = "macos")]
+    let family = c_int::from(addr.0[1]);
+    let kind = if family == c::AF_UNIX_FAMILY {
+        let end = (len as usize).min(addr.0.len());
+        let path = addr.0.get(2..end).unwrap_or(&[]);
+        // Up to the terminator; an abstract name (leading NUL) counts as unnamed.
+        let path = path.split(|&b| b == 0).next().unwrap_or(&[]);
+        SockKind::Unix(path.to_vec())
+    } else {
+        match decode_addr(&addr.0, len) {
+            Some(a) => SockKind::Tcp(a),
+            None => return Err(KindError::WrongKind),
+        }
+    };
+    let listening = match get_int(sock, c::SOL_SOCKET, c::SO_ACCEPTCONN) {
+        Ok(v) => v != 0,
+        // macOS: no SO_ACCEPTCONN; a bound socket without a peer counts (as in
+        // `is_listening_stream`).
+        Err(e) if e.raw_os_error() == Some(errno::ENOPROTOOPT) => {
+            let bound = match &kind {
+                SockKind::Tcp(a) => a.port() != 0,
+                SockKind::Unix(p) => !p.is_empty(),
+            };
+            bound && !has_peer(sock).map_err(KindError::Os)?
+        }
+        Err(e) => return Err(KindError::Os(e)),
+    };
+    if !listening {
+        return Err(KindError::NotListening);
+    }
+    Ok(kind)
+}
+
+/// Whether `sock` is connected (`getpeername` succeeds; `ENOTCONN` means no peer).
+pub(crate) fn has_peer(sock: Sock<'_>) -> io::Result<bool> {
+    let mut addr = AddrBuf([0; 128]);
+    let mut len = 128 as SockLen;
+    // SAFETY: as in `listener_kind`.
+    let ret = unsafe {
+        getpeername(
+            sock.as_raw_fd(),
+            addr.0.as_mut_ptr().cast::<c_void>(),
+            &raw mut len,
+        )
+    };
+    if ret == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    if e.kind() == io::ErrorKind::NotConnected {
+        Ok(false)
+    } else {
+        Err(e)
+    }
+}
+
+/// Identifies a descriptor this process was given by number (systemd, FastCGI):
+/// checks it is open first, then as [`listener_kind`].
+pub(crate) fn inherited_kind(fd: RawFd) -> Result<super::SockKind, super::KindError> {
+    // SAFETY: F_GETFD only reads the descriptor's flags; on a closed number it
+    // fails with EBADF and touches nothing.
+    if unsafe { fcntl(fd, c::F_GETFD) } == -1 {
+        return Err(super::KindError::NotASocket);
+    }
+    // SAFETY: the descriptor is open (checked above) and stays open for this
+    // call: only `claim_inherited` takes ownership of inherited descriptors.
+    listener_kind(unsafe { BorrowedFd::borrow_raw(fd) })
+}
+
+/// Takes ownership of an inherited descriptor and sets close-on-exec. The caller
+/// (`inherit`) does this once per descriptor per process, under its lock, after
+/// `inherited_kind` verified it; nothing else in net-io owns these numbers.
+pub(crate) fn claim_inherited(fd: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: see above: the descriptor is open and has no other owner in net-io.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `owned` is open; F_SETFD with FD_CLOEXEC is fcntl(2)'s documented use.
+    cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
+    Ok(owned)
+}
+
+/// `CLOCK_MONOTONIC` in microseconds.
+pub(crate) fn monotonic_micros() -> u64 {
+    let mut ts = Timespec::default();
+    // SAFETY: `ts` is a live, correctly sized timespec; CLOCK_MONOTONIC always exists.
+    let _ = unsafe { clock_gettime(c::CLOCK_MONOTONIC, &raw mut ts) };
+    (ts.tv_sec.max(0) as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add((ts.tv_nsec.max(0) as u64) / 1_000)
+}
+
+/// This process's effective user id.
+#[cfg(feature = "local")]
+pub(crate) fn effective_uid() -> u32 {
+    // SAFETY: geteuid(2) takes no arguments and cannot fail.
+    unsafe { geteuid() }
+}
+
+/// The inode of this process's pidfd, which systemd passes as `LISTEN_PIDFDID`
+/// (Linux 6.9 and later).
+#[cfg(target_os = "linux")]
+pub(crate) fn pidfd_inode() -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let pid = std::ffi::c_long::from(std::process::id() as i32);
+    // SAFETY: pidfd_open(2) takes a pid and flags (0) and returns a new descriptor or -1.
+    let fd = unsafe { syscall(c::SYS_PIDFD_OPEN, pid, 0 as std::ffi::c_long) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = RawFd::try_from(fd).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    // SAFETY: `fd` was just returned by pidfd_open, is open, and is owned by no one else.
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    Ok(file.metadata()?.ino())
+}
+
+/// Places a duplicate of `sock` at descriptor number `target` (tests only).
+#[cfg(test)]
+pub(crate) fn dup_to(sock: Sock<'_>, target: RawFd) -> io::Result<()> {
+    unsafe extern "C" {
+        fn dup2(old: c_int, new: c_int) -> c_int;
+    }
+    // SAFETY: dup2 takes two descriptor numbers; `sock` is open, `target` is a
+    // number the test reserved.
+    cvt(unsafe { dup2(sock.as_raw_fd(), target) }).map(drop)
+}
+
+/// Closes descriptor number `fd` (tests only).
+#[cfg(test)]
+pub(crate) fn close_number(fd: RawFd) {
+    // SAFETY: `fd` was placed by `dup_to` and has no owner.
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+}
+
 /// Accepts one connection. On Linux `std` uses `accept4(SOCK_CLOEXEC)` and the
 /// socket is blocking; on macOS `std` sets close-on-exec after `accept`, this adds
 /// `SO_NOSIGPIPE`, and the socket stays non-blocking (D-083).
@@ -601,19 +957,22 @@ pub(crate) const WAIT_BEFORE_RECV: bool = cfg!(target_os = "macos");
 /// One receive. On Linux it blocks until bytes arrive, the receive timeout passes
 /// (`WouldBlock`), the peer closes (0), or a kill shuts the read side (0); on
 /// macOS the socket is non-blocking and the caller waited first.
-pub(crate) fn recv(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn recv(stream: &super::Stream, buf: &mut [u8]) -> io::Result<usize> {
     retry_interrupted(|| {
         #[cfg(any(test, net_io_shim))]
         let buf = match super::shim::io(super::shim::Op::Recv, buf.len())? {
             Some(n) => &mut buf[..n],
             None => &mut *buf,
         };
-        (&mut &*stream).read(buf)
+        stream.read(buf)
     })
 }
 
 /// Sets the receive timeout used by `recv` (`None` = wait forever).
-pub(crate) fn set_recv_timeout(stream: &TcpStream, timeout: Option<Duration>) -> io::Result<()> {
+pub(crate) fn set_recv_timeout(
+    stream: &super::Stream,
+    timeout: Option<Duration>,
+) -> io::Result<()> {
     #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::RecvTimeout)?;
     // std rejects a zero duration; the caller never passes one, but be safe.
@@ -621,7 +980,7 @@ pub(crate) fn set_recv_timeout(stream: &TcpStream, timeout: Option<Duration>) ->
 }
 
 /// One send that never blocks: `WouldBlock` when the socket buffer is full.
-pub(crate) fn send(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
+pub(crate) fn send(stream: &super::Stream, buf: &[u8]) -> io::Result<usize> {
     retry_interrupted(|| {
         #[cfg(any(test, net_io_shim))]
         let buf = match super::shim::io(super::shim::Op::Send, buf.len())? {
@@ -633,7 +992,7 @@ pub(crate) fn send(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
 }
 
 /// One `send` system call with net-io's flags.
-fn send_once(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
+fn send_once(stream: &super::Stream, buf: &[u8]) -> io::Result<usize> {
     #[cfg(target_os = "linux")]
     let flags = c::MSG_DONTWAIT | c::MSG_NOSIGNAL;
     #[cfg(target_os = "macos")]
@@ -644,7 +1003,7 @@ fn send_once(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
         // keep a closed peer from raising SIGPIPE.
         let n = unsafe {
             c_send(
-                stream.as_raw_fd(),
+                stream.sock().as_raw_fd(),
                 buf.as_ptr().cast::<c_void>(),
                 buf.len(),
                 flags,
@@ -662,7 +1021,7 @@ fn send_once(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
 pub(crate) const MAX_SLICES: usize = 64;
 
 /// One vectored send that never blocks (at most [`MAX_SLICES`] slices).
-pub(crate) fn send_vectored(stream: &TcpStream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
     let bufs = &bufs[..bufs.len().min(MAX_SLICES)];
     #[cfg(target_os = "linux")]
     let flags = c::MSG_DONTWAIT | c::MSG_NOSIGNAL;
@@ -695,7 +1054,7 @@ pub(crate) fn send_vectored(stream: &TcpStream, bufs: &[IoSlice<'_>]) -> io::Res
         // SAFETY: `IoSlice` is documented as ABI-compatible with `struct iovec` on Unix;
         // `bufs` (at most 64 slices) and the bytes they point to live for the call;
         // `msg` carries no name and no control data. MSG_DONTWAIT keeps the call from blocking.
-        let n = unsafe { sendmsg(stream.as_raw_fd(), &raw const msg, flags) };
+        let n = unsafe { sendmsg(stream.sock().as_raw_fd(), &raw const msg, flags) };
         if n < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -983,6 +1342,417 @@ impl Wake {
     }
 }
 
+// ---- local sockets (feature `local`) ----------------------------------------
+
+/// `struct ucred` (`unix(7)`), for `SO_PEERCRED`.
+#[cfg(all(feature = "local", target_os = "linux"))]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Ucred {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+/// `struct cmsghdr` (`cmsg(3)`): Linux uses `size_t` for the length.
+#[cfg(all(feature = "local", target_os = "linux"))]
+#[repr(C)]
+struct CmsgHdr {
+    cmsg_len: usize,
+    cmsg_level: c_int,
+    cmsg_type: c_int,
+}
+
+/// `struct cmsghdr` on macOS: `socklen_t` for the length.
+#[cfg(all(feature = "local", target_os = "macos"))]
+#[repr(C)]
+struct CmsgHdr {
+    cmsg_len: u32,
+    cmsg_level: c_int,
+    cmsg_type: c_int,
+}
+
+/// `CMSG_ALIGN`: to `size_t` on Linux, to 4 bytes on macOS.
+#[cfg(feature = "local")]
+const CMSG_ALIGN_TO: usize = if cfg!(target_os = "linux") {
+    size_of::<usize>()
+} else {
+    4
+};
+
+#[cfg(feature = "local")]
+const fn cmsg_align(n: usize) -> usize {
+    (n + CMSG_ALIGN_TO - 1) & !(CMSG_ALIGN_TO - 1)
+}
+
+/// `CMSG_SPACE(n)`.
+#[cfg(feature = "local")]
+const fn cmsg_space(n: usize) -> usize {
+    cmsg_align(size_of::<CmsgHdr>()) + cmsg_align(n)
+}
+
+/// `CMSG_LEN(n)`.
+#[cfg(feature = "local")]
+const fn cmsg_len(n: usize) -> usize {
+    cmsg_align(size_of::<CmsgHdr>()) + n
+}
+
+/// The most descriptors one message carries.
+#[cfg(feature = "local")]
+pub(crate) const MAX_FDS: usize = 64;
+
+/// Control-message space for [`MAX_FDS`] descriptors, aligned for `cmsghdr`.
+#[cfg(feature = "local")]
+#[repr(C, align(8))]
+struct CmsgBuf([u8; cmsg_space(4 * MAX_FDS)]);
+
+/// Sends `body` (not empty) with `fds` attached (`SCM_RIGHTS`, at most
+/// [`MAX_FDS`]); never blocks. Returns the bytes of `body` sent; the descriptors
+/// travel with the first byte.
+#[cfg(feature = "local")]
+pub(crate) fn send_with_fds(
+    stream: &super::Stream,
+    body: &[u8],
+    fds: &[BorrowedFd<'_>],
+) -> io::Result<usize> {
+    if body.is_empty() || fds.len() > MAX_FDS {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let mut control = CmsgBuf([0; cmsg_space(4 * MAX_FDS)]);
+    let data_len = 4 * fds.len();
+    let space = if fds.is_empty() {
+        0
+    } else {
+        cmsg_space(data_len)
+    };
+    if !fds.is_empty() {
+        let hdr = cmsg_align(size_of::<CmsgHdr>());
+        let len = cmsg_len(data_len);
+        #[cfg(target_os = "linux")]
+        control.0[..size_of::<usize>()].copy_from_slice(&len.to_ne_bytes());
+        #[cfg(target_os = "macos")]
+        control.0[..4].copy_from_slice(&(len as u32).to_ne_bytes());
+        let level_at = size_of::<CmsgHdr>() - 2 * size_of::<c_int>();
+        control.0[level_at..level_at + 4].copy_from_slice(&c::SOL_SOCKET.to_ne_bytes());
+        control.0[level_at + 4..level_at + 8].copy_from_slice(&c::SCM_RIGHTS.to_ne_bytes());
+        for (i, fd) in fds.iter().enumerate() {
+            let at = hdr + 4 * i;
+            control.0[at..at + 4].copy_from_slice(&fd.as_raw_fd().to_ne_bytes());
+        }
+    }
+    let iov = [IoSlice::new(body)];
+    let msg = MsgHdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: iov.as_ptr().cast::<IoSlice<'static>>(),
+        #[cfg(target_os = "linux")]
+        msg_iovlen: 1,
+        #[cfg(target_os = "macos")]
+        msg_iovlen: 1,
+        msg_control: if space == 0 {
+            std::ptr::null_mut()
+        } else {
+            control.0.as_mut_ptr().cast::<c_void>()
+        },
+        #[cfg(target_os = "linux")]
+        msg_controllen: space,
+        #[cfg(target_os = "macos")]
+        msg_controllen: space as u32,
+        msg_flags: 0,
+    };
+    #[cfg(target_os = "linux")]
+    let flags = c::MSG_DONTWAIT | c::MSG_NOSIGNAL;
+    #[cfg(target_os = "macos")]
+    let flags = c::MSG_DONTWAIT;
+    retry_interrupted(|| {
+        // SAFETY: `iov` (one slice of `body`) and `control` (a cmsghdr with `fds.len()`
+        // open descriptors, `space` bytes) live for the call; `msg` points only at them.
+        let n = unsafe { sendmsg(stream.sock().as_raw_fd(), &raw const msg, flags) };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n.unsigned_abs())
+        }
+    })
+}
+
+/// What [`recv_with_fds`] got.
+#[cfg(feature = "local")]
+pub(crate) struct Received {
+    /// Bytes of body.
+    pub(crate) bytes: usize,
+    /// Descriptors stored into the caller's array.
+    pub(crate) fds: usize,
+    /// The control data did not fit: every descriptor received was closed.
+    pub(crate) truncated: bool,
+}
+
+/// Receives into `body` and stores attached descriptors (close-on-exec) into
+/// `into` from index 0. Like [`recv`]: on Linux it blocks under the receive
+/// timeout, on macOS the socket is non-blocking and the caller waited first.
+/// On a truncated control message every descriptor received is closed and
+/// `truncated` is set.
+#[cfg(feature = "local")]
+pub(crate) fn recv_with_fds(
+    stream: &super::Stream,
+    body: &mut [u8],
+    into: &mut [Option<OwnedFd>; MAX_FDS],
+) -> io::Result<Received> {
+    let mut control = CmsgBuf([0; cmsg_space(4 * MAX_FDS)]);
+    let mut iov = [io::IoSliceMut::new(body)];
+    let mut msg = MsgHdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: iov.as_mut_ptr().cast::<IoSlice<'static>>(),
+        #[cfg(target_os = "linux")]
+        msg_iovlen: 1,
+        #[cfg(target_os = "macos")]
+        msg_iovlen: 1,
+        msg_control: control.0.as_mut_ptr().cast::<c_void>(),
+        #[cfg(target_os = "linux")]
+        msg_controllen: control.0.len(),
+        #[cfg(target_os = "macos")]
+        msg_controllen: control.0.len() as u32,
+        msg_flags: 0,
+    };
+    #[cfg(target_os = "linux")]
+    let flags = c::MSG_CMSG_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = 0;
+    let n = retry_interrupted(|| {
+        // SAFETY: `iov` (`IoSliceMut`, ABI-compatible with `struct iovec`) covers
+        // `body`; `control` is `msg_controllen` bytes; both live for the call.
+        let n = unsafe { recvmsg(stream.sock().as_raw_fd(), &raw mut msg, flags) };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n.unsigned_abs())
+        }
+    })?;
+    #[cfg(target_os = "linux")]
+    let used = msg.msg_controllen.min(control.0.len());
+    #[cfg(target_os = "macos")]
+    let used = (msg.msg_controllen as usize).min(control.0.len());
+    let truncated = msg.msg_flags & c::MSG_CTRUNC != 0;
+    let hdr = cmsg_align(size_of::<CmsgHdr>());
+    let level_at = size_of::<CmsgHdr>() - 2 * size_of::<c_int>();
+    let mut count = 0;
+    let mut off = 0;
+    while off + size_of::<CmsgHdr>() <= used {
+        let bytes = &control.0[off..used];
+        #[cfg(target_os = "linux")]
+        let len = usize::from_ne_bytes(
+            bytes[..size_of::<usize>()]
+                .try_into()
+                .unwrap_or([0; size_of::<usize>()]),
+        );
+        #[cfg(target_os = "macos")]
+        let len = u32::from_ne_bytes(bytes[..4].try_into().unwrap_or([0; 4])) as usize;
+        let level =
+            c_int::from_ne_bytes(bytes[level_at..level_at + 4].try_into().unwrap_or([0; 4]));
+        let kind = c_int::from_ne_bytes(
+            bytes[level_at + 4..level_at + 8]
+                .try_into()
+                .unwrap_or([0; 4]),
+        );
+        if len < hdr || off + len > used {
+            break;
+        }
+        if level == c::SOL_SOCKET && kind == c::SCM_RIGHTS {
+            for i in 0..(len - hdr) / 4 {
+                let at = off + hdr + 4 * i;
+                let raw =
+                    RawFd::from_ne_bytes(control.0[at..at + 4].try_into().unwrap_or([0xFF; 4]));
+                if raw < 0 {
+                    continue;
+                }
+                // SAFETY: the kernel just installed `raw` in this process for us
+                // (SCM_RIGHTS); nothing else owns it.
+                let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+                #[cfg(target_os = "macos")]
+                {
+                    // SAFETY: `owned` is open; F_SETFD with FD_CLOEXEC takes an int.
+                    unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) };
+                }
+                if count < MAX_FDS && !truncated {
+                    into[count] = Some(owned);
+                    count += 1;
+                }
+                // Otherwise `owned` drops here and the descriptor is closed.
+            }
+        }
+        off += cmsg_align(len);
+    }
+    if truncated {
+        for slot in into.iter_mut().take(count) {
+            *slot = None;
+        }
+        count = 0;
+    }
+    Ok(Received {
+        bytes: n,
+        fds: count,
+        truncated,
+    })
+}
+
+/// The peer's process id (where the OS says), user id, and group id.
+#[cfg(all(feature = "local", target_os = "linux"))]
+pub(crate) fn peer_credentials(sock: Sock<'_>) -> io::Result<(Option<u32>, u32, u32)> {
+    let mut cred = Ucred::default();
+    let mut len = size_of::<Ucred>() as SockLen;
+    // SAFETY: `sock` is open; `cred` and `len` are live locals and `len` holds the
+    // size of `cred`, as `unix(7)` describes for SO_PEERCRED.
+    let ret = unsafe {
+        getsockopt(
+            sock.as_raw_fd(),
+            c::SOL_SOCKET,
+            c::SO_PEERCRED,
+            (&raw mut cred).cast::<c_void>(),
+            &raw mut len,
+        )
+    };
+    cvt(ret)?;
+    Ok((
+        u32::try_from(cred.pid).ok().filter(|&p| p > 0),
+        cred.uid,
+        cred.gid,
+    ))
+}
+
+/// The peer's process id (where the OS says), user id, and group id.
+#[cfg(all(feature = "local", target_os = "macos"))]
+pub(crate) fn peer_credentials(sock: Sock<'_>) -> io::Result<(Option<u32>, u32, u32)> {
+    let mut uid = 0u32;
+    let mut gid = 0u32;
+    // SAFETY: `sock` is open; `uid` and `gid` are live locals getpeereid(3) writes.
+    cvt(unsafe { getpeereid(sock.as_raw_fd(), &raw mut uid, &raw mut gid) })?;
+    let pid = get_int(sock, c::SOL_LOCAL, c::LOCAL_PEERPID)
+        .ok()
+        .and_then(|p| u32::try_from(p).ok());
+    Ok((pid, uid, gid))
+}
+
+/// `struct sockaddr_un` (`unix(7)`).
+#[cfg(all(feature = "local", target_os = "linux"))]
+#[repr(C)]
+struct SockaddrUn {
+    sun_family: u16,
+    sun_path: [u8; 108],
+}
+
+/// `struct sockaddr_un` on macOS.
+#[cfg(all(feature = "local", target_os = "macos"))]
+#[repr(C)]
+struct SockaddrUn {
+    sun_len: u8,
+    sun_family: u8,
+    sun_path: [u8; 104],
+}
+
+/// The size of `sun_path`: the longest Unix socket path plus its terminator.
+#[cfg(all(feature = "local", target_os = "linux"))]
+pub(crate) const UNIX_PATH_MAX: usize = 108;
+/// The size of `sun_path`: the longest Unix socket path plus its terminator.
+#[cfg(all(feature = "local", target_os = "macos"))]
+pub(crate) const UNIX_PATH_MAX: usize = 104;
+
+/// Encodes a filesystem path (no NUL byte, shorter than [`UNIX_PATH_MAX`]).
+#[cfg(feature = "local")]
+fn encode_unix(path: &[u8]) -> io::Result<(SockaddrUn, SockLen)> {
+    if path.is_empty() || path.len() >= UNIX_PATH_MAX || path.contains(&0) {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let mut sa = SockaddrUn {
+        #[cfg(target_os = "macos")]
+        sun_len: 0,
+        #[cfg(target_os = "macos")]
+        sun_family: c::AF_UNIX as u8,
+        #[cfg(target_os = "linux")]
+        sun_family: c::AF_UNIX as u16,
+        sun_path: [0; UNIX_PATH_MAX],
+    };
+    sa.sun_path[..path.len()].copy_from_slice(path);
+    let len = std::mem::offset_of!(SockaddrUn, sun_path) + path.len() + 1;
+    #[cfg(target_os = "macos")]
+    {
+        sa.sun_len = len as u8;
+    }
+    Ok((sa, len as SockLen))
+}
+
+/// A new Unix stream socket: close-on-exec, and on macOS with `SO_NOSIGPIPE`.
+#[cfg(feature = "local")]
+pub(crate) fn unix_socket() -> io::Result<OwnedFd> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::Socket)?;
+    #[cfg(target_os = "linux")]
+    let ty = c::SOCK_STREAM | c::SOCK_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let ty = c::SOCK_STREAM;
+    // SAFETY: socket(2) takes plain integers and returns a new descriptor or -1.
+    let fd = cvt(unsafe { socket(c::AF_UNIX, ty, 0) })?;
+    // SAFETY: `fd` was just returned by socket(2), is open, and is owned by no one else.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: as in `tcp_socket`.
+        cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
+        set_int(owned.as_fd(), c::SOL_SOCKET, c::SO_NOSIGPIPE, 1)?;
+    }
+    Ok(owned)
+}
+
+/// Binds a Unix socket to `path`; the file appears with the umask's permissions,
+/// and nothing can connect until [`unix_listen`].
+#[cfg(feature = "local")]
+pub(crate) fn unix_bind(sock: Sock<'_>, path: &[u8]) -> io::Result<()> {
+    let (sa, len) = encode_unix(path)?;
+    // SAFETY: `sa` is a valid sockaddr_un of `len` bytes that lives for the call;
+    // `sock` is open.
+    cvt(unsafe { bind(sock.as_raw_fd(), (&raw const sa).cast::<c_void>(), len) }).map(drop)
+}
+
+/// Starts listening on a bound Unix socket.
+#[cfg(feature = "local")]
+pub(crate) fn unix_listen(sock: Sock<'_>, backlog: u32) -> io::Result<()> {
+    // SAFETY: `sock` is an open, bound stream socket; listen(2) takes an int backlog.
+    cvt(unsafe { listen(sock.as_raw_fd(), clamp_int(backlog)) }).map(drop)
+}
+
+/// Connects a blocking Unix socket to `path`. On Linux a full backlog makes this
+/// wait up to the socket's send timeout (`SO_SNDTIMEO`).
+#[cfg(feature = "local")]
+pub(crate) fn unix_connect(sock: Sock<'_>, path: &[u8]) -> io::Result<()> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::Connect)?;
+    let (sa, len) = encode_unix(path)?;
+    // SAFETY: as in `unix_bind`.
+    cvt(unsafe { connect(sock.as_raw_fd(), (&raw const sa).cast::<c_void>(), len) }).map(drop)
+}
+
+/// Accepts one Unix connection from a non-blocking listener and sets it up for
+/// net-io's IO model on this OS (as [`accept`] does for TCP).
+#[cfg(feature = "local")]
+pub(crate) fn accept_unix(
+    listener: &std::os::unix::net::UnixListener,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::Accept)?;
+    let (stream, _) = listener.accept()?;
+    #[cfg(target_os = "linux")]
+    stream.set_nonblocking(false)?;
+    #[cfg(target_os = "macos")]
+    {
+        let setup = set_int(stream.as_fd(), c::SOL_SOCKET, c::SO_NOSIGPIPE, 1)
+            .and_then(|()| stream.set_nonblocking(true));
+        if setup.is_err() {
+            return Err(io::Error::from_raw_os_error(errno::ECONNABORTED));
+        }
+    }
+    Ok(stream)
+}
+
 #[cfg(test)]
 mod layout {
     //! Cross-checks the declarations above against `libc` (a dev-dependency).
@@ -1101,6 +1871,301 @@ mod layout {
             std::mem::offset_of!(PollFd, revents),
             std::mem::offset_of!(libc::pollfd, revents)
         );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn test_layout_local_matches_libc() {
+        assert_eq!(c::AF_UNIX, libc::AF_UNIX);
+        assert_eq!(c::SCM_RIGHTS, libc::SCM_RIGHTS);
+        assert_eq!(c::MSG_CTRUNC, libc::MSG_CTRUNC);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(c::SO_PEERCRED, libc::SO_PEERCRED);
+            assert_eq!(c::MSG_CMSG_CLOEXEC, libc::MSG_CMSG_CLOEXEC);
+            assert_eq!(size_of::<Ucred>(), size_of::<libc::ucred>());
+            assert_eq!(
+                std::mem::offset_of!(Ucred, uid),
+                std::mem::offset_of!(libc::ucred, uid)
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(c::SOL_LOCAL, libc::SOL_LOCAL);
+            assert_eq!(c::LOCAL_PEERPID, libc::LOCAL_PEERPID);
+        }
+        assert_eq!(size_of::<CmsgHdr>(), size_of::<libc::cmsghdr>());
+        assert_eq!(
+            std::mem::offset_of!(CmsgHdr, cmsg_level),
+            std::mem::offset_of!(libc::cmsghdr, cmsg_level)
+        );
+        assert_eq!(size_of::<SockaddrUn>(), size_of::<libc::sockaddr_un>());
+        assert_eq!(
+            std::mem::offset_of!(SockaddrUn, sun_path),
+            std::mem::offset_of!(libc::sockaddr_un, sun_path)
+        );
+        for n in [0usize, 4, 8, 12, 4 * MAX_FDS] {
+            #[allow(unused_unsafe)]
+            // SAFETY: CMSG_SPACE and CMSG_LEN are arithmetic on their argument.
+            let (space, len) = unsafe { (libc::CMSG_SPACE(n as u32), libc::CMSG_LEN(n as u32)) };
+            assert_eq!(cmsg_space(n), space as usize, "CMSG_SPACE({n})");
+            assert_eq!(cmsg_len(n), len as usize, "CMSG_LEN({n})");
+        }
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn test_descriptors_cross_a_socket_pair() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = (super::super::Stream::Unix(a), super::super::Stream::Unix(b));
+        let (mut x, y) = UnixStream::pair().unwrap();
+        assert_eq!(send_with_fds(&a, b"fd", &[y.as_fd()]).unwrap(), 2);
+        drop(y);
+        let mut slots: [Option<OwnedFd>; MAX_FDS] = [const { None }; MAX_FDS];
+        let mut body = [0u8; 8];
+        let got = recv_with_fds(&b, &mut body, &mut slots).unwrap();
+        assert_eq!((got.bytes, got.fds, got.truncated), (2, 1, false));
+        assert_eq!(&body[..2], b"fd");
+        let fd = slots[0].take().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: fcntl(F_GETFD) on an open descriptor.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(
+                flags & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC,
+                "received close-on-exec"
+            );
+        }
+        let mut y = UnixStream::from(fd);
+        y.write_all(b"via").unwrap();
+        let mut out = [0u8; 3];
+        x.read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"via");
+        // No descriptors, and the limits.
+        assert_eq!(send_with_fds(&a, b"x", &[]).unwrap(), 1);
+        let got = recv_with_fds(&b, &mut body, &mut slots).unwrap();
+        assert_eq!((got.bytes, got.fds), (1, 0));
+        assert!(send_with_fds(&a, b"", &[x.as_fd()]).is_err());
+        let many = vec![x.as_fd(); MAX_FDS + 1];
+        assert!(send_with_fds(&a, b"x", &many).is_err());
+    }
+
+    /// Edge case 81: more descriptors than the receive buffer holds sets
+    /// `MSG_CTRUNC`; every descriptor that arrived is closed, none leak.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    #[test]
+    fn test_truncated_control_message_closes_every_descriptor() {
+        use std::os::unix::net::UnixStream;
+        let (a, b) = UnixStream::pair().unwrap();
+        let (x, mut y) = UnixStream::pair().unwrap();
+        let count = MAX_FDS + 6;
+        let fds = vec![x.as_raw_fd(); count];
+        let data_len = 4 * count;
+        // SAFETY: CMSG_SPACE and CMSG_LEN are arithmetic on their argument.
+        let (space, len) = unsafe {
+            (
+                libc::CMSG_SPACE(data_len as u32),
+                libc::CMSG_LEN(data_len as u32),
+            )
+        };
+        let mut control = vec![0u64; (space as usize).div_ceil(8)];
+        let body = [7u8; 3];
+        let mut iov = libc::iovec {
+            iov_base: body.as_ptr() as *mut c_void,
+            iov_len: body.len(),
+        };
+        // SAFETY: a zeroed msghdr is valid; every pointer set below points at a
+        // live local of the stated length, and the cmsg macros stay inside `control`.
+        unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &raw mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast::<c_void>();
+            msg.msg_controllen = space as usize;
+            let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = len as usize;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr().cast::<u8>(),
+                libc::CMSG_DATA(cmsg),
+                data_len,
+            );
+            assert_eq!(libc::sendmsg(a.as_raw_fd(), &raw const msg, 0), 3);
+        }
+        // The message holds the only other copies of `x`.
+        drop(x);
+        let b = super::super::Stream::Unix(b);
+        let mut slots: [Option<OwnedFd>; MAX_FDS] = [const { None }; MAX_FDS];
+        let mut out = [0u8; 8];
+        let got = recv_with_fds(&b, &mut out, &mut slots).unwrap();
+        assert!(got.truncated);
+        assert_eq!((got.bytes, got.fds), (3, 0));
+        assert!(slots.iter().all(Option::is_none));
+        // `y` reads end of stream only once every copy of `x` is closed.
+        y.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut one = [0u8; 1];
+        assert_eq!(
+            std::io::Read::read(&mut y, &mut one).unwrap(),
+            0,
+            "a copy leaked"
+        );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn test_peer_credentials_of_a_pair() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (pid, uid, gid) = peer_credentials(a.as_fd()).unwrap();
+        // SAFETY: getuid and getgid cannot fail.
+        let (me, group) = unsafe { (libc::getuid(), libc::getgid()) };
+        assert_eq!((uid, gid), (me, group));
+        assert_eq!(pid, Some(std::process::id()));
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn test_unix_bind_listen_connect_accept() {
+        let dir = std::env::temp_dir().join(format!("net-io-sys-{}", std::process::id()));
+        let _ = std::fs::create_dir(&dir);
+        let path = dir.join("s.sock");
+        let _ = std::fs::remove_file(&path);
+        let p = path.as_os_str().as_encoded_bytes();
+        let l = unix_socket().unwrap();
+        unix_bind(l.as_fd(), p).unwrap();
+        // Bound but not listening: a connect is refused.
+        let c = unix_socket().unwrap();
+        assert!(unix_connect(c.as_fd(), p).is_err());
+        unix_listen(l.as_fd(), 8).unwrap();
+        let l = std::os::unix::net::UnixListener::from(l);
+        l.set_nonblocking(true).unwrap();
+        let c = unix_socket().unwrap();
+        unix_connect(c.as_fd(), p).unwrap();
+        let s = accept_unix(&l).unwrap();
+        assert!(peer_credentials(s.as_fd()).is_ok());
+        assert!(encode_unix(&[b'a'; UNIX_PATH_MAX]).is_err());
+        assert!(encode_unix(&[b'a'; UNIX_PATH_MAX - 1]).is_ok());
+        assert!(encode_unix(b"a\0b").is_err());
+        assert!(encode_unix(b"").is_err());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn test_layout_udp_matches_libc() {
+        assert_eq!(c::SOCK_DGRAM, libc::SOCK_DGRAM);
+        assert_eq!(c::MSG_TRUNC, libc::MSG_TRUNC);
+        assert!(size_of::<AddrBuf>() >= size_of::<libc::sockaddr_storage>());
+    }
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn test_udp_recv_reports_truncation_and_source() {
+        let a = udp_bind("127.0.0.1:0".parse().unwrap(), true).unwrap();
+        let b = udp_bind("[::1]:0".parse().unwrap(), true).unwrap();
+        let to = a.local_addr().unwrap();
+        let src = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        src.send_to(&[1u8; 100], to).unwrap();
+        let mut small = [0u8; 10];
+        let (n, from, truncated) = udp_recv_from(a.as_fd(), &mut small).unwrap();
+        assert!(truncated);
+        assert_eq!(from, src.local_addr().unwrap());
+        #[cfg(target_os = "linux")]
+        assert_eq!(n, 100);
+        #[cfg(target_os = "macos")]
+        assert_eq!(n, 10);
+        let src6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        src6.send_to(&[], b.local_addr().unwrap()).unwrap();
+        let (n, from, truncated) = udp_recv_from(b.as_fd(), &mut small).unwrap();
+        assert_eq!((n, truncated), (0, false));
+        assert_eq!(from, src6.local_addr().unwrap());
+    }
+
+    #[test]
+    fn test_monotonic_micros_matches_libc() {
+        assert_eq!(i64::from(c::CLOCK_MONOTONIC), libc::CLOCK_MONOTONIC as i64);
+        assert_eq!(size_of::<Timespec>(), size_of::<libc::timespec>());
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let ours = monotonic_micros();
+        // SAFETY: a live timespec.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+        let theirs = ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000;
+        assert!(theirs >= ours && theirs - ours < 1_000_000);
+    }
+
+    #[test]
+    fn test_layout_inherit_matches_libc() {
+        assert_eq!(c::AF_UNIX_FAMILY, libc::AF_UNIX);
+        assert_eq!(c::F_GETFD, libc::F_GETFD);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(c::F_SETFD, libc::F_SETFD);
+            assert_eq!(c::FD_CLOEXEC, libc::FD_CLOEXEC);
+            assert_eq!(c::SYS_PIDFD_OPEN, libc::SYS_pidfd_open);
+        }
+        let _: unsafe extern "C" fn(c_int, *mut c_void, *mut SockLen) -> c_int = getsockname;
+        #[cfg(feature = "local")]
+        {
+            let _: unsafe extern "C" fn() -> u32 = geteuid;
+            // SAFETY: geteuid cannot fail.
+            assert_eq!(effective_uid(), unsafe { libc::geteuid() });
+        }
+    }
+
+    #[test]
+    fn test_listener_kind_tells_listeners_apart() {
+        use super::super::{KindError, SockKind};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert_eq!(
+            listener_kind(l.as_fd()).unwrap(),
+            SockKind::Tcp(l.local_addr().unwrap())
+        );
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        assert!(matches!(
+            listener_kind(c.as_fd()),
+            Err(KindError::NotListening)
+        ));
+        let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(matches!(
+            listener_kind(u.as_fd()),
+            Err(KindError::WrongKind)
+        ));
+        let f = std::fs::File::open("/dev/null").unwrap();
+        assert!(matches!(
+            listener_kind(f.as_fd()),
+            Err(KindError::NotASocket)
+        ));
+        let dir = std::env::temp_dir().join(format!("nio-kind-{}", std::process::id()));
+        let _ = std::fs::create_dir(&dir);
+        let path = dir.join("k.sock");
+        let _ = std::fs::remove_file(&path);
+        let ul = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(
+            listener_kind(ul.as_fd()).unwrap(),
+            SockKind::Unix(path.as_os_str().as_encoded_bytes().to_vec())
+        );
+        drop(ul);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+        assert!(matches!(inherited_kind(-1), Err(KindError::NotASocket)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pidfd_inode_is_stable() {
+        match pidfd_inode() {
+            Ok(a) => assert_eq!(a, pidfd_inode().unwrap()),
+            // Kernels before 5.3 have no pidfd_open.
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOSYS)),
+        }
     }
 
     #[test]

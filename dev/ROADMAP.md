@@ -84,7 +84,7 @@ Moved to a later version (anti-deferral record):
 | Appendix A case 11 (reads pause when the buffer budget is spent) | 0.5 | the blocking driver takes each worker's buffers at warm-up and validates the budget at build, so it cannot run dry mid-connection; pausing one connection's reads is reactor behaviour |
 | Benchmark B-2 goal (1.2x the std thread-per-connection server) | 0.6 | measured under load with the `compare/` harness from 0.6, where the competitor gate starts; the 0.3 baseline (one connection, loopback) is at parity within noise |
 
-## v0.4.0 - Extended: edges
+## v0.4.0 - Extended: edges (DONE, 2026-10-29)
 Exit: net-io runs behind Apache and nginx over TCP and over a Unix socket with the real client address from PROXY v1 and v2; serves TLS directly through tls-net; a listener hand-off between two processes under 1,000 connections per second refuses zero connections (Linux and macOS); systemd socket activation and FastCGI descriptor 0 work in emulated tests and on one real host each.
 
 | Area | Items |
@@ -98,6 +98,34 @@ Exit: net-io runs behind Apache and nginx over TCP and over a Unix socket with t
 | Back-channel | `Server::adopt`, `AdoptSpec`, `AdmitStage::{Adopt, Dialed}`, `TcpConnection::set_gate` |
 | Tests | fuzz targets (PROXY, manifest, systemd environment, CIDR, trusted proxies); conformance vectors; cross-process tests; edge cases 13-17, 76-85, 90-104 |
 | Docs | `docs/SECURITY.md` draft; examples `behind_proxy.rs`, `unix_socket.rs`, `handoff_restart.rs`, `systemd_activation.rs`, `fastcgi_detect.rs`, `udp_echo.rs` |
+
+Done:
+- [x] PROXY v1 and v2 (strict sans-IO parser, CRC32C, every TLV) and its server integration with per-listener trusted proxies, the handshake deadline, the source slot moved to the real client, and `Gate::readmit` (D-088).
+- [x] The TLS seam on listeners: records decrypted in place, one gate check per plaintext write, `close_notify` on graceful closes (D-089, D-090).
+- [x] Unix domain sockets: mode and owner set before `listen`, `bind_atomic`, stale-socket rules, peer credentials, `require_uid`, descriptor passing, `listen_local` / `connect_local`, server listeners (D-091 to D-095).
+- [x] UDP with truncation detection, per-source and global budgets, a bounded source table, and the amplification guard (D-096).
+- [x] Restarts: `add_listener` / `remove_listener` on a running server (D-097); systemd and FastCGI inheritance (D-098); listener hand-off with a checksummed manifest (D-099); `Server::adopt`, `TcpConnection::set_gate` (D-100); `monotonic_micros` (D-101).
+- [x] Edge cases 13-17, 76-85, 90-103, 111, 112 mapped to tests in `dev/EDGE-CASES.md`.
+- [x] Fuzz targets `proxy`, `manifest`, `systemd_env`, `cidr`, `trusted` (`fuzz/`; 60 s each locally without a finding, 30 s each in CI per push).
+- [x] Cross-process tests: a hand-off between two processes under about 1,000 connections per second with zero refused connections (Linux and macOS in CI), systemd activation through `systemd-socket-activate`, a listener as a child's descriptor 0.
+- [x] CI job running net-io behind HAProxy (PROXY v1 and v2) and nginx (v1), each over TCP and a Unix socket, checking the client address end to end.
+- [x] `docs/SECURITY.md` draft with the threat table; the six examples; `docs/PLATFORM-NOTES.md` for the new transports.
+
+Exit criteria, as met:
+
+| Criterion | Status |
+|---|---|
+| Behind a proxy over TCP and a Unix socket with the real client address from PROXY v1 and v2 | HAProxy (v1, v2) and nginx (v1) in CI. Apache cannot be tested here: its `mod_proxy` does not send the PROXY protocol (`mod_remoteip` only receives it), so "behind Apache" means Apache in front over HTTP or `mod_fcgid` starting net-io, which the FastCGI test covers |
+| Serves TLS directly through tls-net | net-io's side is tested with an engine in `tests/tls.rs`; building tls-net against the published 0.4 is tls-net's own release step in its repository |
+| Hand-off between two processes under 1,000 connections per second refuses zero connections (Linux and macOS) | `cross_process::handoff_between_processes_refuses_nothing_under_load`, run by CI on both |
+| systemd activation and FastCGI descriptor 0 in emulated tests and on one real host each | systemd: `systemd-socket-activate` on Linux (WSL2 and the CI runner). FastCGI: emulated exactly as `mod_fcgid` starts a server (the listening socket as the child's descriptor 0); no FastCGI manager was available on the build host |
+
+Moved to a later version (anti-deferral record):
+
+| Item | To | Reason |
+|---|---|---|
+| Edge cases 104, 105 (Windows hand-off) | 0.5 | they belong to the Windows hand-off, scheduled with named pipes |
+| Hash-flooding chain test (threat T-22) | 0.7 | the per-source tables use `std`'s keyed SipHash; the chain-length attack test is part of the 0.7 hardening suite |
 
 ## v0.5.0 - Feature complete
 Exit: 10,000 idle connections held on each OS with bounded memory, and throughput at or above the blocking driver for active connections; Windows hand-off refuses zero connections under load; every P0 and P1 item is in `docs/API.md` and tested.

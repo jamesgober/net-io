@@ -3,9 +3,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-#[cfg(loom)]
+#[cfg(net_io_loom)]
 use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-#[cfg(not(loom))]
+#[cfg(not(net_io_loom))]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::id::{ConnectionId, WorkerId};
@@ -136,7 +136,7 @@ impl Ring {
         Some(item)
     }
 
-    #[cfg(all(test, not(loom)))]
+    #[cfg(all(test, not(net_io_loom)))]
     pub(crate) fn is_empty(&self) -> bool {
         let pos = self.head.load(Ordering::Relaxed);
         self.slots[pos & self.mask].seq.load(Ordering::Acquire) != pos.wrapping_add(1)
@@ -255,7 +255,7 @@ impl fmt::Debug for Completer {
     }
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, not(net_io_loom)))]
 mod tests {
     use super::*;
 
@@ -307,7 +307,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, loom))]
+#[cfg(all(test, net_io_loom))]
 mod loom_tests {
     use super::*;
 

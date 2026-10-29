@@ -3,8 +3,10 @@
 mod engine;
 mod source;
 
+use std::any::TypeId;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -14,13 +16,17 @@ use crate::driver::DriverKind;
 use crate::error::{CloseReason, ConfigReason, KillReason, NetError, RefusalCause};
 use crate::events::{EventSink, NoopSink};
 use crate::gate::Gate;
-use crate::id::{ConnectionId, WorkerId};
+use crate::handoff::ListenerHandle;
+use crate::id::{ConnectionId, ListenerId, WorkerId};
 use crate::limits::Limits;
-use crate::opts::ListenOptions;
+use crate::opts::{ListenOptions, LocalOptions};
+use crate::proxy::ProxyMode;
 use crate::session::SessionFactory;
 use crate::tcp::{ListenerInfo, TcpConnection};
 use crate::time::Clock;
+use crate::tls::ErasedAcceptor;
 use crate::tls::{NoTls, TlsAcceptor};
+use crate::trusted::TrustedProxies;
 
 pub(crate) use engine::Shared;
 
@@ -106,6 +112,33 @@ impl Stats {
     pub fn closed_for(&self, reason: CloseReason) -> u64 {
         self.closed_by[reason.index()]
     }
+
+    /// Every close reason with a non-zero count, one entry per variant (inner
+    /// values are not kept: `Killed` carries reason 0, `Io` class `Other(0)`).
+    ///
+    /// ```no_run
+    /// let server = net_io::serve("127.0.0.1:0", |_c| Ok(()))?;
+    /// for (reason, n) in server.stats().closes() {
+    ///     println!("{}: {n}", reason.as_str());
+    /// }
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn closes(&self) -> impl Iterator<Item = (CloseReason, u64)> + '_ {
+        CloseReason::BY_INDEX
+            .iter()
+            .zip(self.closed_by.iter())
+            .filter(|(_, n)| **n > 0)
+            .map(|(r, n)| (*r, *n))
+    }
+
+    /// Every refusal cause with a non-zero count (gate codes summed under `Gate(0)`).
+    pub fn refusals(&self) -> impl Iterator<Item = (RefusalCause, u64)> + '_ {
+        RefusalCause::BY_INDEX
+            .iter()
+            .zip(self.refused_by.iter())
+            .filter(|(_, n)| **n > 0)
+            .map(|(r, n)| (*r, *n))
+    }
 }
 
 /// One listener of a server.
@@ -125,6 +158,11 @@ pub struct ListenerSpec {
     pub(crate) options: Option<ListenOptions>,
     pub(crate) name: Option<String>,
     pub(crate) limits: Limits,
+    pub(crate) proxy: ProxyMode,
+    pub(crate) trusted: Option<Arc<TrustedProxies>>,
+    pub(crate) tls: bool,
+    pub(crate) unix: Option<(PathBuf, LocalOptions)>,
+    pub(crate) adopt: Option<ListenerHandle>,
 }
 
 impl ListenerSpec {
@@ -138,6 +176,11 @@ impl ListenerSpec {
             options: None,
             name: None,
             limits: Limits::default(),
+            proxy: ProxyMode::Off,
+            trusted: None,
+            tls: false,
+            unix: None,
+            adopt: None,
         }
     }
 
@@ -146,6 +189,63 @@ impl ListenerSpec {
         ListenerSpec {
             options: Some(options),
             ..ListenerSpec::tcp(addr)
+        }
+    }
+
+    /// A Unix domain socket listener at `path` (feature `local`, Unix; Windows
+    /// AF_UNIX arrives in `0.5.0`). The socket file gets `options`' mode and
+    /// owner before it listens, and is removed at shutdown if it is still the
+    /// file this server created. Connections carry `Transport::Unix`, the peer's
+    /// credentials, and no IP address: the per-source cap does not apply, and a
+    /// `BlockingHandler` receives them as a `TcpConnection` whose `peer_addr` is
+    /// unspecified. With `proxy`, every peer is trusted: the socket file's
+    /// permissions decide who may connect.
+    ///
+    /// ```
+    /// use net_io::{ListenerSpec, LocalOptions};
+    /// let spec = ListenerSpec::unix("/run/myapp/api.sock", LocalOptions::new().group_access(33));
+    /// # let _ = spec;
+    /// ```
+    pub fn unix(path: impl Into<PathBuf>, options: LocalOptions) -> ListenerSpec {
+        ListenerSpec {
+            addrs: Ok(Vec::new()),
+            options: None,
+            name: None,
+            limits: Limits::default(),
+            proxy: ProxyMode::Off,
+            trusted: None,
+            tls: false,
+            unix: Some((path.into(), options)),
+            adopt: None,
+        }
+    }
+
+    /// A listener this process was given: inherited from systemd or a FastCGI
+    /// manager, received in a hand-off, or released by another server. Its name
+    /// is the handle's unless [`ListenerSpec::name`] sets one. The socket is not
+    /// bound again; options set at bind time stay as they are, and the backlog is
+    /// reported as unknown. An adopted Unix socket's file is left in place at
+    /// shutdown (the next bind removes it as stale).
+    ///
+    /// ```no_run
+    /// use net_io::ListenerSpec;
+    /// for inherited in net_io::systemd()? {
+    ///     let spec = ListenerSpec::adopt(inherited.handle);
+    ///     # let _ = spec;
+    /// }
+    /// # Ok::<(), net_io::InheritError>(())
+    /// ```
+    pub fn adopt(handle: ListenerHandle) -> ListenerSpec {
+        ListenerSpec {
+            addrs: Ok(Vec::new()),
+            options: None,
+            name: None,
+            limits: Limits::default(),
+            proxy: ProxyMode::Off,
+            trusted: None,
+            tls: false,
+            unix: None,
+            adopt: Some(handle),
         }
     }
 
@@ -158,6 +258,32 @@ impl ListenerSpec {
     /// Per-listener caps and deadlines; values set here override the server's.
     pub fn limits(mut self, limits: Limits) -> ListenerSpec {
         self.limits = limits;
+        self
+    }
+
+    /// Requires a PROXY protocol header on every connection (feature `proxy`).
+    /// Peers outside the trusted proxies are closed before any byte is read.
+    ///
+    /// ```
+    /// use net_io::{ListenerSpec, ProxyMode, ProxyVersions};
+    /// let spec = ListenerSpec::tcp("127.0.0.1:0").proxy(ProxyMode::Required { versions: ProxyVersions::Both });
+    /// # let _ = spec;
+    /// ```
+    pub fn proxy(mut self, mode: ProxyMode) -> ListenerSpec {
+        self.proxy = mode;
+        self
+    }
+
+    /// Serves TLS on this listener through the builder's acceptor
+    /// ([`ServerBuilder::tls`], feature `tls`).
+    pub fn tls(mut self, on: bool) -> ListenerSpec {
+        self.tls = on;
+        self
+    }
+
+    /// The proxies trusted on this listener, instead of the server's list.
+    pub fn trusted_proxies(mut self, proxies: TrustedProxies) -> ListenerSpec {
+        self.trusted = Some(Arc::new(proxies));
         self
     }
 }
@@ -243,6 +369,7 @@ pub struct ServerBuilder<W = NoWork, G = NoGate, S = NoopSink, T = NoTls> {
     control: Option<Arc<dyn ControlLine>>,
     wipe: bool,
     clock: Option<Arc<dyn Clock>>,
+    trusted: Option<Arc<TrustedProxies>>,
 }
 
 impl ServerBuilder {
@@ -260,6 +387,7 @@ impl ServerBuilder {
             control: None,
             wipe: true,
             clock: None,
+            trusted: None,
         }
     }
 }
@@ -287,6 +415,7 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
             control,
             wipe,
             clock,
+            trusted,
         } = self;
         let (work, gate, sink, tls) = f(work, gate, sink, tls);
         ServerBuilder {
@@ -301,7 +430,15 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
             control,
             wipe,
             clock,
+            trusted,
         }
+    }
+
+    /// The proxies whose PROXY headers are believed, for every listener that
+    /// requires one and has no list of its own.
+    pub fn trusted_proxies(mut self, proxies: TrustedProxies) -> Self {
+        self.trusted = Some(Arc::new(proxies));
+        self
     }
 
     /// Adds a listener (at most 64).
@@ -339,6 +476,11 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
         H: Fn(&mut TcpConnection) -> Result<(), NetError> + Send + Sync + 'static,
     {
         self.map(|_, g, s, t| (BlockingHandler { handler }, g, s, t))
+    }
+
+    /// The TLS engine for listeners with `ListenerSpec::tls(true)` (feature `tls`).
+    pub fn tls<T2: TlsAcceptor>(self, acceptor: T2) -> ServerBuilder<W, G, S, T2> {
+        self.map(|w, g, s, _| (w, g, s, acceptor))
     }
 
     /// The connection gate (required; `AllowAll` for none).
@@ -410,15 +552,12 @@ where
         if workers > 4096 {
             return Err(invalid("workers", ConfigReason::TooLarge { max: 4096 }));
         }
+        let mut listeners = self.listeners;
+        let has_tls = TypeId::of::<T>() != TypeId::of::<NoTls>();
         let mut names = Vec::new();
-        for spec in &self.listeners {
+        for spec in &mut listeners {
+            check_spec(spec, self.trusted.as_ref(), has_tls, &names)?;
             if let Some(n) = &spec.name {
-                if n.len() > 64 {
-                    return Err(invalid("name", ConfigReason::TooLarge { max: 64 }));
-                }
-                if names.contains(n) {
-                    return Err(invalid("name", ConfigReason::Inconsistent));
-                }
                 names.push(n.clone());
             }
         }
@@ -432,12 +571,18 @@ where
             self.limits.clone()
         };
         limits.validate(workers, crate::sys::descriptor_limit())?;
-        for spec in &self.listeners {
+        for spec in &listeners {
             limits.overlay(&spec.limits).validate(workers, None)?;
         }
-        let _ = &self.tls;
+        let tls: Option<Arc<dyn ErasedAcceptor>> = if has_tls {
+            Some(Arc::new(self.tls))
+        } else {
+            None
+        };
         engine::start(engine::Config {
-            listeners: self.listeners,
+            tls,
+            trusted: self.trusted,
+            listeners,
             driver,
             workers,
             limits,
@@ -453,6 +598,105 @@ where
 
 fn invalid(field: &'static str, reason: ConfigReason) -> NetError {
     NetError::InvalidConfig { field, reason }
+}
+
+/// Where `Server::adopt` registers a connection: the listener (by name) whose
+/// limits and caps apply, and an optional starting lane (the gate may change it).
+///
+/// ```
+/// let spec = net_io::AdoptSpec::new("main").lane(net_io::Lane(1));
+/// # let _ = spec;
+/// ```
+#[must_use]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptSpec {
+    listener: String,
+    lane: Option<crate::info::Lane>,
+}
+
+impl AdoptSpec {
+    /// Registers on the listener named `listener`.
+    pub fn new(listener: &str) -> AdoptSpec {
+        AdoptSpec {
+            listener: listener.to_owned(),
+            lane: None,
+        }
+    }
+
+    /// The lane the connection starts in, before the gate's admission.
+    pub fn lane(mut self, lane: crate::info::Lane) -> AdoptSpec {
+        self.lane = Some(lane);
+        self
+    }
+}
+
+/// The checks `build` and `add_listener` run on one listener: the features it
+/// needs, a TLS engine, trusted proxies (resolved into the spec), and its name.
+fn check_spec(
+    spec: &mut ListenerSpec,
+    server_trusted: Option<&Arc<TrustedProxies>>,
+    has_tls: bool,
+    taken: &[String],
+) -> Result<(), NetError> {
+    if spec.name.is_none() {
+        spec.name = spec
+            .adopt
+            .as_ref()
+            .and_then(|h| h.name())
+            .map(str::to_owned);
+    }
+    let unix = spec.unix.is_some()
+        || spec
+            .adopt
+            .as_ref()
+            .is_some_and(|h| h.kind() == crate::info::Transport::Unix);
+    if unix && !cfg!(all(unix, feature = "local")) {
+        return Err(NetError::Unsupported {
+            feature: if cfg!(unix) {
+                "Unix domain sockets (the `local` feature)"
+            } else {
+                "Unix domain sockets on Windows (0.5.0)"
+            },
+            platform: std::env::consts::OS,
+        });
+    }
+    if spec.tls {
+        if !cfg!(feature = "tls") {
+            return Err(NetError::Unsupported {
+                feature: "TLS (the `tls` feature)",
+                platform: std::env::consts::OS,
+            });
+        }
+        if !has_tls {
+            return Err(invalid("tls", ConfigReason::Missing));
+        }
+    }
+    if spec.proxy != ProxyMode::Off {
+        if !cfg!(feature = "proxy") {
+            return Err(NetError::Unsupported {
+                feature: "PROXY protocol (the `proxy` feature)",
+                platform: std::env::consts::OS,
+            });
+        }
+        // On a Unix socket the file's permissions decide who may connect.
+        if !unix {
+            let trusted = spec.trusted.clone().or_else(|| server_trusted.cloned());
+            match trusted {
+                Some(t) if !t.is_empty() => spec.trusted = Some(t),
+                // Required without anyone to trust would refuse every connection.
+                _ => return Err(invalid("trusted_proxies", ConfigReason::Missing)),
+            }
+        }
+    }
+    if let Some(n) = &spec.name {
+        if n.len() > 64 {
+            return Err(invalid("name", ConfigReason::TooLarge { max: 64 }));
+        }
+        if taken.contains(n) {
+            return Err(invalid("name", ConfigReason::Inconsistent));
+        }
+    }
+    Ok(())
 }
 
 /// A running server. Dropping it stops it (with a drain), so keep it and call
@@ -518,7 +762,132 @@ impl Server {
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
+        self.shared.join_listeners();
         report
+    }
+
+    /// Registers a dialed connection exactly like an accepted one on the
+    /// listener named in `spec`: a new id, the caps, `Gate::admit` with
+    /// `AdmitStage::Adopt`, that listener's limits, the server's handler or
+    /// sessions, its kill handle, and its events. For back-channels and outbound
+    /// connections a server should run and revoke like its own. A gate the
+    /// connection had from `set_gate` is closed (`SessionClosed`) first.
+    ///
+    /// # Errors
+    ///
+    /// `Refused { cause }` (caps, the gate, `Busy`; the connection was reset),
+    /// `InvalidConfig { field: "listener" }` (no listener with that name),
+    /// `InvalidConfig { field: "connection" }` (a TLS connection, or bytes read
+    /// ahead), `ShuttingDown`, `ForkedChild`, `Closed`.
+    ///
+    /// ```no_run
+    /// use net_io::{AdoptSpec, AllowAll, ListenerSpec, ServerBuilder};
+    /// let server = ServerBuilder::new()
+    ///     .listener(ListenerSpec::tcp("127.0.0.1:7000").name("main"))
+    ///     .handler(|conn| { conn.send_all(b"hello, upstream\n")?; Ok(()) })
+    ///     .gate(AllowAll)
+    ///     .build()?;
+    /// let upstream = net_io::connect("10.0.0.9:9000")?;
+    /// let id = server.adopt(upstream, AdoptSpec::new("main"))?;
+    /// # let _ = id;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn adopt(&self, conn: TcpConnection, spec: AdoptSpec) -> Result<ConnectionId, NetError> {
+        let mut conn = conn;
+        let link = conn.take_link().ok_or(NetError::Closed)?;
+        let (Some(peer), Some(local)) =
+            (link.info.peer.socket_addr(), link.info.local.socket_addr())
+        else {
+            return Err(invalid("connection", ConfigReason::Inconsistent));
+        };
+        let stream = link
+            .into_stream(CloseReason::SessionClosed)
+            .and_then(crate::sys::Stream::into_tcp)
+            .ok_or(invalid("connection", ConfigReason::Inconsistent))?;
+        self.shared
+            .adopt(stream, peer, local, &spec.listener, spec.lane)
+    }
+
+    /// Owned duplicates of every listening socket, for a hand-off to the next
+    /// process (`send_listeners`, Unix). This server keeps
+    /// accepting meanwhile, so the new process can start before this one stops
+    /// (decision D-042); a later `shutdown` closes only this server's copies, and
+    /// a Unix socket file stays in place for the new process.
+    ///
+    /// # Errors
+    ///
+    /// `Os` when a socket cannot be duplicated, `ForkedChild`.
+    pub fn release_listeners(&self) -> Result<Vec<ListenerHandle>, NetError> {
+        self.shared.release_listeners()
+    }
+
+    /// Binds one more listener on the running server and starts its accept
+    /// thread. Its door is closed until the next [`Server::open_door`] (which
+    /// opens every listener's door); the same checks as `build` apply. The id is
+    /// new: ids of removed listeners are never reused.
+    ///
+    /// # Errors
+    ///
+    /// As `build` for the listener; `InvalidConfig { field: "listener" }` past 64
+    /// listeners, `ShuttingDown`, `ForkedChild`.
+    ///
+    /// ```no_run
+    /// use net_io::{AllowAll, ListenerSpec, ServerBuilder};
+    /// let mut server = ServerBuilder::new()
+    ///     .listener(ListenerSpec::tcp("127.0.0.1:8080"))
+    ///     .handler(|conn| { conn.send_all(b"hi\n")?; Ok(()) })
+    ///     .gate(AllowAll)
+    ///     .build()?;
+    /// server.open_door()?;
+    /// let added = server.add_listener(ListenerSpec::tcp("127.0.0.1:8081").name("extra"))?;
+    /// server.open_door()?; // opens the new listener's door
+    /// # let _ = added;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn add_listener(&mut self, spec: ListenerSpec) -> Result<ListenerId, NetError> {
+        let mut spec = spec;
+        if self.listeners.len() >= 64 {
+            return Err(invalid("listener", ConfigReason::TooLarge { max: 64 }));
+        }
+        let names: Vec<String> = self
+            .listeners
+            .iter()
+            .filter_map(|l| l.name.clone())
+            .collect();
+        check_spec(
+            &mut spec,
+            self.shared.trusted.as_ref(),
+            self.shared.tls.is_some(),
+            &names,
+        )?;
+        let workers = u16::try_from(self.shared.worker_count()).unwrap_or(u16::MAX);
+        self.shared
+            .base_limits
+            .overlay(&spec.limits)
+            .validate(workers, None)?;
+        let info = self.shared.add_listener(spec)?;
+        let id = info.id;
+        self.listeners.push(info);
+        Ok(id)
+    }
+
+    /// Closes one listener's socket at once (its connections keep running),
+    /// then drains them: idle ones close now, the rest may finish until
+    /// `deadline` and are then killed (`DrainDeadline`). Other listeners and
+    /// their connections are not touched.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidConfig { field: "listener", reason: Missing }` for an unknown id,
+    /// `ForkedChild`.
+    pub fn remove_listener(
+        &mut self,
+        id: ListenerId,
+        deadline: Instant,
+    ) -> Result<DrainReport, NetError> {
+        let report = self.shared.remove_listener(id, deadline)?;
+        self.listeners.retain(|l| l.id != id);
+        Ok(report)
     }
 
     /// A cloneable handle for other threads.

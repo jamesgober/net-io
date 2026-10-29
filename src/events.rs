@@ -74,6 +74,11 @@ pub enum Event {
         /// The effective backlog, when known.
         backlog: Option<u32>,
     },
+    /// A listener was removed (`Server::remove_listener`); its socket is closed.
+    ListenerClosed {
+        /// The listener.
+        listener: ListenerId,
+    },
     /// Accepting started.
     DoorOpened,
     /// Accepting stopped.

@@ -13,6 +13,71 @@
 
 ---
 
+## [0.4.0] - 2026-10-29
+
+Edges: everything around the TCP core that a real deployment meets. Behind a
+proxy, on a Unix socket, over UDP, started by systemd or a FastCGI manager,
+and restarted without closing the port.
+
+### Added
+
+- PROXY protocol v1 and v2: `ProxyParser` (sans-IO, strict grammar, every
+  TLV, CRC32C), `ProxyHeader`, `ProxyAddress`, `Tlv`, `Tlvs`, `ProxySsl`.
+  On a server, `ListenerSpec::proxy` reads the header under the handshake
+  deadline from trusted proxies only (an untrusted peer is closed before any
+  byte is read), sets `ConnectionInfo::real_peer` and `proxy`, moves the
+  per-source slot to the real client, and asks the gate again
+  (`Gate::readmit`). `ListenerSpec::trusted_proxies` per listener.
+- The TLS seam on listeners: `ServerBuilder::tls` and `ListenerSpec::tls`.
+  Reads return plaintext, every write is checked by the gate once, and a
+  graceful close sends `close_notify`.
+- Unix domain sockets: `UnixListener` (`bind`, `bind_with`, `bind_atomic`,
+  `accept`, `accept_timeout`), `UnixConnection`, `LocalOptions` (mode 0600 by
+  default, owner, group, `require_uid`), peer credentials, descriptor
+  passing (`send_descriptors`, `recv_descriptors`, `Descriptors`),
+  `listen_local` and `connect_local`, and `ListenerSpec::unix` on servers.
+  The socket file gets its mode before it listens; a stale file is removed
+  only when nothing listens on it; a listener removes only the file it
+  created.
+- UDP: `UdpSocket` with truncation detection, per-source and global budgets
+  (`UdpBudget`), a bounded source table, and the no-amplification guard
+  (`mark_verified`, `amplification_factor`, `amplification_window`),
+  `Datagram`, `UdpOptions`, `UdpStats`.
+- Restarts: `systemd`, `systemd_named`, `fastcgi_listener`,
+  `InheritedListener`, `ListenerHandle`, `ListenerSpec::adopt`,
+  `Server::release_listeners`, `send_listeners` and `recv_listeners` (a
+  checksummed manifest, credential checks, all or nothing), `HandoffPeer`.
+- `Server::add_listener` and `Server::remove_listener` on a running server,
+  with the `ListenerClosed` event.
+- Back-channels: `Server::adopt` with `AdoptSpec`, and
+  `TcpConnection::set_gate`.
+- `monotonic_micros`, the clock systemd's `MONOTONIC_USEC` expects.
+- `RefusalCause::Credentials`, `ConfigReason::Malformed`.
+- Examples: `behind_proxy`, `unix_socket`, `handoff_restart`,
+  `systemd_activation`, `fastcgi_detect`, `udp_echo`.
+- `docs/SECURITY.md` (draft): the threat model and the threat table with each
+  defence's cost and test.
+- Fuzz targets for the PROXY parser, the hand-off manifest, the systemd
+  environment, CIDR blocks, and trusted-proxy lists (`fuzz/`).
+
+### Changed
+
+- The per-source cap is counted per listener, sized from that listener's
+  limits.
+- The loom models build under `--cfg net_io_loom` instead of `--cfg loom`, so
+  a downstream crate running its own loom models can build net-io.
+- `Stats::closes` and `Stats::refusals` iterate the non-zero counters;
+  `WorkerId::for_testing`.
+- The gate's check covers only bytes it has not approved yet, so the tail of a
+  partial send is never counted twice.
+
+### Fixed
+
+- A test that counted connections exactly could fail on a loaded host when
+  the server refused a quick reconnect; it now checks bounds.
+
+---
+
 ## [0.3.0] - 2026-10-26
 
 TCP and the blocking driver: the first release with working code. Servers
@@ -143,7 +208,8 @@ The scaffold and the plan. No functional code yet.
   dependencies, testing, open decisions, and the decision log.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/net-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/net-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/net-io/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/net-io/releases/tag/v0.1.0

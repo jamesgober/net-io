@@ -1,6 +1,5 @@
 //! Socket options: before bind, per accepted or dialed connection, and live.
 
-use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::error::NetError;
@@ -281,7 +280,7 @@ impl ListenOptions {
 /// ```
 #[derive(Debug)]
 pub struct SocketOptions<'a> {
-    pub(crate) stream: &'a TcpStream,
+    pub(crate) sock: sys::Sock<'a>,
     pub(crate) v6: bool,
 }
 
@@ -296,7 +295,7 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn nodelay(&self) -> Result<bool, NetError> {
-        sys::nodelay(self.stream.sock()).map_err(os("TCP_NODELAY"))
+        sys::nodelay(self.sock).map_err(os("TCP_NODELAY"))
     }
 
     /// Sets `TCP_NODELAY`.
@@ -305,7 +304,7 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn set_nodelay(&self, on: bool) -> Result<(), NetError> {
-        sys::set_nodelay(self.stream.sock(), on).map_err(os("TCP_NODELAY"))
+        sys::set_nodelay(self.sock, on).map_err(os("TCP_NODELAY"))
     }
 
     /// Keepalive probes (`None` = off).
@@ -314,7 +313,7 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn keepalive(&self) -> Result<Option<Keepalive>, NetError> {
-        Ok(sys::keepalive(self.stream.sock())
+        Ok(sys::keepalive(self.sock)
             .map_err(os("keepalive"))?
             .map(|(idle, interval, count)| Keepalive {
                 idle,
@@ -332,7 +331,7 @@ impl SocketOptions<'_> {
         if let Some(k) = &k {
             check_keepalive(k)?;
         }
-        sys::set_keepalive(self.stream.sock(), k.map(|k| (k.idle, k.interval, k.count)))
+        sys::set_keepalive(self.sock, k.map(|k| (k.idle, k.interval, k.count)))
             .map_err(os("keepalive"))
     }
 
@@ -342,13 +341,11 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn linger(&self) -> Result<Linger, NetError> {
-        Ok(
-            match sys::linger(self.stream.sock()).map_err(os("SO_LINGER"))? {
-                None => Linger::Off,
-                Some(d) if d.is_zero() => Linger::Abortive,
-                Some(d) => Linger::Timeout(d),
-            },
-        )
+        Ok(match sys::linger(self.sock).map_err(os("SO_LINGER"))? {
+            None => Linger::Off,
+            Some(d) if d.is_zero() => Linger::Abortive,
+            Some(d) => Linger::Timeout(d),
+        })
     }
 
     /// Sets linger at close.
@@ -357,7 +354,7 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn set_linger(&self, l: Linger) -> Result<(), NetError> {
-        sys::set_linger(self.stream.sock(), l.to_sys()).map_err(os("SO_LINGER"))
+        sys::set_linger(self.sock, l.to_sys()).map_err(os("SO_LINGER"))
     }
 
     /// The effective `SO_SNDBUF`.
@@ -366,7 +363,7 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn send_buffer(&self) -> Result<u32, NetError> {
-        sys::send_buffer(self.stream.sock()).map_err(os("SO_SNDBUF"))
+        sys::send_buffer(self.sock).map_err(os("SO_SNDBUF"))
     }
 
     /// Sets `SO_SNDBUF` and returns the effective value (Linux doubles it).
@@ -375,7 +372,7 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn set_send_buffer(&self, bytes: u32) -> Result<u32, NetError> {
-        sys::set_send_buffer(self.stream.sock(), bytes).map_err(os("SO_SNDBUF"))
+        sys::set_send_buffer(self.sock, bytes).map_err(os("SO_SNDBUF"))
     }
 
     /// The effective `SO_RCVBUF`.
@@ -384,7 +381,7 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn receive_buffer(&self) -> Result<u32, NetError> {
-        sys::receive_buffer(self.stream.sock()).map_err(os("SO_RCVBUF"))
+        sys::receive_buffer(self.sock).map_err(os("SO_RCVBUF"))
     }
 
     /// Sets `SO_RCVBUF` and returns the effective value (Linux doubles it).
@@ -393,7 +390,7 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn set_receive_buffer(&self, bytes: u32) -> Result<u32, NetError> {
-        sys::set_receive_buffer(self.stream.sock(), bytes).map_err(os("SO_RCVBUF"))
+        sys::set_receive_buffer(self.sock, bytes).map_err(os("SO_RCVBUF"))
     }
 
     /// The hop limit.
@@ -402,7 +399,7 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn ttl(&self) -> Result<u8, NetError> {
-        sys::ttl(self.stream.sock(), self.v6).map_err(os("IP_TTL"))
+        sys::ttl(self.sock, self.v6).map_err(os("IP_TTL"))
     }
 
     /// Sets the hop limit.
@@ -411,13 +408,114 @@ impl SocketOptions<'_> {
     ///
     /// `Os` when the OS call fails.
     pub fn set_ttl(&self, hops: u8) -> Result<(), NetError> {
-        sys::set_ttl(self.stream.sock(), self.v6, hops).map_err(os("IP_TTL"))
+        sys::set_ttl(self.sock, self.v6, hops).map_err(os("IP_TTL"))
+    }
+}
+
+/// Options for a Unix socket listener. The defaults: mode `0600` (only the
+/// owner may connect, decision D-024), stale socket files removed, backlog 1,024.
+///
+/// ```
+/// let options = net_io::LocalOptions::new().group_access(33).require_uid(1000);
+/// # let _ = options;
+/// ```
+#[must_use]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalOptions {
+    pub(crate) mode: u32,
+    pub(crate) owner: Option<u32>,
+    pub(crate) group: Option<u32>,
+    pub(crate) remove_stale: bool,
+    pub(crate) require_uid: Option<u32>,
+    pub(crate) backlog: u32,
+}
+
+impl Default for LocalOptions {
+    fn default() -> LocalOptions {
+        LocalOptions::new()
+    }
+}
+
+impl LocalOptions {
+    /// Mode `0600`, stale socket files removed, backlog 1,024.
+    pub fn new() -> LocalOptions {
+        LocalOptions {
+            mode: 0o600,
+            owner: None,
+            group: None,
+            remove_stale: true,
+            require_uid: None,
+            backlog: 1024,
+        }
+    }
+
+    /// The socket file's permission bits (only the low 9 bits are used).
+    pub fn mode(mut self, mode: u32) -> LocalOptions {
+        self.mode = mode & 0o777;
+        self
+    }
+
+    /// The socket file's owner (needs the privilege to change owners).
+    pub fn owner(mut self, uid: u32) -> LocalOptions {
+        self.owner = Some(uid);
+        self
+    }
+
+    /// The socket file's group; the mode is unchanged.
+    pub fn group(mut self, gid: u32) -> LocalOptions {
+        self.group = Some(gid);
+        self
+    }
+
+    /// The socket file's group and mode `0660`: members of `gid` may connect.
+    pub fn group_access(mut self, gid: u32) -> LocalOptions {
+        self.group = Some(gid);
+        self.mode = 0o660;
+        self
+    }
+
+    /// Whether a socket file nobody listens on is removed before binding
+    /// (default on). A live listener's file, or anything that is not a socket,
+    /// is never removed.
+    pub fn remove_stale(mut self, on: bool) -> LocalOptions {
+        self.remove_stale = on;
+        self
+    }
+
+    /// Refuses peers whose user id is not `uid`, at accept, before any read.
+    pub fn require_uid(mut self, uid: u32) -> LocalOptions {
+        self.require_uid = Some(uid);
+        self
+    }
+
+    /// The listen backlog (capped by the OS).
+    pub fn backlog(mut self, backlog: u32) -> LocalOptions {
+        self.backlog = backlog;
+        self
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_local_options_builders() {
+        let o = LocalOptions::new();
+        assert_eq!((o.mode, o.remove_stale, o.backlog), (0o600, true, 1024));
+        let o = o
+            .group_access(7)
+            .owner(3)
+            .require_uid(9)
+            .mode(0o1777)
+            .backlog(5);
+        assert_eq!(o.mode, 0o777);
+        assert_eq!(
+            (o.group, o.owner, o.require_uid),
+            (Some(7), Some(3), Some(9))
+        );
+        assert_eq!(LocalOptions::default(), LocalOptions::new());
+    }
 
     #[test]
     fn test_keepalive_zero_rejected() {

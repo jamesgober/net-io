@@ -556,7 +556,7 @@ Close style per reason (decision D-032): **graceful** (flush within the write de
 
 ```rust
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RefusalCause { GlobalCap, ListenerCap, SourceCap, LaneReserve, Gate(u16), Session, Busy, DoorClosed, Shed, Lockdown }
+pub enum RefusalCause { GlobalCap, ListenerCap, SourceCap, LaneReserve, Gate(u16), Session, Busy, DoorClosed, Shed, Lockdown, Credentials }
 
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LimitKind {
@@ -596,6 +596,7 @@ pub enum ConfigReason {
     Missing,                                // a required part is not set (gate, trusted proxies, session factory)
     NotListening,                           // an adopted socket is not a listening socket
     Inconsistent,                           // values that contradict each other (for example pressure.high <= pressure.low)
+    Malformed,                              // a byte or character the value cannot hold (a NUL in a socket path)
 }
 ```
 
@@ -753,7 +754,7 @@ impl ListenerId { pub const fn get(self) -> u16; }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerId(u16);
-impl WorkerId { pub const fn get(self) -> u16; pub const fn first() -> WorkerId; }   // first: worker 0, for tests and `ServerHandle::completer`
+impl WorkerId { pub const fn get(self) -> u16; pub const fn first() -> WorkerId; pub const fn for_testing(index: u16) -> WorkerId; }   // first: worker 0; for_testing: tests of per-worker state
 ```
 
 `ConnectionId` is issued for every accepted, adopted, dialed-and-registered, or inherited connection; it is never zero and never reused within a process. Workers take blocks of 1,024 ids from one process-wide counter, so ids are ordered within a worker, not globally; at one million connections per second the counter lasts about 584,000 years. The block also tells `ServerHandle::kill` which worker owns an id. P0, Tier 1, `0.3.0`. `ListenerId` and `WorkerId` (P0, Tier 2) count from 0 within one server; at most 65,535 of each.
@@ -969,7 +970,7 @@ assert!(Limits::builder().max_connections(100).build().is_ok()); // max_per_sour
 |---|---|---|---|---|
 | `max_connections` | 10,000 | `workers` (128) | descriptor and memory exhaustion | fits the default `RLIMIT_NOFILE` of many servers (65,536 hard) with room for files; blocking: one connection per worker |
 | `max_per_listener` | follows `max_connections` | same | one listener starving others | equal by default; lower it for admin listeners |
-| `max_per_source` | 256 per IPv4 /32 or IPv6 /64, at most `max_connections` | 16, at most `max_connections` | one host taking every slot | browsers open 6 to 10 connections per host; 256 leaves room for NAT; blocking pools are small |
+| `max_per_source` | 256 per IPv4 /32 or IPv6 /64, at most `max_connections` | 16, at most `max_connections` | one host taking every slot | browsers open 6 to 10 connections per host; 256 leaves room for NAT; blocking pools are small. Counted per listener (each listener applies its own value, D-085), over every open connection including one finishing a graceful close, so a client at the cap that reconnects at once can be refused until its last connection is closed; a load test from one host needs a higher cap |
 | `backlog` | 1,024 | 1,024 | SYN bursts overflowing the accept queue | Linux caps it at `somaxconn` (4,096 since 5.4, 128 before) |
 | `accept_batch` | 64 | 16 | one listener starving other work | bounds accept work per wake-up |
 | `handshake_timeout` | 10 s | 10 s | PROXY or TLS that never finishes | a TLS handshake over a slow mobile link takes under 2 s; 10 s is generous |
@@ -1405,7 +1406,7 @@ impl SessionFactory for OnlyLoopback {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
-    Read,                                   // wait for more input
+    Read,                                   // wait for more input; queued output is NOT sent (return Write first)
     Write,                                  // flush pending output, then on_writable
     Park { until: Option<Instant> },        // no reads, no idle timer, until a completion or the park deadline
     Close,                                  // graceful: flush, FIN, bounded linger
@@ -1600,7 +1601,7 @@ pub struct ListenerSpec { /* source + options */ }
 impl ListenerSpec {
     pub fn tcp<A: ToSocketAddrs>(addr: A) -> Self;                                  // resolved now; a failure is reported by build
     pub fn tcp_with<A: ToSocketAddrs>(addr: A, options: ListenOptions) -> Self;
-    pub fn unix(path: impl Into<PathBuf>, options: LocalOptions) -> Self;          // P1, 0.4.0
+    pub fn unix(path: impl Into<PathBuf>, options: LocalOptions) -> Self;          // P1, 0.4.0: see below
     #[cfg(windows)] pub fn pipe(name: &str, options: PipeOptions) -> Self;          // P1, 0.5.0
     pub fn adopt(listener: ListenerHandle) -> Self;                                 // P0, 0.4.0
     pub fn name(self, name: &str) -> Self;                                          // up to 64 bytes; events and hand-off
@@ -1611,7 +1612,9 @@ impl ListenerSpec {
 }
 ```
 
-One listener of a server. P0, Tier 2, `0.3.0` unless marked. A name longer than 64 bytes, or a repeated name, fails `build` with `InvalidConfig { field: "name" }`.
+One listener of a server. P0, Tier 2, `0.3.0` unless marked.
+
+`unix` (feature `local`, Unix; Windows AF_UNIX in `0.5.0`, `Unsupported` until then) binds as `UnixListener::bind_with` at `build` and removes its file at shutdown only if it is still the one it created. Its connections carry `Transport::Unix`, the peer's credentials, and no IP address, so the per-source cap does not apply; `require_uid` refusals count as `RefusalCause::Credentials`. A `BlockingHandler` receives them as a `TcpConnection` (`info().transport` is `Unix`, `peer_addr` is unspecified, socket options fail). With `proxy`, every peer is trusted and no trusted list is needed: the socket file's mode decides who may connect (decision D-093). A name longer than 64 bytes, or a repeated name, fails `build` with `InvalidConfig { field: "name" }`.
 
 ### `Server`
 
@@ -1626,6 +1629,8 @@ impl Server {
     pub fn shutdown(self, deadline: Instant) -> DrainReport;
     pub fn wait_for_stop(self) -> DrainReport;
     pub fn release_listeners(&self) -> Result<Vec<ListenerHandle>, NetError>;
+    pub fn add_listener(&mut self, spec: ListenerSpec) -> Result<ListenerId, NetError>;      // P1, 0.4.0
+    pub fn remove_listener(&mut self, id: ListenerId, deadline: Instant) -> Result<DrainReport, NetError>; // P1, 0.4.0
     pub fn adopt(&self, conn: TcpConnection, spec: AdoptSpec) -> Result<ConnectionId, NetError>;
     pub fn handle(&self) -> ServerHandle;
     pub fn stats(&self) -> Stats;
@@ -1642,6 +1647,8 @@ impl Drop for Server;   // shutdown with the drain timeout as the deadline
 | `drain` | closes the door, tells every session to finish (`SessionContext::draining()`), closes idle connections at once, waits for the rest until `deadline`, then kills them with `DrainDeadline`; returns the counts | none (report) | 10,000 idle connections under 100 ms [est.] | P0 | 2 | `0.3.0` |
 | `shutdown` | `drain`, then closes the listening sockets (except released ones) and joins every worker; afterwards no net-io thread runs and every descriptor net-io opened is closed | none (report) | | P0 | 2 | `0.3.0` |
 | `wait_for_stop` | blocks the calling thread until a stop is requested (`ServerHandle::request_stop`, or the control line moves to `Draining` or `Stopping`), then shuts down with the drain deadline (the drain timeout or the control line's) | none (report) | zero CPU while waiting | P0 | 1 | `0.3.0` |
+| `add_listener` | binds one more listener on a running server with the same checks as `build` (features, TLS engine, trusted proxies, unique name, limits) and starts its accept thread; its door stays closed until the next `open_door`, which opens every listener's door; ids are never reused; at most 64 listeners at a time (decision D-097) | as `build`, `ShuttingDown`, `ForkedChild` | one bind and one thread | P1 | 2 | `0.4.0` |
+| `remove_listener` | closes that listener's socket at once (a Unix socket file it created is removed) and emits `ListenerClosed`, then drains only its connections: idle ones close now (`Drained`), queued ones close unread, the rest may finish until `deadline` and are then killed (`DrainDeadline`); other listeners are not touched | `InvalidConfig { field: "listener", reason: Missing }`, `ForkedChild` | as `drain`, for one listener | P1 | 2 | `0.4.0` |
 | `release_listeners` | owned duplicates of every listening socket, for [hand-off](#listener-hand-off); works while the door is open, so the new process can start accepting before this one stops (decision D-042); a later `shutdown` does not close the released sockets | `Os` | 1 system call per listener | P0 | 3 | `0.4.0` |
 | `adopt` | registers a dialed connection exactly like an accepted one: new id, `Gate::admit` with `AdmitStage::Adopt`, the named listener's limits, sessions, kill handle, events | `Refused`, `Limit`, `ShuttingDown` | as accept | P1 | 3 | `0.4.0` |
 | `handle` | a cloneable handle for other threads | | `Arc` clone | P0 | 2 | `0.3.0` |
@@ -1702,6 +1709,8 @@ pub struct Stats {
 impl Stats {
     pub fn refused_for(&self, cause: RefusalCause) -> u64;     // per cause (gate codes summed)
     pub fn closed_for(&self, reason: CloseReason) -> u64;      // per reason variant (inner values ignored)
+    pub fn closes(&self) -> impl Iterator<Item = (CloseReason, u64)> + '_;      // non-zero counts, one per variant
+    pub fn refusals(&self) -> impl Iterator<Item = (RefusalCause, u64)> + '_;
 }
 
 #[non_exhaustive]
@@ -2000,6 +2009,7 @@ impl EventSink for NoopSink { #[inline(always)] fn event(&self, _: &Event) {} }
 #[derive(Clone, Copy, Debug)]
 pub enum Event {
     ListenerOpened { listener: ListenerId, local: Option<SocketAddr>, backlog: Option<u32> },
+    ListenerClosed { listener: ListenerId },                       // remove_listener, 0.4.0
     DoorOpened,
     DoorClosed,
     Accepted { id: ConnectionId, peer: Option<SocketAddr>, listener: ListenerId },
@@ -2103,7 +2113,11 @@ impl ManualClock {
     pub fn set(&self, at: Instant);         // never earlier than the current value
 }
 impl Clock for ManualClock;
+
+pub fn monotonic_micros() -> u64;           // CLOCK_MONOTONIC (Linux, macOS), the performance counter (Windows)
 ```
+
+`monotonic_micros` is the raw monotonic clock in microseconds, the value systemd's `MONOTONIC_USEC` expects in `sd_notify` reload and watchdog messages (decision D-101). It is not related to `Instant` or to an injected `Clock`. P1, Tier 2, `0.4.0`; one system call (vDSO on Linux) [est. under 50 ns].
 
 All deadlines run on one hierarchical timing wheel per worker: 6 levels of 64 slots, tick `Limits::tick` (1 ms by default), covering about 2.2 years at 1 ms; later deadlines go to an overflow list re-examined when the top level wraps. Timer slots are part of each connection's record, so inserting and cancelling allocate nothing. Extending a deadline (every read resets the idle timer) only stores the new time; the wheel entry is moved only when it fires early. A timer never fires before its deadline; a clock that jumps forward (a resumed VM) fires every expired timer once, in order, at most 1,024 per loop iteration so IO is not starved. With no IO and no timer due, every net-io thread sleeps in the kernel: no periodic tick. P1 (`Clock`, `ManualClock`), Tier 3, `0.3.0`; insert and cancel under 20 ns, extend under 2 ns [est.].
 
@@ -2202,6 +2216,7 @@ impl UdpSocket {
     pub fn mark_verified(&mut self, peer: SocketAddr);
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), NetError>;
     pub fn local_addr(&self) -> Result<SocketAddr, NetError>;
+    pub fn stats(&self) -> UdpStats;
     pub fn recv_batch(&mut self, bufs: &mut [DatagramBuffer]) -> Result<usize, NetError>;      // P2, 0.6.0
     pub fn send_batch(&mut self, datagrams: &[OutgoingDatagram<'_>]) -> Result<usize, NetError>; // P2, 0.6.0
     pub fn join_multicast(&self, group: IpAddr, interface: MulticastInterface) -> Result<(), NetError>; // P2, 0.6.0
@@ -2209,6 +2224,11 @@ impl UdpSocket {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Datagram { pub len: usize, pub from: SocketAddr, pub truncated: bool, pub destination: Option<IpAddr> }
+// `len` when truncated: the real length on Linux (MSG_TRUNC), the bytes copied elsewhere
+
+#[non_exhaustive] #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UdpStats { pub received: u64, pub sent: u64, pub dropped: u64, pub refused: u64,
+                      pub truncated: u64, pub icmp_errors: u64, pub overflow: u64, pub sources: u32 }
 
 #[must_use]
 #[derive(Clone, Debug)]
@@ -2216,6 +2236,7 @@ pub struct UdpOptions { /* ... */ }
 impl UdpOptions {
     pub fn new() -> Self;
     pub fn amplification_factor(self, factor: u8) -> Self;     // 1 by default, at most 3
+    pub fn amplification_window(self, window: Duration) -> Self; // 10 s by default, at least 1 s
     pub fn source_budget(self, budget: UdpBudget) -> Self;
     pub fn global_budget(self, budget: UdpBudget) -> Self;
     pub fn source_table(self, entries: u32) -> Self;            // 65,536 by default
@@ -2224,6 +2245,7 @@ impl UdpOptions {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpBudget { pub datagrams_per_sec: u32, pub bytes_per_sec: u32, pub burst: u32 }
+impl UdpBudget { pub const SOURCE_DEFAULT: UdpBudget; }   // 1,000 datagrams/s, 1 MB/s, burst 100
 
 // P2, 0.6.0: batches and multicast
 pub struct DatagramBuffer<'a> { pub buf: &'a mut [u8], pub datagram: Option<Datagram> }   // filled by recv_batch
@@ -2248,12 +2270,13 @@ UDP source addresses are trivially spoofed, so the socket protects others and it
 
 | Item | Behaviour | Errors | Cost | Grade | Tier | Version |
 |---|---|---|---|---|---|---|
-| `bind`, `bind_with` | close-on-exec; peers normalized | bind errors | one-time | P1 | 1 / 2 | `0.4.0` |
+| `bind`, `bind_with` | close-on-exec; no `SO_REUSEADDR` (and `SO_EXCLUSIVEADDRUSE` on Windows), so no other socket shares the port; `IPV6_V6ONLY` on by default; on Windows `SIO_UDP_CONNRESET` is switched off; peers normalized; options checked (`factor` 1 to 3, window at least 1 s, non-zero budgets and table) | bind errors, `InvalidConfig` | one-time | P1 | 1 / 2 | `0.4.0` |
 | `recv_from`, `recv` | a datagram larger than `buf` is reported with `truncated: true` and its real length where the OS gives it (`MSG_TRUNC` on Linux, `WSAEMSGSIZE` on Windows), never as a silently cut datagram; a zero-length datagram is valid; datagrams from sources over their budget are read, dropped, and counted before returning; ICMP "port unreachable" reports (`ECONNREFUSED`, Windows `WSAECONNRESET`) never end the socket | `TimedOut`, `Os` | 1 system call plus the budget check [est. under 30 ns] | P1 | 1 | `0.4.0` |
-| `send_to`, `send` | **no amplification**: to a peer not marked verified, the bytes sent never exceed `factor x` the bytes received from it within the window; otherwise `Limit { which: Amplification }` and nothing is sent | `Limit`, `Os` | 1 system call plus the guard | P1 | 1 | `0.4.0` |
+| `send_to`, `send` | **no amplification**: to a peer not marked verified, the bytes sent never exceed `factor x` the bytes received from it within the window (the current and the previous window, so a reply just after the boundary passes); a peer never heard from gets nothing; otherwise `Limit { which: Amplification }` and nothing is sent. Peers are keyed by IP address, not port, since the victim of amplification is an address (decision D-096). An IPv4 destination on a dual-stack socket goes out IPv4-mapped | `Limit`, `Closed` (`send` unconnected), `Os` | 1 system call plus the guard (one hash lookup [est. under 30 ns]) | P1 | 1 | `0.4.0` |
+| `stats` | counters: returned, sent, dropped over budget, refused by the guard, truncated, ICMP reports ignored, overflow datagrams, sources tracked | | none | P1 | 2 | `0.4.0` |
 | `connect` | fixes the peer; the kernel filters other sources | `Os` | one-time | P1 | 2 | `0.4.0` |
 | `mark_verified` | the protocol proved the peer can receive (a cookie, a handshake); lifts the guard for it | | O(1) | P1 | 2 | `0.4.0` |
-| source table | bounded (default 65,536 entries) with CLOCK eviction; when full, unknown sources share one small overflow budget (strangers lose first, verified peers keep their entries) | | O(1) | P1 | 2 | `0.4.0` |
+| source table | bounded (default 65,536 entries, about 130 bytes each [est.], 8.5 MiB full) with CLOCK eviction of unverified entries (one insertion looks at most 64 entries); when nothing can be evicted, unknown sources share one overflow budget the size of a source budget and get no send allowance (strangers lose first, verified peers keep their entries) | | O(1) | P1 | 2 | `0.4.0` |
 | `recv_batch`, `send_batch` | `recvmmsg` / `sendmmsg` on Linux, a loop elsewhere | | 1 system call per batch on Linux | P2 | 3 | `0.6.0` |
 | packet info (`destination`) | `IP_PKTINFO`, `IPV6_RECVPKTINFO` | `Unsupported` | ancillary data parse | P2 | 3 | `0.6.0` |
 | `join_multicast` | IPv4 and IPv6 groups | `Os` | | P2 | 2 | `0.6.0` |
@@ -2293,6 +2316,8 @@ impl UnixListener {
     #[cfg(target_os = "linux")]
     pub fn bind_abstract(name: &[u8], options: LocalOptions) -> Result<UnixListener, NetError>;   // P3
     pub fn accept(&self) -> Result<(UnixConnection, ConnectionInfo), NetError>;
+    pub fn accept_timeout(&self, timeout: Duration) -> Result<Option<(UnixConnection, ConnectionInfo)>, NetError>;
+    pub fn info(&self) -> &ListenerInfo;
     pub fn path(&self) -> Option<&Path>;                       // the final path (recorded, not read back: decision D-058)
 }
 impl Drop for UnixListener;   // removes its path only if it is still the file this listener created
@@ -2318,7 +2343,7 @@ impl UnixConnection {
     #[cfg(unix)] pub fn recv_descriptors(&mut self, body: &mut [u8], into: &mut Descriptors) -> Result<usize, NetError>;
 }
 #[cfg(unix)] pub struct Descriptors { /* fixed capacity 64 OwnedFd */ }
-#[cfg(unix)] impl Descriptors { pub fn new() -> Self; pub fn len(&self) -> usize; pub fn take(&mut self) -> impl Iterator<Item = OwnedFd> + '_; }
+#[cfg(unix)] impl Descriptors { pub fn new() -> Self; pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool; pub fn take(&mut self) -> impl Iterator<Item = OwnedFd> + '_; }
 impl Read for UnixConnection; impl Write for UnixConnection; impl Drop for UnixConnection;   // as TcpConnection
 
 #[must_use]
@@ -2332,18 +2357,20 @@ impl LocalOptions {
     pub fn group_access(self, gid: u32) -> Self; // group(gid) and mode 0o660: members of that group may connect
     pub fn remove_stale(self, on: bool) -> Self;
     pub fn require_uid(self, uid: u32) -> Self; // refuse peers with another uid (checked at accept)
+    pub fn backlog(self, backlog: u32) -> Self; // default 1,024, capped by the OS
 }
 ```
 
 | Item | Behaviour | Errors | Grade | Tier | Version |
 |---|---|---|---|---|---|
-| `bind`, `bind_with` | path length checked (Linux 108 bytes, macOS and FreeBSD 104, including the terminator); a NUL byte in the path is refused; a stale socket file is removed only if `lstat` (no symlink following) says it is a socket and a connect to it is refused; `bind`, then `chmod` (and `chown` when set) | `PathTooLong`, `StaleSocketInUse`, `PermissionDenied`, `Bind` | P1 | 1 / 2 | `0.4.0` |
-| `bind_atomic` | binds under a fresh temporary name with mode `0700` in the same directory, sets the final mode, then renames into place, so the socket is never reachable with the umask's permissions | as `bind` | P1 | 2 | `0.4.0` |
-| `accept` | peer credentials read once and stored in `ConnectionInfo`; `require_uid` refuses a mismatched peer before any read | `Os` | P1 | 1 | `0.4.0` |
+| `bind`, `bind_with` | path length checked (Linux 108 bytes, macOS and FreeBSD 104, including the terminator); a NUL byte in the path is refused (`InvalidConfig { field: "path", reason: Malformed }`); a stale socket file is removed only if `lstat` (no symlink following) says it is a socket and a connect to it is refused, while a live socket, a regular file, a directory, or a symbolic link is left alone and fails with `StaleSocketInUse`; then `bind`, `chmod` and `lchown` (when set) on the file the bind created (its device and inode checked before and after), and only then `listen`, so no connection is ever accepted under the umask's permissions (decision D-091). Cost [est.]: two to three `lstat`, one probe connect when a file exists, and the `chmod`, once per bind | `PathTooLong`, `StaleSocketInUse`, `PermissionDenied`, `NotFound` (no such directory), `InvalidConfig`, `Os` | P1 | 1 / 2 | `0.4.0` |
+| `bind_atomic` | as `bind_with`, but bound under `.<name>.<pid>.<n>` in the same directory and renamed into place after `listen`, so the path never names a socket that refuses or has the wrong mode | as `bind` | P1 | 2 | `0.4.0` |
+| `accept`, `accept_timeout` | the accept discipline of `TcpListener` (reserve descriptor, backoff); peer credentials read once (one `getsockopt`, under 1 µs [est.]) and stored in `ConnectionInfo`; `require_uid` closes a mismatched peer, or one whose uid the OS did not report, before any read, and accepting continues | `Limit { which: Descriptors }`, `Os` | P1 | 1 | `0.4.0` |
 | `Drop` | unlinks the path only if `lstat` still shows the inode this listener created, never a replacement someone else bound | none (event) | P1 | 1 | `0.4.0` |
-| `UnixConnection` IO | as `TcpConnection` | as `TcpConnection` | P1 | 1 | `0.4.0` |
+| `UnixConnection` IO | as `TcpConnection`: the same connection core, limits, deadlines, kill handle, and close behaviour (decision D-093) | as `TcpConnection` | P1 | 1 | `0.4.0` |
+| `UnixConnection::connect` | blocking connect; a full backlog waits up to 10 s (`SO_SNDTIMEO`); no socket at the path and a socket nobody listens on are both `NotFound` (decision D-092) | `NotFound`, `PermissionDenied`, `TimedOut { kind: Connect }`, `PathTooLong` | P1 | 1 | `0.4.0` |
 | `peer_credentials` | see [`PeerCredentials`](#peercredentials) | `Unsupported` | P1 | 2 | `0.4.0` (Windows `0.5.0`) |
-| `send_descriptors`, `recv_descriptors` | `SCM_RIGHTS`, at most 64 descriptors per message, received close-on-exec (`MSG_CMSG_CLOEXEC` where it exists); a truncated control message (`MSG_CTRUNC`) closes every descriptor received and fails | `Handoff(Truncated)`, `Os` | P0 | 3 | `0.4.0` |
+| `send_descriptors`, `recv_descriptors` | `SCM_RIGHTS`, at most 64 descriptors per message, attached to the first byte of a non-empty body that is sent in full (one gate check for the body); received through the connection's normal read path (deadlines, kill, drain), close-on-exec (`MSG_CMSG_CLOEXEC` on Linux; on macOS `FD_CLOEXEC` right after the receive, so a `fork` plus `exec` on another thread in between can inherit one); a truncated control message (`MSG_CTRUNC`) closes every descriptor received and fails the connection, since its bytes can no longer be framed (decision D-094); on a TLS connection both are `Unsupported` | `Handoff(Truncated)`, `InvalidConfig` (empty body, more than 64), `Unsupported`, `Os` | P0 | 3 | `0.4.0` |
 | Windows AF_UNIX | `UnixListener` and `UnixConnection` on Windows 10 1803+: stream sockets only, no descriptor passing; permissions are NTFS ACLs; the socket file is deleted with `DeleteFileW` before rebinding | `Unsupported` on older Windows | P2 | 2 | `0.5.0` |
 | `bind_abstract` | Linux abstract namespace; refused unless `require_uid` is set, because no file permission protects it | `InvalidConfig { field: "require_uid", reason: Missing }` | P3 | 3 | after `1.0.0` |
 
@@ -2608,8 +2635,8 @@ How the server drives it (P0, Tier 3, `0.4.0`):
 
 1. Order: accept, `Gate::admit`, PROXY header, `Gate::readmit`, `TlsAcceptor::session` (an acceptor at capacity refuses here, before reading), then `step` under the handshake deadline until `HandshakeComplete`; `info()` is copied into `ConnectionInfo::tls`.
 2. **ClientHello inspection lives in the engine.** The engine parses the ClientHello from net-io's read buffer inside `step` and can refuse it (fingerprinting); net-io copies nothing. A refusal is `TlsError { kind: HelloRefused, .. }` and closes with `CloseReason::HelloRefused`; other errors close with `TlsFailed`. A ClientHello split into many tiny records is the engine's to bound; net-io's read buffer limit and handshake deadline bound it too.
-3. `Data` slices are plaintext inside the read buffer; net-io moves each one down to follow the previous unconsumed plaintext (one `copy_within`, no second buffer) and calls `Session::on_data` with the plaintext.
-4. Outbound: the gate check runs on the plaintext before `encrypt` and again before each ciphertext flush; a denial is encrypted like any other output and followed by `close_notify`.
+3. `Data` slices are plaintext inside net-io's ciphertext buffer; net-io copies each one once into the reader's buffer (the session's input or a handler's `recv` buffer), so blocking handlers and sessions share one TLS path (D-089).
+4. Outbound: the gate check runs once on the plaintext before `encrypt`, for exactly the bytes encrypted, and the ciphertext is sent within the same call; a denial is encrypted like any other output and followed by `close_notify`. `TcpConnection::peek` is `Unsupported` on a TLS connection.
 5. Graceful close sends `close_notify`; abortive close does not. The read buffer grows (up to the maximum read class) when `input_capacity_required` exceeds it, for example for a large client certificate chain.
 6. The engine's minimum buffer sizes are met by the default 16 KiB class with the 64 KiB growth limit (rustls needs at least 18,437 bytes for one full record; `input_capacity_required` says more when a handshake message spans several records).
 
@@ -2668,9 +2695,10 @@ pub enum InheritError {
 
 | Item | Behaviour | Grade | Tier | Version |
 |---|---|---|---|---|
-| `systemd` | socket activation: reads `LISTEN_PID` (must equal this process id, otherwise the variables were meant for another process and the result is an empty list), `LISTEN_FDS` (at most 64), `LISTEN_FDNAMES` (optional), and `LISTEN_PIDFDID` where present; descriptors start at 3; each is verified (a socket, listening, a known family and type) and set close-on-exec. The variables are left in the environment (decision D-036). Not systemd (no `LISTEN_PID`): `Ok(vec![])` | P1 | 1 | `0.4.0` |
+| `InheritedListener` | a verified listener with its `LISTEN_FDNAMES` name (an empty name is `None`) | P1 | 1 | `0.4.0` |
+| `systemd` | socket activation: reads `LISTEN_PID` (must equal this process id, otherwise the variables were meant for another process and the result is an empty list), `LISTEN_FDS` (at most 64), `LISTEN_FDNAMES` (optional), and `LISTEN_PIDFDID` where present; descriptors start at 3; each is verified (a socket, listening, a known family and type) and set close-on-exec. The variables are left in the environment (decision D-036). Not systemd (no `LISTEN_PID`, or one that is not a number): `Ok(vec![])`. Every descriptor is verified before any is taken, so an error takes nothing. Taken once per process: a second call (or `systemd_named`) gets what is left, never a second owner of the same number. A Unix socket needs the `local` feature (otherwise `WrongKind`); a UDP socket is `WrongKind` until datagram sessions (`0.6.0`) (decision D-098) | P1 | 1 | `0.4.0` |
 | `systemd_named` | the one listener with that `LISTEN_FDNAMES` entry, or `None` | P1 | 1 | `0.4.0` |
-| `fastcgi_listener` | FastCGI's convention (`FCGI_LISTENSOCK_FILENO`, as `mod_fcgid` starts a FastCGI server): descriptor 0 is adopted only if it is a socket, listening, and has no peer (`getpeername` fails with `ENOTCONN`); otherwise `None` (a terminal, a file, a pipe, a connected socket) | P1 | 1 | `0.4.0` |
+| `fastcgi_listener` | FastCGI's convention (`FCGI_LISTENSOCK_FILENO`, as `mod_fcgid` starts a FastCGI server): descriptor 0 is adopted only if it is a socket, listening, and has no peer (`getpeername` fails with `ENOTCONN`); otherwise `None` (a terminal, a file, a pipe, a connected socket) and descriptor 0 is left untouched; taken once per process | P1 | 1 | `0.4.0` |
 | FastCGI on Windows | open decision OD-26: `0.6.0` if a Windows FastCGI deployment is planned; otherwise it is regraded P3 and moves after `1.0.0` | P2 | 2 | per OD-26 |
 
 ```rust,no_run
@@ -2722,7 +2750,7 @@ pub enum HandoffError {
 | Item | Behaviour | Grade | Tier | Version |
 |---|---|---|---|---|
 | `ListenerHandle` | owned, move-only; dropping it closes the socket | P0 | 3 | `0.4.0` |
-| `send_listeners`, `recv_listeners` | one `sendmsg` carrying up to 64 descriptors (`SCM_RIGHTS`) and a manifest: magic `NIOH`, version 1, count, per listener kind, name, local address, and an options digest, then a CRC32C. The receiver checks the sender's credentials against `expect` (default: same uid), receives close-on-exec, fails on a truncated control message, checks magic, version, checksum, and count, and verifies every descriptor (`SO_TYPE`, `SO_ACCEPTCONN`, `getsockname` equals the manifest address). Any failure closes every received descriptor and returns the error: all or nothing | P0 | 3 | `0.4.0` |
+| `send_listeners`, `recv_listeners` | one message carrying up to 64 descriptors (`SCM_RIGHTS`, attached to its first byte) and a manifest: magic `NIOH`, version 1, count, total length, per listener its kind, name (at most 64 bytes, cut at a character boundary), and local address, then a CRC32C of everything before it. The receiver checks the sender's credentials against `expect` (default: same uid) before reading, reads under `deadline`, receives close-on-exec, fails on a truncated control message or a sender that closes mid-message, refuses descriptors on any later read, checks magic, version, checksum, and count, and verifies every descriptor (`SO_TYPE`, `SO_ACCEPTCONN`, `getsockname` equals the manifest address). Any failure closes every received descriptor and returns the error: all or nothing (decision D-099) | P0 | 3 | `0.4.0` |
 | `share_listeners`, `receive_shared` | Windows: `WSADuplicateSocketW` per socket for one target pid (each blob works once, in that process only), sent with a random nonce over a named pipe with an owner-only security descriptor; the receiver checks `GetNamedPipeClientProcessId`, refuses a nonce it already accepted, creates each socket with `WSASocketW(FROM_PROTOCOL_INFO, WSA_FLAG_OVERLAPPED)`, and verifies it | P0 | 3 | `0.5.0` |
 | `HandoffPeer`, `HandoffError` | | P0 | 3 | `0.4.0` |
 

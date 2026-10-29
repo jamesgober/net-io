@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::accept::{Accepted, Acceptor};
 use crate::driver::DriverKind;
-use crate::error::{CloseReason, ConfigReason, LimitKind, NetError, TimeoutKind};
-use crate::gate::KillHandle;
+use crate::error::{CloseReason, ConfigReason, LimitKind, NetError, RefusalCause, TimeoutKind};
+use crate::gate::{AdmitStage, Gate, GateCell, KillHandle, guarded};
 use crate::id::{ConnectionId, ListenerId, WorkerId};
 use crate::info::{ConnectionInfo, Endpoint, Origin, Transport};
 use crate::limits::{Effective, Limits};
@@ -45,7 +45,7 @@ pub struct ListenerInfo {
 }
 
 /// Linux silently caps the backlog at `net.core.somaxconn`; read it once.
-fn effective_backlog(requested: u32) -> Option<u32> {
+pub(crate) fn effective_backlog(requested: u32) -> Option<u32> {
     if cfg!(target_os = "linux") {
         let cap = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
             .ok()
@@ -228,7 +228,7 @@ impl TcpListener {
                 .unwrap_or_else(PoisonError::into_inner)
                 .accept(&self.inner);
             match outcome {
-                Accepted::Conn(stream, peer) => {
+                Accepted::Conn((stream, peer)) => {
                     let conn = TcpConnection::accepted(stream, peer, &self.tcp, self.info.id)?;
                     let info = conn.info().clone();
                     return Ok(Some((conn, info)));
@@ -267,6 +267,22 @@ impl TcpListener {
 
     pub(crate) fn std(&self) -> &std::net::TcpListener {
         &self.inner
+    }
+
+    /// Records the listener's id and name in its facts (adopted listeners).
+    pub(crate) fn set_identity(&mut self, id: ListenerId, name: Option<String>) {
+        self.info.id = id;
+        self.info.name = name;
+    }
+
+    /// Records whether the listener serves TLS in its facts.
+    pub(crate) fn set_tls(&mut self, on: bool) {
+        self.info.tls = on;
+    }
+
+    /// Records the listener's PROXY requirement in its facts.
+    pub(crate) fn set_proxy_mode(&mut self, mode: crate::proxy::ProxyMode) {
+        self.info.proxy = mode;
     }
 
     pub(crate) fn tcp_options(&self) -> &TcpOptions {
@@ -577,7 +593,7 @@ impl TcpConnection {
         );
         let limits = Limits::default().effective(DriverKind::Blocking);
         Ok(TcpConnection::from_link(Link::new(
-            stream,
+            sys::Stream::Tcp(stream),
             info,
             limits,
             ClockRef::Monotonic,
@@ -595,11 +611,11 @@ impl TcpConnection {
         self.link.take()
     }
 
-    fn link(&mut self) -> Result<&mut Link, NetError> {
+    pub(crate) fn link(&mut self) -> Result<&mut Link, NetError> {
         self.link.as_mut().ok_or(NetError::Closed)
     }
 
-    fn link_ref(&self) -> &Link {
+    pub(crate) fn link_ref(&self) -> &Link {
         match &self.link {
             Some(l) => l,
             // Only `take_link` (crate-internal, at the end of a handler) empties it.
@@ -656,11 +672,18 @@ impl TcpConnection {
     ///
     /// # Errors
     ///
-    /// As [`TcpConnection::recv`].
+    /// As [`TcpConnection::recv`]; `Unsupported` on a TLS connection.
     pub fn peek(&self, buf: &mut [u8]) -> Result<usize, NetError> {
         let link = self.link_ref();
         if buf.is_empty() {
             return Ok(0);
+        }
+        if link.has_tls() {
+            // The socket holds ciphertext; peeking at it would mean nothing here.
+            return Err(NetError::Unsupported {
+                feature: "peek on a TLS connection",
+                platform: std::env::consts::OS,
+            });
         }
         let timeout = link.limits.read_timeout;
         match sys::wait(link.stream.sock(), Interest::Read, None, Some(timeout)) {
@@ -815,12 +838,58 @@ impl TcpConnection {
         }
     }
 
+    /// Registers this dialed connection with `gate` (`Gate::admit` with
+    /// `AdmitStage::Dialed`): from then on `Gate::check` runs before every write
+    /// and `Gate::closed` runs once at close, so a back-channel or outbound
+    /// connection can be revoked like an accepted one.
+    ///
+    /// # Errors
+    ///
+    /// `Refused { cause: Gate(code) }` when the gate refuses (the connection is
+    /// then aborted and later calls return `Closed`); `InvalidConfig { field:
+    /// "gate" }` when a gate is already set; `Closed`.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// let mut upstream = net_io::connect("10.0.0.9:9000")?;
+    /// upstream.set_gate(Arc::new(net_io::AllowAll))?;
+    /// upstream.send_all(b"PING\r\n")?;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn set_gate<G: Gate>(&mut self, gate: Arc<G>) -> Result<(), NetError> {
+        let link = self.link()?;
+        if link.gate.is_some() {
+            return Err(NetError::InvalidConfig {
+                field: "gate",
+                reason: ConfigReason::Inconsistent,
+            });
+        }
+        let code = match guarded(|| gate.admit(&link.info, AdmitStage::Dialed)) {
+            Some(Ok(admitted)) => {
+                link.info.lane = admitted.lane;
+                link.info.gate = admitted.tag;
+                link.gate = Some(Box::new(GateCell {
+                    gate,
+                    ticket: Some(admitted.ticket),
+                }));
+                return Ok(());
+            }
+            Some(Err(refusal)) => refusal.code(),
+            None => 0,
+        };
+        let cause = RefusalCause::Gate(code);
+        if let Some(link) = self.link.take() {
+            link.finish(CloseReason::Refused(cause));
+        }
+        Err(NetError::Refused { cause })
+    }
+
     /// Live socket options.
     #[must_use]
     pub fn options(&self) -> SocketOptions<'_> {
         let link = self.link_ref();
         SocketOptions {
-            stream: &link.stream,
+            sock: link.stream.sock(),
             v6: link.info.local.socket_addr().is_some_and(|a| a.is_ipv6()),
         }
     }
@@ -893,7 +962,7 @@ fn connect_one(
         Instant::now(),
     );
     Ok(TcpConnection::from_link(Link::new(
-        stream,
+        sys::Stream::Tcp(stream),
         info,
         options.limits.effective(DriverKind::Blocking),
         ClockRef::Monotonic,

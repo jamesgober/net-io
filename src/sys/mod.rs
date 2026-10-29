@@ -38,13 +38,114 @@ mod windows;
 pub(crate) use windows::*;
 
 mod kill;
+
+use std::io::{self, IoSlice, Read, Write};
+use std::net::{Shutdown, TcpStream};
+use std::time::Duration;
+
+/// A connected stream socket: TCP, or a Unix domain socket (feature `local`).
+#[derive(Debug)]
+pub(crate) enum Stream {
+    Tcp(TcpStream),
+    #[cfg(all(unix, feature = "local"))]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl Stream {
+    pub(crate) fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => (&mut &*s).read(buf),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(s) => (&mut &*s).read(buf),
+        }
+    }
+
+    #[cfg_attr(unix, allow(dead_code))]
+    pub(crate) fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => (&mut &*s).write(buf),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(s) => (&mut &*s).write(buf),
+        }
+    }
+
+    #[cfg_attr(unix, allow(dead_code))]
+    pub(crate) fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => (&mut &*s).write_vectored(bufs),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(s) => (&mut &*s).write_vectored(bufs),
+        }
+    }
+
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_read_timeout(timeout),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(s) => s.set_read_timeout(timeout),
+        }
+    }
+
+    pub(crate) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.shutdown(how),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(s) => s.shutdown(how),
+        }
+    }
+
+    /// The owned TCP stream, when this is one.
+    pub(crate) fn into_tcp(self) -> Option<TcpStream> {
+        match self {
+            Stream::Tcp(s) => Some(s),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(_) => None,
+        }
+    }
+
+    /// The TCP stream, when this is one.
+    pub(crate) fn tcp(&self) -> Option<&TcpStream> {
+        match self {
+            Stream::Tcp(s) => Some(s),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(_) => None,
+        }
+    }
+
+    /// Bytes waiting, without consuming them (TCP only).
+    pub(crate) fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.peek(buf),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for Stream {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        match self {
+            Stream::Tcp(s) => s.as_fd(),
+            #[cfg(feature = "local")]
+            Stream::Unix(s) => s.as_fd(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsSocket for Stream {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        match self {
+            Stream::Tcp(s) => s.as_socket(),
+        }
+    }
+}
 pub(crate) use kill::KillSlot;
 
 #[cfg(any(test, net_io_shim))]
 pub(crate) mod shim;
-
-use std::io;
-use std::time::Duration;
 
 /// What a wait is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +165,31 @@ pub(crate) enum Ready {
     Woken,
     /// The timeout passed.
     TimedOut,
+}
+
+/// What a listening socket handed to this process is (inheritance, hand-off,
+/// adoption).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SockKind {
+    /// A TCP listener bound to this address.
+    Tcp(std::net::SocketAddr),
+    /// A Unix stream listener bound to this path (empty when unnamed or abstract).
+    #[cfg(unix)]
+    Unix(Vec<u8>),
+}
+
+/// Why a socket handed to this process cannot be a listener.
+#[derive(Debug)]
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) enum KindError {
+    /// Not a socket (or not an open descriptor).
+    NotASocket,
+    /// A socket, but not listening.
+    NotListening,
+    /// Not a stream socket of a family net-io serves.
+    WrongKind,
+    /// An OS call failed.
+    Os(io::Error),
 }
 
 /// How an `accept` failure is handled.

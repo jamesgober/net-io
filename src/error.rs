@@ -550,6 +550,39 @@ pub enum CloseReason {
 }
 
 impl CloseReason {
+    /// One value per counter slot, inner values at their first or zero value, in
+    /// `index` order (for iterating counters).
+    pub(crate) const BY_INDEX: [CloseReason; CloseReason::COUNT] = [
+        CloseReason::PeerClosed,
+        CloseReason::PeerReset,
+        CloseReason::Idle,
+        CloseReason::HandshakeTimeout,
+        CloseReason::ReadTimeout,
+        CloseReason::WriteTimeout,
+        CloseReason::ExchangeDeadline,
+        CloseReason::ParkDeadline,
+        CloseReason::SlowPeer {
+            direction: Direction::In,
+        },
+        CloseReason::Refused(RefusalCause::GlobalCap),
+        CloseReason::ProxyUntrusted,
+        CloseReason::ProxyMissing,
+        CloseReason::ProxyInvalid,
+        CloseReason::TlsFailed,
+        CloseReason::HelloRefused,
+        CloseReason::Killed(KillReason(0)),
+        CloseReason::EgressDenied(0),
+        CloseReason::Drained,
+        CloseReason::DrainDeadline,
+        CloseReason::Shed,
+        CloseReason::Shutdown,
+        CloseReason::SessionClosed,
+        CloseReason::SessionError,
+        CloseReason::SessionPanicked,
+        CloseReason::Limit(LimitKind::Connections),
+        CloseReason::Io(OsErrorClass::Other(0)),
+    ];
+
     /// A stable snake_case name for logs.
     ///
     /// ```
@@ -691,9 +724,27 @@ pub enum RefusalCause {
     Shed,
     /// The control line is in lockdown and the listener does not allow it.
     Lockdown,
+    /// A local socket peer's user id is not the one the listener requires
+    /// (`LocalOptions::require_uid`).
+    Credentials,
 }
 
 impl RefusalCause {
+    /// One value per counter slot in `index` order (`Gate` carries code 0).
+    pub(crate) const BY_INDEX: [RefusalCause; RefusalCause::COUNT] = [
+        RefusalCause::GlobalCap,
+        RefusalCause::ListenerCap,
+        RefusalCause::SourceCap,
+        RefusalCause::LaneReserve,
+        RefusalCause::Gate(0),
+        RefusalCause::Session,
+        RefusalCause::Busy,
+        RefusalCause::DoorClosed,
+        RefusalCause::Shed,
+        RefusalCause::Lockdown,
+        RefusalCause::Credentials,
+    ];
+
     /// A stable snake_case name for logs.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
@@ -708,6 +759,7 @@ impl RefusalCause {
             RefusalCause::DoorClosed => "door_closed",
             RefusalCause::Shed => "shed",
             RefusalCause::Lockdown => "lockdown",
+            RefusalCause::Credentials => "credentials",
         }
     }
 
@@ -723,10 +775,11 @@ impl RefusalCause {
             RefusalCause::DoorClosed => 7,
             RefusalCause::Shed => 8,
             RefusalCause::Lockdown => 9,
+            RefusalCause::Credentials => 10,
         }
     }
 
-    pub(crate) const COUNT: usize = 10;
+    pub(crate) const COUNT: usize = 11;
 }
 
 /// Which configured bound was hit.
@@ -948,6 +1001,8 @@ pub enum ConfigReason {
     NotListening,
     /// Values that contradict each other.
     Inconsistent,
+    /// A byte or character the value cannot contain (a NUL in a socket path).
+    Malformed,
 }
 
 impl fmt::Display for ConfigReason {
@@ -974,6 +1029,7 @@ impl fmt::Display for ConfigReason {
                 f.write_str("the socket is not a listening stream socket")
             }
             ConfigReason::Inconsistent => f.write_str("values contradict each other"),
+            ConfigReason::Malformed => f.write_str("contains a byte or character it cannot"),
         }
     }
 }
@@ -981,6 +1037,16 @@ impl fmt::Display for ConfigReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_by_index_tables_match_index() {
+        for (i, r) in CloseReason::BY_INDEX.iter().enumerate() {
+            assert_eq!(r.index(), i, "{r:?}");
+        }
+        for (i, c) in RefusalCause::BY_INDEX.iter().enumerate() {
+            assert_eq!(c.index(), i, "{c:?}");
+        }
+    }
 
     #[test]
     fn test_close_reason_index_covers_every_variant_once() {

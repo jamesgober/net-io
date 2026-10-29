@@ -45,9 +45,10 @@
 //!
 //! ## Status
 //!
-//! `0.3.0`: TCP and the blocking driver on Linux, macOS, and Windows. PROXY
-//! protocol, UDP, local sockets, the TLS server integration, inheritance, and
-//! hand-off arrive in `0.4.0`; the reactor in `0.5.0`.
+//! `0.4.0`: TCP, Unix domain sockets, and UDP on the blocking driver (Linux,
+//! macOS, Windows; Unix sockets and hand-off on Unix), the PROXY protocol, the
+//! TLS seam on listeners, systemd and FastCGI inheritance, and listener
+//! hand-off. The reactor and Windows named pipes arrive in `0.5.0`.
 
 #![doc(html_root_url = "https://docs.rs/net-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -73,6 +74,7 @@ mod addr;
 mod buf;
 mod completer;
 mod control;
+mod crc32c;
 mod driver;
 mod error;
 mod events;
@@ -83,8 +85,12 @@ mod info;
 mod inherit;
 mod limits;
 mod link;
+#[cfg(feature = "local")]
+mod local;
 mod opts;
 mod proxy;
+#[cfg(feature = "proxy")]
+mod proxy_parse;
 mod rate;
 mod server;
 mod session;
@@ -95,6 +101,24 @@ mod testing;
 mod time;
 mod tls;
 mod trusted;
+#[cfg(feature = "udp")]
+mod udp;
+
+/// Entry points for net-io's fuzz targets (`fuzz/`), compiled only under
+/// cargo-fuzz (`--cfg fuzzing`). Not part of the public API and not covered by semver.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod __fuzz {
+    /// The hand-off manifest decoder.
+    pub fn manifest(data: &[u8]) {
+        crate::handoff::fuzz_manifest(data);
+    }
+
+    /// The systemd environment reader.
+    pub fn systemd_env(data: &[u8]) {
+        crate::inherit::fuzz_systemd_env(data);
+    }
+}
 
 /// Fault injection for net-io's own tests, compiled only with `--cfg net_io_shim`.
 /// Not part of the public API and not covered by semver.
@@ -117,29 +141,44 @@ pub use error::{
 };
 pub use events::{CoalescedKind, Event, EventSink, NoopSink};
 pub use gate::{AdmitStage, Admitted, AllowAll, Denial, Gate, KillHandle, Refusal, WriteCheck};
-pub use handoff::HandoffError;
+pub use handoff::{HandoffError, HandoffPeer, ListenerHandle};
+#[cfg(all(unix, feature = "local"))]
+pub use handoff::{recv_listeners, send_listeners};
 pub use id::{ConnectionId, ListenerId, WorkerId};
 pub use info::{
     ConnectionInfo, Endpoint, GateTag, Lane, Origin, PeerCredentials, PipeName, Transport, UnixPath,
 };
-pub use inherit::InheritError;
+#[cfg(unix)]
+pub use inherit::fastcgi_listener;
+pub use inherit::{InheritError, InheritedListener, systemd, systemd_named};
 pub use limits::{Limits, LimitsBuilder, MinRate, Pressure, SizeClass};
-pub use opts::{Keepalive, Linger, ListenOptions, SocketOptions, TcpOptions};
+#[cfg(all(unix, feature = "local"))]
+pub use local::{Descriptors, UnixConnection, UnixListener};
+#[cfg(feature = "local")]
+pub use local::{LocalConnection, LocalListener};
+pub use opts::{Keepalive, Linger, ListenOptions, LocalOptions, SocketOptions, TcpOptions};
 pub use proxy::{ProxyError, ProxyFacts, ProxyMode, ProxyVersions};
+#[cfg(feature = "proxy")]
+pub use proxy_parse::{
+    ProxyAddress, ProxyCommand, ProxyHeader, ProxyParser, ProxyProgress, ProxySsl, ProxyTransport,
+    Tlv, Tlvs,
+};
 pub use server::{
-    BlockingHandler, DoorState, DrainReport, ListenerSpec, NoGate, NoWork, Server, ServerBuilder,
-    ServerHandle, Sessions, Stats, Workload,
+    AdoptSpec, BlockingHandler, DoorState, DrainReport, ListenerSpec, NoGate, NoWork, Server,
+    ServerBuilder, ServerHandle, Sessions, Stats, Workload,
 };
 pub use session::{
     Input, Output, OutputFull, Phase, Session, SessionContext, SessionFactory, Step, SwapError,
 };
 pub use tcp::{ConnectOptions, ListenerInfo, TcpConnection, TcpListener};
-pub use time::{Clock, ManualClock, MonotonicClock};
+pub use time::{Clock, ManualClock, MonotonicClock, monotonic_micros};
 pub use tls::{
     NoTls, NoTlsSession, TlsAcceptor, TlsCloseKind, TlsError, TlsEvent, TlsFailure, TlsInfo,
     TlsProgress, TlsSession,
 };
 pub use trusted::TrustedProxies;
+#[cfg(feature = "udp")]
+pub use udp::{Datagram, UdpBudget, UdpOptions, UdpSocket, UdpStats};
 
 /// Crate version string, populated by Cargo at build time.
 ///
@@ -269,6 +308,46 @@ where
         .build()?;
     server.open_door()?;
     Ok(server)
+}
+
+/// Opens a local IPC listener: on Unix, a Unix domain socket at the path `name`
+/// with mode `0600` (only the owner may connect; [`LocalOptions`] and
+/// `UnixListener::bind_with` for more). On Windows, named pipes arrive in
+/// `0.5.0`; until then this returns `Unsupported`.
+///
+/// # Errors
+///
+/// `PathTooLong`, `StaleSocketInUse` (a live listener owns the path, or it is
+/// not a socket), `PermissionDenied`, `NotFound`, `Unsupported`, `Os`.
+///
+/// ```no_run
+/// let listener = net_io::listen_local("/run/myapp/control.sock")?;
+/// let (mut conn, info) = listener.accept()?;
+/// println!("peer process {:?}", info.peer_credentials.and_then(|c| c.pid));
+/// conn.send_all(b"ok\n")?;
+/// # Ok::<(), net_io::NetError>(())
+/// ```
+#[cfg(feature = "local")]
+pub fn listen_local(name: &str) -> Result<LocalListener, NetError> {
+    local::listen(name)
+}
+
+/// Connects to a local IPC listener (see [`listen_local`]); waits up to 10 s
+/// when its backlog is full.
+///
+/// # Errors
+///
+/// `NotFound` (no socket, or nobody listening), `PermissionDenied`,
+/// `TimedOut { kind: Connect }`, `PathTooLong`, `Unsupported`, `Os`.
+///
+/// ```no_run
+/// let mut conn = net_io::connect_local("/run/myapp/control.sock")?;
+/// conn.send_all(b"status\n")?;
+/// # Ok::<(), net_io::NetError>(())
+/// ```
+#[cfg(feature = "local")]
+pub fn connect_local(name: &str) -> Result<LocalConnection, NetError> {
+    local::connect(name)
 }
 
 #[cfg(test)]

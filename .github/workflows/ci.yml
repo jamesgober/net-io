@@ -49,6 +49,7 @@ jobs:
         run: |
           cargo run --example kill_and_drain
           cargo run --example gate
+          cargo run --example unix_socket
       - name: Doc (all features)
         run: cargo doc --no-deps --all-features
         env:
@@ -74,7 +75,7 @@ jobs:
     name: Loom models
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: "-D warnings --cfg loom"
+      RUSTFLAGS: "-D warnings --cfg net_io_loom"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -117,6 +118,100 @@ jobs:
             echo "unsafe outside src/sys (see dev/DIRECTIVES.md section 2)"
             exit 1
           fi
+
+  interop:
+    name: Behind HAProxy and nginx (PROXY v1 and v2, TCP and Unix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install HAProxy and nginx
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q haproxy nginx libnginx-mod-stream
+      - name: Start net-io behind both proxies
+        run: |
+          cargo build --example behind_proxy
+          mkdir -p /tmp/nio /tmp/nginx
+          chmod 0700 /tmp/nio
+          target/debug/examples/behind_proxy 127.0.0.1:7002 /tmp/nio/proxy.sock > /tmp/nio/server.log 2>&1 &
+          cat > /tmp/nio/haproxy.cfg <<'CFG'
+          global
+            maxconn 256
+          defaults
+            mode tcp
+            timeout connect 5s
+            timeout client 10s
+            timeout server 10s
+          listen tcp_v1
+            bind 127.0.0.1:8001
+            server s 127.0.0.1:7002 send-proxy
+          listen tcp_v2
+            bind 127.0.0.1:8002
+            server s 127.0.0.1:7002 send-proxy-v2
+          listen unix_v1
+            bind 127.0.0.1:8003
+            server s /tmp/nio/proxy.sock send-proxy
+          listen unix_v2
+            bind 127.0.0.1:8004
+            server s /tmp/nio/proxy.sock send-proxy-v2
+          CFG
+          haproxy -f /tmp/nio/haproxy.cfg -D -p /tmp/nio/haproxy.pid
+          module=$(ls /usr/lib/nginx/modules/ngx_stream_module.so 2>/dev/null || true)
+          cat > /tmp/nginx/nginx.conf <<CFG
+          ${module:+load_module $module;}
+          pid /tmp/nginx/nginx.pid;
+          error_log /tmp/nginx/error.log;
+          events {}
+          stream {
+            server { listen 127.0.0.1:8005; proxy_pass 127.0.0.1:7002; proxy_protocol on; }
+            server { listen 127.0.0.1:8006; proxy_pass unix:/tmp/nio/proxy.sock; proxy_protocol on; }
+          }
+          CFG
+          nginx -p /tmp/nginx -c /tmp/nginx/nginx.conf
+          sleep 1
+      - name: The real client address arrives through every path
+        run: |
+          python3 - <<'PY'
+          import socket, sys
+          paths = {8001: "HAProxy v1 to TCP", 8002: "HAProxy v2 to TCP", 8003: "HAProxy v1 to Unix",
+                   8004: "HAProxy v2 to Unix", 8005: "nginx v1 to TCP", 8006: "nginx v1 to Unix"}
+          failed = False
+          for port, name in paths.items():
+              s = socket.create_connection(("127.0.0.1", port), timeout=10)
+              mine = s.getsockname()
+              line = s.makefile().readline().strip()
+              want = f"client={mine[0]}:{mine[1]}"
+              ok = line.startswith(want + " ")
+              failed |= not ok
+              print(("ok  " if ok else "BAD ") + f"{name}: {line} (expected {want})")
+          sys.exit(1 if failed else 0)
+          PY
+      - name: Logs
+        if: always()
+        run: |
+          cat /tmp/nio/server.log || true
+          cat /tmp/nginx/error.log || true
+
+  fuzz:
+    name: Fuzz (30 s per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz
+        working-directory: fuzz
+        run: |
+          for t in proxy manifest systemd_env cidr trusted; do
+            # The prebuilt cargo-fuzz is a musl binary; name the target explicitly.
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=30 -rss_limit_mb=1024
+          done
+        env:
+          RUSTFLAGS: ""
 
   security:
     name: Security (audit + deny)

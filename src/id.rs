@@ -89,6 +89,17 @@ impl WorkerId {
     pub const fn first() -> WorkerId {
         WorkerId(0)
     }
+
+    /// Worker `index`, for tests of per-worker state (a server never hands out a
+    /// worker it does not have).
+    ///
+    /// ```
+    /// assert_eq!(net_io::WorkerId::for_testing(3).get(), 3);
+    /// ```
+    #[must_use]
+    pub const fn for_testing(index: u16) -> WorkerId {
+        WorkerId(index)
+    }
 }
 
 /// Ids handed out per block.
@@ -142,7 +153,7 @@ pub(crate) fn issue_single() -> ConnectionId {
     to_id(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, not(net_io_loom)))]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -195,7 +206,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, loom))]
+#[cfg(all(test, net_io_loom))]
 mod loom_tests {
     use super::*;
     use loom::sync::Arc;

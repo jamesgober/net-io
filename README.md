@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). No dependencies: OS calls the standard library does not expose go through the crate's own fenced FFI layer.
     </p>
     <blockquote>
-        <strong>Status: <code>0.3.0</code>, TCP and the blocking driver.</strong> Servers and clients over TCP on Linux, macOS, and Windows, with every limit, the gate seam, kill, and graceful drain. Pre-1.0: the API in <a href="./docs/API.md"><code>docs/API.md</code></a> is locked, and each item says the version that ships it. Unix sockets, UDP, and the PROXY protocol arrive in <code>0.4.0</code>; the reactor in <code>0.5.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
+        <strong>Status: <code>0.4.0</code>, the edges.</strong> TCP, Unix domain sockets, and UDP on the blocking driver, the PROXY protocol, the TLS seam on listeners, systemd and FastCGI inheritance, and listener hand-off between processes. Pre-1.0: the API in <a href="./docs/API.md"><code>docs/API.md</code></a> is locked, and each item says the version that ships it. The reactor and Windows named pipes arrive in <code>0.5.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
@@ -38,13 +38,13 @@
 
 ## What it does
 
-| Area | In `0.3.0` | Later |
+| Area | In `0.4.0` | Later |
 |---|---|---|
-| Transports | TCP listeners and connections | UDP, Unix domain sockets (`0.4.0`), Windows named pipes (`0.5.0`) |
+| Transports | TCP; Unix domain sockets with peer credentials and descriptor passing; UDP with budgets and an amplification guard | Windows named pipes and AF_UNIX (`0.5.0`) |
 | Drivers | a bounded blocking worker pool: 2 system calls per keep-alive round trip on Linux (3 on macOS and Windows), no allocation after warm-up | its own reactor on epoll, kqueue, and IOCP (`0.5.0`) |
 | Limits | global, per-listener, and per-source caps; idle, read, write, exchange, and park deadlines; a minimum transfer rate against slowloris and slow readers; bounded buffers | adaptive deadlines and lane reservations (`0.6.0`) |
-| Lifecycle | the door, graceful drain with a deadline, kill from any thread, one `CloseReason` and one closed event per connection, a control line (shed, lockdown, drain, stop) | listener hand-off, systemd activation (`0.4.0`) |
-| Seams | the gate (admission before any byte is read, a check before every write), sans-IO sessions, an event sink, a completion queue for offloaded work | PROXY protocol, the TLS seam wired to listeners (`0.4.0`) |
+| Lifecycle | the door, graceful drain with a deadline, kill from any thread, one `CloseReason` and one closed event per connection, a control line (shed, lockdown, drain, stop); listeners added and removed while running; systemd and FastCGI inheritance; listener hand-off between processes (Unix) | the Windows hand-off (`0.5.0`) |
+| Seams | the gate (admission before any byte is read, a check before every write, also for adopted and dialed connections), sans-IO sessions, an event sink, a completion queue for offloaded work; the PROXY protocol from trusted proxies; the TLS seam on listeners | adaptive deadlines and lane reservations (`0.6.0`) |
 
 The full plan:
 
