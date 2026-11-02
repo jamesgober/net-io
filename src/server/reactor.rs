@@ -49,6 +49,8 @@ use crate::wheel::{Ticks, TimerId, Wheel};
 /// The driver this build's reactor runs on.
 #[cfg(unix)]
 pub(crate) type Backend = crate::driver::ready::ReadyDriver;
+#[cfg(windows)]
+pub(crate) type Backend = crate::driver::iocp::IocpDriver;
 
 /// How many expired timers one loop iteration handles, so IO keeps moving after
 /// a clock jump.

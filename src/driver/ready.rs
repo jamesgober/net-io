@@ -270,7 +270,10 @@ impl Driver for ReadyDriver {
                     }
                 }
             }
-            Operation::Close { .. } => {
+            Operation::Close { abortive, .. } => {
+                if abortive {
+                    reg.socket.set_abortive();
+                }
                 reg.close = true;
                 ReadyDriver::try_close(reg, local);
             }

@@ -48,6 +48,11 @@ impl Registered {
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
     }
 
+    /// A reset instead of a FIN at close.
+    pub(crate) fn set_abortive(self) {
+        let _ = super::set_linger(self.sock(), Some(std::time::Duration::ZERO));
+    }
+
     /// One receive that never blocks.
     pub(crate) fn recv(self, buf: &mut [u8]) -> io::Result<usize> {
         #[cfg(any(test, net_io_shim))]

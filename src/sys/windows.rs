@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use super::{Interest, Ready, poll_millis, retry_interrupted};
 
-type Socket = usize;
+pub(super) type Socket = usize;
 
 /// Winsock error codes net-io classifies.
 pub(crate) mod errno {
@@ -70,7 +70,7 @@ pub(crate) fn classify_addr_error(e: &io::Error) -> super::AddrFailure {
     }
 }
 
-mod c {
+pub(super) mod c {
     pub const AF_INET: i32 = 2;
     pub const AF_INET6: i32 = 23;
     pub const SOCK_STREAM: i32 = 1;
@@ -155,7 +155,35 @@ struct WsaData {
     sz_system_status: [u8; 129],
 }
 
+/// `WSAPROTOCOL_INFOW`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct WsaProtocolInfo {
+    pub(super) service_flags1: u32,
+    service_flags2: u32,
+    service_flags3: u32,
+    service_flags4: u32,
+    provider_flags: u32,
+    provider_id: [u8; 16],
+    catalog_entry_id: u32,
+    chain_len: i32,
+    chain: [u32; 7],
+    version: i32,
+    address_family: i32,
+    max_sockaddr: i32,
+    min_sockaddr: i32,
+    socket_type: i32,
+    pub(super) i_protocol: i32,
+    protocol_max_offset: i32,
+    network_byte_order: i32,
+    security_scheme: i32,
+    message_size: u32,
+    provider_reserved: u32,
+    protocol: [u16; 256],
+}
+
 const _: () = assert!(size_of::<SockaddrIn>() == 16);
+const _: () = assert!(size_of::<WsaProtocolInfo>() == 628);
 const _: () = assert!(size_of::<SockaddrIn6>() == 28);
 const _: () = assert!(size_of::<Linger>() == 4);
 const _: () = assert!(size_of::<WsaPollFd>() == 16);
@@ -240,11 +268,33 @@ impl<T: AsSocket> AsSock for T {
     }
 }
 
+/// A socket number as a borrowed socket.
+///
+/// # Safety
+///
+/// `s` is open for as long as the result is used.
+#[cfg(feature = "reactor")]
+pub(super) unsafe fn borrow(s: Socket) -> Sock<'static> {
+    // SAFETY: by this function's contract.
+    unsafe { BorrowedSocket::borrow_raw(s as RawSocket) }
+}
+
+/// Sets a socket-level option that takes no value.
+///
+/// # Safety
+///
+/// None beyond passing a number: a stale socket fails the call.
+#[cfg(feature = "reactor")]
+pub(super) unsafe fn setsockopt_empty(s: Socket, name: i32) -> io::Result<()> {
+    // SAFETY: a null value of length 0 is what these options take.
+    cvt(unsafe { setsockopt(s, c::SOL_SOCKET, name, std::ptr::null(), 0) }).map(drop)
+}
+
 pub(crate) fn raw_of(sock: Sock<'_>) -> RawSock {
     sock.as_raw_socket()
 }
 
-fn raw(sock: Sock<'_>) -> Socket {
+pub(super) fn raw(sock: Sock<'_>) -> Socket {
     // RawSocket is u64; SOCKET is pointer-sized, and both targets here are 64-bit.
     sock.as_raw_socket() as Socket
 }
@@ -266,7 +316,7 @@ static STARTUP: Once = Once::new();
 
 /// Winsock must be started before the first socket call. `WSAStartup` is
 /// reference counted, so this coexists with the standard library's own call.
-fn startup() {
+pub(super) fn startup() {
     STARTUP.call_once(|| {
         // SAFETY: WsaData is plain data; zeroed is a valid starting value that
         // WSAStartup overwrites. Version 2.2 is requested as Microsoft documents.
@@ -307,7 +357,7 @@ fn get_int(sock: Sock<'_>, level: i32, name: i32) -> io::Result<i32> {
     cvt(ret).map(|_| value)
 }
 
-fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> i32 {
+pub(super) fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> i32 {
     match addr {
         SocketAddr::V4(a) => {
             let sa = SockaddrIn {

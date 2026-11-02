@@ -52,6 +52,13 @@ mod kqueue;
 #[cfg(all(feature = "reactor", any(target_os = "macos", target_os = "freebsd")))]
 pub(crate) use kqueue::{PollWaker, Poller};
 
+#[cfg(all(feature = "reactor", windows))]
+mod iocp;
+#[cfg(all(feature = "reactor", windows))]
+pub(crate) use iocp::{
+    Associated, Finished, InFlight, OpKind, PollWaker, Port, Started, is_aborted,
+};
+
 mod kill;
 
 use std::io::{self, IoSlice, Read, Write};
