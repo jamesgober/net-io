@@ -43,7 +43,7 @@ What differs between operating systems, what net-io does about it, and what an o
 ## FreeBSD
 
 - **Same model as macOS.** Sockets stay non-blocking, every receive on the blocking pool waits in `poll` first, and the reactor uses kqueue with `EV_CLEAR`. Each socket gets `SO_NOSIGPIPE`.
-- **Peer credentials.** `getpeereid` gives the uid and gid; the pid is `None`.
+- **Peer credentials.** `getpeereid` gives the uid and gid, and `LOCAL_PEERCRED` the pid.
 - **Close-on-exec.** As on macOS, descriptors get `FD_CLOEXEC` right after the call.
 
 ## Windows

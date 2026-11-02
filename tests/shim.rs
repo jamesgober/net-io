@@ -164,6 +164,8 @@ fn test_system_calls_per_echo_round_trip() {
         let budget = match name {
             "sessions" if cfg!(net_io_force_blocking) => budget,
             "sessions" if cfg!(windows) => 4.0,
+            // The write filter fires now and then after an ACK: an empty wake.
+            "sessions" if cfg!(not(target_os = "linux")) => 3.1,
             "sessions" => 3.0,
             _ => budget,
         };

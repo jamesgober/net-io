@@ -252,10 +252,12 @@ mod c {
     pub const SCM_RIGHTS: c_int = 1;
     #[cfg(feature = "local")]
     pub const MSG_CTRUNC: c_int = 0x20;
-    #[cfg(all(feature = "local", target_os = "macos"))]
+    #[cfg(all(feature = "local", not(target_os = "linux")))]
     pub const SOL_LOCAL: c_int = 0;
     #[cfg(all(feature = "local", target_os = "macos"))]
     pub const LOCAL_PEERPID: c_int = 0x002;
+    #[cfg(all(feature = "local", target_os = "freebsd"))]
+    pub const LOCAL_PEERCRED: c_int = 1;
 }
 
 // ---- structs ---------------------------------------------------------------
@@ -1683,14 +1685,55 @@ pub(crate) fn peer_credentials(sock: Sock<'_>) -> io::Result<(Option<u32>, u32, 
     let mut gid = 0u32;
     // SAFETY: `sock` is open; `uid` and `gid` are live locals getpeereid(3) writes.
     cvt(unsafe { getpeereid(sock.as_raw_fd(), &raw mut uid, &raw mut gid) })?;
-    // FreeBSD has no call that gives the process alone.
     #[cfg(target_os = "macos")]
     let pid = get_int(sock, c::SOL_LOCAL, c::LOCAL_PEERPID)
         .ok()
         .and_then(|p| u32::try_from(p).ok());
-    #[cfg(not(target_os = "macos"))]
-    let pid = None;
+    #[cfg(target_os = "freebsd")]
+    let pid = peer_pid(sock);
     Ok((pid, uid, gid))
+}
+
+/// `struct xucred` (`unix(4)` on FreeBSD), for `LOCAL_PEERCRED`. `cr_pid` shares a
+/// pointer-sized union, and FreeBSD fills it from 13.
+#[cfg(all(feature = "local", target_os = "freebsd"))]
+#[repr(C)]
+struct Xucred {
+    cr_version: u32,
+    cr_uid: u32,
+    cr_ngroups: i16,
+    cr_groups: [u32; 16],
+    cr_pid: usize,
+}
+
+/// The process at the other end of a Unix socket; only FreeBSD's credentials carry it.
+#[cfg(all(feature = "local", target_os = "freebsd"))]
+fn peer_pid(sock: Sock<'_>) -> Option<u32> {
+    let mut cred = Xucred {
+        cr_version: 0,
+        cr_uid: 0,
+        cr_ngroups: 0,
+        cr_groups: [0; 16],
+        cr_pid: 0,
+    };
+    let mut len = size_of::<Xucred>() as SockLen;
+    // SAFETY: `sock` is open; `cred` is writable for `len` bytes and lives for the call.
+    let ret = unsafe {
+        getsockopt(
+            sock.as_raw_fd(),
+            c::SOL_LOCAL,
+            c::LOCAL_PEERCRED,
+            (&raw mut cred).cast::<c_void>(),
+            &raw mut len,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    // The low half of the union, on these little-endian targets.
+    u32::try_from(cred.cr_pid as u32 as i32)
+        .ok()
+        .filter(|p| *p != 0)
 }
 
 /// `struct sockaddr_un` (`unix(7)`).
@@ -1961,6 +2004,12 @@ mod layout {
         {
             assert_eq!(c::SOL_LOCAL, libc::SOL_LOCAL);
             assert_eq!(c::LOCAL_PEERPID, libc::LOCAL_PEERPID);
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            assert_eq!(size_of::<Xucred>(), size_of::<libc::xucred>());
+            assert_eq!(c::SOL_LOCAL, libc::SOL_LOCAL);
+            assert_eq!(c::LOCAL_PEERCRED, libc::LOCAL_PEERCRED);
         }
         assert_eq!(size_of::<CmsgHdr>(), size_of::<libc::cmsghdr>());
         assert_eq!(

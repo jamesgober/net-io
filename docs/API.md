@@ -844,7 +844,7 @@ P0, Tier 2, `0.3.0` (`Ip`, `Tcp`, `Accepted`, `Dialed`), `0.4.0` (the rest).
 pub struct PeerCredentials { pub pid: Option<u32>, pub uid: Option<u32>, pub gid: Option<u32> }
 ```
 
-Who is on the other end of a local socket, read once at accept: `SO_PEERCRED` (Linux), `getpeereid` plus `LOCAL_PEERPID` (macOS), `getpeereid` (FreeBSD, no pid), `SIO_AF_UNIX_GETPEERPID` (Windows AF_UNIX, pid only), `GetNamedPipeClientProcessId` (named pipes, pid only). A field the platform cannot report is `None`. P1, Tier 2, `0.4.0` (Unix), `0.5.0` (Windows).
+Who is on the other end of a local socket, read once at accept: `SO_PEERCRED` (Linux), `getpeereid` plus `LOCAL_PEERPID` (macOS), `getpeereid` plus `LOCAL_PEERCRED` (FreeBSD), `SIO_AF_UNIX_GETPEERPID` (Windows AF_UNIX, pid only), `GetNamedPipeClientProcessId` (named pipes, pid only). A field the platform cannot report is `None`. P1, Tier 2, `0.4.0` (Unix), `0.5.0` (Windows).
 
 ---
 

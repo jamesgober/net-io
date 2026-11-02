@@ -4,7 +4,7 @@ The targets and the method are in the project plan (section 9). This file record
 
 ## 0.5.0: the reactor
 
-Hardware as below. The machine was shared with other builds during these runs (load average 45 to 65 on 32 threads), so read ratios, not absolutes; `cargo bench --bench echo` also runs in CI as a job that does not gate, on a quiet runner.
+Two machines. The build host (hardware as below) was shared with other builds during these runs, load average 45 to 65 on 32 threads, so read its ratios, not its absolutes. GitHub's `ubuntu-latest` runner is small and quiet; `cargo bench --bench echo` runs there in CI on every change, as a job that does not gate.
 
 ### B-1: echo, 64 B, many connections
 
@@ -14,10 +14,12 @@ Eight client threads share the connections, so the load generator does not take 
 |---|---|---|---|---|
 | Windows 11 | 64 | 190,419 | 211,486 | 1.11x |
 | Windows 11 | 256 | 172,058 | 281,037 | 1.63x |
-| Linux (WSL2) | 64 | 185,617 | 47,332 | 0.25x |
-| Linux (WSL2) | 256 | 122,049 | 25,838 | 0.21x |
+| Linux (GitHub runner) | 64 | 211,353 | 244,417 | 1.16x |
+| Linux (GitHub runner) | 256 | 218,828 | 262,033 | 1.20x |
+| Linux (WSL2, loaded) | 64 | 185,617 | 47,332 | 0.25x |
+| Linux (WSL2, loaded) | 256 | 122,049 | 25,838 | 0.21x |
 
-Reading: Windows meets the 0.5 exit criterion. Linux does not, on this machine. CPU per round trip, client and server together: 11 us on the pool, 17 us on the reactor with 4 workers, 31 us with 32. The time goes to waking a worker: the pool's thread is woken synchronously, on the CPU of the thread that wrote, while epoll on this kernel (6.6) wakes without that hint, so the worker queues on a busy CPU behind the other builds and runs on a cold cache. Register R-20 holds the plan.
+Reading: the reactor is ahead on Windows and on a quiet Linux host, where it also spends less CPU per round trip, client and server together: 15 us against 18 at 64 connections. On the loaded host it was far behind, at 31 us against 11 with 32 workers, and 17 us with 4. The likely cause is waking a worker: the pool's thread wakes on the CPU of the thread that wrote, while epoll on that kernel (6.6) has no such hint, so the worker queues on a CPU busy with other work and runs on a cold cache. That is a hypothesis; register R-20 holds the way to test it.
 
 ### B-2: echo, 64 B, one connection
 
@@ -28,26 +30,26 @@ Reading: Windows meets the 0.5 exit criterion. Linux does not, on this machine. 
 | sessions on the pool | 83,923 rt/s, p50 7.8 us | 26,479 rt/s, p50 29.7 us |
 | sessions on the reactor | 81,662 rt/s, p50 8.5 us | 40,798 rt/s, p50 16.0 us |
 
-Reading: on Linux the reactor adds 0.7 us per round trip, one `epoll_wait`. On Windows it is nearly twice the pool's rate, because the pool waits in `WSAPoll` before every receive (D-052).
+On the GitHub runner: pool 45,218 rt/s (p50 21.5 us), reactor 43,670 rt/s (p50 22.5 us).
+
+Reading: on Linux the reactor adds about 1 us per round trip, one `epoll_wait`. On Windows it is nearly twice the pool's rate, because the pool waits in `WSAPoll` before every receive (D-052).
 
 ### B-8: timers
 
 `cargo test --release --lib bench_wheel -- --ignored --nocapture`, one million timers.
 
-| Operation | Target | Linux (WSL2) | Windows 11 |
-|---|---|---|---|
-| insert | under 20 ns | 29.9 ns | 25.7 ns |
-| lazy extend | under 2 ns | 4.7 ns | 3.9 ns |
-| cancel | under 20 ns | 5.7 ns | 5.1 ns |
-
-Insert and extend miss their targets (register R-21); a connection extends its one timer once per read, so neither shows in B-2.
+| Operation | Target | GitHub runner | Linux (WSL2, loaded) | Windows 11 (loaded) |
+|---|---|---|---|---|
+| insert | under 20 ns | 17.0 ns | 29.9 ns | 25.7 ns |
+| lazy extend | under 2 ns | 1.5 ns | 4.7 ns | 3.9 ns |
+| cancel | under 20 ns | 2.3 ns | 5.7 ns | 5.1 ns |
 
 ### B-13: system calls per echo round trip, reactor
 
 | Platform | Target | Measured |
 |---|---|---|
 | Linux (WSL2) | 3 | 3.00 (`epoll_wait`, `recv`, `send`) |
-| macOS, FreeBSD (CI) | 3 | asserted at most 3 |
+| macOS (CI) | 3 | 3.05: the write filter fires now and then after an ACK (register R-24) |
 | Windows 11 | 3 | asserted at most 4: the zero-byte receive is one more (register R-22) |
 
 ### Idle connections
