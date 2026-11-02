@@ -8,7 +8,9 @@
 //! a socket is writable nearly always, and the wait is the expensive part.
 
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io::{self, IoSlice};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
@@ -34,6 +36,7 @@ enum Out {
     None,
     Connect,
     Chunks(SendChunks),
+    File(Arc<File>, u64, u32),
 }
 
 #[derive(Debug)]
@@ -144,6 +147,18 @@ impl ReadyDriver {
                         let mut c = Completion::new(token, OperationKind::Send, result);
                         c.chunks = Some(chunks);
                         local.push_back(c);
+                    }
+                }
+            }
+            Out::File(file, offset, len) if reg.writable => {
+                match reg.socket.send_file(&file, offset, len as usize) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        reg.writable = false;
+                        reg.out = Out::File(file, offset, len);
+                    }
+                    other => {
+                        let result = other.map_err(|e| OsErrorClass::from_io(&e));
+                        local.push_back(Completion::new(token, OperationKind::SendFile, result));
                     }
                 }
             }
@@ -259,6 +274,12 @@ impl Driver for ReadyDriver {
                 reg.out = Out::Chunks(chunks);
                 ReadyDriver::try_send(reg, local);
             }
+            Operation::SendFile {
+                file, offset, len, ..
+            } if matches!(reg.out, Out::None) => {
+                reg.out = Out::File(file, offset, len);
+                ReadyDriver::try_send(reg, local);
+            }
             Operation::Connect { addr, .. } if matches!(reg.out, Out::None) => {
                 match reg.socket.connect_start(addr) {
                     Ok(false) => {
@@ -342,17 +363,22 @@ impl Driver for ReadyDriver {
                     }
                 }
             }
-            OperationKind::Send | OperationKind::Connect => match std::mem::take(&mut reg.out) {
-                Out::None => {}
-                Out::Chunks(chunks) => {
-                    let mut c = Completion::new(token, OperationKind::Send, aborted);
-                    c.chunks = Some(chunks);
-                    local.push_back(c);
+            OperationKind::Send | OperationKind::SendFile | OperationKind::Connect => {
+                match std::mem::take(&mut reg.out) {
+                    Out::None => {}
+                    Out::Chunks(chunks) => {
+                        let mut c = Completion::new(token, OperationKind::Send, aborted);
+                        c.chunks = Some(chunks);
+                        local.push_back(c);
+                    }
+                    Out::File(..) => {
+                        local.push_back(Completion::new(token, OperationKind::SendFile, aborted));
+                    }
+                    Out::Connect => {
+                        local.push_back(Completion::new(token, OperationKind::Connect, aborted));
+                    }
                 }
-                Out::Connect => {
-                    local.push_back(Completion::new(token, OperationKind::Connect, aborted));
-                }
-            },
+            }
             _ => {}
         }
         ReadyDriver::try_close(reg, local);

@@ -407,6 +407,27 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn getsockname(fd: c_int, addr: *mut c_void, len: *mut SockLen) -> c_int;
     fn getpeername(fd: c_int, addr: *mut c_void, len: *mut SockLen) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn sendfile(out: c_int, file: c_int, offset: *mut i64, count: usize) -> isize;
+    #[cfg(target_os = "macos")]
+    fn sendfile(
+        file: c_int,
+        sock: c_int,
+        offset: i64,
+        len: *mut i64,
+        headers: *mut c_void,
+        flags: c_int,
+    ) -> c_int;
+    #[cfg(target_os = "freebsd")]
+    fn sendfile(
+        file: c_int,
+        sock: c_int,
+        offset: i64,
+        count: usize,
+        headers: *mut c_void,
+        sent: *mut i64,
+        flags: c_int,
+    ) -> c_int;
     #[cfg(feature = "local")]
     fn geteuid() -> u32;
     fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int;
@@ -737,6 +758,94 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
     // Listeners are always non-blocking: accepts wait in poll with a wake channel.
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+/// One `sendfile` on a non-blocking socket: `WouldBlock` when the buffer is full, `0`
+/// when the file has nothing at `offset`.
+pub(crate) fn send_file(
+    sock: Sock<'_>,
+    file: &std::fs::File,
+    offset: u64,
+    len: usize,
+) -> io::Result<usize> {
+    let raw_file = file.as_raw_fd();
+    let start = i64::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    retry_interrupted(|| {
+        #[cfg(any(test, net_io_shim))]
+        let len = match super::shim::io(super::shim::Op::Send, len)? {
+            Some(n) => n,
+            None => len,
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let mut at = start;
+            // SAFETY: both descriptors are open for the call, and `at` is a live local.
+            let n = unsafe { sendfile(sock.as_raw_fd(), raw_file, &raw mut at, len) };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n.unsigned_abs())
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut moved = len as i64;
+            // SAFETY: both descriptors are open for the call; no headers; `moved` is a
+            // live local that the call reads as the count and writes as the result.
+            let ret = unsafe {
+                sendfile(
+                    raw_file,
+                    sock.as_raw_fd(),
+                    start,
+                    &raw mut moved,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            sendfile_result(ret, moved)
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            let mut moved = 0i64;
+            // SAFETY: both descriptors are open for the call; no headers; `moved` is a
+            // live local written during the call.
+            let ret = unsafe {
+                sendfile(
+                    raw_file,
+                    sock.as_raw_fd(),
+                    start,
+                    len,
+                    std::ptr::null_mut(),
+                    &raw mut moved,
+                    0,
+                )
+            };
+            sendfile_result(ret, moved)
+        }
+    })
+}
+
+/// On the BSDs a call that stopped at a full buffer fails and still reports its bytes.
+#[cfg(not(target_os = "linux"))]
+fn sendfile_result(ret: c_int, moved: i64) -> io::Result<usize> {
+    if ret == 0 || moved > 0 {
+        return Ok(moved.unsigned_abs() as usize);
+    }
+    Err(io::Error::last_os_error())
+}
+
+/// Whether `sendfile` turned this file or socket down, as opposed to failing: the
+/// bytes can still go by reading and writing.
+pub(crate) fn send_file_refused(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(errno::EINVAL | errno::EOPNOTSUPP | errno::ENOTSOCK)
+    ) || e.kind() == io::ErrorKind::Unsupported
+}
+
+/// Bytes of `file` at `offset`, leaving its position alone.
+pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
 }
 
 /// `SO_INCOMING_CPU`: connections to a reuse-port group go to the listener on the

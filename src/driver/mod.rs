@@ -19,6 +19,7 @@ pub(crate) mod iocp;
 pub(crate) mod ready;
 
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io::IoSlice;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -125,6 +126,18 @@ pub enum Operation {
         /// The bytes.
         chunks: SendChunks,
     },
+    /// Sends up to `len` bytes of `file` from `offset`, zero copy where the OS can. The
+    /// result says how many went out; `Ok(0)` means the file has nothing there.
+    SendFile {
+        /// The socket.
+        token: Token,
+        /// The file; held until the completion.
+        file: Arc<File>,
+        /// Where to start.
+        offset: u64,
+        /// The most to send.
+        len: u32,
+    },
     /// Connects a registered, non-blocking socket.
     Connect {
         /// The socket.
@@ -154,6 +167,7 @@ impl Operation {
             Operation::Receive { token, .. }
             | Operation::ReceiveZero { token }
             | Operation::Send { token, .. }
+            | Operation::SendFile { token, .. }
             | Operation::Connect { token, .. }
             | Operation::Close { token, .. }
             | Operation::Nop { token } => *token,
@@ -175,6 +189,8 @@ pub enum OperationKind {
     Receive,
     /// [`Operation::Send`].
     Send,
+    /// [`Operation::SendFile`].
+    SendFile,
     /// [`Operation::Connect`].
     Connect,
     /// [`Operation::Close`].
@@ -298,18 +314,16 @@ impl SendChunks {
     /// Bytes held.
     #[must_use]
     pub fn pending(&self) -> usize {
-        self.chunks.iter().map(|c| c.remaining().len()).sum()
+        self.chunks.iter().map(Chunk::len).sum()
     }
 
     /// Marks `n` bytes of the front chunks sent; `true` when bytes remain.
     #[cfg(feature = "reactor")]
     pub(crate) fn advance(&mut self, mut n: usize) -> bool {
         while let Some(front) = self.chunks.front_mut() {
-            let rem = front.remaining().len();
+            let rem = front.len();
             if n < rem {
-                match front {
-                    Chunk::Pooled(_, off) | Chunk::Static(_, off) => *off += n,
-                }
+                front.advance(n);
                 return true;
             }
             if self.chunks.len() == 1 {
@@ -333,7 +347,13 @@ impl SendChunks {
     #[cfg(feature = "reactor")]
     pub(crate) fn slices<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
         let mut n = 0;
-        for chunk in self.chunks.iter().take(out.len()) {
+        // A file goes by its own operation: the slices stop before it.
+        for chunk in self
+            .chunks
+            .iter()
+            .take(out.len())
+            .take_while(|c| !c.is_file())
+        {
             out[n] = IoSlice::new(chunk.remaining());
             n += 1;
         }

@@ -87,6 +87,16 @@ impl Registered {
         super::retry_interrupted(|| super::send_vectored_sock(self.sock(), bufs))
     }
 
+    /// One `sendfile` that never blocks.
+    pub(crate) fn send_file(
+        self,
+        file: &std::fs::File,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<usize> {
+        super::send_file(self.sock(), file, offset, len)
+    }
+
     pub(crate) fn connect_start(self, addr: std::net::SocketAddr) -> io::Result<bool> {
         super::connect_start(self.sock(), addr)
     }

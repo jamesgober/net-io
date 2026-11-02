@@ -53,6 +53,9 @@ pub(crate) type Backend = crate::driver::ready::ReadyDriver;
 #[cfg(windows)]
 pub(crate) type Backend = crate::driver::iocp::IocpDriver;
 
+/// How much of a file one operation, and one gate check, covers.
+const FILE_CHUNK: u64 = 1 << 20;
+
 /// How many rounds of finished-at-once completions run between looks at the OS.
 const LOCAL_ROUNDS: usize = 16;
 
@@ -121,6 +124,10 @@ enum Sending {
     None,
     /// Output chunks: `total` bytes offered.
     Plain {
+        total: usize,
+    },
+    /// A piece of the file at the output's front.
+    File {
         total: usize,
     },
     /// Sealed records of `taken` plaintext bytes.
@@ -1067,6 +1074,47 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             c.link.bytes_out > 0
         };
         c.link.response_tag = output.response_tag;
+        if output.front_file().is_some() && !c.link.sends_files_directly() {
+            // TLS and pipes take bytes: this piece becomes a chunk like any other.
+            if let Err(reason) = output.pull_file() {
+                self.close(index, reason);
+                return Flushed::Waiting;
+            }
+        }
+        if let Some((file, offset, left)) = output.front_file() {
+            let len = left.min(FILE_CHUNK) as usize;
+            let token = c.token;
+            return match c.link.check_send(len) {
+                Ok(()) => {
+                    c.sending = Sending::File { total: len };
+                    c.wait = after;
+                    let op = Operation::SendFile {
+                        token,
+                        file,
+                        offset,
+                        len: len as u32,
+                    };
+                    if self.driver.submit(op).is_err() {
+                        if let Some(c) = self.conn(index) {
+                            c.sending = Sending::None;
+                        }
+                        self.close(index, CloseReason::Io(OsErrorClass::Other(0)));
+                    } else {
+                        self.arm_timer(index);
+                    }
+                    Flushed::Waiting
+                }
+                Err(NetError::EgressDenied { code }) => {
+                    self.denied(index, code);
+                    Flushed::Waiting
+                }
+                Err(_) => {
+                    let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                    self.close(index, reason);
+                    Flushed::Waiting
+                }
+            };
+        }
         let total = output.pending_in_send();
         let tls = c.link.has_tls();
         let token = c.token;
@@ -1165,7 +1213,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
         match done.kind {
             OperationKind::Receive => self.on_receive(index, done),
-            OperationKind::Send => self.on_send(index, done),
+            OperationKind::Send | OperationKind::SendFile => self.on_send(index, done),
             _ => {}
         }
     }
@@ -1334,6 +1382,30 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     }
                 }
             }
+            Sending::File { total } => match done.result {
+                Ok(0) => {
+                    if closing {
+                        return self.settle(index);
+                    }
+                    return self.close(index, CloseReason::Io(OsErrorClass::FileTruncated));
+                }
+                Ok(n) => {
+                    c.link.note_sent(n);
+                    c.link.sent_of(total, n);
+                    if let Some(output) = c.output.as_mut() {
+                        output.advance(n);
+                        output.bytes_since_begin += n as u64;
+                    }
+                }
+                Err(class) => {
+                    if closing {
+                        return self.settle(index);
+                    }
+                    c.link.note_failure(class);
+                    let reason = c.link.reason_or(CloseReason::Io(class));
+                    return self.close(index, reason);
+                }
+            },
             Sending::Sealed { taken } => {
                 let Some(mut chunks) = chunks else { return };
                 match done.result {

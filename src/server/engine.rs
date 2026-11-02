@@ -2789,10 +2789,18 @@ fn flush<G: Gate, S: Session>(
             link.bytes_out > 0
         };
         link.response_tag = w.output.response_tag;
-        let result = {
+        let result = if let Some((file, offset, left)) = w.output.front_file() {
+            link.send_file(&file, offset, left).map(|n| n as usize)
+        } else {
             let mut slices = [IoSlice::new(&[]); 64];
             let mut k = 0;
-            for chunk in w.output.chunks.iter().take(slices.len()) {
+            for chunk in w
+                .output
+                .chunks
+                .iter()
+                .take(slices.len())
+                .take_while(|c| !c.is_file())
+            {
                 slices[k] = IoSlice::new(chunk.remaining());
                 k += 1;
             }

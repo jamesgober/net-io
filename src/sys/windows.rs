@@ -645,6 +645,17 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
     Ok(listener)
 }
 
+/// Whether a file send was turned down, so the bytes must go by reading and writing.
+pub(crate) fn send_file_refused(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Unsupported
+}
+
+/// Bytes of `file` at `offset`. Windows moves the file's position, which no net-io
+/// path relies on.
+pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
 /// `TCP_MAXRT`: how long sent bytes may stay unacknowledged, in whole seconds.
 pub(crate) fn set_user_timeout(sock: Sock<'_>, timeout: Duration) -> io::Result<()> {
     set_int(sock, c::IPPROTO_TCP, c::TCP_MAXRT, secs(timeout).max(1))

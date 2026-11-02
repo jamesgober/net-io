@@ -138,7 +138,6 @@ impl Stream {
         }
     }
 
-    #[cfg(feature = "reactor")]
     pub(crate) fn set_nonblocking(&self, on: bool) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.set_nonblocking(on),

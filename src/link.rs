@@ -12,7 +12,7 @@ use crate::error::{
     CloseReason, Direction, KillReason, LimitKind, NetError, OsErrorClass, TimeoutKind,
 };
 use crate::gate::{Denial, ErasedGate, WriteCheck};
-use crate::info::{ConnectionInfo, GateTag};
+use crate::info::{ConnectionInfo, GateTag, Transport};
 use crate::limits::Effective;
 use crate::rate::Rate;
 use crate::session::Phase;
@@ -161,6 +161,11 @@ enum Ev {
     OutputFull,
     Closed,
 }
+
+/// How much of a file one gate check covers.
+const FILE_CHUNK: u64 = 1 << 20;
+/// The buffer of a file sent by reading and writing.
+const FILE_COPY: usize = 64 * 1024;
 
 /// The largest plaintext encrypted into one record.
 const TLS_RECORD: usize = 16 * 1024;
@@ -1152,6 +1157,149 @@ impl Link {
                 Err(e) => return Err(self.os_error("send", e)),
             }
         }
+    }
+
+    /// Whether `sendfile` can take this connection: a plain socket, and on Windows only
+    /// through the reactor's `TransmitFile`.
+    pub(crate) fn sends_files_directly(&self) -> bool {
+        self.tls.is_none()
+            && match self.info.transport {
+                Transport::Tcp => true,
+                Transport::Unix => cfg!(target_os = "linux"),
+                _ => false,
+            }
+    }
+
+    /// Sends `len` bytes of `file` from `offset`, a gate check before each chunk; returns
+    /// the count, which is `len`: a file that ends early fails the connection.
+    pub(crate) fn send_file(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let start = self.now();
+        self.rate_out.activate(start);
+        let direct = cfg!(unix) && self.sends_files_directly();
+        let sent = if direct {
+            self.send_file_direct(file, offset, len)?
+        } else {
+            0
+        };
+        let copied = self.send_file_copy(file, offset + sent, len - sent)?;
+        self.rate_out.deactivate();
+        Ok(sent + copied)
+    }
+
+    /// Zero copy until the file is done. Stops early, with the count so far, if the OS
+    /// turns the file down, and the rest goes by reading and writing.
+    fn send_file_direct(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        // `sendfile` has no non-blocking flag, and Linux keeps sockets blocking here.
+        let was_blocking = !sys::WAIT_BEFORE_RECV;
+        if was_blocking {
+            self.stream
+                .set_nonblocking(true)
+                .map_err(|e| self.fail_os("ioctl", e))?;
+        }
+        let result = self.send_file_chunks(file, offset, len);
+        if was_blocking {
+            let _ = self.stream.set_nonblocking(false);
+        }
+        result
+    }
+
+    fn send_file_chunks(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        let mut sent = 0u64;
+        while sent < len {
+            let take = (len - sent).min(FILE_CHUNK) as usize;
+            self.check_terminal()?;
+            self.gate_check(take.saturating_sub(self.approved))?;
+            self.approved = take;
+            loop {
+                self.check_terminal()?;
+                match self.send_file_once(file, offset + sent, take) {
+                    Ok(0) => return Err(self.file_truncated(sent)),
+                    Ok(n) => {
+                        self.sent(n);
+                        self.approved = take - n;
+                        sent += n as u64;
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.wait_writable()?,
+                    Err(e) if sent == 0 && sys::send_file_refused(&e) => return Ok(0),
+                    Err(e) => return Err(self.os_error("sendfile", e)),
+                }
+            }
+        }
+        Ok(sent)
+    }
+
+    #[cfg(unix)]
+    fn send_file_once(&self, file: &std::fs::File, offset: u64, len: usize) -> io::Result<usize> {
+        sys::send_file(self.stream.sock(), file, offset, len)
+    }
+
+    #[cfg(not(unix))]
+    fn send_file_once(
+        &self,
+        _file: &std::fs::File,
+        _offset: u64,
+        _len: usize,
+    ) -> io::Result<usize> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    /// Reads and writes, for what cannot use `sendfile`: TLS, pipes, and the blocking
+    /// path on Windows.
+    fn send_file_copy(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut buf = vec![0u8; FILE_COPY.min(len as usize)];
+        let mut sent = 0u64;
+        while sent < len {
+            let take = ((len - sent) as usize).min(buf.len());
+            let n = sys::read_file_at(file, &mut buf[..take], offset + sent)
+                .map_err(|e| self.os_error("read", e))?;
+            if n == 0 {
+                return Err(self.file_truncated(sent));
+            }
+            let mut at = 0;
+            while at < n {
+                at += self.write(&buf[at..n])?;
+            }
+            sent += n as u64;
+        }
+        Ok(sent)
+    }
+
+    fn file_truncated(&mut self, sent: u64) -> NetError {
+        self.fail(
+            CloseReason::Io(OsErrorClass::FileTruncated),
+            NetError::FileTruncated { sent },
+        )
+    }
+
+    fn fail_os(&mut self, op: &'static str, e: io::Error) -> NetError {
+        self.os_error(op, e)
     }
 
     /// Sends every slice, advancing them in place (no copy).

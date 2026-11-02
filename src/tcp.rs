@@ -768,6 +768,24 @@ impl TcpConnection {
         self.link()?.write_vectored(bufs)
     }
 
+    /// Sends `len` bytes of `file` from `offset`: zero copy where the OS can (`sendfile`
+    /// on Unix), by reading and writing otherwise (TLS; Windows outside the reactor). A
+    /// gate check runs before each 1 MiB. The file's position does not matter, and on
+    /// Unix it does not move.
+    ///
+    /// # Errors
+    ///
+    /// As [`TcpConnection::send`]; `FileTruncated { sent }` when the file ends early,
+    /// and the connection is then reset. Send files that do not change while in flight.
+    pub fn send_file(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        self.link()?.send_file(file, offset, len)
+    }
+
     /// Sends every slice, advancing them in place (no copy).
     ///
     /// # Errors

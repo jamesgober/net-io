@@ -53,6 +53,7 @@ fn completion(f: Finished) -> Completion {
     let kind = match f.kind {
         OpKind::Receive => OperationKind::Receive,
         OpKind::Send => OperationKind::Send,
+        OpKind::SendFile => OperationKind::SendFile,
         OpKind::Connect => OperationKind::Connect,
     };
     let result = f.result.as_ref().map(|n| *n).map_err(class);
@@ -89,7 +90,7 @@ fn on_finished(regs: &mut [Option<Reg>], local: &mut VecDeque<Completion>, f: Fi
     };
     match f.kind {
         OpKind::Receive => reg.recv = None,
-        OpKind::Send | OpKind::Connect => reg.out = None,
+        OpKind::Send | OpKind::SendFile | OpKind::Connect => reg.out = None,
     }
     local.push_back(completion(f));
     try_close(reg, local);
@@ -205,6 +206,19 @@ impl Driver for IocpDriver {
                 self.port.receive(on, token.0, Some(buffer))
             }
             Operation::Send { chunks, .. } if out_free => self.port.send(on, token.0, chunks),
+            Operation::SendFile {
+                file, offset, len, ..
+            } if out_free => match self.port.send_file(on, token.0, file, offset, len) {
+                Ok(started) => started,
+                Err(e) => {
+                    self.local.push_back(Completion::new(
+                        token,
+                        OperationKind::SendFile,
+                        Err(class(&e)),
+                    ));
+                    return Ok(());
+                }
+            },
             Operation::Connect { addr, .. } if out_free => {
                 match self.port.connect(on, token.0, addr) {
                     Ok(started) => started,
@@ -277,7 +291,9 @@ impl Driver for IocpDriver {
         };
         let (on, op) = match which {
             OperationKind::Receive | OperationKind::Accept => (reg.socket, reg.recv),
-            OperationKind::Send | OperationKind::Connect => (reg.socket, reg.out),
+            OperationKind::Send | OperationKind::SendFile | OperationKind::Connect => {
+                (reg.socket, reg.out)
+            }
             _ => return Ok(()),
         };
         if let Some(op) = op {

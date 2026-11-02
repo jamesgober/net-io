@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::fs::File;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -353,13 +354,44 @@ impl std::error::Error for OutputFull {}
 pub(crate) enum Chunk {
     Pooled(Buffer, usize),
     Static(&'static [u8], usize),
+    /// `left` bytes of a file from `offset`.
+    File {
+        file: Arc<File>,
+        offset: u64,
+        left: u64,
+    },
 }
 
 impl Chunk {
+    /// The bytes in memory; a file has none.
     pub(crate) fn remaining(&self) -> &[u8] {
         match self {
             Chunk::Pooled(b, off) => &b.as_slice()[*off..],
             Chunk::Static(s, off) => &s[*off..],
+            Chunk::File { .. } => &[],
+        }
+    }
+
+    /// Bytes still to go.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Chunk::File { left, .. } => usize::try_from(*left).unwrap_or(usize::MAX),
+            other => other.remaining().len(),
+        }
+    }
+
+    pub(crate) fn is_file(&self) -> bool {
+        matches!(self, Chunk::File { .. })
+    }
+
+    /// `n` bytes of this chunk went out.
+    pub(crate) fn advance(&mut self, n: usize) {
+        match self {
+            Chunk::Pooled(_, off) | Chunk::Static(_, off) => *off += n,
+            Chunk::File { offset, left, .. } => {
+                *offset += n as u64;
+                *left -= n as u64;
+            }
         }
     }
 }
@@ -520,6 +552,74 @@ impl Output {
         Ok(())
     }
 
+    /// Queues `len` bytes of `file` from `offset`, sent zero copy where the OS can and
+    /// read in pieces otherwise (TLS, named pipes). Not counted against the budget; the
+    /// file stays open until the chunk has gone. Keep it from shrinking meanwhile: the
+    /// connection is reset with `Io(FileTruncated)` if it does. A read on TLS or a pipe
+    /// happens on the worker's thread, so a slow disk holds that worker.
+    ///
+    /// # Errors
+    ///
+    /// [`OutputFull`] when the chunk limit is reached.
+    pub fn push_file(&mut self, file: Arc<File>, offset: u64, len: u64) -> Result<(), OutputFull> {
+        if self.chunks.len() >= MAX_CHUNKS {
+            return Err(OutputFull);
+        }
+        if len > 0 {
+            self.chunks.push_back(Chunk::File {
+                file,
+                offset,
+                left: len,
+            });
+        }
+        Ok(())
+    }
+
+    /// The file at the front of the queue, if that is what goes next.
+    pub(crate) fn front_file(&self) -> Option<(Arc<File>, u64, u64)> {
+        match self.chunks.front() {
+            Some(Chunk::File { file, offset, left }) => Some((file.clone(), *offset, *left)),
+            _ => None,
+        }
+    }
+
+    /// Reads the front file's next piece into a buffer at the front of the queue, for
+    /// a path that cannot send a file directly.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn pull_file(&mut self) -> Result<(), crate::error::CloseReason> {
+        use crate::error::{CloseReason, LimitKind, OsErrorClass};
+        let Some((file, offset, left)) = self.front_file() else {
+            return Ok(());
+        };
+        let Some(mut b) = self.take_buffer() else {
+            return Err(CloseReason::Limit(LimitKind::BufferBudget));
+        };
+        let spare = b.spare();
+        let take = usize::try_from(left).unwrap_or(usize::MAX).min(spare.len());
+        let read = crate::sys::read_file_at(&file, &mut spare[..take], offset);
+        let n = match read {
+            Ok(0) => {
+                self.release_chunk(b);
+                return Err(CloseReason::Io(OsErrorClass::FileTruncated));
+            }
+            Ok(n) => n,
+            Err(e) => {
+                self.release_chunk(b);
+                return Err(CloseReason::Io(OsErrorClass::from_io(&e)));
+            }
+        };
+        b.set_len(n);
+        self.used += OUTPUT_CLASS.bytes();
+        if let Some(front) = self.chunks.front_mut() {
+            front.advance(n);
+            if front.len() == 0 {
+                self.chunks.pop_front();
+            }
+        }
+        self.chunks.push_front(Chunk::Pooled(b, 0));
+        Ok(())
+    }
+
     /// Marks the start of a response (for the gate's denial boundary).
     pub fn begin_response(&mut self) {
         self.response_open = true;
@@ -542,7 +642,7 @@ impl Output {
     /// Bytes queued and not yet sent.
     #[must_use]
     pub fn pending(&self) -> usize {
-        self.chunks.iter().map(|c| c.remaining().len()).sum()
+        self.chunks.iter().map(Chunk::len).sum()
     }
 
     /// Whether nothing is queued.
@@ -586,7 +686,8 @@ impl Output {
         self.chunks
             .iter()
             .take(crate::sys::MAX_SLICES)
-            .map(|c| c.remaining().len())
+            .take_while(|c| !c.is_file())
+            .map(Chunk::len)
             .sum()
     }
 
@@ -594,7 +695,12 @@ impl Output {
     #[cfg(feature = "reactor")]
     pub(crate) fn fill_slices<'a>(&'a self, out: &mut [std::io::IoSlice<'a>]) -> usize {
         let mut n = 0;
-        for chunk in self.chunks.iter().take(out.len()) {
+        for chunk in self
+            .chunks
+            .iter()
+            .take(out.len())
+            .take_while(|c| !c.is_file())
+        {
             out[n] = std::io::IoSlice::new(chunk.remaining());
             n += 1;
         }
@@ -604,11 +710,9 @@ impl Output {
     /// Marks `n` bytes as sent, releasing finished chunks.
     pub(crate) fn advance(&mut self, mut n: usize) {
         while let Some(front) = self.chunks.front_mut() {
-            let rem = front.remaining().len();
+            let rem = front.len();
             if n < rem {
-                match front {
-                    Chunk::Pooled(_, off) | Chunk::Static(_, off) => *off += n,
-                }
+                front.advance(n);
                 return;
             }
             n -= rem;
