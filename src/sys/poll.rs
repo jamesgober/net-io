@@ -55,32 +55,36 @@ impl Registered {
 
     /// One receive that never blocks.
     pub(crate) fn recv(self, buf: &mut [u8]) -> io::Result<usize> {
-        #[cfg(any(test, net_io_shim))]
-        let buf = match super::shim::io(super::shim::Op::Recv, buf.len())? {
-            Some(n) => &mut buf[..n],
-            None => buf,
-        };
-        // SAFETY: `buf` is writable for its length and lives for the call. The
-        // descriptor is open by the `Driver` contract; a stale number can only
-        // make recv(2) fail or read another socket's bytes into `buf`.
-        let n = unsafe {
-            recv(
-                self.0,
-                buf.as_mut_ptr().cast::<c_void>(),
-                buf.len(),
-                MSG_DONTWAIT,
-            )
-        };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(n.unsigned_abs())
-        }
+        super::retry_interrupted(|| {
+            #[cfg(any(test, net_io_shim))]
+            let room = match super::shim::io(super::shim::Op::Recv, buf.len())? {
+                Some(n) => n,
+                None => buf.len(),
+            };
+            #[cfg(not(any(test, net_io_shim)))]
+            let room = buf.len();
+            // SAFETY: `buf` is writable for `room` bytes and lives for the call. The
+            // descriptor is open by the `Driver` contract; a stale number can only
+            // make recv(2) fail or read another socket's bytes into `buf`.
+            let n = unsafe {
+                recv(
+                    self.0,
+                    buf.as_mut_ptr().cast::<c_void>(),
+                    room,
+                    MSG_DONTWAIT,
+                )
+            };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n.unsigned_abs())
+            }
+        })
     }
 
     /// One vectored send that never blocks.
     pub(crate) fn send_vectored(self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        super::send_vectored_sock(self.sock(), bufs)
+        super::retry_interrupted(|| super::send_vectored_sock(self.sock(), bufs))
     }
 
     pub(crate) fn connect_start(self, addr: std::net::SocketAddr) -> io::Result<bool> {

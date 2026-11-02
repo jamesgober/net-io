@@ -443,7 +443,7 @@ impl Port {
         #[cfg(any(test, net_io_shim))]
         let limit = {
             let room = op.buffer.as_mut().map_or(0, |b| b.spare().len());
-            match super::shim::io(super::shim::Op::Recv, room) {
+            match super::retry_interrupted(|| super::shim::io(super::shim::Op::Recv, room)) {
                 Ok(limit) => limit,
                 Err(e) => {
                     let raw = Box::into_raw(op);
@@ -494,7 +494,7 @@ impl Port {
         #[cfg(any(test, net_io_shim))]
         let limit = {
             let total = op.chunks.as_ref().map_or(0, SendChunks::pending);
-            match super::shim::io(super::shim::Op::Send, total) {
+            match super::retry_interrupted(|| super::shim::io(super::shim::Op::Send, total)) {
                 Ok(limit) => limit,
                 Err(e) => {
                     let raw = Box::into_raw(op);
@@ -635,6 +635,8 @@ impl Port {
                 .unwrap_or(u32::MAX)
                 .min(INFINITE - 1)
         });
+        #[cfg(any(test, net_io_shim))]
+        super::shim::check(super::shim::Op::Wait)?;
         let mut removed = 0u32;
         // SAFETY: `entries` holds ENTRIES items; the port is open.
         let ok = unsafe {

@@ -18,6 +18,7 @@
 //!
 //! An idle connection holds no read buffer and no output queue, only its state.
 
+use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -51,6 +52,9 @@ use crate::wheel::{Ticks, TimerId, Wheel};
 pub(crate) type Backend = crate::driver::ready::ReadyDriver;
 #[cfg(windows)]
 pub(crate) type Backend = crate::driver::iocp::IocpDriver;
+
+/// How often a worker with paused connections looks for a free buffer.
+const STARVED_RETRY: Duration = Duration::from_millis(10);
 
 /// How many expired timers one loop iteration handles, so IO keeps moving after
 /// a clock jump.
@@ -154,6 +158,10 @@ struct Conn<S> {
     linger_left: u32,
     /// The session runs; before that a handshake does.
     opened: bool,
+    /// Reading waits for the buffer budget (edge case 11).
+    paused: bool,
+    /// The last send moved nothing: once is retried, twice is an error.
+    zero_send: bool,
 }
 
 struct Slot<S> {
@@ -177,6 +185,8 @@ struct Reactor<F: SessionFactory, G: Gate> {
     #[allow(clippy::vec_box)]
     outputs: Vec<Box<Output>>,
     completer: Completer,
+    /// Connections waiting for a buffer, oldest first.
+    starved: VecDeque<(u32, Token)>,
     view: ControlView,
     clock: ClockRef,
     notes: Arc<KillNotes>,
@@ -210,6 +220,7 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         ticks: Ticks::new(start, engine.limits.tick),
         pool: BufferPool::new(engine.budget.clone(), engine.wipe),
         outputs: Vec::new(),
+        starved: VecDeque::new(),
         completer: Completer {
             shared: ws.completer.clone(),
         },
@@ -232,6 +243,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
             self.take_kills();
             self.take_posted();
             self.fire_timers();
+            self.resume_starved();
             if self.shared.is_stopping() {
                 self.close_all(CloseReason::Shutdown);
                 if self.open == 0 && self.engine.inbox_empty(self.idx) {
@@ -262,12 +274,42 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
             .wheel
             .next_expiry()
             .map(|t| self.ticks.until(t, now).max(Duration::from_micros(100)));
+        // Buffers free on any worker, and nothing wakes this one for them.
+        let starved = !self.starved.is_empty();
         match self.clock {
-            ClockRef::Monotonic => timer,
+            ClockRef::Monotonic if !starved => timer,
+            ClockRef::Monotonic => {
+                let cap = STARVED_RETRY;
+                Some(timer.map_or(cap, |t| t.min(cap)))
+            }
             ClockRef::Custom(_) => {
                 let cap = Duration::from_millis(5);
                 Some(timer.map_or(cap, |t| t.min(cap)))
             }
+        }
+    }
+
+    /// Reading resumes, oldest connection first, as buffers free up.
+    fn resume_starved(&mut self) {
+        while let Some(&(index, token)) = self.starved.front() {
+            let class = match self.conn(index) {
+                Some(c) if c.token == token && c.paused && c.wait == Wait::Read => {
+                    c.link.limits.read_class
+                }
+                _ => {
+                    self.starved.pop_front();
+                    continue;
+                }
+            };
+            let Some(buffer) = self.pool.take(class) else {
+                return;
+            };
+            self.starved.pop_front();
+            if let Some(c) = self.conn(index) {
+                c.paused = false;
+                c.input = Some(Input::new(buffer));
+            }
+            self.read(index);
         }
     }
 
@@ -362,6 +404,8 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
             proxy: None,
             linger_left: 0,
             opened: false,
+            paused: false,
+            zero_send: false,
         };
         self.slots[index as usize].conn = Some(conn);
         let setup = {
@@ -746,7 +790,14 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
                 true
             }
             None => {
-                self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
+                // Reading pauses (edge case 11): the peer's bytes wait in the kernel,
+                // TCP pushes back, and the connection's read deadline keeps running.
+                if let Some(c) = self.conn(index) {
+                    c.paused = true;
+                    let token = c.token;
+                    self.starved.push_back((index, token));
+                }
+                self.arm_timer(index);
                 false
             }
         }
@@ -893,17 +944,18 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
             self.arm_timer(index);
             return self.tls_turn(index);
         }
-        if c.recv != Recv::None {
+        if c.recv != Recv::None || c.paused {
             return self.arm_timer(index);
         }
         let token = c.token;
-        if c.input.is_some() || c.readable {
-            // Mid-exchange, or the socket already reported bytes: read now.
-            c.readable = false;
+        let holding = c.input.as_ref().is_some_and(|i| !i.bytes().is_empty());
+        if holding || c.readable {
+            // A partial message, or the socket already reported bytes: read now.
             if !self.ensure_input(index) {
                 return;
             }
             let Some(c) = self.conn(index) else { return };
+            c.readable = false;
             let Some(input) = c.input.as_mut() else {
                 return;
             };
@@ -912,7 +964,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
             c.recv = Recv::Input;
             self.submit_receive(index, token, buffer);
         } else {
-            // Waiting for an exchange: no buffer is held.
+            // Nothing to keep: a silent peer pins no buffer, in any phase.
             self.release_idle(index);
             let Some(c) = self.conn(index) else { return };
             c.recv = Recv::Zero;
@@ -1219,8 +1271,19 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
         }
     }
 
-    fn on_send(&mut self, index: u32, done: Completion) {
+    fn on_send(&mut self, index: u32, mut done: Completion) {
         let Some(c) = self.conn(index) else { return };
+        let moved_nothing =
+            done.result == Ok(0) && done.chunks.as_ref().is_some_and(|ch| ch.pending() > 0);
+        if !moved_nothing {
+            c.zero_send = false;
+        } else if c.zero_send {
+            done.result = Err(OsErrorClass::Other(0));
+        } else if let Some(chunks) = done.chunks.take() {
+            c.zero_send = true;
+            let token = c.token;
+            return self.submit_send(index, token, chunks);
+        }
         let sending = std::mem::replace(&mut c.sending, Sending::None);
         let wait = c.wait;
         let chunks = done.chunks;

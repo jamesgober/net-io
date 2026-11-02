@@ -53,7 +53,9 @@ impl DriverKind {
     /// The driver `Auto` resolves to in this build.
     pub(crate) fn resolve(self) -> DriverKind {
         match self {
-            DriverKind::Auto if DriverKind::reactor_built() => DriverKind::Reactor,
+            DriverKind::Auto if DriverKind::reactor_built() && !cfg!(net_io_force_blocking) => {
+                DriverKind::Reactor
+            }
             DriverKind::Auto => DriverKind::Blocking,
             other => other,
         }

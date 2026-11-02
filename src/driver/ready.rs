@@ -109,9 +109,6 @@ impl ReadyDriver {
                         reg.hangup = false;
                         reg.recv = Recv::Into(buffer);
                     }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                        reg.recv = Recv::Into(buffer);
-                    }
                     Err(e) => {
                         let mut c = Completion::new(
                             token,
@@ -140,9 +137,6 @@ impl ReadyDriver {
                 match result {
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         reg.writable = false;
-                        reg.out = Out::Chunks(chunks);
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                         reg.out = Out::Chunks(chunks);
                     }
                     other => {

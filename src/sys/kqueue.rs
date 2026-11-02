@@ -216,6 +216,8 @@ impl Poller {
         timeout: Option<Duration>,
         mut f: impl FnMut(PollEvent),
     ) -> io::Result<()> {
+        #[cfg(any(test, net_io_shim))]
+        super::shim::check(super::shim::Op::Wait)?;
         let ts = timeout.map(|d| Timespec {
             tv_sec: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
             tv_nsec: i64::from(d.subsec_nanos()),

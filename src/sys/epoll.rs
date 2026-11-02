@@ -149,6 +149,8 @@ impl Poller {
         timeout: Option<Duration>,
         mut f: impl FnMut(PollEvent),
     ) -> io::Result<()> {
+        #[cfg(any(test, net_io_shim))]
+        super::shim::check(super::shim::Op::Wait)?;
         // SAFETY: `buf` holds EVENTS entries and lives for the call; EpollEventBox
         // is transparent over EpollEvent.
         let n = unsafe {

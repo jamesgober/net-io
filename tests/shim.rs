@@ -56,6 +56,22 @@ fn echo_server() -> net_io::Server {
     net_io::serve_sessions("127.0.0.1:0", |_: &ConnectionInfo| Echo).expect("serve")
 }
 
+fn blocking_echo_server() -> net_io::Server {
+    driver_echo_server(net_io::DriverKind::Blocking)
+}
+
+fn driver_echo_server(driver: net_io::DriverKind) -> net_io::Server {
+    let server = net_io::ServerBuilder::new()
+        .listener(net_io::ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(driver)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(net_io::AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    server
+}
+
 #[test]
 fn test_accept_out_of_descriptors_recovers() {
     let _shim = Shim::take();
@@ -144,6 +160,13 @@ fn test_system_calls_per_echo_round_trip() {
         println!(
             "{name}: {per:.2} system calls per round trip (recv, send, wait, timeout: {calls:?})"
         );
+        // The reactor: wait, receive, send; on Windows also the zero-byte receive.
+        let budget = match name {
+            "sessions" if cfg!(net_io_force_blocking) => budget,
+            "sessions" if cfg!(windows) => 4.0,
+            "sessions" => 3.0,
+            _ => budget,
+        };
         assert!(per <= budget + 0.01, "{name}: {per:.2} > {budget}");
     }
 }
@@ -305,10 +328,28 @@ fn test_zero_byte_send_once_then_error() {
 #[test]
 fn test_spurious_would_block_is_retried() {
     let _shim = Shim::take();
-    let server = echo_server();
+    let server = blocking_echo_server();
     let mut c = client(addr(&server));
     program(Op::Recv, 0, 3, Fault::Kind(std::io::ErrorKind::WouldBlock));
     assert_eq!(round_trip(&mut c, b"again"), b"again");
+}
+
+/// Edge case 6 on an edge-triggered driver: after a spurious `WouldBlock` nothing
+/// is lost, and the next arrival's edge reads everything.
+#[cfg(unix)]
+#[test]
+fn test_spurious_would_block_recovers_at_the_next_edge() {
+    use std::io::{Read, Write};
+    let _shim = Shim::take();
+    let server = driver_echo_server(net_io::DriverKind::Reactor);
+    let mut c = client(addr(&server));
+    program(Op::Recv, 0, 1, Fault::Kind(std::io::ErrorKind::WouldBlock));
+    c.write_all(b"a").expect("write");
+    std::thread::sleep(Duration::from_millis(50));
+    c.write_all(b"b").expect("write");
+    let mut back = [0; 2];
+    c.read_exact(&mut back).expect("read");
+    assert_eq!(&back, b"ab");
 }
 
 /// Edge case 8: the kernel timing the connection out (keepalive) is `Io(TimedOut)`,

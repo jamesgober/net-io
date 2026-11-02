@@ -114,7 +114,7 @@ harness = false
 # LINTS
 # #################################
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(net_io_loom)", "cfg(net_io_shim)", "cfg(fuzzing)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(net_io_loom)", "cfg(net_io_shim)", "cfg(net_io_force_blocking)", "cfg(fuzzing)"] }
 
 
 # RELEASE PROFILE
