@@ -8,7 +8,8 @@
 
 mod common;
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -78,10 +79,17 @@ fn test_accept_out_of_descriptors_recovers() {
     let server = echo_server();
     program(Op::Accept, 0, 1, Fault::Os(EMFILE));
     // The first connection meets the fault; it may be shed or served after the pause.
-    let _first = client(addr(&server));
+    let _first = TcpStream::connect(addr(&server));
     assert!(eventually(WAIT, || server.stats().descriptor_pressure == 1));
-    let mut c = client(addr(&server));
-    assert_eq!(round_trip(&mut c, b"after"), b"after");
+    // A connection accepted during the pause is shed too, and on the BSDs that can
+    // reach the client inside `connect`.
+    assert!(eventually(WAIT, || {
+        TcpStream::connect(addr(&server)).is_ok_and(|mut c| {
+            let _ = c.set_read_timeout(Some(WAIT));
+            let mut b = [0u8; 5];
+            c.write_all(b"after").is_ok() && c.read_exact(&mut b).is_ok() && &b == b"after"
+        })
+    }));
 }
 
 #[test]
@@ -170,8 +178,6 @@ fn test_system_calls_per_echo_round_trip() {
         let budget = match name {
             "sessions" if cfg!(net_io_force_blocking) => budget,
             "sessions" if cfg!(windows) => 4.0,
-            // The write filter fires now and then after an ACK: an empty wake.
-            "sessions" if cfg!(not(target_os = "linux")) => 3.1,
             "sessions" => 3.0,
             _ => budget,
         };
