@@ -3097,6 +3097,7 @@ fn flush<G: Gate, S: Session>(
         match result {
             Ok(n) => {
                 w.output.advance(n);
+                w.output.return_spares(&mut w.pool);
                 w.output.bytes_since_begin += n as u64;
             }
             Err(NetError::EgressDenied { code }) => {

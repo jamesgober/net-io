@@ -419,6 +419,8 @@ pub struct Output {
 
 const OUTPUT_CLASS: SizeClass = SizeClass::MEDIUM;
 const MAX_CHUNKS: usize = 64;
+/// The most free buffers one output holds; the rest of a large close goes to the budget.
+const FREE_MAX: usize = 4;
 
 impl Output {
     pub(crate) fn new(budget: Arc<AtomicU64>, limit: u32, wipe: bool) -> Output {
@@ -671,12 +673,23 @@ impl Output {
         } else {
             b.clear();
         }
-        if b.class() == OUTPUT_CLASS {
+        if b.class() == OUTPUT_CLASS && self.free.len() < FREE_MAX {
             self.free.push(b);
         } else {
             // A buffer moved in with push_buffer goes back to the shared budget.
             self.budget
                 .fetch_add(b.capacity() as u64, Ordering::Release);
+        }
+    }
+
+    /// Keeps one free buffer and gives the rest to `pool`. A buffer moved in with
+    /// `push_buffer` came from that pool, and kept here it would be allocated again
+    /// for the next one.
+    pub(crate) fn return_spares(&mut self, pool: &mut BufferPool) {
+        while self.free.len() > 1 {
+            if let Some(b) = self.free.pop() {
+                pool.put(b);
+            }
         }
     }
 

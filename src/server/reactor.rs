@@ -1480,6 +1480,16 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             }
             Sending::None => return,
         }
+        // Before anything below can park the output with the connection idle.
+        let pool = &mut self.pool;
+        if let Some(output) = self
+            .slots
+            .get_mut(index as usize)
+            .and_then(|s| s.conn.as_mut())
+            .and_then(|c| c.output.as_mut())
+        {
+            output.return_spares(pool);
+        }
         if closing {
             return self.settle(index);
         }
