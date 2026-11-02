@@ -93,7 +93,7 @@ jobs:
           components: miri
       - name: Miri
         run: |
-          cargo miri test --lib -- addr:: buf:: rate:: session:: completer:: limits:: id:: control:: events:: error:: time:: info:: trusted::
+          cargo miri test --lib -- addr:: buf:: rate:: session:: completer:: limits:: id:: control:: events:: error:: time:: info:: trusted:: wheel::
 
   leak:
     name: Descriptor leak, 100,000 connections

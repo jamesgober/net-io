@@ -103,6 +103,8 @@ mod tls;
 mod trusted;
 #[cfg(feature = "udp")]
 mod udp;
+#[cfg_attr(not(test), allow(dead_code))]
+mod wheel;
 
 /// Entry points for net-io's fuzz targets (`fuzz/`), compiled only under
 /// cargo-fuzz (`--cfg fuzzing`). Not part of the public API and not covered by semver.
