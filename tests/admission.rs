@@ -1,0 +1,199 @@
+//! Lanes, lockdown, adaptive deadlines, and placement.
+
+mod common;
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use common::{addr, client, eventually, round_trip};
+use net_io::{
+    AdmitStage, Admitted, AllowAll, ConnectionInfo, ControlState, Denial, DriverKind, Gate,
+    GateTag, Input, Lane, Limits, ListenerSpec, NetError, Placement, PrefixPolicy, Pressure,
+    Refusal, RefusalCause, ServerBuilder, Session, SessionContext, SimpleControl, Step, WriteCheck,
+};
+
+const WAIT: Duration = Duration::from_secs(5);
+const DRIVERS: [DriverKind; 2] = [DriverKind::Blocking, DriverKind::Reactor];
+
+struct Echo;
+
+impl Session for Echo {
+    fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+        let taken = cx.output().push_partial(input.bytes());
+        input.consume(taken);
+        Step::Write
+    }
+}
+
+/// Puts every connection in one lane.
+struct InLane(Lane);
+
+impl Gate for InLane {
+    type Ticket = ();
+    fn admit(&self, _: &ConnectionInfo, _: AdmitStage) -> Result<Admitted<()>, Refusal> {
+        Ok(Admitted {
+            lane: self.0,
+            ticket: (),
+            tag: GateTag(0),
+        })
+    }
+    fn readmit(&self, _: &mut (), _: &ConnectionInfo) -> Result<(), Refusal> {
+        Ok(())
+    }
+    fn check(&self, _: &mut (), _: &WriteCheck) -> Result<(), Denial> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_lane_reserve_keeps_slots_for_the_more_important() {
+    for driver in DRIVERS {
+        let limits = Limits::builder()
+            .max_connections(4)
+            .lane_reserve(Lane(0), 3)
+            .build()
+            .expect("limits");
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(8)
+            .limits(limits)
+            .sessions(|_: &ConnectionInfo| Echo)
+            .gate(InLane(Lane(1)))
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut first = client(addr(&server));
+        assert_eq!(round_trip(&mut first, b"in"), b"in");
+        let mut second = client(addr(&server));
+        let _ = second.write_all(b"x");
+        let mut b = [0u8; 1];
+        assert!(!matches!(second.read(&mut b), Ok(n) if n > 0), "{driver:?}");
+        assert!(
+            eventually(WAIT, || server
+                .stats()
+                .refused_for(RefusalCause::LaneReserve)
+                == 1),
+            "{driver:?}: {:?}",
+            server.stats()
+        );
+    }
+}
+
+#[test]
+fn test_the_reserved_lane_itself_may_use_every_slot() {
+    let limits = Limits::builder()
+        .max_connections(4)
+        .lane_reserve(Lane(0), 3)
+        .build()
+        .expect("limits");
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .limits(limits)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(InLane(Lane(0)))
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let mut all: Vec<TcpStream> = (0..4).map(|_| client(addr(&server))).collect();
+    for c in &mut all {
+        assert_eq!(round_trip(c, b"ok"), b"ok");
+    }
+}
+
+#[test]
+fn test_lockdown_leaves_the_allowed_listener_open() {
+    let control = Arc::new(SimpleControl::new());
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .listener(ListenerSpec::tcp("127.0.0.1:0").lockdown_allowed(true))
+        .sessions(|_: &ConnectionInfo| Echo)
+        .control(control.clone())
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let (public, admin) = (
+        server.listeners()[0].local.socket_addr().expect("ip"),
+        server.listeners()[1].local.socket_addr().expect("ip"),
+    );
+    control.set(ControlState::Lockdown, None);
+    // The control line is read before an accept batch: let one connection see it.
+    assert!(eventually(WAIT, || {
+        let mut c = client(public);
+        let _ = c.write_all(b"x");
+        let mut b = [0u8; 1];
+        !matches!(c.read(&mut b), Ok(n) if n > 0)
+    }));
+    let mut c = client(admin);
+    assert_eq!(round_trip(&mut c, b"admin"), b"admin");
+}
+
+#[test]
+fn test_pressure_shrinks_idle_deadlines_and_lets_go() {
+    for driver in DRIVERS {
+        let limits = Limits::builder()
+            .max_connections(10)
+            .max_per_source(10, PrefixPolicy::DEFAULT)
+            .idle_timeout(Duration::from_secs(30))
+            .pressure(Pressure {
+                high: 0.5,
+                low: 0.2,
+                factor: 0.01,
+            })
+            .build()
+            .expect("limits");
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(12)
+            .limits(limits)
+            .sessions(|_: &ConnectionInfo| Echo)
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut conns: Vec<TcpStream> = (0..6).map(|_| client(addr(&server))).collect();
+        for c in &mut conns {
+            assert_eq!(round_trip(c, b"hi"), b"hi");
+        }
+        let started = Instant::now();
+        // 30 s scaled to the floor of 1 s, on a tick or two; well under the 30.
+        assert!(
+            eventually(Duration::from_secs(10), || server.stats().timeouts >= 3),
+            "{driver:?}: {:?}",
+            server.stats()
+        );
+        assert!(started.elapsed() < Duration::from_secs(10), "{driver:?}");
+    }
+}
+
+#[test]
+fn test_placement() {
+    let result = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .workers(2)
+        .placement(Placement::PinPerCore)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(AllowAll)
+        .build();
+    if cfg!(target_os = "macos") {
+        assert!(matches!(result, Err(NetError::Unsupported { .. })));
+    } else {
+        let server = result.expect("build");
+        server.open_door().expect("open");
+        let mut c = client(addr(&server));
+        assert_eq!(round_trip(&mut c, b"pinned"), b"pinned");
+    }
+    if !cfg!(target_os = "macos") {
+        let empty = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .placement(Placement::Explicit(Vec::new()))
+            .sessions(|_: &ConnectionInfo| Echo)
+            .gate(AllowAll)
+            .build();
+        assert!(matches!(empty, Err(NetError::InvalidConfig { .. })));
+    }
+}

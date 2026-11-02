@@ -439,6 +439,16 @@ unsafe extern "C" {
     fn getsockname(fd: c_int, addr: *mut c_void, len: *mut SockLen) -> c_int;
     fn getpeername(fd: c_int, addr: *mut c_void, len: *mut SockLen) -> c_int;
     #[cfg(target_os = "linux")]
+    fn sched_setaffinity(pid: c_int, size: usize, mask: *const u64) -> c_int;
+    #[cfg(target_os = "freebsd")]
+    fn cpuset_setaffinity(
+        level: c_int,
+        which: c_int,
+        id: i64,
+        size: usize,
+        mask: *const u64,
+    ) -> c_int;
+    #[cfg(target_os = "linux")]
     fn sendfile(out: c_int, file: c_int, offset: *mut i64, count: usize) -> isize;
     #[cfg(target_os = "macos")]
     fn sendfile(
@@ -1086,6 +1096,45 @@ pub(crate) fn send_file_refused(e: &io::Error) -> bool {
 /// Bytes of `file` at `offset`, leaving its position alone.
 pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+/// Whether this OS can pin a thread.
+pub(crate) const CAN_PIN: bool = cfg!(any(target_os = "linux", target_os = "freebsd"));
+
+/// `cpu` as a `cpu_set_t` or `cpuset_t` (1,024 CPUs on Linux, 256 on FreeBSD).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn cpu_mask(cpu: usize) -> io::Result<[u64; 16]> {
+    let mut mask = [0u64; 16];
+    let word = mask
+        .get_mut(cpu / 64)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    *word = 1 << (cpu % 64);
+    Ok(mask)
+}
+
+/// Pins the calling thread to `cpu`.
+#[cfg(target_os = "linux")]
+pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
+    let mask = cpu_mask(cpu)?;
+    // SAFETY: pid 0 means the calling thread; `mask` is live for its stated size.
+    cvt(unsafe { sched_setaffinity(0, size_of_val(&mask), mask.as_ptr()) }).map(drop)
+}
+
+/// Pins the calling thread to `cpu`.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
+    const CPU_LEVEL_WHICH: c_int = 3;
+    const CPU_WHICH_TID: c_int = 1;
+    let mask = cpu_mask(cpu)?;
+    // SAFETY: id -1 means the calling thread; `mask` is live, and 32 bytes is `cpuset_t`.
+    cvt(unsafe { cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 32, mask.as_ptr()) })
+        .map(drop)
+}
+
+/// macOS has no affinity call; `build` refuses a placement there.
+#[cfg(target_os = "macos")]
+pub(crate) fn pin_current_thread(_cpu: usize) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// `SO_INCOMING_CPU`: connections to a reuse-port group go to the listener on the

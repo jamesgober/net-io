@@ -76,6 +76,8 @@ pub(crate) const CMD_KILL_ALL: u32 = 4;
 pub(crate) const CMD_LISTENER_SWEEP: u32 = 8;
 #[cfg(feature = "reactor")]
 pub(crate) const CMD_LISTENER_KILL: u32 = 16;
+/// Deadlines shrank or returned: every waiting connection looks again.
+pub(crate) const CMD_PRESSURE: u32 = 32;
 
 /// How many admitted connections wait for one reactor worker before new ones are
 /// refused with `Busy`.
@@ -122,6 +124,7 @@ pub(crate) struct Config<W, G, S> {
     pub control: Option<Arc<dyn ControlLine>>,
     pub wipe: bool,
     pub clock: Option<Arc<dyn Clock>>,
+    pub placement: super::Placement,
     #[cfg(feature = "udp")]
     pub udp: Option<Arc<dyn crate::udp::UdpSessionFactory>>,
 }
@@ -283,6 +286,10 @@ impl CompleterTarget for WorkerTarget {
 
 /// The non-generic state `Server` and `ServerHandle` share with the threads.
 pub(crate) struct Shared {
+    /// Adaptive deadlines, when set.
+    pressure: Option<crate::limits::Pressure>,
+    /// Open connections passed `pressure.high` and have not yet fallen below `low`.
+    pressured: AtomicBool,
     /// Makes the session of each UDP listener.
     #[cfg(feature = "udp")]
     udp: Option<Arc<dyn crate::udp::UdpSessionFactory>>,
@@ -380,7 +387,6 @@ impl Shared {
     }
 
     /// Connections in use against the global cap, 0.0 to 1.0.
-    #[cfg(feature = "reactor")]
     pub(crate) fn occupancy(&self) -> f32 {
         let open = self.open.load(Ordering::Relaxed) as f32;
         (open / self.max_open.max(1) as f32).min(1.0)
@@ -947,8 +953,31 @@ impl Shared {
         self.wake_all();
     }
 
+    /// Moves the pressure state when the open count crossed a threshold.
+    fn update_pressure(&self) {
+        let Some(p) = self.pressure else { return };
+        let fill = self.occupancy();
+        let on = self.pressured.load(Ordering::Acquire);
+        if on != (fill >= p.high) && (!on || fill <= p.low) {
+            self.pressured.store(!on, Ordering::Release);
+            #[cfg(feature = "reactor")]
+            if self.reactor {
+                self.command(CMD_PRESSURE);
+            }
+        }
+    }
+
+    /// What deadlines are multiplied by right now.
+    pub(crate) fn deadline_scale(&self) -> f32 {
+        match self.pressure {
+            Some(p) if self.pressured.load(Ordering::Acquire) => p.factor,
+            _ => 1.0,
+        }
+    }
+
     pub(crate) fn release(&self, listener: &ListenerConf, source: Option<PrefixKey>) {
         self.open.fetch_sub(1, Ordering::AcqRel);
+        self.update_pressure();
         listener.count.fetch_sub(1, Ordering::AcqRel);
         if let Some(k) = source {
             listener.sources.release(k);
@@ -988,6 +1017,8 @@ pub(crate) struct ListenerConf {
     /// `Some` when the listener requires a PROXY header.
     #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
     pub(crate) proxy: Option<ListenerProxy>,
+    /// Connections are still admitted under `ControlState::Lockdown`.
+    lockdown_allowed: bool,
     /// Whether the listener serves TLS.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub(crate) tls: bool,
@@ -1163,6 +1194,7 @@ fn bind_listener(
         limits: Arc::new(lim),
         tcp,
         proxy,
+        lockdown_allowed: spec.lockdown_allowed,
         tls: spec.tls,
         #[cfg(feature = "reactor")]
         killed: AtomicU32::new(0),
@@ -1401,6 +1433,8 @@ where
     let queue_capacity = limits.completion_queue as usize;
     let next_listener = u32::try_from(infos.len()).unwrap_or(u32::MAX);
     let shared = Arc::new_cyclic(|weak: &Weak<Shared>| Shared {
+        pressure: limits.pressure,
+        pressured: AtomicBool::new(false),
         #[cfg(feature = "udp")]
         udp: cfg.udp,
         pid: std::process::id(),
@@ -1524,6 +1558,7 @@ where
             .spawn(move || accept_loop(&e, &conf, &rt))
     }));
 
+    let cfg_placement = cfg.placement;
     let mut threads = Vec::with_capacity(usize::from(cfg.workers));
     let spawn_error = |e: std::io::Error| NetError::DriverSetup {
         driver: DriverKind::Blocking,
@@ -1532,11 +1567,22 @@ where
     let mut failure = None;
     for i in 0..usize::from(cfg.workers) {
         let e = engine.clone();
+        let cpu = match &cfg_placement {
+            super::Placement::Off => None,
+            super::Placement::PinPerCore => Some(i),
+            super::Placement::Explicit(cpus) => Some(cpus[i % cpus.len()]),
+        };
         match std::thread::Builder::new()
             .name(format!("net-io-worker-{i}"))
             .stack_size(WORKER_STACK)
-            .spawn(move || W::run_worker(&e, i))
-        {
+            .spawn(move || {
+                if let Some(cpu) = cpu {
+                    // Placement is a tuning hint: a CPU this process may not use leaves
+                    // the worker where it is, working.
+                    let _ = sys::pin_current_thread(cpu);
+                }
+                W::run_worker(&e, i);
+            }) {
             Ok(t) => threads.push(t),
             Err(err) => {
                 failure = Some(spawn_error(err));
@@ -1954,8 +2000,9 @@ impl<W, G: Gate> Engine<W, G> {
                 }
             }
         }
+        shared.update_pressure();
         let release = |s: &Self| s.shared.release(conf, source);
-        if matches!(view.state(), ControlState::Lockdown) {
+        if matches!(view.state(), ControlState::Lockdown) && !conf.lockdown_allowed {
             release(self);
             {
                 self.refuse(stream, peer, RefusalCause::Lockdown, None, co);
@@ -1994,6 +2041,22 @@ impl<W, G: Gate> Engine<W, G> {
         info.lane = admitted.lane;
         info.gate = admitted.tag;
         let ticket = admitted.ticket;
+        // What is left must cover what the more important lanes keep for themselves.
+        let reserved = lim.reserved_above(info.lane);
+        if reserved > 0
+            && shared.open.load(Ordering::Acquire).saturating_add(reserved) > lim.max_connections
+        {
+            let _ = guarded(|| {
+                self.gate.closed(
+                    ticket,
+                    &info,
+                    CloseReason::Refused(RefusalCause::LaneReserve),
+                )
+            });
+            release(self);
+            self.refuse(stream, peer, RefusalCause::LaneReserve, None, co);
+            return Err(Some(RefusalCause::LaneReserve));
+        }
         if let ControlState::Shed { from_lane } = view.state() {
             if info.lane >= from_lane {
                 let _ = guarded(|| {
@@ -2244,7 +2307,8 @@ impl<G: Gate> Worker<G> {
             return Err(CloseReason::Limit(crate::error::LimitKind::BufferBudget));
         };
         link.attach_tls(session, cin, cout);
-        link.begin_handshake(link.info.accepted_at + lim.handshake_timeout);
+        link.set_deadline_scale(self.shared.deadline_scale());
+        link.begin_handshake(link.info.accepted_at + link.scaled(lim.handshake_timeout));
         let r = link.tls_handshake();
         link.end_handshake(None);
         match r {
@@ -2286,7 +2350,8 @@ impl<G: Gate> Worker<G> {
             .unwrap_or(u16::MAX)
             .min(lim.proxy_header_max);
         let mut parser = ProxyParser::new(proxy.versions, body_max);
-        link.begin_handshake(link.info.accepted_at + lim.handshake_timeout);
+        link.set_deadline_scale(self.shared.deadline_scale());
+        link.begin_handshake(link.info.accepted_at + link.scaled(lim.handshake_timeout));
         let outcome = loop {
             match parser.feed(buf.as_slice()) {
                 Ok(ProxyProgress::Done { header, consumed }) => {
@@ -2778,6 +2843,7 @@ fn drive<G: Gate, S: Session>(
                 }
                 input.changed = false;
                 link.settle_phase(input.bytes().is_empty());
+                link.set_deadline_scale(w.shared.deadline_scale());
                 let idle = link.phase() == Phase::Idle && input.bytes().is_empty();
                 if w.draining() && idle {
                     return CloseReason::Drained;

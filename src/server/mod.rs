@@ -169,6 +169,7 @@ pub struct ListenerSpec {
     #[cfg(feature = "udp")]
     pub(crate) udp: Option<crate::udp::UdpOptions>,
     pub(crate) adopt: Option<ListenerHandle>,
+    pub(crate) lockdown_allowed: bool,
 }
 
 impl ListenerSpec {
@@ -191,7 +192,15 @@ impl ListenerSpec {
             #[cfg(feature = "udp")]
             udp: None,
             adopt: None,
+            lockdown_allowed: false,
         }
+    }
+
+    /// Keeps admitting under `ControlState::Lockdown`, for the listener an operator
+    /// comes in through while everything else is refused.
+    pub fn lockdown_allowed(mut self, on: bool) -> ListenerSpec {
+        self.lockdown_allowed = on;
+        self
     }
 
     /// A TCP listener with explicit options (their backlog wins over the limits').
@@ -262,6 +271,7 @@ impl ListenerSpec {
             trusted: None,
             tls: false,
             unix: Some((path.into(), options)),
+            lockdown_allowed: false,
             #[cfg(all(windows, feature = "local"))]
             pipe: None,
             #[cfg(feature = "udp")]
@@ -300,6 +310,7 @@ impl ListenerSpec {
             #[cfg(feature = "udp")]
             udp: None,
             adopt: Some(handle),
+            lockdown_allowed: false,
         }
     }
 
@@ -355,6 +366,24 @@ pub struct UdpOnly;
 /// The unset gate (no `build` exists for it): name `AllowAll` to run without a gate.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoGate;
+
+/// Where workers run.
+///
+/// ```
+/// let pinned = net_io::Placement::Explicit(vec![0, 2, 4, 6]);
+/// # let _ = pinned;
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Placement {
+    /// The OS decides.
+    #[default]
+    Off,
+    /// Worker `n` on CPU `n`, wrapping around.
+    PinPerCore,
+    /// Worker `n` on `cpus[n % cpus.len()]`.
+    Explicit(Vec<usize>),
+}
 
 /// What `ServerBuilder::sessions` produces; programs never name it.
 #[derive(Debug)]
@@ -442,6 +471,7 @@ pub struct ServerBuilder<W = NoWork, G = NoGate, S = NoopSink, T = NoTls> {
     wipe: bool,
     clock: Option<Arc<dyn Clock>>,
     trusted: Option<Arc<TrustedProxies>>,
+    placement: Placement,
     #[cfg(feature = "udp")]
     udp: Option<Arc<dyn crate::udp::UdpSessionFactory>>,
 }
@@ -462,6 +492,7 @@ impl ServerBuilder {
             wipe: true,
             clock: None,
             trusted: None,
+            placement: Placement::Off,
             #[cfg(feature = "udp")]
             udp: None,
         }
@@ -492,6 +523,7 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
             wipe,
             clock,
             trusted,
+            placement,
             #[cfg(feature = "udp")]
             udp,
         } = self;
@@ -509,6 +541,7 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
             wipe,
             clock,
             trusted,
+            placement,
             #[cfg(feature = "udp")]
             udp,
         }
@@ -530,6 +563,13 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
     /// The driver (default `Auto`).
     pub fn driver(mut self, kind: DriverKind) -> Self {
         self.driver = kind;
+        self
+    }
+
+    /// Pins workers to CPUs (`Unsupported` on macOS). A worker that stays on one CPU
+    /// keeps its cache; the cost is that the OS can no longer move it off a busy CPU.
+    pub fn placement(mut self, placement: Placement) -> Self {
+        self.placement = placement;
         self
     }
 
@@ -731,6 +771,15 @@ where
         for spec in &listeners {
             limits.overlay(&spec.limits).validate(workers, None)?;
         }
+        if self.placement != Placement::Off && !crate::sys::CAN_PIN {
+            return Err(NetError::Unsupported {
+                feature: "worker placement",
+                platform: std::env::consts::OS,
+            });
+        }
+        if self.placement == Placement::Explicit(Vec::new()) {
+            return Err(invalid("placement", ConfigReason::Zero));
+        }
         let tls: Option<Arc<dyn ErasedAcceptor>> = if has_tls {
             Some(Arc::new(self.tls))
         } else {
@@ -749,6 +798,7 @@ where
             control: self.control,
             wipe: self.wipe,
             clock: self.clock,
+            placement: self.placement,
             #[cfg(feature = "udp")]
             udp: self.udp,
         })

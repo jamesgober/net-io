@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use super::Sessions;
 use super::engine::{
-    CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP, CMD_SHED,
-    CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, record_close,
+    CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP, CMD_PRESSURE,
+    CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, record_close,
 };
 use crate::addr::PrefixKey;
 use crate::buf::{Buffer, BufferPool};
@@ -468,9 +468,11 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     fn handshake(&mut self, index: u32) {
         #[cfg(feature = "tls")]
         let acceptor = self.shared.tls.clone();
+        let scale = self.shared.deadline_scale();
         let Some(c) = self.conn(index) else { return };
         let accepted = c.link.info.accepted_at;
-        let timeout = c.link.limits.handshake_timeout;
+        c.link.set_deadline_scale(scale);
+        let timeout = c.link.scaled(c.link.limits.handshake_timeout);
         #[cfg(feature = "proxy")]
         if let Some(settings) = c.listener.proxy.clone() {
             if c.proxy.is_none() && !c.link.proxy_done() {
@@ -1668,6 +1670,15 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let cmd = ws.cmd.swap(0, Ordering::AcqRel);
         if cmd & CMD_SWEEP != 0 {
             self.sweep(|_| true, CloseReason::Drained);
+        }
+        if cmd & CMD_PRESSURE != 0 {
+            let scale = shared.deadline_scale();
+            for i in 0..self.slots.len() as u32 {
+                if let Some(c) = self.conn(i) {
+                    c.link.set_deadline_scale(scale);
+                    self.arm_timer(i);
+                }
+            }
         }
         if cmd & CMD_SHED != 0 {
             let lane = Lane(ws.lane.load(Ordering::Acquire));

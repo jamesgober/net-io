@@ -708,6 +708,139 @@ fn groups_into(text: &[u8], out: &mut [u16; 8], mut at: usize, last: bool) -> Op
     Some(at)
 }
 
+/// Writes a v1 header for a proxied TCP connection; returns its length (at most 107).
+/// For a proxy that speaks PROXY to its backends.
+///
+/// ```
+/// let mut out = [0u8; 107];
+/// let n = net_io::encode_v1(
+///     "192.0.2.1:5000".parse().unwrap(),
+///     "192.0.2.2:80".parse().unwrap(),
+///     &mut out,
+/// )?;
+/// assert_eq!(&out[..n], b"PROXY TCP4 192.0.2.1 192.0.2.2 5000 80\r\n");
+/// # Ok::<(), net_io::ProxyError>(())
+/// ```
+///
+/// # Errors
+///
+/// `FamilyMismatch` when the two addresses differ in family, `OutputTooSmall`.
+pub fn encode_v1(
+    source: SocketAddr,
+    destination: SocketAddr,
+    out: &mut [u8],
+) -> Result<usize, ProxyError> {
+    let family = match (source, destination) {
+        (SocketAddr::V4(_), SocketAddr::V4(_)) => "TCP4",
+        (SocketAddr::V6(_), SocketAddr::V6(_)) => "TCP6",
+        _ => return Err(ProxyError::FamilyMismatch),
+    };
+    let line = format!(
+        "PROXY {family} {} {} {} {}\r\n",
+        source.ip(),
+        destination.ip(),
+        source.port(),
+        destination.port()
+    );
+    let need = line.len();
+    let target = out
+        .get_mut(..need)
+        .ok_or(ProxyError::OutputTooSmall { need })?;
+    target.copy_from_slice(line.as_bytes());
+    Ok(need)
+}
+
+/// Writes a v2 header; returns its length. `None` for either address sends `UNSPEC`,
+/// which is what `ProxyCommand::Local` means. `with_crc` adds a CRC32C TLV.
+///
+/// ```
+/// use net_io::{ProxyCommand, ProxyParser, ProxyProgress, ProxyVersions};
+/// let mut out = [0u8; 64];
+/// let n = net_io::encode_v2(
+///     ProxyCommand::Proxy,
+///     Some("192.0.2.1:5000".parse().unwrap()),
+///     Some("192.0.2.2:80".parse().unwrap()),
+///     &[],
+///     true,
+///     &mut out,
+/// )?;
+/// assert!(n > 16);
+/// # Ok::<(), net_io::ProxyError>(())
+/// ```
+///
+/// # Errors
+///
+/// `FamilyMismatch`, `OutputTooSmall`, `V2LengthTooLarge` when it cannot fit 65,535 bytes.
+pub fn encode_v2(
+    command: ProxyCommand,
+    source: Option<SocketAddr>,
+    destination: Option<SocketAddr>,
+    tlvs: &[Tlv<'_>],
+    with_crc: bool,
+    out: &mut [u8],
+) -> Result<usize, ProxyError> {
+    const STREAM: u8 = 1;
+    let (family, address_len) = match (source, destination) {
+        (Some(SocketAddr::V4(_)), Some(SocketAddr::V4(_))) => (0x10 | STREAM, 12),
+        (Some(SocketAddr::V6(_)), Some(SocketAddr::V6(_))) => (0x20 | STREAM, 36),
+        (None, None) => (0, 0),
+        _ => return Err(ProxyError::FamilyMismatch),
+    };
+    let tlv_len: usize = tlvs.iter().map(|t| 3 + t.value.len()).sum();
+    let crc_len = if with_crc { 7 } else { 0 };
+    let body = address_len + tlv_len + crc_len;
+    let declared = u16::try_from(body).map_err(|_| ProxyError::V2LengthTooLarge {
+        declared: u16::MAX,
+        max: u16::MAX,
+    })?;
+    let need = V2_FIXED + body;
+    let frame = out
+        .get_mut(..need)
+        .ok_or(ProxyError::OutputTooSmall { need })?;
+    frame[..12].copy_from_slice(&V2_SIGNATURE);
+    frame[12] = match command {
+        ProxyCommand::Proxy => 0x21,
+        ProxyCommand::Local => 0x20,
+    };
+    frame[13] = family;
+    frame[14..16].copy_from_slice(&declared.to_be_bytes());
+    let mut at = V2_FIXED;
+    match (source, destination) {
+        (Some(SocketAddr::V4(s)), Some(SocketAddr::V4(d))) => {
+            frame[at..at + 4].copy_from_slice(&s.ip().octets());
+            frame[at + 4..at + 8].copy_from_slice(&d.ip().octets());
+            frame[at + 8..at + 10].copy_from_slice(&s.port().to_be_bytes());
+            frame[at + 10..at + 12].copy_from_slice(&d.port().to_be_bytes());
+            at += 12;
+        }
+        (Some(SocketAddr::V6(s)), Some(SocketAddr::V6(d))) => {
+            frame[at..at + 16].copy_from_slice(&s.ip().octets());
+            frame[at + 16..at + 32].copy_from_slice(&d.ip().octets());
+            frame[at + 32..at + 34].copy_from_slice(&s.port().to_be_bytes());
+            frame[at + 34..at + 36].copy_from_slice(&d.port().to_be_bytes());
+            at += 36;
+        }
+        _ => {}
+    }
+    for t in tlvs {
+        let len = t.value.len() as u16;
+        frame[at] = t.kind;
+        frame[at + 1..at + 3].copy_from_slice(&len.to_be_bytes());
+        frame[at + 3..at + 3 + t.value.len()].copy_from_slice(t.value);
+        at += 3 + t.value.len();
+    }
+    if with_crc {
+        frame[at] = TLV_CRC32C;
+        frame[at + 1..at + 3].copy_from_slice(&4u16.to_be_bytes());
+        frame[at + 3..at + 7].fill(0);
+        let mut crc = Crc32c::new();
+        crc.update(frame);
+        let value = crc.finish().to_be_bytes();
+        frame[at + 3..at + 7].copy_from_slice(&value);
+    }
+    Ok(need)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,5 +1300,67 @@ mod tests {
         ] {
             assert_eq!(parse_ipv4(s.as_bytes()).is_some(), ok, "{s}");
         }
+    }
+
+    #[test]
+    fn test_encoders_round_trip_through_the_parser() {
+        let s: SocketAddr = "[2001:db8::1]:5000".parse().unwrap();
+        let d: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+        let mut out = [0u8; 256];
+        let n = encode_v1(s, d, &mut out).unwrap();
+        let mut p = ProxyParser::new(ProxyVersions::Both, 1024);
+        match p.feed(&out[..n]).unwrap() {
+            ProxyProgress::Done { header, consumed } => {
+                assert_eq!(consumed, n);
+                assert_eq!(header.source.and_then(|a| a.socket_addr()), Some(s));
+            }
+            other => panic!("{other:?}"),
+        }
+        let tlv = Tlv {
+            kind: 0x02,
+            value: b"example.com",
+        };
+        let n = encode_v2(
+            ProxyCommand::Proxy,
+            Some(s),
+            Some(d),
+            &[tlv],
+            true,
+            &mut out,
+        )
+        .unwrap();
+        let mut p = ProxyParser::new(ProxyVersions::Both, 1024);
+        match p.feed(&out[..n]).unwrap() {
+            ProxyProgress::Done { header, consumed } => {
+                assert_eq!(consumed, n);
+                assert_eq!(header.source.and_then(|a| a.socket_addr()), Some(s));
+                assert!(header.crc_checked());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encoders_refuse_what_they_cannot_write() {
+        let v4: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let v6: SocketAddr = "[::1]:1".parse().unwrap();
+        let mut small = [0u8; 8];
+        assert_eq!(
+            encode_v1(v4, v6, &mut small),
+            Err(ProxyError::FamilyMismatch)
+        );
+        assert!(matches!(
+            encode_v1(v4, v4, &mut small),
+            Err(ProxyError::OutputTooSmall { .. })
+        ));
+        assert!(matches!(
+            encode_v2(ProxyCommand::Local, None, None, &[], false, &mut small),
+            Err(ProxyError::OutputTooSmall { need: 16 })
+        ));
+        let mut out = [0u8; 16];
+        assert_eq!(
+            encode_v2(ProxyCommand::Local, None, None, &[], false, &mut out),
+            Ok(16)
+        );
     }
 }

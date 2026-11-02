@@ -180,11 +180,13 @@ pub use proxy::{ProxyError, ProxyFacts, ProxyMode, ProxyVersions};
 #[cfg(feature = "proxy")]
 pub use proxy_parse::{
     ProxyAddress, ProxyCommand, ProxyHeader, ProxyParser, ProxyProgress, ProxySsl, ProxyTransport,
-    Tlv, Tlvs,
+    Tlv, Tlvs, encode_v1, encode_v2,
 };
+#[cfg(feature = "udp")]
+pub use server::UdpOnly;
 pub use server::{
-    AdoptSpec, BlockingHandler, DoorState, DrainReport, ListenerSpec, NoGate, NoWork, Server,
-    ServerBuilder, ServerHandle, Sessions, Stats, UdpOnly, Workload,
+    AdoptSpec, BlockingHandler, DoorState, DrainReport, ListenerSpec, NoGate, NoWork, Placement,
+    Server, ServerBuilder, ServerHandle, Sessions, Stats, Workload,
 };
 pub use session::{
     Input, Output, OutputFull, Phase, Session, SessionContext, SessionFactory, Step, SwapError,

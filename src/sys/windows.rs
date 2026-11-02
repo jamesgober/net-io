@@ -269,6 +269,14 @@ const FROM_PROTOCOL_INFO: i32 = -1;
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    fn GetActiveProcessorGroupCount() -> u16;
+    fn GetActiveProcessorCount(group: u16) -> u32;
+    fn GetCurrentThread() -> *mut c_void;
+    fn SetThreadGroupAffinity(
+        thread: *mut c_void,
+        affinity: *const GroupAffinity,
+        previous: *mut GroupAffinity,
+    ) -> i32;
     fn CreateEventW(
         attributes: *const c_void,
         manual: i32,
@@ -654,6 +662,50 @@ pub(crate) fn send_file_refused(e: &io::Error) -> bool {
 /// path relies on.
 pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
+/// Whether this OS can pin a thread.
+pub(crate) const CAN_PIN: bool = true;
+
+/// `GROUP_AFFINITY`.
+#[repr(C)]
+struct GroupAffinity {
+    mask: usize,
+    group: u16,
+    reserved: [u16; 3],
+}
+
+/// Pins the calling thread to the `cpu`th processor, counting across processor groups.
+pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
+    let mut left = cpu;
+    // SAFETY: takes no pointers.
+    let groups = unsafe { GetActiveProcessorGroupCount() };
+    for group in 0..groups {
+        // SAFETY: takes no pointers.
+        let in_group = unsafe { GetActiveProcessorCount(group) } as usize;
+        if left < in_group {
+            let affinity = GroupAffinity {
+                mask: 1usize << left,
+                group,
+                reserved: [0; 3],
+            };
+            // SAFETY: the pseudo handle needs no closing; `affinity` lives for the call,
+            // and the previous-affinity pointer may be null.
+            let ok = unsafe {
+                SetThreadGroupAffinity(
+                    GetCurrentThread(),
+                    &raw const affinity,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+        left -= in_group;
+    }
+    Err(io::Error::from(io::ErrorKind::InvalidInput))
 }
 
 /// `TCP_MAXRT`: how long sent bytes may stay unacknowledged, in whole seconds.

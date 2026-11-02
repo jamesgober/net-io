@@ -96,6 +96,8 @@ pub(crate) struct Link {
     idle_timeout: Duration,
     /// While a PROXY (or TLS) handshake runs: its deadline replaces the phase's.
     handshake_deadline: Option<Instant>,
+    /// What deadlines are multiplied by under pressure (1 otherwise).
+    deadline_scale: f32,
     /// Bytes read past a handshake, served before the socket (the buffer returns
     /// to the worker's pool at close).
     pending: Option<Buffer>,
@@ -216,6 +218,7 @@ impl Link {
             replied: false,
             idle_timeout,
             handshake_deadline: None,
+            deadline_scale: 1.0,
             pending: None,
             pending_at: 0,
             approved: 0,
@@ -660,6 +663,20 @@ impl Link {
         buf[..n].copy_from_slice(&have[..n]);
         self.pending_at = self.pending_at.saturating_add(n);
         n
+    }
+
+    /// Under pressure deadlines shrink by `scale`, never below 1 s.
+    pub(crate) fn set_deadline_scale(&mut self, scale: f32) {
+        self.deadline_scale = scale;
+    }
+
+    pub(crate) fn scaled(&self, d: Duration) -> Duration {
+        if self.deadline_scale >= 1.0 {
+            return d;
+        }
+        d.mul_f32(self.deadline_scale)
+            .max(Duration::from_secs(1))
+            .min(d)
     }
 
     /// This connection's idle timeout from its next idle wait on (`None`: the
@@ -1395,7 +1412,10 @@ impl Link {
     fn read_deadline(&self) -> (Instant, TimeoutKind) {
         match (self.handshake_deadline, self.phase) {
             (Some(d), _) => (d, TimeoutKind::Handshake),
-            (None, Phase::Idle) => (self.progress_at + self.idle_timeout, TimeoutKind::Idle),
+            (None, Phase::Idle) => (
+                self.progress_at + self.scaled(self.idle_timeout),
+                TimeoutKind::Idle,
+            ),
             (None, _) => (
                 self.progress_at + self.limits.read_timeout,
                 TimeoutKind::Read,
