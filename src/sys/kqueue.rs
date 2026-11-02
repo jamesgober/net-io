@@ -26,6 +26,7 @@ const EVFILT_USER: i16 = -10;
 const EVFILT_USER: i16 = -11;
 const EV_ADD: u16 = 0x0001;
 const EV_DELETE: u16 = 0x0002;
+const EV_ENABLE: u16 = 0x0004;
 const EV_CLEAR: u16 = 0x0020;
 const EV_DISPATCH: u16 = 0x0080;
 const EV_EOF: u16 = 0x8000;
@@ -152,7 +153,8 @@ impl WriteArm {
     /// A failure here is the kernel out of memory for a filter: the send waits, and
     /// its write deadline ends the connection.
     pub(crate) fn arm(self, reg: Registered, key: u64) {
-        let flags = EV_ADD | EV_CLEAR | EV_DISPATCH;
+        // Adding again does not enable what the last event disabled.
+        let flags = EV_ADD | EV_ENABLE | EV_CLEAR | EV_DISPATCH;
         let changes = [change(reg.raw() as usize, EVFILT_WRITE, flags, 0, key)];
         // SAFETY: `kq` outlives the driver that holds this and `reg` is registered;
         // one live change, no events asked for.
@@ -322,6 +324,7 @@ mod tests {
         assert_eq!(EV_ADD, libc::EV_ADD);
         assert_eq!(EV_DELETE, libc::EV_DELETE);
         assert_eq!(EV_CLEAR, libc::EV_CLEAR);
+        assert_eq!(EV_ENABLE, libc::EV_ENABLE);
         assert_eq!(EV_DISPATCH, libc::EV_DISPATCH);
         assert_eq!(EV_EOF, libc::EV_EOF);
         assert_eq!(EV_ERROR, libc::EV_ERROR);
@@ -337,9 +340,21 @@ mod tests {
         s.set_nonblocking(true).unwrap();
         let reg = p.add(s.as_fd(), 7).unwrap();
         let mut seen = Vec::new();
-        p.wait(Some(Duration::from_secs(1)), |e| seen.push(e))
+        p.wait(Some(Duration::from_millis(50)), |e| seen.push(e))
             .unwrap();
-        assert!(seen.iter().any(|e| e.key == 7 && e.writable));
+        assert!(!seen.iter().any(|e| e.writable), "nobody asked");
+        // One event per ask, and the second ask works as the first did.
+        for _ in 0..2 {
+            seen.clear();
+            p.write_arm().arm(reg, 7);
+            p.wait(Some(Duration::from_secs(1)), |e| seen.push(e))
+                .unwrap();
+            assert!(seen.iter().any(|e| e.key == 7 && e.writable));
+            seen.clear();
+            p.wait(Some(Duration::from_millis(50)), |e| seen.push(e))
+                .unwrap();
+            assert!(!seen.iter().any(|e| e.writable), "once");
+        }
         seen.clear();
         (&c).write_all(b"hi").unwrap();
         p.wait(Some(Duration::from_secs(1)), |e| seen.push(e))
