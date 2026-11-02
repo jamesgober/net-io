@@ -1,6 +1,8 @@
 //! The server: listeners, workers, the door, drain, and shutdown.
 
 mod engine;
+#[cfg(feature = "reactor")]
+mod reactor;
 mod source;
 
 use std::any::TypeId;
@@ -162,6 +164,8 @@ pub struct ListenerSpec {
     pub(crate) trusted: Option<Arc<TrustedProxies>>,
     pub(crate) tls: bool,
     pub(crate) unix: Option<(PathBuf, LocalOptions)>,
+    #[cfg(all(windows, feature = "local"))]
+    pub(crate) pipe: Option<(String, crate::pipe::PipeOptions)>,
     pub(crate) adopt: Option<ListenerHandle>,
 }
 
@@ -180,6 +184,8 @@ impl ListenerSpec {
             trusted: None,
             tls: false,
             unix: None,
+            #[cfg(all(windows, feature = "local"))]
+            pipe: None,
             adopt: None,
         }
     }
@@ -192,10 +198,28 @@ impl ListenerSpec {
         }
     }
 
-    /// A Unix domain socket listener at `path` (feature `local`, Unix; Windows
-    /// AF_UNIX arrives in `0.5.0`). The socket file gets `options`' mode and
-    /// owner before it listens, and is removed at shutdown if it is still the
-    /// file this server created. Connections carry `Transport::Unix`, the peer's
+    /// A named pipe listener on `\\\\.\\pipe\\<name>` (feature `local`, Windows).
+    /// Remote clients are always rejected, and connections carry `Transport::Pipe`,
+    /// the client's pid, and no IP address: the per-source cap does not apply. With
+    /// `proxy`, every peer is trusted: the pipe's security decides who may connect.
+    ///
+    /// ```no_run
+    /// use net_io::{ListenerSpec, PipeOptions};
+    /// let spec = ListenerSpec::pipe("myapp-control", PipeOptions::new());
+    /// # let _ = spec;
+    /// ```
+    #[cfg(all(windows, feature = "local"))]
+    pub fn pipe(name: &str, options: crate::pipe::PipeOptions) -> ListenerSpec {
+        ListenerSpec {
+            pipe: Some((name.to_owned(), options)),
+            ..ListenerSpec::tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        }
+    }
+
+    /// A Unix domain socket listener at `path` (feature `local`; on Windows, AF_UNIX,
+    /// where NTFS ACLs replace `options`' mode and owner). The socket file gets
+    /// `options`' mode and owner before it listens, and is removed at shutdown if it
+    /// is still the file this server created. Connections carry `Transport::Unix`, the peer's
     /// credentials, and no IP address: the per-source cap does not apply, and a
     /// `BlockingHandler` receives them as a `TcpConnection` whose `peer_addr` is
     /// unspecified. With `proxy`, every peer is trusted: the socket file's
@@ -216,6 +240,8 @@ impl ListenerSpec {
             trusted: None,
             tls: false,
             unix: Some((path.into(), options)),
+            #[cfg(all(windows, feature = "local"))]
+            pipe: None,
             adopt: None,
         }
     }
@@ -245,6 +271,8 @@ impl ListenerSpec {
             trusted: None,
             tls: false,
             unix: None,
+            #[cfg(all(windows, feature = "local"))]
+            pipe: None,
             adopt: Some(handle),
         }
     }
@@ -300,6 +328,13 @@ pub struct NoGate;
 #[derive(Debug)]
 pub struct Sessions<F> {
     pub(crate) factory: F,
+}
+
+#[cfg(feature = "reactor")]
+impl<F> Sessions<F> {
+    pub(crate) fn factory(&self) -> &F {
+        &self.factory
+    }
 }
 
 /// What `ServerBuilder::handler` produces; programs never name it.
@@ -527,17 +562,28 @@ where
     /// `InvalidConfig` (`field` names the method), bind errors, `Unsupported` for a
     /// driver this version does not have.
     pub fn build(self) -> Result<Server, NetError> {
-        let driver = match self.driver.resolve() {
-            DriverKind::Blocking => DriverKind::Blocking,
-            other => {
+        // A handler holds its worker for the whole connection (blocking pool only).
+        let requested = match self.driver {
+            DriverKind::Auto if <W as engine::Serve>::BLOCKING_ONLY => DriverKind::Blocking,
+            other => other,
+        };
+        let driver = match requested.resolve() {
+            DriverKind::Reactor if <W as engine::Serve>::BLOCKING_ONLY => {
+                return Err(invalid("driver", ConfigReason::Inconsistent));
+            }
+            DriverKind::Reactor if !DriverKind::reactor_built() => {
                 return Err(NetError::Unsupported {
-                    feature: match other {
-                        DriverKind::Uring => "the io_uring driver (after 1.0.0)",
-                        _ => "the reactor driver (0.5.0)",
-                    },
+                    feature: "the reactor driver",
                     platform: std::env::consts::OS,
                 });
             }
+            DriverKind::Uring => {
+                return Err(NetError::Unsupported {
+                    feature: "the io_uring driver (after 1.0.0)",
+                    platform: std::env::consts::OS,
+                });
+            }
+            kind => kind,
         };
         if self.listeners.is_empty() {
             return Err(invalid("listener", ConfigReason::Missing));
@@ -545,7 +591,14 @@ where
         if self.listeners.len() > 64 {
             return Err(invalid("listener", ConfigReason::TooLarge { max: 64 }));
         }
-        let workers = self.workers.unwrap_or(128);
+        let workers = self.workers.unwrap_or_else(|| {
+            if driver == DriverKind::Reactor {
+                std::thread::available_parallelism()
+                    .map_or(4, |n| u16::try_from(n.get()).unwrap_or(4096).min(4096))
+            } else {
+                128
+            }
+        });
         if workers == 0 {
             return Err(invalid("workers", ConfigReason::Zero));
         }
@@ -561,12 +614,15 @@ where
                 names.push(n.clone());
             }
         }
-        // On the blocking driver an unset global cap is one connection per worker.
+        // On the blocking driver an unset global cap is one connection per worker;
+        // on the reactor the default, but never more than the descriptors allow.
         let limits = if self.limits.max_connections().is_none() {
-            self.limits
-                .to_builder()
-                .max_connections(u32::from(workers))
-                .build()?
+            let cap = if driver == DriverKind::Reactor {
+                reactor_default_cap(workers)
+            } else {
+                u32::from(workers)
+            };
+            self.limits.to_builder().max_connections(cap).build()?
         } else {
             self.limits.clone()
         };
@@ -593,6 +649,20 @@ where
             wipe: self.wipe,
             clock: self.clock,
         })
+    }
+}
+
+/// The reactor's default global cap: 10,000, less where the process's descriptor
+/// limit would not hold it.
+fn reactor_default_cap(workers: u16) -> u32 {
+    let wanted = 10_000u32;
+    match crate::sys::descriptor_limit() {
+        Some(have) => {
+            let spare = u64::from(workers).saturating_mul(2) + 64;
+            let room = have.saturating_sub(spare).clamp(16, u64::from(wanted));
+            u32::try_from(room).unwrap_or(wanted)
+        }
+        None => wanted,
     }
 }
 
@@ -650,13 +720,9 @@ fn check_spec(
             .adopt
             .as_ref()
             .is_some_and(|h| h.kind() == crate::info::Transport::Unix);
-    if unix && !cfg!(all(unix, feature = "local")) {
+    if unix && !cfg!(feature = "local") {
         return Err(NetError::Unsupported {
-            feature: if cfg!(unix) {
-                "Unix domain sockets (the `local` feature)"
-            } else {
-                "Unix domain sockets on Windows (0.5.0)"
-            },
+            feature: "Unix domain sockets (the `local` feature)",
             platform: std::env::consts::OS,
         });
     }

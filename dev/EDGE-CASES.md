@@ -18,7 +18,7 @@ Test locations: `tests/<file>.rs::<name>`, unit tests as `src/<file>.rs::<name>`
 | 8. Keepalive `ETIMEDOUT`: `Io(TimedOut)` | `shim::test_keepalive_timeout_is_an_io_error_not_a_deadline` (D-080) |
 | 9. Data after our `shutdown(Read)` never delivered | `server::test_kill_ends_a_blocked_handler`, `src/tcp.rs::test_kill_wakes_blocked_recv` |
 | 10. Data while parked read after the wake | `edge::edge_10_bytes_sent_while_parked_are_read_after_the_wake` |
-| 11. Buffer budget exhausted: reading pauses | 0.5. The blocking driver takes each worker's buffers at warm-up and validates the budget at build, so it never runs dry mid-connection; pausing a connection's reads applies to the reactor |
+| 11. Buffer budget exhausted: reading pauses | `reactor::test_buffer_budget_pauses_reading`, `reactor::test_paused_connection_closes_cleanly` (the reactor; the blocking pool takes its buffers at warm-up and validates the budget at build, so it never runs dry mid-connection) |
 | 12. Zero-length `recv` | `edge::edge_12_zero_length_receive_returns_at_once` |
 | 13. 107 bytes without CRLF: `V1TooLong` | `src/proxy_parse.rs::test_v1_too_long` (0.4) |
 | 14. v2 signature split across 12 segments | `src/proxy_parse.rs::test_v2_split_into_segments_waits_then_succeeds`, `src/proxy_parse.rs::prop_every_split_point_agrees` (0.4) |
@@ -75,15 +75,29 @@ Test locations: `tests/<file>.rs::<name>`, unit tests as `src/<file>.rs::<name>`
 
 | Case | Tests |
 |---|---|
-| 53 to 60. Wheel cases | 0.5, with the timing wheel (D-063) |
+| 53 to 60. Wheel cases | `src/wheel.rs`: `test_fires_at_its_tick_and_never_before`, `test_deadline_at_the_current_tick`, `test_deadline_in_the_past`, `test_overflow_fires_across_the_wrap`, `test_many_timers_in_one_slot_are_bounded_by_the_caller`, `test_extended_a_million_times_fires_once`, `test_clock_jump_fires_everything_in_order`, `test_frozen_clock_fires_nothing`, `prop_matches_a_sorted_model` |
 | 61. Tick coarser than a deadline: rejected at build | `src/limits.rs::test_timeout_below_tick_rejected` |
 
 ## IOCP, io_uring, Unix sockets, named pipes, UDP, hand-off (62 to 105)
 
-IOCP (62 to 66), named pipes (86 to 89), and the Windows hand-off (104, 105) ship in 0.5; io_uring (67 to 75) after 1.0 (D-015). Unix sockets, UDP, and the Unix hand-off ship in 0.4:
+io_uring (cases of its own, 71 to 75) after 1.0 (D-015). IOCP, named pipes, and the Windows hand-off shipped in 0.5; Unix sockets, UDP, and the Unix hand-off in 0.4:
 
-| Case | Tests (0.4) |
+| Case | Tests |
 |---|---|
+| 62. `CancelIoEx` returns `ERROR_NOT_FOUND`: success | `src/driver/iocp.rs::test_cancel_completes_once_with_the_buffer` |
+| 63. The operation succeeds after the cancel: its result stands | `src/driver/iocp.rs::test_cancel_after_success_keeps_the_result` |
+| 64. A completion for a reused slot: dropped with its buffer | `src/driver/iocp.rs::test_stale_packet_is_dropped` |
+| 65. A packet with a null `OVERLAPPED`: the wake, nothing else | `src/driver/iocp.rs::test_waker_ends_a_wait` |
+| 66. A client resets before the worker's association: closed quietly, counted | `close_reasons::reason_peer_reset`, on the reactor by default |
+| 67. A socket on exactly one port, never a listener | `src/driver/iocp.rs::test_listener_is_refused` |
+| 68. Zero-byte receive, then the peer had closed: the next receive returns 0 | `src/driver/iocp.rs::test_zero_byte_receive_then_end_of_stream` |
+| 69. Skip mode on and off | every test in `src/driver/iocp.rs` runs both through `both()` |
+| 86. All instances busy: waits within the timeout | `src/pipe.rs::test_instance_cap_makes_a_client_wait` |
+| 87. Next instance made before hand-over | `src/pipe.rs::test_name_in_use_and_next_instance` |
+| 88. Client gone before `ConnectNamedPipe`; `ERROR_PIPE_CONNECTED` is success | `src/pipe.rs::test_client_gone_before_accept`, `test_client_pid_and_credentials` |
+| 89. A backslash in the name: refused before any call | `src/pipe.rs::test_names_are_checked_before_any_call` |
+| 104. Windows blob used twice: refused before `WSASocketW` | `src/handoff.rs::test_a_hand_off_works_once` |
+| 105. A received listener never joins a port | `src/driver/iocp.rs::test_listener_is_refused`, `windows_handoff::handoff_between_processes_refuses_nothing_under_load` |
 | 76. Path exactly at the maximum; one more byte: `PathTooLong` | `src/local.rs::test_longest_path_binds_and_non_sockets_stay`, `src/local.rs::test_path_checks` |
 | 77. NUL in the path: rejected | `src/local.rs::test_path_checks` (`InvalidConfig { reason: Malformed }`, D-095) |
 | 78. Stale socket file: removed, bind succeeds | `src/local.rs::test_stale_socket_removed_live_one_refused` |

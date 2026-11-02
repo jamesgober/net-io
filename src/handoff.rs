@@ -1,8 +1,9 @@
 //! Listener hand-off between processes, and the owned listener handle that
 //! inheritance, hand-off, and `Server::release_listeners` produce.
 //!
-//! `send_listeners` and `recv_listeners` are Unix (feature `local`); Windows
-//! follows in `0.5.0`. `ListenerHandle` and the error type exist in every build.
+//! `send_listeners` and `recv_listeners` are Unix (feature `local`);
+//! `share_listeners` and `receive_shared` are their Windows counterparts. A
+//! `ListenerHandle` and the error type exist in every build.
 //!
 //! Manifest, version 1 (big-endian integers):
 //!
@@ -13,9 +14,12 @@
 //!                  Unix: the path bytes)
 //!  CRC32C of everything before it (u32)
 //! ```
+//!
+//! On Windows the manifest is followed by a 16-byte nonce, one 628-byte
+//! `WSAPROTOCOL_INFOW` per listener, and a CRC32C of those.
 
-// The manifest is read and written only by the Unix hand-off functions.
-#![cfg_attr(not(all(unix, feature = "local")), allow(dead_code))]
+// The manifest is read and written only by the hand-off functions.
+#![cfg_attr(not(feature = "local"), allow(dead_code))]
 
 use std::fmt;
 use std::io;
@@ -113,6 +117,7 @@ pub struct ListenerHandle {
 impl ListenerHandle {
     /// Verifies `sock` (a listening stream socket of a family net-io serves) and
     /// records its endpoint.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn verified(
         sock: sys::OwnedSock,
         name: Option<String>,
@@ -522,7 +527,7 @@ fn receive(
     Ok((records, fds))
 }
 
-#[cfg(all(unix, feature = "local"))]
+#[cfg(feature = "local")]
 fn handoff_error(e: crate::error::NetError) -> HandoffError {
     use crate::error::NetError;
     match e {
@@ -540,6 +545,198 @@ fn why(e: &KindError) -> &'static str {
         KindError::WrongKind => "not a TCP or Unix stream listener",
         KindError::Os(_) => "could not be inspected",
     }
+}
+
+/// Listeners described for one process, ready to go over a pipe once.
+///
+/// ```no_run
+/// use net_io::{PipeConnection, share_listeners};
+/// # fn f(handles: Vec<net_io::ListenerHandle>, pid: u32, mut pipe: PipeConnection)
+/// #     -> Result<(), net_io::HandoffError> {
+/// let shared = share_listeners(&handles.iter().collect::<Vec<_>>(), pid)?;
+/// shared.write_to(&mut pipe)?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(all(windows, feature = "local"))]
+#[cfg_attr(docsrs, doc(cfg(windows)))]
+pub struct SharedListeners {
+    frame: Vec<u8>,
+}
+
+#[cfg(all(windows, feature = "local"))]
+impl std::fmt::Debug for SharedListeners {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedListeners").finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(windows, feature = "local"))]
+const NONCE: usize = 16;
+
+/// Nonces this process has accepted. Windows lets a description be used twice and
+/// returns the same socket; this makes it once.
+#[cfg(all(windows, feature = "local"))]
+static ACCEPTED: std::sync::Mutex<Vec<[u8; NONCE]>> = std::sync::Mutex::new(Vec::new());
+
+/// Describes `listeners` for the process `target_pid`. Each description works in that
+/// process alone. Send them over a pipe with an owner-only security descriptor, which
+/// is what [`PipeListener::create`](crate::PipeListener::create) makes.
+///
+/// # Errors
+///
+/// `TooMany`, `VerifyFailed`, `Os`.
+#[cfg(all(windows, feature = "local"))]
+#[cfg_attr(docsrs, doc(cfg(windows)))]
+pub fn share_listeners(
+    listeners: &[&ListenerHandle],
+    target_pid: u32,
+) -> Result<SharedListeners, HandoffError> {
+    use std::os::windows::io::AsSocket;
+    if listeners.len() > MAX_LISTENERS {
+        return Err(HandoffError::TooMany {
+            max: MAX_LISTENERS as u8,
+        });
+    }
+    let mut records = Vec::with_capacity(listeners.len());
+    let mut tail = vec![0u8; NONCE];
+    sys::random_bytes(&mut tail).map_err(HandoffError::Os)?;
+    for (i, l) in listeners.iter().enumerate() {
+        let kind = sys::listener_kind(l.as_socket()).map_err(|e| HandoffError::VerifyFailed {
+            index: i as u8,
+            why: why(&e),
+        })?;
+        records.push(Record {
+            kind,
+            name: l.name.clone(),
+        });
+        let blob = sys::share_socket(l.as_socket(), target_pid).map_err(HandoffError::Os)?;
+        tail.extend_from_slice(&blob);
+    }
+    let mut crc = crate::crc32c::Crc32c::new();
+    crc.update(&tail);
+    let check = crc.finish().to_be_bytes();
+    let mut frame = encode(&records);
+    frame.extend_from_slice(&tail);
+    frame.extend_from_slice(&check);
+    Ok(SharedListeners { frame })
+}
+
+#[cfg(all(windows, feature = "local"))]
+impl SharedListeners {
+    /// Sends the listeners; consumed, so they go once.
+    ///
+    /// # Errors
+    ///
+    /// `Timeout`, `Truncated`, `Os`.
+    pub fn write_to(self, pipe: &mut crate::pipe::PipeConnection) -> Result<(), HandoffError> {
+        pipe.send_all(&self.frame).map_err(handoff_error)
+    }
+}
+
+/// Receives listeners sent with [`SharedListeners::write_to`]. The process at the
+/// far end must be `expect.pid` when that is set; `expect.uid` has no meaning here,
+/// since the pipe's security descriptor decides who gets to the pipe. The message
+/// must be intact and never seen before, and every socket a listener bound to the
+/// address the manifest names. All or nothing: on any error every received socket
+/// is closed.
+///
+/// # Errors
+///
+/// `PeerMismatch`, `Timeout`, `Truncated`, `BadMagic`, `BadVersion`, `BadChecksum`,
+/// `TooMany`, `VerifyFailed` (also for a message accepted before), `Os`.
+#[cfg(all(windows, feature = "local"))]
+#[cfg_attr(docsrs, doc(cfg(windows)))]
+pub fn receive_shared(
+    pipe: &mut crate::pipe::PipeConnection,
+    expect: &HandoffPeer,
+    deadline: std::time::Instant,
+) -> Result<Vec<ListenerHandle>, HandoffError> {
+    let peer = pipe.peer_pid().map_err(|_| HandoffError::PeerMismatch)?;
+    if expect.pid.is_some_and(|p| p != peer) {
+        return Err(HandoffError::PeerMismatch);
+    }
+    pipe.set_phase(crate::session::Phase::Receiving);
+    pipe.set_exchange_deadline(Some(deadline));
+    let result = read_shared(pipe);
+    pipe.set_exchange_deadline(None);
+    let (records, tail) = result?;
+    let (nonce, blobs) = tail.split_at(NONCE);
+    let nonce: [u8; NONCE] = nonce.try_into().map_err(|_| HandoffError::Truncated)?;
+    adopt_shared(records, nonce, blobs)
+}
+
+#[cfg(all(windows, feature = "local"))]
+fn read_shared(
+    pipe: &mut crate::pipe::PipeConnection,
+) -> Result<(Vec<Record>, Vec<u8>), HandoffError> {
+    let mut header = [0u8; HEADER];
+    pipe.recv_exact(&mut header).map_err(handoff_error)?;
+    let (count, total) = parse_header(&header)?;
+    let mut manifest = vec![0u8; total];
+    manifest[..HEADER].copy_from_slice(&header);
+    pipe.recv_exact(&mut manifest[HEADER..])
+        .map_err(handoff_error)?;
+    let records = decode(&manifest)?;
+    let mut tail = vec![0u8; NONCE + count * sys::SHARED_SOCKET + 4];
+    pipe.recv_exact(&mut tail).map_err(handoff_error)?;
+    let check_at = tail.len() - 4;
+    let mut crc = crate::crc32c::Crc32c::new();
+    crc.update(&tail[..check_at]);
+    if crc.finish().to_be_bytes() != tail[check_at..] {
+        return Err(HandoffError::BadChecksum);
+    }
+    tail.truncate(check_at);
+    Ok((records, tail))
+}
+
+#[cfg(all(windows, feature = "local"))]
+fn adopt_shared(
+    records: Vec<Record>,
+    nonce: [u8; NONCE],
+    blobs: &[u8],
+) -> Result<Vec<ListenerHandle>, HandoffError> {
+    {
+        let mut seen = ACCEPTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.contains(&nonce) {
+            return Err(HandoffError::VerifyFailed {
+                index: 0,
+                why: "this hand-off was already accepted",
+            });
+        }
+        seen.push(nonce);
+    }
+    let mut handles = Vec::with_capacity(records.len());
+    for (i, (record, blob)) in records
+        .into_iter()
+        .zip(blobs.chunks_exact(sys::SHARED_SOCKET))
+        .enumerate()
+    {
+        let index = i as u8;
+        let blob: &[u8; sys::SHARED_SOCKET] =
+            blob.try_into().map_err(|_| HandoffError::Truncated)?;
+        let sock = sys::socket_from_shared(blob).map_err(HandoffError::Os)?;
+        let got = sys::listener_kind(sys::AsSock::sock(&sock)).map_err(|e| {
+            HandoffError::VerifyFailed {
+                index,
+                why: why(&e),
+            }
+        })?;
+        if got != record.kind {
+            return Err(HandoffError::VerifyFailed {
+                index,
+                why: "bound to another address than the manifest says",
+            });
+        }
+        let (kind, local) = endpoint_of(got).map_err(|e| HandoffError::VerifyFailed {
+            index,
+            why: why(&e),
+        })?;
+        handles.push(ListenerHandle::new(kind, record.name, local, sock));
+    }
+    Ok(handles)
 }
 
 #[cfg(test)]
@@ -727,6 +924,85 @@ mod tests {
         assert!(matches!(
             ListenerHandle::verified(sys::OwnedSock::from(u), None),
             Err(KindError::WrongKind)
+        ));
+    }
+
+    /// Edge case 104: the same message twice is refused before any `WSASocketW`.
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_a_hand_off_works_once() {
+        use std::net::TcpListener as Std;
+        use std::time::{Duration, Instant};
+        let std = Std::bind("127.0.0.1:0").unwrap();
+        let addr = std.local_addr().unwrap();
+        let handle =
+            ListenerHandle::verified(sys::OwnedSock::from(std), Some("a".to_owned())).unwrap();
+        let name = format!("net-io-handoff-{}", std::process::id());
+        let listener = crate::pipe::PipeListener::create(&name).unwrap();
+        let mut tx = crate::pipe::PipeConnection::connect(&name, Duration::from_secs(1)).unwrap();
+        let (mut rx, _) = listener.accept().unwrap();
+        let shared = share_listeners(&[&handle], std::process::id()).unwrap();
+        let frame = shared.frame.clone();
+        tx.send_all(&frame).unwrap();
+        tx.send_all(&frame).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let peer = HandoffPeer {
+            uid: None,
+            pid: Some(std::process::id()),
+        };
+        let got = receive_shared(&mut rx, &peer, until).unwrap();
+        assert_eq!(got[0].name(), Some("a"));
+        assert_eq!(got[0].local().socket_addr(), Some(addr));
+        assert!(matches!(
+            receive_shared(&mut rx, &peer, until),
+            Err(HandoffError::VerifyFailed { .. })
+        ));
+    }
+
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_wrong_peer_and_bad_checksum() {
+        use std::net::TcpListener as Std;
+        use std::time::{Duration, Instant};
+        let std = Std::bind("127.0.0.1:0").unwrap();
+        let handle = ListenerHandle::verified(sys::OwnedSock::from(std), None).unwrap();
+        let name = format!("net-io-handoff-b-{}", std::process::id());
+        let listener = crate::pipe::PipeListener::create(&name).unwrap();
+        let mut tx = crate::pipe::PipeConnection::connect(&name, Duration::from_secs(1)).unwrap();
+        let (mut rx, _) = listener.accept().unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let wrong = HandoffPeer {
+            uid: None,
+            pid: Some(1),
+        };
+        assert!(matches!(
+            receive_shared(&mut rx, &wrong, until),
+            Err(HandoffError::PeerMismatch)
+        ));
+        let mut frame = share_listeners(&[&handle], std::process::id())
+            .unwrap()
+            .frame;
+        let last = frame.len() - 1;
+        frame[last] ^= 1;
+        tx.send_all(&frame).unwrap();
+        assert!(matches!(
+            receive_shared(&mut rx, &HandoffPeer::default(), until),
+            Err(HandoffError::BadChecksum)
+        ));
+    }
+
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_nothing_arrives_by_the_deadline() {
+        use std::time::{Duration, Instant};
+        let name = format!("net-io-handoff-c-{}", std::process::id());
+        let listener = crate::pipe::PipeListener::create(&name).unwrap();
+        let _tx = crate::pipe::PipeConnection::connect(&name, Duration::from_secs(1)).unwrap();
+        let (mut rx, _) = listener.accept().unwrap();
+        let until = Instant::now() + Duration::from_millis(50);
+        assert!(matches!(
+            receive_shared(&mut rx, &HandoffPeer::default(), until),
+            Err(HandoffError::Timeout)
         ));
     }
 }

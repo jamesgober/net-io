@@ -350,8 +350,8 @@ impl ConnectionInfo {
         )
     }
 
-    /// A connection on a Unix domain socket.
-    #[cfg(all(unix, feature = "local"))]
+    /// A connection on a Unix domain socket or a named pipe.
+    #[cfg(feature = "local")]
     pub(crate) fn new_unix(
         id: ConnectionId,
         listener: Option<ListenerId>,

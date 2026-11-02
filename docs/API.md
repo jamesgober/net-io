@@ -1,7 +1,7 @@
 # net-io - API Reference
 
 > Reference for every public item in `net-io`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.2.0` (design lock; no functional code yet).** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; items marked with a later version than the current release are specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.5.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; items marked with a later version than the current release are specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -127,7 +127,7 @@ Every cost is a target. Numbers marked **[est.]** are estimates that a benchmark
 | Windows | 10 1809 / Server 2019 (AF_UNIX from 1803, `TCP_KEEPIDLE` and `TCP_KEEPINTVL` from 1709, `TCP_KEEPCNT` from 1703) | `Unsupported`; keepalive falls back to `SIO_KEEPALIVE_VALS` |
 | FreeBSD | 13 (in CI from `0.5.0`) | `Unsupported` |
 
-Targets with hand-written OS declarations: `x86_64` and `aarch64` on `linux-gnu`, `linux-musl`, `apple-darwin`, `unknown-freebsd`, `pc-windows-msvc`, `pc-windows-gnu`. On any other target the crate builds the blocking driver over `std` alone and returns `Unsupported` for options and features `std` lacks.
+Targets with hand-written OS declarations: `x86_64` and `aarch64` on `linux-gnu`, `linux-musl`, `apple-darwin`, `unknown-freebsd`, `pc-windows-msvc`, `pc-windows-gnu`. On any other target the crate stops at a compile error that says so; the std-only fallback arrives in `0.6.0` (D-119).
 
 Items that exist on one platform family only carry `#[cfg(unix)]` or `#[cfg(windows)]` in their signature. Each such item has a documented counterpart or a documented reason why there is none (see `docs/PLATFORM-NOTES.md`, from `0.3.0`).
 
@@ -844,7 +844,7 @@ P0, Tier 2, `0.3.0` (`Ip`, `Tcp`, `Accepted`, `Dialed`), `0.4.0` (the rest).
 pub struct PeerCredentials { pub pid: Option<u32>, pub uid: Option<u32>, pub gid: Option<u32> }
 ```
 
-Who is on the other end of a local socket, read once at accept: `SO_PEERCRED` (Linux), `getpeereid` plus `LOCAL_PEERPID` (macOS), `getpeereid` and `LOCAL_PEERCRED` (FreeBSD), `SIO_AF_UNIX_GETPEERPID` (Windows AF_UNIX, pid only), `GetNamedPipeClientProcessId` (named pipes, pid only). A field the platform cannot report is `None`. P1, Tier 2, `0.4.0` (Unix), `0.5.0` (Windows).
+Who is on the other end of a local socket, read once at accept: `SO_PEERCRED` (Linux), `getpeereid` plus `LOCAL_PEERPID` (macOS), `getpeereid` plus `LOCAL_PEERCRED` (FreeBSD), `SIO_AF_UNIX_GETPEERPID` (Windows AF_UNIX, pid only), `GetNamedPipeClientProcessId` (named pipes, pid only). A field the platform cannot report is `None`. P1, Tier 2, `0.4.0` (Unix), `0.5.0` (Windows).
 
 ---
 
@@ -1614,7 +1614,7 @@ impl ListenerSpec {
 
 One listener of a server. P0, Tier 2, `0.3.0` unless marked.
 
-`unix` (feature `local`, Unix; Windows AF_UNIX in `0.5.0`, `Unsupported` until then) binds as `UnixListener::bind_with` at `build` and removes its file at shutdown only if it is still the one it created. Its connections carry `Transport::Unix`, the peer's credentials, and no IP address, so the per-source cap does not apply; `require_uid` refusals count as `RefusalCause::Credentials`. A `BlockingHandler` receives them as a `TcpConnection` (`info().transport` is `Unix`, `peer_addr` is unspecified, socket options fail). With `proxy`, every peer is trusted and no trusted list is needed: the socket file's mode decides who may connect (decision D-093). A name longer than 64 bytes, or a repeated name, fails `build` with `InvalidConfig { field: "name" }`.
+`unix` (feature `local`; on Windows, AF_UNIX) binds as `UnixListener::bind_with` at `build` and removes its file at shutdown only if it is still the one it created. Its connections carry `Transport::Unix`, the peer's credentials, and no IP address, so the per-source cap does not apply; `require_uid` refusals count as `RefusalCause::Credentials`. A `BlockingHandler` receives them as a `TcpConnection` (`info().transport` is `Unix`, `peer_addr` is unspecified, socket options fail). With `proxy`, every peer is trusted and no trusted list is needed: the socket file's mode decides who may connect (decision D-093). A name longer than 64 bytes, or a repeated name, fails `build` with `InvalidConfig { field: "name" }`.
 
 ### `Server`
 
@@ -2156,7 +2156,7 @@ P0, Tier 2, `0.3.0`.
 | Version | `0.3.0` | `0.5.0` | after `1.0.0` (P3, feature `uring`) |
 | Threads | `workers` (default 128, 256 KiB stacks) plus one accept thread per listener | one per logical CPU by default, each with its own epoll, kqueue, or IOCP port | one per CPU, one ring each |
 | Connections per worker | one at a time | thousands | thousands |
-| Idle connection memory | a parked thread's stack pages | connection state only (target under 512 B), no read buffer (IOCP: zero-byte receives) | connection state, shared provided buffers |
+| Idle connection memory | a parked thread's stack pages | connection state only (848 B in the slab, about 1.8 KiB of heap with its bookkeeping), no read buffer (IOCP: zero-byte receives) | connection state, shared provided buffers |
 | Best for | tens to low thousands of concurrent connections; shared hosting; development; CI; a first deployment behind a reverse proxy | thousands to hundreds of thousands, many idle keep-alive or WebSocket connections | highest throughput with large batches on Linux hosts that permit io_uring |
 
 `Auto` picks the reactor where it is built and available, otherwise the blocking pool. `Uring` falls back to epoll when `io_uring_setup` fails (`EPERM`, `ENOSYS`, seccomp, `kernel.io_uring_disabled`) and emits `DriverFallback`; it is never the default (decision D-015).
@@ -2179,13 +2179,13 @@ pub trait Driver: Send {
     Receive { token: Token, buffer: Buffer },
     ReceiveZero { token: Token },                              // IOCP readiness for idle connections
     Send { token: Token, chunks: SendChunks },
-    SendFile { token: Token, file: Arc<File>, offset: u64, len: u32 },
+    SendFile { token: Token, file: Arc<File>, offset: u64, len: u32 },         // 0.6.0, with send_file
     Connect { token: Token, addr: SocketAddr },
     Close { token: Token, abortive: bool },
     Nop { token: Token },
 }
-#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum OperationKind { Accept, Receive, Send, SendFile, Connect, Close, Nop }
-#[non_exhaustive] pub struct Completion { pub token: Token, pub kind: OperationKind, pub result: Result<usize, OsErrorClass>, pub buffer: Option<Buffer> }
+#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum OperationKind { Accept, Receive, Send, Connect, Close, Nop }   // SendFile with send_file, 0.6.0
+#[non_exhaustive] pub struct Completion { pub token: Token, pub kind: OperationKind, pub result: Result<usize, OsErrorClass>, pub buffer: Option<Buffer>, pub chunks: Option<SendChunks> }
 pub struct Completions { /* fixed capacity, 256 entries; wait never allocates */ }
 pub struct SendChunks { /* up to 64 chunks: pool buffers, &'static slices; taken from Output */ }
 pub struct Rejected { pub operation: Operation }
@@ -2195,7 +2195,11 @@ impl DriverWaker { pub fn wake(&self); }
 #[cfg(windows)] pub type BorrowedSocket<'a> = std::os::windows::io::BorrowedSocket<'a>;
 ```
 
-Completion-shaped (decision D-005): operations own their buffers until the completion returns them, which is what IOCP and io_uring need; epoll and kqueue adapt by doing the non-blocking call when readiness arrives. Cancellation always ends in exactly one completion. P2, Tier 3, `0.5.0`.
+```rust
+#[cfg(feature = "reactor")] pub fn new_reactor_driver(capacity: usize) -> Result<Box<dyn Driver>, NetError>;
+```
+
+Completion-shaped (decision D-005): operations own their buffers until the completion returns them, which is what IOCP and io_uring need; epoll and kqueue adapt by doing the non-blocking call when readiness arrives. Cancellation always ends in exactly one completion. A token's low 32 bits index a table the driver keeps, so keep them small and dense, and put a generation in the high 32 bits to catch a completion for a slot that moved on. On Windows a listener cannot be registered (D-016) and `Accept` is refused. P2, Tier 3, `0.5.0`.
 
 ---
 
@@ -2371,7 +2375,7 @@ impl LocalOptions {
 | `UnixConnection::connect` | blocking connect; a full backlog waits up to 10 s (`SO_SNDTIMEO`); no socket at the path and a socket nobody listens on are both `NotFound` (decision D-092) | `NotFound`, `PermissionDenied`, `TimedOut { kind: Connect }`, `PathTooLong` | P1 | 1 | `0.4.0` |
 | `peer_credentials` | see [`PeerCredentials`](#peercredentials) | `Unsupported` | P1 | 2 | `0.4.0` (Windows `0.5.0`) |
 | `send_descriptors`, `recv_descriptors` | `SCM_RIGHTS`, at most 64 descriptors per message, attached to the first byte of a non-empty body that is sent in full (one gate check for the body); received through the connection's normal read path (deadlines, kill, drain), close-on-exec (`MSG_CMSG_CLOEXEC` on Linux; on macOS `FD_CLOEXEC` right after the receive, so a `fork` plus `exec` on another thread in between can inherit one); a truncated control message (`MSG_CTRUNC`) closes every descriptor received and fails the connection, since its bytes can no longer be framed (decision D-094); on a TLS connection both are `Unsupported` | `Handoff(Truncated)`, `InvalidConfig` (empty body, more than 64), `Unsupported`, `Os` | P0 | 3 | `0.4.0` |
-| Windows AF_UNIX | `UnixListener` and `UnixConnection` on Windows 10 1803+: stream sockets only, no descriptor passing; permissions are NTFS ACLs; the socket file is deleted with `DeleteFileW` before rebinding | `Unsupported` on older Windows | P2 | 2 | `0.5.0` |
+| Windows AF_UNIX | `UnixListener` (`bind`, `bind_with`, `accept`, `accept_timeout`) and `UnixConnection` on Windows 10 1803+: stream sockets only, no descriptor passing, no `bind_atomic`; permissions are NTFS ACLs, and the mode, owner, group, and `require_uid` options are refused; a socket file nobody listens on is deleted before rebinding | `Unsupported` on older Windows or for those options | P2 | 2 | `0.5.0` |
 | `bind_abstract` | Linux abstract namespace; refused unless `require_uid` is set, because no file permission protects it | `InvalidConfig { field: "require_uid", reason: Missing }` | P3 | 3 | after `1.0.0` |
 
 The default mode is `0600` (decision D-024): only the owner can connect; `group_access` opens it to one group. Keep sockets in a private directory (`0750`) as well.
@@ -2751,7 +2755,7 @@ pub enum HandoffError {
 |---|---|---|---|---|
 | `ListenerHandle` | owned, move-only; dropping it closes the socket | P0 | 3 | `0.4.0` |
 | `send_listeners`, `recv_listeners` | one message carrying up to 64 descriptors (`SCM_RIGHTS`, attached to its first byte) and a manifest: magic `NIOH`, version 1, count, total length, per listener its kind, name (at most 64 bytes, cut at a character boundary), and local address, then a CRC32C of everything before it. The receiver checks the sender's credentials against `expect` (default: same uid) before reading, reads under `deadline`, receives close-on-exec, fails on a truncated control message or a sender that closes mid-message, refuses descriptors on any later read, checks magic, version, checksum, and count, and verifies every descriptor (`SO_TYPE`, `SO_ACCEPTCONN`, `getsockname` equals the manifest address). Any failure closes every received descriptor and returns the error: all or nothing (decision D-099) | P0 | 3 | `0.4.0` |
-| `share_listeners`, `receive_shared` | Windows: `WSADuplicateSocketW` per socket for one target pid (each blob works once, in that process only), sent with a random nonce over a named pipe with an owner-only security descriptor; the receiver checks `GetNamedPipeClientProcessId`, refuses a nonce it already accepted, creates each socket with `WSASocketW(FROM_PROTOCOL_INFO, WSA_FLAG_OVERLAPPED)`, and verifies it | P0 | 3 | `0.5.0` |
+| `share_listeners`, `receive_shared` | Windows: `WSADuplicateSocketW` per socket for one target pid (each blob works once, in that process only), sent with a random nonce over a named pipe with an owner-only security descriptor; the receiver checks the process at the far end of the pipe against `expect.pid`, refuses a nonce it already accepted, creates each socket with `WSASocketW(FROM_PROTOCOL_INFO, WSA_FLAG_OVERLAPPED)`, and verifies it | P0 | 3 | `0.5.0` |
 | `HandoffPeer`, `HandoffError` | | P0 | 3 | `0.4.0` |
 
 Keep the channel's socket in a private directory (`0700`). Cost: under 1 ms per hand-off [est.].

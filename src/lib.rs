@@ -45,10 +45,12 @@
 //!
 //! ## Status
 //!
-//! `0.4.0`: TCP, Unix domain sockets, and UDP on the blocking driver (Linux,
-//! macOS, Windows; Unix sockets and hand-off on Unix), the PROXY protocol, the
-//! TLS seam on listeners, systemd and FastCGI inheritance, and listener
-//! hand-off. The reactor and Windows named pipes arrive in `0.5.0`.
+//! `0.5.0`: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
+//! Linux, macOS, FreeBSD, and Windows. TCP, Unix domain sockets (AF_UNIX on
+//! Windows), Windows named pipes, and UDP; the PROXY protocol, the TLS seam,
+//! systemd and FastCGI inheritance, listener hand-off on Unix and Windows, and
+//! the public [`Driver`] interface. Performance work and the remaining P2 items
+//! come in `0.6.0`.
 
 #![doc(html_root_url = "https://docs.rs/net-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -87,7 +89,11 @@ mod limits;
 mod link;
 #[cfg(feature = "local")]
 mod local;
+#[cfg(all(windows, feature = "local"))]
+mod local_windows;
 mod opts;
+#[cfg(all(windows, feature = "local"))]
+mod pipe;
 mod proxy;
 #[cfg(feature = "proxy")]
 mod proxy_parse;
@@ -103,6 +109,8 @@ mod tls;
 mod trusted;
 #[cfg(feature = "udp")]
 mod udp;
+#[cfg_attr(not(test), allow(dead_code))]
+mod wheel;
 
 /// Entry points for net-io's fuzz targets (`fuzz/`), compiled only under
 /// cargo-fuzz (`--cfg fuzzing`). Not part of the public API and not covered by semver.
@@ -134,7 +142,12 @@ pub use addr::{AddrError, Cidr, PrefixKey, PrefixPolicy, normalize, normalize_so
 pub use buf::{Buffer, BufferPool, PoolStats};
 pub use completer::{Completer, PostError};
 pub use control::{ControlLine, ControlState, NoControl, SimpleControl};
-pub use driver::DriverKind;
+#[cfg(feature = "reactor")]
+pub use driver::new_reactor_driver;
+pub use driver::{
+    BorrowedSocket, Completion, Completions, Driver, DriverKind, DriverWaker, Operation,
+    OperationKind, Rejected, SendChunks, Token,
+};
 pub use error::{
     CloseReason, ConfigReason, Direction, ErrorClass, KillReason, LimitKind, NetError,
     OsErrorClass, RefusalCause, TimeoutKind,
@@ -142,6 +155,8 @@ pub use error::{
 pub use events::{CoalescedKind, Event, EventSink, NoopSink};
 pub use gate::{AdmitStage, Admitted, AllowAll, Denial, Gate, KillHandle, Refusal, WriteCheck};
 pub use handoff::{HandoffError, HandoffPeer, ListenerHandle};
+#[cfg(all(windows, feature = "local"))]
+pub use handoff::{SharedListeners, receive_shared, share_listeners};
 #[cfg(all(unix, feature = "local"))]
 pub use handoff::{recv_listeners, send_listeners};
 pub use id::{ConnectionId, ListenerId, WorkerId};
@@ -156,7 +171,11 @@ pub use limits::{Limits, LimitsBuilder, MinRate, Pressure, SizeClass};
 pub use local::{Descriptors, UnixConnection, UnixListener};
 #[cfg(feature = "local")]
 pub use local::{LocalConnection, LocalListener};
+#[cfg(all(windows, feature = "local"))]
+pub use local_windows::{UnixConnection, UnixListener};
 pub use opts::{Keepalive, Linger, ListenOptions, LocalOptions, SocketOptions, TcpOptions};
+#[cfg(all(windows, feature = "local"))]
+pub use pipe::{PipeConnection, PipeListener, PipeOptions, PipeSecurity};
 pub use proxy::{ProxyError, ProxyFacts, ProxyMode, ProxyVersions};
 #[cfg(feature = "proxy")]
 pub use proxy_parse::{
@@ -312,8 +331,8 @@ where
 
 /// Opens a local IPC listener: on Unix, a Unix domain socket at the path `name`
 /// with mode `0600` (only the owner may connect; [`LocalOptions`] and
-/// `UnixListener::bind_with` for more). On Windows, named pipes arrive in
-/// `0.5.0`; until then this returns `Unsupported`.
+/// `UnixListener::bind_with` for more). On Windows, the named pipe
+/// `\\\\.\\pipe\\<name>`, owner only, remote clients rejected.
 ///
 /// # Errors
 ///

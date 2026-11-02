@@ -47,6 +47,14 @@ pub(crate) struct Acceptor {
 }
 
 impl Acceptor {
+    /// Backs off for a resource shortage seen outside `accept`.
+    #[cfg(all(windows, feature = "local"))]
+    pub(crate) fn pause(&mut self) -> Accepted<()> {
+        let d = self.backoff;
+        self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+        Accepted::Pause(d)
+    }
+
     pub(crate) fn new() -> Acceptor {
         Acceptor {
             #[cfg(unix)]
@@ -76,6 +84,23 @@ impl Acceptor {
                 Accepted::Conn((stream, crate::addr::normalize_socket(peer)))
             }
             Err(e) => self.failed(e, |a| a.shed_one(listener)),
+        }
+    }
+
+    /// One accept on an AF_UNIX listener on Windows.
+    #[cfg(all(windows, feature = "local"))]
+    pub(crate) fn accept_af_unix(&mut self, listener: &TcpListener) -> Accepted<TcpStream> {
+        let accepted = sys::unix_accept(listener.sock()).and_then(|s| {
+            let stream = TcpStream::from(s);
+            stream.set_nonblocking(true)?;
+            Ok(stream)
+        });
+        match accepted {
+            Ok(stream) => {
+                self.backoff = BACKOFF_START;
+                Accepted::Conn(stream)
+            }
+            Err(e) => self.failed(e, |_| {}),
         }
     }
 

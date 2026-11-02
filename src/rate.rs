@@ -4,35 +4,40 @@ use std::time::{Duration, Instant};
 
 use crate::limits::MinRate;
 
-const MAX_BUCKETS: usize = 64;
+/// The default window takes ten one-second buckets; a longer one widens its
+/// buckets, so an idle connection stays small.
+const MAX_BUCKETS: usize = 10;
 
 /// Bytes moved in one direction over a sliding window of `check`-wide buckets.
 ///
 /// A slowloris client sends one byte every few seconds, which passes any
-/// per-read timeout; this does not let it pass.
+/// per-read timeout; this does not let it pass. The settings stay with the
+/// limits, shared by every connection that has them.
 #[derive(Debug, Clone)]
 pub(crate) struct Rate {
-    cfg: MinRate,
     width: Duration,
     n: usize,
-    buckets: [u64; MAX_BUCKETS],
+    buckets: [u32; MAX_BUCKETS],
     base: Instant,
     head: u64,
     since: Option<Instant>,
 }
 
 impl Rate {
-    pub(crate) fn new(cfg: MinRate, now: Instant) -> Rate {
-        let width = if cfg.check.is_zero() {
+    pub(crate) fn new(cfg: &MinRate, now: Instant) -> Rate {
+        let mut width = if cfg.check.is_zero() {
             Duration::from_secs(1)
         } else {
             cfg.check
         };
+        let want = cfg.window.as_nanos() / width.as_nanos().max(1);
+        if want > MAX_BUCKETS as u128 {
+            width = cfg.window / MAX_BUCKETS as u32;
+        }
         let n = usize::try_from(cfg.window.as_nanos() / width.as_nanos().max(1))
             .unwrap_or(MAX_BUCKETS)
             .clamp(1, MAX_BUCKETS);
         Rate {
-            cfg,
             width,
             n,
             buckets: [0; MAX_BUCKETS],
@@ -57,8 +62,8 @@ impl Rate {
         self.since = None;
     }
 
-    pub(crate) fn is_active(&self) -> bool {
-        self.since.is_some() && !self.cfg.is_off()
+    pub(crate) fn is_active(&self, cfg: &MinRate) -> bool {
+        self.since.is_some() && !cfg.is_off()
     }
 
     fn index(&self, now: Instant) -> u64 {
@@ -86,19 +91,20 @@ impl Rate {
         }
         self.advance(now);
         let b = (self.head % self.n as u64) as usize;
-        self.buckets[b] = self.buckets[b].saturating_add(bytes as u64);
+        let bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
+        self.buckets[b] = self.buckets[b].saturating_add(bytes);
     }
 
     /// Whether the peer is below the minimum rate (only after the grace period).
-    pub(crate) fn too_slow(&mut self, now: Instant) -> bool {
+    pub(crate) fn too_slow(&mut self, cfg: &MinRate, now: Instant) -> bool {
         let Some(since) = self.since else {
             return false;
         };
-        if self.cfg.is_off() {
+        if cfg.is_off() {
             return false;
         }
         let active = now.saturating_duration_since(since);
-        if active < self.cfg.grace {
+        if active < cfg.grace {
             return false;
         }
         self.advance(now);
@@ -110,18 +116,18 @@ impl Rate {
             .as_nanos()
             .saturating_sub(u128::from(self.head) * width);
         let covered = (width * (self.n as u128 - 1) + into_current).min(active.as_nanos());
-        let moved: u64 = self.buckets[..self.n].iter().sum();
-        let required = u128::from(self.cfg.bytes_per_sec) * covered / 1_000_000_000;
+        let moved: u64 = self.buckets[..self.n].iter().map(|&b| u64::from(b)).sum();
+        let required = u128::from(cfg.bytes_per_sec) * covered / 1_000_000_000;
         u128::from(moved) < required
     }
 
     /// When the next check is due, if the direction is active.
-    pub(crate) fn next_check(&self, now: Instant) -> Option<Instant> {
+    pub(crate) fn next_check(&self, cfg: &MinRate, now: Instant) -> Option<Instant> {
         let since = self.since?;
-        if self.cfg.is_off() {
+        if cfg.is_off() {
             return None;
         }
-        let grace_end = since + self.cfg.grace;
+        let grace_end = since + cfg.grace;
         Some(if now < grace_end {
             grace_end
         } else {
@@ -141,56 +147,56 @@ mod tests {
     #[test]
     fn test_rate_no_check_before_grace() {
         let t = Instant::now();
-        let mut r = Rate::new(rate(), t);
+        let mut r = Rate::new(&rate(), t);
         r.activate(t);
-        assert!(!r.too_slow(t + Duration::from_secs(4)));
+        assert!(!r.too_slow(&rate(), t + Duration::from_secs(4)));
     }
 
     #[test]
     fn test_rate_trickle_is_too_slow() {
         let t = Instant::now();
-        let mut r = Rate::new(rate(), t);
+        let mut r = Rate::new(&rate(), t);
         r.activate(t);
         for s in 0..10 {
             r.record(t + Duration::from_secs(s), 1);
         }
-        assert!(r.too_slow(t + Duration::from_secs(10)));
+        assert!(r.too_slow(&rate(), t + Duration::from_secs(10)));
     }
 
     #[test]
     fn test_rate_fast_peer_passes() {
         let t = Instant::now();
-        let mut r = Rate::new(rate(), t);
+        let mut r = Rate::new(&rate(), t);
         r.activate(t);
         for s in 0..20 {
             r.record(t + Duration::from_secs(s), 200);
         }
-        assert!(!r.too_slow(t + Duration::from_secs(20)));
+        assert!(!r.too_slow(&rate(), t + Duration::from_secs(20)));
     }
 
     #[test]
     fn test_rate_window_slides() {
         let t = Instant::now();
-        let mut r = Rate::new(rate(), t);
+        let mut r = Rate::new(&rate(), t);
         r.activate(t);
         // A burst at the start, then nothing: after the window passes, it is too slow.
         r.record(t, 10_000);
-        assert!(!r.too_slow(t + Duration::from_secs(6)));
-        assert!(r.too_slow(t + Duration::from_secs(25)));
+        assert!(!r.too_slow(&rate(), t + Duration::from_secs(6)));
+        assert!(r.too_slow(&rate(), t + Duration::from_secs(25)));
     }
 
     #[test]
     fn test_rate_off_and_inactive_never_slow() {
         let t = Instant::now();
-        let mut off = Rate::new(MinRate::off(), t);
+        let mut off = Rate::new(&MinRate::off(), t);
         off.activate(t);
-        assert!(!off.too_slow(t + Duration::from_secs(100)));
-        let mut idle = Rate::new(rate(), t);
-        assert!(!idle.too_slow(t + Duration::from_secs(100)));
-        assert!(idle.next_check(t).is_none());
+        assert!(!off.too_slow(&MinRate::off(), t + Duration::from_secs(100)));
+        let mut idle = Rate::new(&rate(), t);
+        assert!(!idle.too_slow(&rate(), t + Duration::from_secs(100)));
+        assert!(idle.next_check(&rate(), t).is_none());
         idle.activate(t);
         idle.deactivate();
-        assert!(!idle.is_active());
+        assert!(!idle.is_active(&rate()));
     }
 
     /// Property: a peer at or above the rate is never too slow, whatever its burst
@@ -209,7 +215,7 @@ mod tests {
                 check: Duration::from_millis(100 + g.below(900)),
             };
             let t0 = Instant::now();
-            let mut r = Rate::new(cfg, t0);
+            let mut r = Rate::new(&cfg, t0);
             r.activate(t0);
             // Twice the rate, delivered in random bursts every 1 to 200 ms.
             let mut now = t0;
@@ -222,11 +228,11 @@ mod tests {
                 let bytes = owed.floor() as usize;
                 owed -= bytes as f64;
                 r.record(now, bytes);
-                assert!(!r.too_slow(now), "{cfg:?} flagged at {:?}", now - t0);
+                assert!(!r.too_slow(&cfg, now), "{cfg:?} flagged at {:?}", now - t0);
             }
             // Then silence for a whole window and one check.
             let quiet = now + window + cfg.check + Duration::from_millis(1);
-            assert!(r.too_slow(quiet), "{cfg:?} silent peer not flagged");
+            assert!(r.too_slow(&cfg, quiet), "{cfg:?} silent peer not flagged");
         }
     }
 }

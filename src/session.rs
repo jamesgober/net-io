@@ -580,6 +580,27 @@ impl Output {
         }
     }
 
+    /// The bytes one send offers: at most the chunks one vectored call takes.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn pending_in_send(&self) -> usize {
+        self.chunks
+            .iter()
+            .take(crate::sys::MAX_SLICES)
+            .map(|c| c.remaining().len())
+            .sum()
+    }
+
+    /// The chunks as slices for one send; returns how many.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn fill_slices<'a>(&'a self, out: &mut [std::io::IoSlice<'a>]) -> usize {
+        let mut n = 0;
+        for chunk in self.chunks.iter().take(out.len()) {
+            out[n] = std::io::IoSlice::new(chunk.remaining());
+            n += 1;
+        }
+        n
+    }
+
     /// Marks `n` bytes as sent, releasing finished chunks.
     pub(crate) fn advance(&mut self, mut n: usize) {
         while let Some(front) = self.chunks.front_mut() {

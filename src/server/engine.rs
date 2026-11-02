@@ -50,13 +50,41 @@ use crate::time::Clock;
 use crate::tls::ErasedAcceptor;
 use crate::trusted::TrustedProxies;
 
+#[cfg(feature = "reactor")]
+use super::reactor::Backend;
+#[cfg(feature = "reactor")]
+use crate::driver::DriverWaker;
+#[cfg(feature = "reactor")]
+use std::collections::HashMap;
+
 const WORKER_STACK: usize = 256 * 1024;
 const DRAIN_KILL: KillReason = KillReason(0);
 
 /// `WorkerShared::kill_cause`: a user's kill, the drain deadline, or `Stopping`.
 const CAUSE_USER: u8 = 0;
-const CAUSE_DRAIN: u8 = 1;
-const CAUSE_STOP: u8 = 2;
+pub(crate) const CAUSE_DRAIN: u8 = 1;
+pub(crate) const CAUSE_STOP: u8 = 2;
+
+/// Commands for a reactor worker, run at the top of its loop.
+#[cfg(feature = "reactor")]
+pub(crate) const CMD_SWEEP: u32 = 1;
+#[cfg(feature = "reactor")]
+pub(crate) const CMD_SHED: u32 = 2;
+#[cfg(feature = "reactor")]
+pub(crate) const CMD_KILL_ALL: u32 = 4;
+#[cfg(feature = "reactor")]
+pub(crate) const CMD_LISTENER_SWEEP: u32 = 8;
+#[cfg(feature = "reactor")]
+pub(crate) const CMD_LISTENER_KILL: u32 = 16;
+
+/// How many admitted connections wait for one reactor worker before new ones are
+/// refused with `Busy`.
+#[cfg(feature = "reactor")]
+const INBOX_MAX: usize = 4_096;
+
+/// Shards of the reactor's table of open connections.
+#[cfg(feature = "reactor")]
+const CONN_SHARDS: usize = 16;
 
 /// `WorkerShared::idle_cause`: an idle connection closed by a drain or by shedding.
 const IDLE_DRAIN: u8 = 0;
@@ -128,6 +156,14 @@ impl WorkerStats {
         self.seq.store(s.wrapping_add(1), Ordering::Release);
     }
 
+    /// A completion for a connection that is gone.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn count_stale(&self) {
+        self.begin_write();
+        self.stale_completions.fetch_add(1, Ordering::Relaxed);
+        self.end_write();
+    }
+
     /// Adds this worker's counters to `s` and `closed_by` as one consistent snapshot.
     fn read_into(&self, s: &mut Stats, closed_by: &mut [u64; CloseReason::COUNT]) {
         loop {
@@ -172,21 +208,48 @@ impl WorkerStats {
     }
 }
 
+// Aligned past a cache line and its prefetched neighbour: each worker writes its own
+// counters on every event, and must not take the next worker's line with it.
+#[repr(align(128))]
 pub(crate) struct WorkerShared {
     slot: Arc<KillSlot>,
     wake: Arc<Wake>,
     current: AtomicU64,
     /// The current connection's listener id (`NO_LISTENER` when none), for
-    /// `remove_listener`'s drain.
-    listener: AtomicU32,
-    /// The current connection's lane, for shedding.
-    lane: AtomicU8,
+    /// `remove_listener`'s drain. On the reactor: the listener being removed.
+    pub(crate) listener: AtomicU32,
+    /// The current connection's lane, for shedding. On the reactor: the lane
+    /// shedding starts from.
+    pub(crate) lane: AtomicU8,
     /// Why net-io itself killed the current connection (`CAUSE_*`).
-    kill_cause: AtomicU8,
+    pub(crate) kill_cause: AtomicU8,
     /// Why net-io closed the current connection while idle (`IDLE_*`).
     idle_cause: AtomicU8,
-    completer: Arc<CompleterShared>,
-    stats: WorkerStats,
+    pub(crate) completer: Arc<CompleterShared>,
+    pub(crate) stats: WorkerStats,
+    /// Pending commands (`CMD_*`), reactor only.
+    #[cfg(feature = "reactor")]
+    pub(crate) cmd: AtomicU32,
+    /// Open connections on this worker, reactor only.
+    #[cfg(feature = "reactor")]
+    pub(crate) load: AtomicU32,
+    /// Wakes this worker's loop, reactor only.
+    #[cfg(feature = "reactor")]
+    pub(crate) waker: OnceLock<DriverWaker>,
+}
+
+/// A worker's inbox, on cache lines of its own: its owner locks it on every turn.
+#[cfg(feature = "reactor")]
+#[repr(align(128))]
+struct Inbox<T>(Mutex<VecDeque<T>>);
+
+/// Where the reactor finds an open connection by id.
+#[cfg(feature = "reactor")]
+pub(crate) struct RegisteredConn {
+    pub(crate) slot: Arc<KillSlot>,
+    pub(crate) generation: u32,
+    pub(crate) worker: u32,
+    pub(crate) index: u32,
 }
 
 struct WorkerTarget {
@@ -196,13 +259,17 @@ struct WorkerTarget {
 
 impl CompleterTarget for WorkerTarget {
     fn owns(&self, id: ConnectionId) -> bool {
-        self.shared
-            .upgrade()
-            .is_some_and(|s| s.workers[self.idx].current.load(Ordering::Acquire) == id.get())
+        self.shared.upgrade().is_some_and(|s| {
+            #[cfg(feature = "reactor")]
+            if s.reactor {
+                return s.conn_worker(id) == Some(self.idx as u32);
+            }
+            s.workers[self.idx].current.load(Ordering::Acquire) == id.get()
+        })
     }
     fn wake(&self) {
         if let Some(s) = self.shared.upgrade() {
-            s.workers[self.idx].wake.wake();
+            s.wake_worker(self.idx);
         }
     }
     fn stopped(&self) -> bool {
@@ -214,6 +281,12 @@ impl CompleterTarget for WorkerTarget {
 
 /// The non-generic state `Server` and `ServerHandle` share with the threads.
 pub(crate) struct Shared {
+    /// The reactor runs this server (the blocking pool otherwise).
+    #[cfg(feature = "reactor")]
+    pub(crate) reactor: bool,
+    /// Open connections by id, reactor only: kills and completions find them here.
+    #[cfg(feature = "reactor")]
+    conns: Box<[Mutex<HashMap<u64, RegisteredConn>>]>,
     pid: u32,
     door: AtomicBool,
     draining: AtomicBool,
@@ -222,7 +295,7 @@ pub(crate) struct Shared {
     stop_cv: Condvar,
     progress: Mutex<()>,
     progress_cv: Condvar,
-    workers: Vec<WorkerShared>,
+    pub(crate) workers: Vec<WorkerShared>,
     /// The listeners and their accept threads (D-097). Locked only on cold paths
     /// (doors, wake-ups, adding, removing, releasing, shutdown).
     listeners: Mutex<Vec<ListenerEntry>>,
@@ -232,6 +305,11 @@ pub(crate) struct Shared {
     spawn_accept: OnceLock<SpawnAccept>,
     /// Admits an adopted connection (holds the engine weakly).
     adopt: OnceLock<AdoptFn>,
+    /// The driver the limits resolve for.
+    driver: DriverKind,
+    /// The global cap, for `pressure`.
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    max_open: u32,
     /// The server's limits, for listeners added later.
     pub(crate) base_limits: Limits,
     /// The server's trusted proxies, for listeners added later.
@@ -275,9 +353,82 @@ type SpawnAccept = Box<
 >;
 
 impl Shared {
-    fn event(&self, e: Event) {
+    pub(crate) fn event(&self, e: Event) {
         if let Some(s) = &self.sink {
             s.event(&e);
+        }
+    }
+
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    pub(crate) fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "reactor")]
+    pub(crate) fn control_line(&self) -> &dyn ControlLine {
+        self.control.as_ref()
+    }
+
+    /// Connections in use against the global cap, 0.0 to 1.0.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn occupancy(&self) -> f32 {
+        let open = self.open.load(Ordering::Relaxed) as f32;
+        (open / self.max_open.max(1) as f32).min(1.0)
+    }
+
+    #[cfg(feature = "reactor")]
+    fn conn_shard(&self, id: u64) -> std::sync::MutexGuard<'_, HashMap<u64, RegisteredConn>> {
+        self.conns[(id as usize) % CONN_SHARDS]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(feature = "reactor")]
+    pub(crate) fn register_conn(&self, id: ConnectionId, conn: RegisteredConn) {
+        self.conn_shard(id.get()).insert(id.get(), conn);
+    }
+
+    #[cfg(feature = "reactor")]
+    pub(crate) fn unregister_conn(&self, id: ConnectionId) {
+        self.conn_shard(id.get()).remove(&id.get());
+    }
+
+    #[cfg(feature = "reactor")]
+    fn conn_worker(&self, id: ConnectionId) -> Option<u32> {
+        self.conn_shard(id.get()).get(&id.get()).map(|c| c.worker)
+    }
+
+    /// The table index of an open connection of `worker`.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn conn_index(&self, id: ConnectionId, worker: u32) -> Option<u32> {
+        self.conn_shard(id.get())
+            .get(&id.get())
+            .filter(|c| c.worker == worker)
+            .map(|c| c.index)
+    }
+
+    fn wake_worker(&self, idx: usize) {
+        #[cfg(feature = "reactor")]
+        if self.reactor {
+            if let Some(w) = self.workers[idx].waker.get() {
+                w.wake();
+            }
+            return;
+        }
+        self.workers[idx].wake.wake();
+    }
+
+    /// Tells every reactor worker to run a command.
+    #[cfg(feature = "reactor")]
+    fn command(&self, bit: u32) {
+        for (i, w) in self.workers.iter().enumerate() {
+            w.cmd.fetch_or(bit, Ordering::AcqRel);
+            self.wake_worker(i);
         }
     }
 
@@ -412,7 +563,7 @@ impl Shared {
                 max: u64::from(u16::MAX),
             },
         })?);
-        let (mut entry, info) = bind_listener(spec, id, &self.base_limits)?;
+        let (mut entry, info) = bind_listener(spec, id, &self.base_limits, self.driver)?;
         let Some(spawn) = self.spawn_accept.get() else {
             return Err(NetError::ShuttingDown);
         };
@@ -469,6 +620,46 @@ impl Shared {
         Ok(self.drain_listener(&conf, deadline))
     }
 
+    /// As `drain_listener`, through the workers' command words.
+    #[cfg(feature = "reactor")]
+    fn drain_listener_reactor(&self, conf: &ListenerConf, deadline: Instant) -> DrainReport {
+        let start = Instant::now();
+        let id = u32::from(conf.id.0);
+        let initial = conf.count.load(Ordering::Acquire);
+        for w in &self.workers {
+            w.listener.store(id, Ordering::Release);
+        }
+        let mut killed_at_deadline = false;
+        let mut guard = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        while conf.count.load(Ordering::Acquire) > 0 {
+            self.command(CMD_LISTENER_SWEEP);
+            let now = Instant::now();
+            if now >= deadline && !killed_at_deadline {
+                killed_at_deadline = true;
+                self.command(CMD_LISTENER_KILL);
+            }
+            let wait = if killed_at_deadline {
+                Duration::from_millis(50)
+            } else {
+                deadline
+                    .saturating_duration_since(now)
+                    .clamp(Duration::from_millis(1), DRAIN_PASS)
+            };
+            guard = self
+                .progress_cv
+                .wait_timeout(guard, wait)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        drop(guard);
+        let killed = conf.killed.load(Ordering::Acquire);
+        DrainReport {
+            graceful: initial.saturating_sub(killed),
+            killed,
+            took: start.elapsed(),
+        }
+    }
+
     /// The drain of one listener's connections (see `remove_listener`).
     fn drain_listener(&self, conf: &ListenerConf, deadline: Instant) -> DrainReport {
         let start = Instant::now();
@@ -476,6 +667,10 @@ impl Shared {
         let initial = conf.count.load(Ordering::Acquire);
         let mut killed = 0u32;
         let mut killed_at_deadline = false;
+        #[cfg(feature = "reactor")]
+        if self.reactor {
+            return self.drain_listener_reactor(conf, deadline);
+        }
         let mut guard = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
         while conf.count.load(Ordering::Acquire) > 0 {
             let mine = |w: &&WorkerShared| {
@@ -564,12 +759,20 @@ impl Shared {
         for e in self.lock_listeners().iter() {
             e.conf.wake.wake();
         }
-        for w in &self.workers {
-            w.wake.wake();
+        for i in 0..self.workers.len() {
+            self.wake_worker(i);
         }
     }
 
     pub(crate) fn kill(&self, id: ConnectionId, reason: KillReason) -> bool {
+        #[cfg(feature = "reactor")]
+        if self.reactor {
+            let found = self
+                .conn_shard(id.get())
+                .get(&id.get())
+                .map(|c| (c.slot.clone(), c.generation));
+            return found.is_some_and(|(slot, generation)| slot.kill(generation, reason));
+        }
         for w in &self.workers {
             if w.current.load(Ordering::Acquire) != id.get() {
                 continue;
@@ -609,12 +812,16 @@ impl Shared {
     }
 
     /// Wakes a drain waiting for connections to finish.
-    fn notify_progress(&self) {
+    pub(crate) fn notify_progress(&self) {
         let _g = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
         self.progress_cv.notify_all();
     }
 
     fn idle(&self) -> bool {
+        #[cfg(feature = "reactor")]
+        if self.reactor {
+            return self.open.load(Ordering::Acquire) == 0;
+        }
         self.busy.load(Ordering::Acquire) == 0 && self.queue_len.load(Ordering::Acquire) == 0
     }
 
@@ -633,12 +840,7 @@ impl Shared {
         while !self.idle() {
             // Close every connection that waits for its next exchange; repeated each
             // pass for connections that finish an exchange during the drain.
-            for w in &self.workers {
-                if w.current.load(Ordering::Acquire) != 0 && !w.slot.drained() {
-                    w.idle_cause.store(IDLE_DRAIN, Ordering::Release);
-                    w.slot.drain_idle(w.slot.generation());
-                }
-            }
+            self.drain_idle_pass();
             let now = Instant::now();
             if now >= deadline && !killed_at_deadline {
                 killed_at_deadline = true;
@@ -670,8 +872,28 @@ impl Shared {
         report
     }
 
+    fn drain_idle_pass(&self) {
+        #[cfg(feature = "reactor")]
+        if self.reactor {
+            return self.command(CMD_SWEEP);
+        }
+        for w in &self.workers {
+            if w.current.load(Ordering::Acquire) != 0 && !w.slot.drained() {
+                w.idle_cause.store(IDLE_DRAIN, Ordering::Release);
+                w.slot.drain_idle(w.slot.generation());
+            }
+        }
+    }
+
     /// Kills every open connection on net-io's own behalf (`cause` names why).
     fn kill_all(&self, cause: u8) {
+        #[cfg(feature = "reactor")]
+        if self.reactor {
+            for w in &self.workers {
+                w.kill_cause.store(cause, Ordering::Release);
+            }
+            return self.command(CMD_KILL_ALL);
+        }
         for w in &self.workers {
             if w.current.load(Ordering::Acquire) != 0 {
                 // Claim the cause first (the owner reads it once it sees the kill). A
@@ -691,6 +913,13 @@ impl Shared {
     /// `ControlState::Shed`: closes the idle connections in shed lanes now; busy
     /// ones see `pressure()` 1.0 and close at their next idle point.
     fn shed_idle(&self, from_lane: Lane) {
+        #[cfg(feature = "reactor")]
+        if self.reactor {
+            for w in &self.workers {
+                w.lane.store(from_lane.0, Ordering::Release);
+            }
+            return self.command(CMD_SHED);
+        }
         for w in &self.workers {
             if w.current.load(Ordering::Acquire) != 0
                 && w.lane.load(Ordering::Acquire) >= from_lane.0
@@ -713,7 +942,7 @@ impl Shared {
         self.wake_all();
     }
 
-    fn release(&self, listener: &ListenerConf, source: Option<PrefixKey>) {
+    pub(crate) fn release(&self, listener: &ListenerConf, source: Option<PrefixKey>) {
         self.open.fetch_sub(1, Ordering::AcqRel);
         listener.count.fetch_sub(1, Ordering::AcqRel);
         if let Some(k) = source {
@@ -726,9 +955,22 @@ impl Shared {
 #[derive(Clone)]
 #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
 pub(crate) struct ListenerProxy {
-    versions: ProxyVersions,
+    pub(crate) versions: ProxyVersions,
     /// `None` on a Unix socket listener: every peer that can connect is trusted.
     trusted: Option<Arc<TrustedProxies>>,
+}
+
+impl ListenerProxy {
+    /// A TCP peer must be a trusted proxy; on a Unix socket listener the file's
+    /// permissions already decided who may connect.
+    #[cfg_attr(not(any(feature = "reactor", feature = "proxy")), allow(dead_code))]
+    pub(crate) fn is_trusted(&self, info: &ConnectionInfo) -> bool {
+        match (&self.trusted, info.peer.socket_addr()) {
+            (Some(list), Some(peer)) => list.contains(peer.ip()),
+            (None, None) => info.transport == Transport::Unix,
+            _ => false,
+        }
+    }
 }
 
 /// One listener's settings and counters (D-097). Its accept thread and every
@@ -736,14 +978,17 @@ pub(crate) struct ListenerProxy {
 /// their limits and give their cap slots back where they took them.
 pub(crate) struct ListenerConf {
     id: ListenerId,
-    limits: Effective,
+    pub(crate) limits: Arc<Effective>,
     tcp: TcpOptions,
     /// `Some` when the listener requires a PROXY header.
     #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
-    proxy: Option<ListenerProxy>,
+    pub(crate) proxy: Option<ListenerProxy>,
     /// Whether the listener serves TLS.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
-    tls: bool,
+    pub(crate) tls: bool,
+    /// Connections a removal killed at its deadline, reactor only.
+    #[cfg(feature = "reactor")]
+    killed: AtomicU32,
     /// Connections admitted and not yet closed (the per-listener cap).
     count: AtomicU32,
     /// The per-source cap's table, sized from this listener's limits (D-085).
@@ -752,8 +997,15 @@ pub(crate) struct ListenerConf {
     door: AtomicBool,
     /// Set by `remove_listener` and at shutdown: the accept thread ends and
     /// queued connections close with `Drained`.
-    removed: AtomicBool,
+    pub(crate) removed: AtomicBool,
     wake: Arc<Wake>,
+}
+
+#[cfg(feature = "reactor")]
+impl ListenerConf {
+    pub(crate) fn note_killed(&self) {
+        self.killed.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// A listener the server owns: settings, socket, accept thread.
@@ -768,8 +1020,9 @@ fn bind_listener(
     spec: ListenerSpec,
     id: ListenerId,
     base: &Limits,
+    driver: DriverKind,
 ) -> Result<(ListenerEntry, ListenerInfo), NetError> {
-    let lim = base.overlay(&spec.limits).effective(DriverKind::Blocking);
+    let lim = base.overlay(&spec.limits).effective(driver);
     let proxy = match spec.proxy {
         ProxyMode::Required { versions } => Some(ListenerProxy {
             versions,
@@ -807,6 +1060,28 @@ fn bind_listener(
                     });
                 }
             }
+        }
+        #[cfg(all(windows, feature = "local"))]
+        if let Some((path, options)) = spec.unix {
+            let mut listener = crate::local_windows::UnixListener::bind_with(&path, options)?;
+            listener.set_identity(id, spec.name.clone());
+            listener.set_proxy_mode(spec.proxy);
+            listener.set_tls(spec.tls);
+            let info = listener.info().clone();
+            break 'bound (
+                ListenerRuntime::AfUnix(listener),
+                info,
+                TcpOptions::default(),
+            );
+        }
+        #[cfg(all(windows, feature = "local"))]
+        if let Some((name, options)) = spec.pipe {
+            let mut listener = crate::pipe::PipeListener::create_with(&name, options)?;
+            listener.set_identity(id, spec.name.clone());
+            listener.set_proxy_mode(spec.proxy);
+            listener.set_tls(spec.tls);
+            let info = listener.info().clone();
+            break 'bound (ListenerRuntime::Pipe(listener), info, TcpOptions::default());
         }
         #[cfg(all(unix, feature = "local"))]
         if let Some((path, options)) = spec.unix {
@@ -856,10 +1131,12 @@ fn bind_listener(
         })?;
     let conf = Arc::new(ListenerConf {
         id,
-        limits: lim,
+        limits: Arc::new(lim),
         tcp,
         proxy,
         tls: spec.tls,
+        #[cfg(feature = "reactor")]
+        killed: AtomicU32::new(0),
         count: AtomicU32::new(0),
         sources: SourceTable::new(lim.max_per_listener, lim.max_per_source),
         door: AtomicBool::new(false),
@@ -885,19 +1162,52 @@ pub struct Job<T> {
     source: Option<PrefixKey>,
 }
 
+/// A job's parts, for the worker that takes it.
+#[cfg(feature = "reactor")]
+pub(crate) type JobParts<T> = (
+    sys::Stream,
+    ConnectionInfo,
+    T,
+    Arc<ListenerConf>,
+    Option<PrefixKey>,
+);
+
+#[cfg(feature = "reactor")]
+impl<T> Job<T> {
+    pub(crate) fn into_parts(self) -> JobParts<T> {
+        (
+            self.stream,
+            self.info,
+            self.ticket,
+            self.listener,
+            self.source,
+        )
+    }
+}
+
 enum ListenerRuntime {
     Tcp(TcpListener),
     #[cfg(all(unix, feature = "local"))]
     Unix(UnixListener),
+    #[cfg(all(windows, feature = "local"))]
+    AfUnix(crate::local_windows::UnixListener),
+    #[cfg(all(windows, feature = "local"))]
+    Pipe(crate::pipe::PipeListener),
 }
 
 impl ListenerRuntime {
-    fn sock(&self) -> sys::Sock<'_> {
-        match self {
+    /// Until a connection waits, or `wake` fires. A pipe's accept does this itself.
+    fn wait(&self, wake: &sys::Wake) {
+        let sock = match self {
             ListenerRuntime::Tcp(l) => l.std().sock(),
             #[cfg(all(unix, feature = "local"))]
             ListenerRuntime::Unix(l) => std::os::fd::AsFd::as_fd(l.std()),
-        }
+            #[cfg(all(windows, feature = "local"))]
+            ListenerRuntime::AfUnix(l) => l.std().sock(),
+            #[cfg(all(windows, feature = "local"))]
+            ListenerRuntime::Pipe(_) => return,
+        };
+        let _ = sys::wait(sock, Interest::Read, Some(wake), None);
     }
 
     fn info(&self) -> &ListenerInfo {
@@ -905,6 +1215,10 @@ impl ListenerRuntime {
             ListenerRuntime::Tcp(l) => l.info(),
             #[cfg(all(unix, feature = "local"))]
             ListenerRuntime::Unix(l) => l.info(),
+            #[cfg(all(windows, feature = "local"))]
+            ListenerRuntime::AfUnix(l) => l.info(),
+            #[cfg(all(windows, feature = "local"))]
+            ListenerRuntime::Pipe(l) => l.info(),
         }
     }
 
@@ -919,21 +1233,86 @@ impl ListenerRuntime {
                 l.keep_file();
                 Ok(dup)
             }
+            #[cfg(all(windows, feature = "local"))]
+            ListenerRuntime::AfUnix(_) | ListenerRuntime::Pipe(_) => {
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+            }
         }
     }
 }
 
-struct Engine<W, G: Gate> {
-    shared: Arc<Shared>,
-    work: W,
-    gate: Arc<G>,
-    gated: bool,
+pub(crate) struct Engine<W, G: Gate> {
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) work: W,
+    pub(crate) gate: Arc<G>,
+    pub(crate) gated: bool,
     queue: Mutex<VecDeque<Job<G::Ticket>>>,
     queue_cv: Condvar,
-    clock: ClockRef,
-    wipe: bool,
-    budget: Arc<AtomicU64>,
-    limits: Effective,
+    pub(crate) clock: ClockRef,
+    pub(crate) wipe: bool,
+    pub(crate) budget: Arc<AtomicU64>,
+    pub(crate) limits: Effective,
+    /// One bounded inbox per reactor worker.
+    #[cfg(feature = "reactor")]
+    inboxes: Vec<Inbox<Job<G::Ticket>>>,
+    /// Each reactor worker's driver, until its thread takes it.
+    #[cfg(feature = "reactor")]
+    drivers: Mutex<Vec<Option<Backend>>>,
+}
+
+#[cfg(feature = "reactor")]
+impl<W, G: Gate> Engine<W, G> {
+    pub(crate) fn take_driver(&self, idx: usize) -> Option<Backend> {
+        self.drivers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(idx)
+            .and_then(Option::take)
+    }
+
+    pub(crate) fn next_inbox(&self, idx: usize) -> Option<Job<G::Ticket>> {
+        self.inboxes[idx]
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+    }
+
+    pub(crate) fn inbox_empty(&self, idx: usize) -> bool {
+        self.inboxes[idx]
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// The least-loaded worker takes the connection. A full inbox refuses.
+    // A refused job goes straight back to its caller, on the path a flood takes;
+    // a `Box` here would allocate there.
+    #[allow(clippy::result_large_err)]
+    fn hand_to_worker(&self, job: Job<G::Ticket>) -> Result<(), Job<G::Ticket>> {
+        let shared = &self.shared;
+        let idx = shared
+            .workers
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, w)| w.load.load(Ordering::Relaxed))
+            .map_or(0, |(i, _)| i);
+        {
+            let mut inbox = self.inboxes[idx]
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if inbox.len() >= INBOX_MAX {
+                return Err(job);
+            }
+            // Counted now, so a burst spreads over the workers.
+            shared.workers[idx].load.fetch_add(1, Ordering::Relaxed);
+            inbox.push_back(job);
+        }
+        shared.wake_worker(idx);
+        Ok(())
+    }
 }
 
 pub(crate) fn start<W, G, S>(cfg: Config<W, G, S>) -> Result<Server, NetError>
@@ -942,13 +1321,14 @@ where
     G: Gate,
     S: EventSink,
 {
-    let _ = cfg.driver;
-    let limits = cfg.limits.effective(DriverKind::Blocking);
+    let driver = cfg.driver;
+    let reactor = driver == DriverKind::Reactor;
+    let limits = cfg.limits.effective(driver);
     let mut entries = Vec::with_capacity(cfg.listeners.len());
     let mut infos = Vec::with_capacity(cfg.listeners.len());
     for (i, spec) in cfg.listeners.into_iter().enumerate() {
         let id = ListenerId(u16::try_from(i).unwrap_or(u16::MAX));
-        let (entry, info) = bind_listener(spec, id, &cfg.limits)?;
+        let (entry, info) = bind_listener(spec, id, &cfg.limits, driver)?;
         entries.push(entry);
         infos.push(info);
     }
@@ -969,6 +1349,16 @@ where
                 })?,
         );
     }
+    #[cfg(feature = "reactor")]
+    let mut backends = Vec::with_capacity(usize::from(cfg.workers));
+    #[cfg(feature = "reactor")]
+    if reactor {
+        for _ in 0..cfg.workers {
+            backends.push(Some(Backend::new(1024)?));
+        }
+    }
+    #[cfg(not(feature = "reactor"))]
+    let _ = reactor;
     let queue_capacity = limits.completion_queue as usize;
     let next_listener = u32::try_from(infos.len()).unwrap_or(u32::MAX);
     let shared = Arc::new_cyclic(|weak: &Weak<Shared>| Shared {
@@ -1000,8 +1390,22 @@ where
                     WorkerId(u16::try_from(i).unwrap_or(u16::MAX)),
                 )),
                 stats: WorkerStats::default(),
+                #[cfg(feature = "reactor")]
+                cmd: AtomicU32::new(0),
+                #[cfg(feature = "reactor")]
+                load: AtomicU32::new(0),
+                #[cfg(feature = "reactor")]
+                waker: OnceLock::new(),
             })
             .collect(),
+        #[cfg(feature = "reactor")]
+        reactor,
+        #[cfg(feature = "reactor")]
+        conns: (0..CONN_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect(),
+        driver,
+        max_open: limits.max_connections,
         listeners: Mutex::new(entries),
         next_listener: AtomicU32::new(next_listener),
         spawn_accept: OnceLock::new(),
@@ -1031,8 +1435,20 @@ where
         });
     }
 
+    #[cfg(feature = "reactor")]
+    for (i, b) in backends.iter().enumerate() {
+        if let Some(b) = b {
+            let _ = shared.workers[i].waker.set(crate::driver::Driver::waker(b));
+        }
+    }
     let engine = Arc::new(Engine {
         shared: shared.clone(),
+        #[cfg(feature = "reactor")]
+        inboxes: (0..backends.len())
+            .map(|_| Inbox(Mutex::new(VecDeque::new())))
+            .collect(),
+        #[cfg(feature = "reactor")]
+        drivers: Mutex::new(backends),
         work: cfg.work,
         gated: TypeId::of::<G>() != TypeId::of::<AllowAll>(),
         gate: Arc::new(cfg.gate),
@@ -1078,7 +1494,7 @@ where
         match std::thread::Builder::new()
             .name(format!("net-io-worker-{i}"))
             .stack_size(WORKER_STACK)
-            .spawn(move || worker_loop(&e, i))
+            .spawn(move || W::run_worker(&e, i))
         {
             Ok(t) => threads.push(t),
             Err(err) => {
@@ -1184,6 +1600,25 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     }
                     other => other.without_conn(),
                 },
+                #[cfg(all(windows, feature = "local"))]
+                ListenerRuntime::AfUnix(l) => match acceptor.accept_af_unix(l.std()) {
+                    Accepted::Conn(stream) => {
+                        engine.admit_af_unix(l, stream, conf, &mut ids, &view, &mut coalescer);
+                        continue;
+                    }
+                    other => other.without_conn(),
+                },
+                #[cfg(all(windows, feature = "local"))]
+                ListenerRuntime::Pipe(l) => match l.accept_or_wake(&wake) {
+                    Ok(Some(stream)) => {
+                        engine.admit_pipe(l, stream, conf, &mut ids, &view, &mut coalescer);
+                        continue;
+                    }
+                    // The wake: the top of the loop decides what it meant.
+                    Ok(None) => break,
+                    // Out of instances or handles: the same pause as out of descriptors.
+                    Err(_) => acceptor.pause(),
+                },
             };
             match outcome {
                 Accepted::Conn(()) => {}
@@ -1192,7 +1627,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     class,
                 }),
                 Accepted::Again => {
-                    let _ = sys::wait(rt.sock(), Interest::Read, Some(&wake), None);
+                    rt.wait(&wake);
                     break;
                 }
                 Accepted::Pause(backoff) => {
@@ -1216,7 +1651,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
     }
 }
 
-impl<W: super::Workload, G: Gate> Engine<W, G> {
+impl<W, G: Gate> Engine<W, G> {
     fn refuse(
         &self,
         stream: sys::Stream,
@@ -1325,6 +1760,62 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
         );
     }
 
+    /// An AF_UNIX client on Windows: no address, so no per-source cap.
+    #[cfg(all(windows, feature = "local"))]
+    fn admit_af_unix(
+        &self,
+        listener: &crate::local_windows::UnixListener,
+        stream: TcpStream,
+        conf: &Arc<ListenerConf>,
+        ids: &mut IdBlock,
+        view: &ControlView,
+        co: &mut Coalescer,
+    ) {
+        let next = &mut || ids.issue();
+        let stage = AdmitStage::Accept;
+        let _ = self.admit_one(
+            sys::Stream::Tcp(stream),
+            None,
+            None,
+            conf,
+            next,
+            view,
+            co,
+            stage,
+            |stream, cid, at| stream.tcp().map(|s| listener.info_of(s, cid, at)),
+        );
+    }
+
+    /// A named pipe client: no address, so no per-source cap.
+    #[cfg(all(windows, feature = "local"))]
+    fn admit_pipe(
+        &self,
+        listener: &crate::pipe::PipeListener,
+        stream: sys::PipeStream,
+        conf: &Arc<ListenerConf>,
+        ids: &mut IdBlock,
+        view: &ControlView,
+        co: &mut Coalescer,
+    ) {
+        let stream = sys::Stream::Pipe(stream);
+        let next = &mut || ids.issue();
+        let stage = AdmitStage::Accept;
+        let _ = self.admit_one(
+            stream,
+            None,
+            None,
+            conf,
+            next,
+            view,
+            co,
+            stage,
+            |stream, cid, at| match stream {
+                sys::Stream::Pipe(p) => Some(listener.info_of(p, cid, at)),
+                _ => None,
+            },
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn admit_one(
         &self,
@@ -1428,10 +1919,8 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
             listener: conf.clone(),
             source,
         };
-        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-        let busy = shared.busy.load(Ordering::Acquire) as usize;
-        if queue.len() + busy >= shared.workers.len() {
-            drop(queue);
+        let (event_id, event_lane) = (job.info.id, job.info.lane);
+        if let Err(job) = self.hand_over(job) {
             let Job {
                 stream,
                 info,
@@ -1443,16 +1932,9 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
                     .closed(ticket, &info, CloseReason::Refused(RefusalCause::Busy))
             });
             release(self);
-            {
-                self.refuse(stream, peer, RefusalCause::Busy, None, co);
-                return Err(Some(RefusalCause::Busy));
-            }
+            self.refuse(stream, peer, RefusalCause::Busy, None, co);
+            return Err(Some(RefusalCause::Busy));
         }
-        let (event_id, event_lane) = (job.info.id, job.info.lane);
-        queue.push_back(job);
-        shared.queue_len.store(queue.len(), Ordering::Release);
-        drop(queue);
-        self.queue_cv.notify_one();
         shared.accepted.fetch_add(1, Ordering::Relaxed);
         shared.event(Event::Accepted {
             id: event_id,
@@ -1464,6 +1946,25 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
             lane: event_lane,
         });
         Ok(event_id)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn hand_over(&self, job: Job<G::Ticket>) -> Result<(), Job<G::Ticket>> {
+        #[cfg(feature = "reactor")]
+        if self.shared.reactor {
+            return self.hand_to_worker(job);
+        }
+        let shared = &self.shared;
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        let busy = shared.busy.load(Ordering::Acquire) as usize;
+        if queue.len() + busy >= shared.workers.len() {
+            return Err(job);
+        }
+        queue.push_back(job);
+        shared.queue_len.store(queue.len(), Ordering::Release);
+        drop(queue);
+        self.queue_cv.notify_one();
+        Ok(())
     }
 
     /// `Server::adopt`: a dialed connection admitted like an accepted one on
@@ -1543,9 +2044,18 @@ impl<W: super::Workload, G: Gate> Engine<W, G> {
 // ---- workers --------------------------------------------------------------
 
 /// What a workload does with one connection. Sealed through `Workload`.
-pub trait Serve: Send + Sync + 'static {
+pub trait Serve: Send + Sync + Sized + 'static {
+    /// Whether this workload needs a thread per connection (a blocking handler).
+    const BLOCKING_ONLY: bool;
+
     /// Serves one admitted connection on a worker.
     fn serve<G: Gate>(&self, w: &mut Worker<G>, job: Job<G::Ticket>);
+
+    /// One worker thread. The reactor runs sessions its own way.
+    #[allow(private_interfaces)]
+    fn run_worker<G: Gate>(engine: &Arc<Engine<Self, G>>, idx: usize) {
+        worker_loop(engine, idx);
+    }
 }
 
 /// One worker's state, reused across its connections (no allocation after warm-up).
@@ -1565,7 +2075,7 @@ pub struct Worker<G: Gate> {
     facts_pool: Vec<Arc<ProxyFacts>>,
 }
 
-fn worker_loop<W: super::Workload, G: Gate>(engine: &Arc<Engine<W, G>>, idx: usize) {
+fn worker_loop<W: Serve, G: Gate>(engine: &Arc<Engine<W, G>>, idx: usize) {
     let shared = engine.shared.clone();
     let ws = &shared.workers[idx];
     ws.wake.bind_thread(std::thread::current());
@@ -1624,7 +2134,7 @@ impl<G: Gate> Worker<G> {
             }
             Err(_) => return Err(CloseReason::TlsFailed),
         };
-        let lim = link.limits;
+        let lim = *link.limits;
         let Some(cin) = self.pool.take(lim.read_class_max) else {
             return Err(CloseReason::Limit(crate::error::LimitKind::BufferBudget));
         };
@@ -1655,17 +2165,10 @@ impl<G: Gate> Worker<G> {
         source: &mut Option<PrefixKey>,
     ) -> Result<(), CloseReason> {
         use crate::proxy_parse::{ProxyAddress, ProxyCommand, ProxyParser, ProxyProgress};
-        // A TCP peer must be a trusted proxy; on a Unix socket listener the file's
-        // permissions already decided who may connect (`trusted` is `None`).
-        let trusted = match (&proxy.trusted, link.info.peer.socket_addr()) {
-            (Some(list), Some(peer)) => list.contains(peer.ip()),
-            (None, None) => link.info.transport == Transport::Unix,
-            _ => false,
-        };
-        if !trusted {
+        if !proxy.is_trusted(&link.info) {
             return Err(CloseReason::ProxyUntrusted);
         }
-        let lim = link.limits;
+        let lim = *link.limits;
         // The header must fit the buffer: at most 16 fixed bytes plus the body limit.
         let need = 16 + u32::from(lim.proxy_header_max);
         let class = if need <= SizeClass::SMALL.bytes() {
@@ -1715,65 +2218,18 @@ impl<G: Gate> Worker<G> {
                 return Err(reason);
             }
         };
-        let shared = self.shared.clone();
-        let result = (|| {
-            let Some(real) = real else {
-                // LOCAL (the proxy itself) and UNKNOWN keep the socket's addresses.
-                return Ok(());
-            };
-            // The per-source slot moves from the proxy to the real client.
-            let key = PrefixKey::of(real.ip(), lim.source_policy);
-            if Some(key) != *source {
-                let table = &listener.sources;
-                if !table.acquire(key) {
-                    return Err(CloseReason::Refused(RefusalCause::SourceCap));
-                }
-                if let Some(old) = source.replace(key) {
-                    table.release(old);
-                }
-            }
-            link.info.real_peer = Some(real);
-            Ok(())
-        })();
-        if let Err(reason) = result {
-            link.end_handshake(Some((buf, usize::MAX)));
-            return Err(reason);
-        }
-        let mut arc = self
-            .facts_pool
-            .pop()
-            .unwrap_or_else(|| Arc::new(ProxyFacts::default()));
-        if let Some(f) = Arc::get_mut(&mut arc) {
-            *f = facts;
-        } else {
-            arc = Arc::new(facts);
-        }
-        link.info.proxy = Some(arc);
         link.end_handshake(Some((buf, consumed)));
-        if let Some(real) = link.info.real_peer {
-            let readmitted = match link.gate.as_mut() {
-                Some(g) => g.readmit(&link.info),
-                None => match self.gate_cell.as_mut() {
-                    Some(c) => c.readmit(&link.info),
-                    None => Ok(()),
-                },
-            };
-            if let Err(refusal) = readmitted {
-                if let Refusal::WithBytes { bytes, .. } = refusal {
-                    let max = usize::from(lim.refusal_bytes_max);
-                    if bytes.len() <= max {
-                        link.send_denial_once(bytes);
-                    }
-                }
-                return Err(CloseReason::Refused(RefusalCause::Gate(refusal.code())));
-            }
-            shared.event(Event::ProxyResolved {
-                id: link.info.id,
-                real_peer: real,
-            });
-        }
-        Ok(())
+        proxy_resolved(
+            &self.shared,
+            link,
+            listener,
+            source,
+            facts,
+            real,
+            &mut self.facts_pool,
+        )
     }
+
     /// Starts serving a job: options (where not inherited), the kill slot, the gate ticket.
     #[allow(clippy::type_complexity)]
     fn begin(
@@ -1788,7 +2244,7 @@ impl<G: Gate> Worker<G> {
             source,
         } = job;
         let shared = self.shared.clone();
-        let limits = listener.limits;
+        let limits = listener.limits.clone();
         info.worker = WorkerId(self.idx as u16);
         let mut cell = self.gate_cell.take().unwrap_or_else(|| {
             Box::new(GateCell {
@@ -1922,54 +2378,7 @@ impl<G: Gate> Worker<G> {
         ws.current.store(0, Ordering::Release);
         ws.listener.store(NO_LISTENER, Ordering::Release);
         shared.release(&listener, source);
-        // Single writer: plain load and store, inside the sequence lock.
-        let st = &ws.stats;
-        let bump =
-            |c: &AtomicU64, n: u64| c.store(c.load(Ordering::Relaxed) + n, Ordering::Relaxed);
-        st.begin_write();
-        bump(&st.closed, 1);
-        bump(&st.bytes_in, bytes_in);
-        bump(&st.bytes_out, bytes_out);
-        bump(&st.closed_by[reason.index()], 1);
-        match reason {
-            CloseReason::EgressDenied(_) => bump(&st.egress_denied, 1),
-            CloseReason::Killed(_) => bump(&st.killed, 1),
-            CloseReason::SlowPeer { .. } => bump(&st.slow_peers, 1),
-            CloseReason::Idle
-            | CloseReason::ReadTimeout
-            | CloseReason::WriteTimeout
-            | CloseReason::ExchangeDeadline
-            | CloseReason::ParkDeadline
-            | CloseReason::HandshakeTimeout => bump(&st.timeouts, 1),
-            CloseReason::SessionPanicked => bump(&st.session_panics, 1),
-            _ => {}
-        }
-        st.end_write();
-        match reason {
-            CloseReason::EgressDenied(code) => {
-                shared.event(Event::EgressDenied { id: info.id, code })
-            }
-            CloseReason::Killed(k) => shared.event(Event::Killed {
-                id: info.id,
-                reason: k,
-            }),
-            CloseReason::SessionPanicked => shared.event(Event::SessionPanicked { id: info.id }),
-            _ => {}
-        }
-        if shared.draining.load(Ordering::Acquire) {
-            if reason == CloseReason::DrainDeadline {
-                shared.drained_killed.fetch_add(1, Ordering::Relaxed);
-            } else {
-                shared.drained_graceful.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        shared.event(Event::Closed {
-            id: info.id,
-            reason,
-            bytes_in,
-            bytes_out,
-            lifetime,
-        });
+        record_close(&shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
         shared.busy.fetch_sub(1, Ordering::AcqRel);
         shared.notify_progress();
         (info, reason)
@@ -2014,6 +2423,8 @@ impl<H> Serve for BlockingHandler<H>
 where
     H: Fn(&mut TcpConnection) -> Result<(), NetError> + Send + Sync + 'static,
 {
+    const BLOCKING_ONLY: bool = true;
+
     fn serve<G: Gate>(&self, w: &mut Worker<G>, job: Job<G::Ticket>) {
         let Some((link, listener, source)) = w.begin(job) else {
             return;
@@ -2034,6 +2445,18 @@ where
 }
 
 impl<F: SessionFactory> Serve for Sessions<F> {
+    const BLOCKING_ONLY: bool = false;
+
+    #[cfg(feature = "reactor")]
+    #[allow(private_interfaces)]
+    fn run_worker<G: Gate>(engine: &Arc<Engine<Self, G>>, idx: usize) {
+        if engine.shared.reactor {
+            super::reactor::run(engine, idx);
+        } else {
+            worker_loop(engine, idx);
+        }
+    }
+
     fn serve<G: Gate>(&self, w: &mut Worker<G>, job: Job<G::Ticket>) {
         let Some((mut link, listener, source)) = w.begin(job) else {
             return;
@@ -2076,6 +2499,123 @@ impl<F: SessionFactory> Serve for Sessions<F> {
         drop(session);
         w.recycle(info);
     }
+}
+
+/// Counts one close and tells the event sink. Both drivers end here.
+pub(crate) fn record_close(
+    shared: &Shared,
+    ws: &WorkerShared,
+    info: &ConnectionInfo,
+    reason: CloseReason,
+    bytes_in: u64,
+    bytes_out: u64,
+    lifetime: Duration,
+) {
+    // Single writer: plain load and store, inside the sequence lock.
+    let st = &ws.stats;
+    let bump = |c: &AtomicU64, n: u64| c.store(c.load(Ordering::Relaxed) + n, Ordering::Relaxed);
+    st.begin_write();
+    bump(&st.closed, 1);
+    bump(&st.bytes_in, bytes_in);
+    bump(&st.bytes_out, bytes_out);
+    bump(&st.closed_by[reason.index()], 1);
+    match reason {
+        CloseReason::EgressDenied(_) => bump(&st.egress_denied, 1),
+        CloseReason::Killed(_) => bump(&st.killed, 1),
+        CloseReason::SlowPeer { .. } => bump(&st.slow_peers, 1),
+        CloseReason::Idle
+        | CloseReason::ReadTimeout
+        | CloseReason::WriteTimeout
+        | CloseReason::ExchangeDeadline
+        | CloseReason::ParkDeadline
+        | CloseReason::HandshakeTimeout => bump(&st.timeouts, 1),
+        CloseReason::SessionPanicked => bump(&st.session_panics, 1),
+        _ => {}
+    }
+    st.end_write();
+    match reason {
+        CloseReason::EgressDenied(code) => shared.event(Event::EgressDenied { id: info.id, code }),
+        CloseReason::Killed(k) => shared.event(Event::Killed {
+            id: info.id,
+            reason: k,
+        }),
+        CloseReason::SessionPanicked => shared.event(Event::SessionPanicked { id: info.id }),
+        _ => {}
+    }
+    if shared.draining.load(Ordering::Acquire) {
+        if reason == CloseReason::DrainDeadline {
+            shared.drained_killed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            shared.drained_graceful.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    shared.event(Event::Closed {
+        id: info.id,
+        reason,
+        bytes_in,
+        bytes_out,
+        lifetime,
+    });
+}
+
+/// A valid PROXY header arrived (the handshake is over): the real client takes
+/// over the per-source slot, the facts land on the connection, and the gate
+/// admits again. Both drivers end here.
+#[cfg(feature = "proxy")]
+pub(crate) fn proxy_resolved(
+    shared: &Shared,
+    link: &mut Link,
+    listener: &ListenerConf,
+    source: &mut Option<PrefixKey>,
+    facts: ProxyFacts,
+    real: Option<SocketAddr>,
+    facts_pool: &mut Vec<Arc<ProxyFacts>>,
+) -> Result<(), CloseReason> {
+    let lim = *link.limits;
+    // LOCAL (the proxy itself) and UNKNOWN keep the socket's addresses.
+    if let Some(real) = real {
+        // The per-source slot moves from the proxy to the real client.
+        let key = PrefixKey::of(real.ip(), lim.source_policy);
+        if Some(key) != *source {
+            let table = &listener.sources;
+            if !table.acquire(key) {
+                return Err(CloseReason::Refused(RefusalCause::SourceCap));
+            }
+            if let Some(old) = source.replace(key) {
+                table.release(old);
+            }
+        }
+        link.info.real_peer = Some(real);
+    }
+    let mut arc = facts_pool
+        .pop()
+        .unwrap_or_else(|| Arc::new(ProxyFacts::default()));
+    if let Some(f) = Arc::get_mut(&mut arc) {
+        *f = facts;
+    } else {
+        arc = Arc::new(facts);
+    }
+    link.info.proxy = Some(arc);
+    if let Some(real) = link.info.real_peer {
+        let readmitted = match link.gate.as_mut() {
+            Some(g) => g.readmit(&link.info),
+            None => Ok(()),
+        };
+        if let Err(refusal) = readmitted {
+            if let Refusal::WithBytes { bytes, .. } = refusal {
+                let max = usize::from(lim.refusal_bytes_max);
+                if bytes.len() <= max {
+                    link.send_denial_once(bytes);
+                }
+            }
+            return Err(CloseReason::Refused(RefusalCause::Gate(refusal.code())));
+        }
+        shared.event(Event::ProxyResolved {
+            id: link.info.id,
+            real_peer: real,
+        });
+    }
+    Ok(())
 }
 
 /// Calls a session hook with a context; the result is `None` when it panicked.

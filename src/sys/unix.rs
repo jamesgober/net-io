@@ -20,7 +20,7 @@ type SockLen = u32;
 
 #[cfg(target_os = "linux")]
 type Nfds = std::ffi::c_ulong;
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 type Nfds = std::ffi::c_uint;
 
 // ---- constants -------------------------------------------------------------
@@ -51,8 +51,8 @@ pub(crate) mod errno {
     pub const EHOSTUNREACH: i32 = 113;
 }
 
-/// Error numbers net-io classifies (`intro(2)` on macOS).
-#[cfg(target_os = "macos")]
+/// Error numbers net-io classifies (`intro(2)` on macOS, `errno(2)` on FreeBSD).
+#[cfg(not(target_os = "linux"))]
 pub(crate) mod errno {
     pub const EPERM: i32 = 1;
     pub const EBADF: i32 = 9;
@@ -73,9 +73,15 @@ pub(crate) mod errno {
     pub const ECONNREFUSED: i32 = 61;
     pub const EHOSTDOWN: i32 = 64;
     pub const EHOSTUNREACH: i32 = 65;
+    #[cfg(target_os = "macos")]
     pub const EPROTO: i32 = 100;
+    #[cfg(target_os = "freebsd")]
+    pub const EPROTO: i32 = 92;
+    #[cfg(target_os = "macos")]
     pub const EOPNOTSUPP: i32 = 102;
-    /// macOS has no ENONET; a value no error carries.
+    #[cfg(target_os = "freebsd")]
+    pub const EOPNOTSUPP: i32 = 45;
+    /// No ENONET on these systems; a value no error carries.
     pub const ENONET: i32 = -1;
 }
 
@@ -172,16 +178,22 @@ mod c {
     pub const MSG_CMSG_CLOEXEC: c_int = 0x4000_0000;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 mod c {
     use std::ffi::{c_int, c_short};
     #[cfg(feature = "local")]
     pub const AF_UNIX: c_int = 1;
     pub const AF_INET: c_int = 2;
+    #[cfg(target_os = "macos")]
     pub const AF_INET6: c_int = 30;
+    #[cfg(target_os = "freebsd")]
+    pub const AF_INET6: c_int = 28;
     pub const AF_UNIX_FAMILY: c_int = 1;
     pub const F_GETFD: c_int = 1;
+    #[cfg(target_os = "macos")]
     pub const CLOCK_MONOTONIC: c_int = 6;
+    #[cfg(target_os = "freebsd")]
+    pub const CLOCK_MONOTONIC: c_int = 4;
     pub const SOCK_STREAM: c_int = 1;
     #[cfg(feature = "udp")]
     pub const SOCK_DGRAM: c_int = 2;
@@ -196,8 +208,15 @@ mod c {
     pub const SO_RCVBUF: c_int = 0x1002;
     pub const SO_ERROR: c_int = 0x1007;
     pub const SO_TYPE: c_int = 0x1008;
+    #[cfg(target_os = "macos")]
     pub const SO_NOSIGPIPE: c_int = 0x1022;
+    #[cfg(target_os = "freebsd")]
+    pub const SO_NOSIGPIPE: c_int = 0x0800;
+    #[cfg(target_os = "macos")]
     pub const SO_LINGER_SEC: c_int = 0x1080;
+    /// FreeBSD's `SO_LINGER` is in seconds already.
+    #[cfg(target_os = "freebsd")]
+    pub const SO_LINGER_SEC: c_int = 0x80;
     pub const IPPROTO_IP: c_int = 0;
     pub const IPPROTO_TCP: c_int = 6;
     pub const IPPROTO_IPV6: c_int = 41;
@@ -205,9 +224,19 @@ mod c {
     pub const IPV6_UNICAST_HOPS: c_int = 4;
     pub const IPV6_V6ONLY: c_int = 27;
     pub const TCP_NODELAY: c_int = 0x1;
+    #[cfg(target_os = "macos")]
     pub const TCP_KEEPALIVE: c_int = 0x10;
+    #[cfg(target_os = "macos")]
     pub const TCP_KEEPINTVL: c_int = 0x101;
+    #[cfg(target_os = "macos")]
     pub const TCP_KEEPCNT: c_int = 0x102;
+    /// `TCP_KEEPIDLE`.
+    #[cfg(target_os = "freebsd")]
+    pub const TCP_KEEPALIVE: c_int = 256;
+    #[cfg(target_os = "freebsd")]
+    pub const TCP_KEEPINTVL: c_int = 512;
+    #[cfg(target_os = "freebsd")]
+    pub const TCP_KEEPCNT: c_int = 1024;
     pub const MSG_DONTWAIT: c_int = 0x80;
     pub const POLLIN: c_short = 0x1;
     pub const POLLOUT: c_short = 0x4;
@@ -223,10 +252,12 @@ mod c {
     pub const SCM_RIGHTS: c_int = 1;
     #[cfg(feature = "local")]
     pub const MSG_CTRUNC: c_int = 0x20;
-    #[cfg(feature = "local")]
+    #[cfg(all(feature = "local", not(target_os = "linux")))]
     pub const SOL_LOCAL: c_int = 0;
-    #[cfg(feature = "local")]
+    #[cfg(all(feature = "local", target_os = "macos"))]
     pub const LOCAL_PEERPID: c_int = 0x002;
+    #[cfg(all(feature = "local", target_os = "freebsd"))]
+    pub const LOCAL_PEERCRED: c_int = 1;
 }
 
 // ---- structs ---------------------------------------------------------------
@@ -252,7 +283,7 @@ struct SockaddrIn6 {
     sin6_scope_id: u32,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SockaddrIn {
@@ -263,7 +294,7 @@ struct SockaddrIn {
     sin_zero: [u8; 8],
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SockaddrIn6 {
@@ -288,7 +319,7 @@ struct MsgHdr {
     msg_flags: c_int,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 #[repr(C)]
 struct MsgHdr {
     msg_name: *mut c_void,
@@ -337,7 +368,7 @@ const _: () = assert!(size_of::<PollFd>() == 8);
 const _: () = assert!(size_of::<Rlimit>() == 16);
 #[cfg(target_os = "linux")]
 const _: () = assert!(size_of::<MsgHdr>() == 56);
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 const _: () = assert!(size_of::<MsgHdr>() == 48);
 
 unsafe extern "C" {
@@ -373,7 +404,7 @@ unsafe extern "C" {
     fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int;
     #[cfg(target_os = "linux")]
     fn syscall(num: std::ffi::c_long, ...) -> std::ffi::c_long;
-    #[cfg(any(feature = "local", all(feature = "udp", target_os = "macos")))]
+    #[cfg(any(feature = "local", all(feature = "udp", not(target_os = "linux"))))]
     fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
     #[cfg(all(feature = "udp", target_os = "linux"))]
     fn recvfrom(
@@ -384,7 +415,7 @@ unsafe extern "C" {
         addr: *mut c_void,
         addr_len: *mut SockLen,
     ) -> isize;
-    #[cfg(all(feature = "local", target_os = "macos"))]
+    #[cfg(all(feature = "local", not(target_os = "linux")))]
     fn getpeereid(fd: c_int, euid: *mut u32, egid: *mut u32) -> c_int;
 }
 
@@ -456,9 +487,9 @@ fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> SockLen {
     match addr {
         SocketAddr::V4(a) => {
             let sa = SockaddrIn {
-                #[cfg(target_os = "macos")]
+                #[cfg(not(target_os = "linux"))]
                 sin_len: size_of::<SockaddrIn>() as u8,
-                #[cfg(target_os = "macos")]
+                #[cfg(not(target_os = "linux"))]
                 sin_family: c::AF_INET as u8,
                 #[cfg(target_os = "linux")]
                 sin_family: c::AF_INET as u16,
@@ -474,9 +505,9 @@ fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> SockLen {
         }
         SocketAddr::V6(a) => {
             let sa = SockaddrIn6 {
-                #[cfg(target_os = "macos")]
+                #[cfg(not(target_os = "linux"))]
                 sin6_len: size_of::<SockaddrIn6>() as u8,
-                #[cfg(target_os = "macos")]
+                #[cfg(not(target_os = "linux"))]
                 sin6_family: c::AF_INET6 as u8,
                 #[cfg(target_os = "linux")]
                 sin6_family: c::AF_INET6 as u16,
@@ -501,7 +532,7 @@ struct AddrBuf([u8; 128]);
 fn decode_addr(b: &[u8; 128], len: SockLen) -> Option<SocketAddr> {
     #[cfg(target_os = "linux")]
     let family = c_int::from(u16::from_ne_bytes([b[0], b[1]]));
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let family = c_int::from(b[1]);
     let port = u16::from_be_bytes([b[2], b[3]]);
     if family == c::AF_INET && len as usize >= 16 {
@@ -531,13 +562,13 @@ fn udp_socket(v6: bool) -> io::Result<OwnedFd> {
     let domain = if v6 { c::AF_INET6 } else { c::AF_INET };
     #[cfg(target_os = "linux")]
     let ty = c::SOCK_DGRAM | c::SOCK_CLOEXEC;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let ty = c::SOCK_DGRAM;
     // SAFETY: socket(2) takes plain integers and returns a new descriptor or -1.
     let fd = cvt(unsafe { socket(domain, ty, 0) })?;
     // SAFETY: `fd` was just returned by socket(2), is open, and is owned by no one else.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
         // SAFETY: as in `tcp_socket`.
         cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
@@ -597,7 +628,7 @@ pub(crate) fn udp_recv_from(
         let n = n.unsigned_abs();
         (n, n > buf.len())
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let (n, truncated) = {
         let mut iov = [io::IoSliceMut::new(buf)];
         let mut msg = MsgHdr {
@@ -632,13 +663,13 @@ pub(crate) fn tcp_socket(v6: bool) -> io::Result<OwnedFd> {
     let domain = if v6 { c::AF_INET6 } else { c::AF_INET };
     #[cfg(target_os = "linux")]
     let ty = c::SOCK_STREAM | c::SOCK_CLOEXEC;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let ty = c::SOCK_STREAM;
     // SAFETY: socket(2) takes plain integers and returns a new descriptor or -1.
     let fd = cvt(unsafe { socket(domain, ty, 0) })?;
     // SAFETY: `fd` was just returned by socket(2), is open, and is owned by no one else.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
         // SAFETY: `owned` is an open descriptor; F_SETFD with FD_CLOEXEC is fcntl(2)'s
         // documented way to set close-on-exec. macOS has no atomic flag, so a fork plus
@@ -736,7 +767,7 @@ pub(crate) fn is_listening_stream(sock: Sock<'_>) -> io::Result<bool> {
     let stream = get_int(sock, c::SOL_SOCKET, c::SO_TYPE)? == c::SOCK_STREAM;
     let listening = match get_int(sock, c::SOL_SOCKET, c::SO_ACCEPTCONN) {
         Ok(v) => v != 0,
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         Err(e) if e.raw_os_error() == Some(errno::ENOPROTOOPT) => bound_without_peer(sock)?,
         Err(e) => return Err(e),
     };
@@ -744,7 +775,7 @@ pub(crate) fn is_listening_stream(sock: Sock<'_>) -> io::Result<bool> {
 }
 
 /// Whether `sock` is bound to a port and has no peer (the macOS listener check).
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 fn bound_without_peer(sock: Sock<'_>) -> io::Result<bool> {
     // SAFETY: `sock` is open for the call; `ManuallyDrop` keeps this temporary
     // `TcpStream` from closing a descriptor it does not own.
@@ -784,7 +815,7 @@ pub(crate) fn listener_kind(sock: Sock<'_>) -> Result<super::SockKind, super::Ki
     .map_err(KindError::Os)?;
     #[cfg(target_os = "linux")]
     let family = c_int::from(u16::from_ne_bytes([addr.0[0], addr.0[1]]));
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let family = c_int::from(addr.0[1]);
     let kind = if family == c::AF_UNIX_FAMILY {
         let end = (len as usize).min(addr.0.len());
@@ -923,7 +954,7 @@ pub(crate) fn accept(listener: &TcpListener) -> io::Result<(TcpStream, SocketAdd
     #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::Accept)?;
     let (stream, peer) = listener.accept()?;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
         // A connection the peer already reset makes these fail (`EINVAL` on
         // macOS); that is this connection's failure, never the listener's.
@@ -952,7 +983,7 @@ pub(crate) fn prepare_dialed(stream: &TcpStream) -> io::Result<()> {
 /// waits first, like Windows (D-083): a send there blocked on a full buffer
 /// despite `MSG_DONTWAIT`, and `setsockopt` fails with `EINVAL` once the
 /// connection has ended, so per-read `SO_RCVTIMEO` updates are not usable.
-pub(crate) const WAIT_BEFORE_RECV: bool = cfg!(target_os = "macos");
+pub(crate) const WAIT_BEFORE_RECV: bool = cfg!(not(target_os = "linux"));
 
 /// One receive. On Linux it blocks until bytes arrive, the receive timeout passes
 /// (`WouldBlock`), the peer closes (0), or a kill shuts the read side (0); on
@@ -987,15 +1018,15 @@ pub(crate) fn send(stream: &super::Stream, buf: &[u8]) -> io::Result<usize> {
             Some(n) => &buf[..n],
             None => buf,
         };
-        send_once(stream, buf)
+        send_once(stream.sock(), buf)
     })
 }
 
 /// One `send` system call with net-io's flags.
-fn send_once(stream: &super::Stream, buf: &[u8]) -> io::Result<usize> {
+fn send_once(sock: Sock<'_>, buf: &[u8]) -> io::Result<usize> {
     #[cfg(target_os = "linux")]
     let flags = c::MSG_DONTWAIT | c::MSG_NOSIGNAL;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let flags = c::MSG_DONTWAIT;
     {
         // SAFETY: `stream` is open for the call; `buf` is a live slice of `buf.len()`
@@ -1003,7 +1034,7 @@ fn send_once(stream: &super::Stream, buf: &[u8]) -> io::Result<usize> {
         // keep a closed peer from raising SIGPIPE.
         let n = unsafe {
             c_send(
-                stream.sock().as_raw_fd(),
+                sock.as_raw_fd(),
                 buf.as_ptr().cast::<c_void>(),
                 buf.len(),
                 flags,
@@ -1022,10 +1053,15 @@ pub(crate) const MAX_SLICES: usize = 64;
 
 /// One vectored send that never blocks (at most [`MAX_SLICES`] slices).
 pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+    send_vectored_sock(stream.sock(), bufs)
+}
+
+/// As [`send_vectored`], on a borrowed socket.
+pub(crate) fn send_vectored_sock(sock: Sock<'_>, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
     let bufs = &bufs[..bufs.len().min(MAX_SLICES)];
     #[cfg(target_os = "linux")]
     let flags = c::MSG_DONTWAIT | c::MSG_NOSIGNAL;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let flags = c::MSG_DONTWAIT;
     retry_interrupted(|| {
         #[cfg(any(test, net_io_shim))]
@@ -1037,7 +1073,7 @@ pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io:
                 .find(|b| !b.is_empty())
                 .map_or(&[][..], |b| &b[..]);
             // Straight to the system call: this send already took its fault.
-            return send_once(stream, &first[..n.min(first.len())]);
+            return send_once(sock, &first[..n.min(first.len())]);
         }
         let msg = MsgHdr {
             msg_name: std::ptr::null_mut(),
@@ -1045,7 +1081,7 @@ pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io:
             msg_iov: bufs.as_ptr().cast::<IoSlice<'static>>(),
             #[cfg(target_os = "linux")]
             msg_iovlen: bufs.len(),
-            #[cfg(target_os = "macos")]
+            #[cfg(not(target_os = "linux"))]
             msg_iovlen: bufs.len() as c_int,
             msg_control: std::ptr::null_mut(),
             msg_controllen: 0,
@@ -1054,7 +1090,7 @@ pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io:
         // SAFETY: `IoSlice` is documented as ABI-compatible with `struct iovec` on Unix;
         // `bufs` (at most 64 slices) and the bytes they point to live for the call;
         // `msg` carries no name and no control data. MSG_DONTWAIT keeps the call from blocking.
-        let n = unsafe { sendmsg(stream.sock().as_raw_fd(), &raw const msg, flags) };
+        let n = unsafe { sendmsg(sock.as_raw_fd(), &raw const msg, flags) };
         if n < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -1123,6 +1159,28 @@ pub(crate) fn wait_wake(wake: &Wake, timeout: Option<Duration>) -> io::Result<bo
     Ok(n > 0)
 }
 
+/// Waits until any of `socks` (at most 64) can write or has failed; bit `i` of the
+/// result stands for `socks[i]`, and 0 means the timeout passed.
+pub(crate) fn wait_writable(socks: &[Sock<'_>], timeout: Duration) -> io::Result<u64> {
+    let mut fds: Vec<PollFd> = socks
+        .iter()
+        .map(|s| PollFd {
+            fd: s.as_raw_fd(),
+            events: c::POLLOUT,
+            revents: 0,
+        })
+        .collect();
+    let ms = poll_millis(Some(timeout));
+    // SAFETY: `fds` is a live slice of initialized pollfd structs whose descriptors are
+    // open for the call (borrowed in `socks`).
+    retry_interrupted(|| cvt(unsafe { poll(fds.as_mut_ptr(), fds.len() as Nfds, ms) }))?;
+    Ok(fds
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.revents != 0)
+        .fold(0, |mask, (i, _)| mask | (1 << i)))
+}
+
 /// Shuts the read side of a raw socket. Used only by the kill guard.
 ///
 /// # Safety
@@ -1148,7 +1206,7 @@ pub(crate) fn set_linger(sock: Sock<'_>, linger: Option<Duration>) -> io::Result
     };
     #[cfg(target_os = "linux")]
     let name = c::SO_LINGER;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let name = c::SO_LINGER_SEC;
     // SAFETY: `value` is a live repr(C) linger struct and the length is its size.
     let ret = unsafe {
@@ -1172,7 +1230,7 @@ pub(crate) fn linger(sock: Sock<'_>) -> io::Result<Option<Duration>> {
     let mut len = size_of::<Linger>() as SockLen;
     #[cfg(target_os = "linux")]
     let name = c::SO_LINGER;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let name = c::SO_LINGER_SEC;
     // SAFETY: `value` and `len` are live locals; `len` holds the struct's size.
     let ret = unsafe {
@@ -1200,7 +1258,7 @@ pub(crate) fn set_keepalive(
             set_int(sock, c::SOL_SOCKET, c::SO_KEEPALIVE, 1)?;
             #[cfg(target_os = "linux")]
             set_int(sock, c::IPPROTO_TCP, c::TCP_KEEPIDLE, secs(idle))?;
-            #[cfg(target_os = "macos")]
+            #[cfg(not(target_os = "linux"))]
             set_int(sock, c::IPPROTO_TCP, c::TCP_KEEPALIVE, secs(idle))?;
             set_int(sock, c::IPPROTO_TCP, c::TCP_KEEPINTVL, secs(interval))?;
             set_int(sock, c::IPPROTO_TCP, c::TCP_KEEPCNT, clamp_int(count))
@@ -1215,7 +1273,7 @@ pub(crate) fn keepalive(sock: Sock<'_>) -> io::Result<Option<(Duration, Duration
     }
     #[cfg(target_os = "linux")]
     let idle = get_int(sock, c::IPPROTO_TCP, c::TCP_KEEPIDLE)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let idle = get_int(sock, c::IPPROTO_TCP, c::TCP_KEEPALIVE)?;
     let interval = get_int(sock, c::IPPROTO_TCP, c::TCP_KEEPINTVL)?;
     let count = get_int(sock, c::IPPROTO_TCP, c::TCP_KEEPCNT)?;
@@ -1294,7 +1352,7 @@ pub(crate) fn descriptor_limit() -> Option<u64> {
     };
     // SAFETY: `r` is a live rlimit struct; getrlimit(2) writes it and returns 0, or -1.
     let ret = unsafe { getrlimit(c::RLIMIT_NOFILE, &raw mut r) };
-    if ret != 0 || r.rlim_cur == u64::MAX {
+    if ret != 0 || r.rlim_cur >= i64::MAX as u64 {
         None
     } else {
         Some(r.rlim_cur)
@@ -1364,7 +1422,7 @@ struct CmsgHdr {
 }
 
 /// `struct cmsghdr` on macOS: `socklen_t` for the length.
-#[cfg(all(feature = "local", target_os = "macos"))]
+#[cfg(all(feature = "local", not(target_os = "linux")))]
 #[repr(C)]
 struct CmsgHdr {
     cmsg_len: u32,
@@ -1372,12 +1430,12 @@ struct CmsgHdr {
     cmsg_type: c_int,
 }
 
-/// `CMSG_ALIGN`: to `size_t` on Linux, to 4 bytes on macOS.
+/// `CMSG_ALIGN`: to 4 bytes on macOS, to `size_t` elsewhere.
 #[cfg(feature = "local")]
-const CMSG_ALIGN_TO: usize = if cfg!(target_os = "linux") {
-    size_of::<usize>()
-} else {
+const CMSG_ALIGN_TO: usize = if cfg!(target_os = "macos") {
     4
+} else {
+    size_of::<usize>()
 };
 
 #[cfg(feature = "local")]
@@ -1430,7 +1488,7 @@ pub(crate) fn send_with_fds(
         let len = cmsg_len(data_len);
         #[cfg(target_os = "linux")]
         control.0[..size_of::<usize>()].copy_from_slice(&len.to_ne_bytes());
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         control.0[..4].copy_from_slice(&(len as u32).to_ne_bytes());
         let level_at = size_of::<CmsgHdr>() - 2 * size_of::<c_int>();
         control.0[level_at..level_at + 4].copy_from_slice(&c::SOL_SOCKET.to_ne_bytes());
@@ -1447,7 +1505,7 @@ pub(crate) fn send_with_fds(
         msg_iov: iov.as_ptr().cast::<IoSlice<'static>>(),
         #[cfg(target_os = "linux")]
         msg_iovlen: 1,
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         msg_iovlen: 1,
         msg_control: if space == 0 {
             std::ptr::null_mut()
@@ -1456,13 +1514,13 @@ pub(crate) fn send_with_fds(
         },
         #[cfg(target_os = "linux")]
         msg_controllen: space,
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         msg_controllen: space as u32,
         msg_flags: 0,
     };
     #[cfg(target_os = "linux")]
     let flags = c::MSG_DONTWAIT | c::MSG_NOSIGNAL;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let flags = c::MSG_DONTWAIT;
     retry_interrupted(|| {
         // SAFETY: `iov` (one slice of `body`) and `control` (a cmsghdr with `fds.len()`
@@ -1506,18 +1564,18 @@ pub(crate) fn recv_with_fds(
         msg_iov: iov.as_mut_ptr().cast::<IoSlice<'static>>(),
         #[cfg(target_os = "linux")]
         msg_iovlen: 1,
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         msg_iovlen: 1,
         msg_control: control.0.as_mut_ptr().cast::<c_void>(),
         #[cfg(target_os = "linux")]
         msg_controllen: control.0.len(),
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         msg_controllen: control.0.len() as u32,
         msg_flags: 0,
     };
     #[cfg(target_os = "linux")]
     let flags = c::MSG_CMSG_CLOEXEC;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let flags = 0;
     let n = retry_interrupted(|| {
         // SAFETY: `iov` (`IoSliceMut`, ABI-compatible with `struct iovec`) covers
@@ -1531,7 +1589,7 @@ pub(crate) fn recv_with_fds(
     })?;
     #[cfg(target_os = "linux")]
     let used = msg.msg_controllen.min(control.0.len());
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let used = (msg.msg_controllen as usize).min(control.0.len());
     let truncated = msg.msg_flags & c::MSG_CTRUNC != 0;
     let hdr = cmsg_align(size_of::<CmsgHdr>());
@@ -1546,7 +1604,7 @@ pub(crate) fn recv_with_fds(
                 .try_into()
                 .unwrap_or([0; size_of::<usize>()]),
         );
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         let len = u32::from_ne_bytes(bytes[..4].try_into().unwrap_or([0; 4])) as usize;
         let level =
             c_int::from_ne_bytes(bytes[level_at..level_at + 4].try_into().unwrap_or([0; 4]));
@@ -1569,7 +1627,7 @@ pub(crate) fn recv_with_fds(
                 // SAFETY: the kernel just installed `raw` in this process for us
                 // (SCM_RIGHTS); nothing else owns it.
                 let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-                #[cfg(target_os = "macos")]
+                #[cfg(not(target_os = "linux"))]
                 {
                     // SAFETY: `owned` is open; F_SETFD with FD_CLOEXEC takes an int.
                     unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) };
@@ -1621,16 +1679,61 @@ pub(crate) fn peer_credentials(sock: Sock<'_>) -> io::Result<(Option<u32>, u32, 
 }
 
 /// The peer's process id (where the OS says), user id, and group id.
-#[cfg(all(feature = "local", target_os = "macos"))]
+#[cfg(all(feature = "local", not(target_os = "linux")))]
 pub(crate) fn peer_credentials(sock: Sock<'_>) -> io::Result<(Option<u32>, u32, u32)> {
     let mut uid = 0u32;
     let mut gid = 0u32;
     // SAFETY: `sock` is open; `uid` and `gid` are live locals getpeereid(3) writes.
     cvt(unsafe { getpeereid(sock.as_raw_fd(), &raw mut uid, &raw mut gid) })?;
+    #[cfg(target_os = "macos")]
     let pid = get_int(sock, c::SOL_LOCAL, c::LOCAL_PEERPID)
         .ok()
         .and_then(|p| u32::try_from(p).ok());
+    #[cfg(target_os = "freebsd")]
+    let pid = peer_pid(sock);
     Ok((pid, uid, gid))
+}
+
+/// `struct xucred` (`unix(4)` on FreeBSD), for `LOCAL_PEERCRED`. `cr_pid` shares a
+/// pointer-sized union, and FreeBSD fills it from 13.
+#[cfg(all(feature = "local", target_os = "freebsd"))]
+#[repr(C)]
+struct Xucred {
+    cr_version: u32,
+    cr_uid: u32,
+    cr_ngroups: i16,
+    cr_groups: [u32; 16],
+    cr_pid: usize,
+}
+
+/// The process at the other end of a Unix socket; only FreeBSD's credentials carry it.
+#[cfg(all(feature = "local", target_os = "freebsd"))]
+fn peer_pid(sock: Sock<'_>) -> Option<u32> {
+    let mut cred = Xucred {
+        cr_version: 0,
+        cr_uid: 0,
+        cr_ngroups: 0,
+        cr_groups: [0; 16],
+        cr_pid: 0,
+    };
+    let mut len = size_of::<Xucred>() as SockLen;
+    // SAFETY: `sock` is open; `cred` is writable for `len` bytes and lives for the call.
+    let ret = unsafe {
+        getsockopt(
+            sock.as_raw_fd(),
+            c::SOL_LOCAL,
+            c::LOCAL_PEERCRED,
+            (&raw mut cred).cast::<c_void>(),
+            &raw mut len,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    // The low half of the union, on these little-endian targets.
+    u32::try_from(cred.cr_pid as u32 as i32)
+        .ok()
+        .filter(|p| *p != 0)
 }
 
 /// `struct sockaddr_un` (`unix(7)`).
@@ -1642,7 +1745,7 @@ struct SockaddrUn {
 }
 
 /// `struct sockaddr_un` on macOS.
-#[cfg(all(feature = "local", target_os = "macos"))]
+#[cfg(all(feature = "local", not(target_os = "linux")))]
 #[repr(C)]
 struct SockaddrUn {
     sun_len: u8,
@@ -1654,7 +1757,7 @@ struct SockaddrUn {
 #[cfg(all(feature = "local", target_os = "linux"))]
 pub(crate) const UNIX_PATH_MAX: usize = 108;
 /// The size of `sun_path`: the longest Unix socket path plus its terminator.
-#[cfg(all(feature = "local", target_os = "macos"))]
+#[cfg(all(feature = "local", not(target_os = "linux")))]
 pub(crate) const UNIX_PATH_MAX: usize = 104;
 
 /// Encodes a filesystem path (no NUL byte, shorter than [`UNIX_PATH_MAX`]).
@@ -1664,9 +1767,9 @@ fn encode_unix(path: &[u8]) -> io::Result<(SockaddrUn, SockLen)> {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
     let mut sa = SockaddrUn {
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         sun_len: 0,
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         sun_family: c::AF_UNIX as u8,
         #[cfg(target_os = "linux")]
         sun_family: c::AF_UNIX as u16,
@@ -1674,7 +1777,7 @@ fn encode_unix(path: &[u8]) -> io::Result<(SockaddrUn, SockLen)> {
     };
     sa.sun_path[..path.len()].copy_from_slice(path);
     let len = std::mem::offset_of!(SockaddrUn, sun_path) + path.len() + 1;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
         sa.sun_len = len as u8;
     }
@@ -1688,13 +1791,13 @@ pub(crate) fn unix_socket() -> io::Result<OwnedFd> {
     super::shim::check(super::shim::Op::Socket)?;
     #[cfg(target_os = "linux")]
     let ty = c::SOCK_STREAM | c::SOCK_CLOEXEC;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let ty = c::SOCK_STREAM;
     // SAFETY: socket(2) takes plain integers and returns a new descriptor or -1.
     let fd = cvt(unsafe { socket(c::AF_UNIX, ty, 0) })?;
     // SAFETY: `fd` was just returned by socket(2), is open, and is owned by no one else.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
         // SAFETY: as in `tcp_socket`.
         cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
@@ -1742,7 +1845,7 @@ pub(crate) fn accept_unix(
     let (stream, _) = listener.accept()?;
     #[cfg(target_os = "linux")]
     stream.set_nonblocking(false)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
         let setup = set_int(stream.as_fd(), c::SOL_SOCKET, c::SO_NOSIGPIPE, 1)
             .and_then(|()| stream.set_nonblocking(true));
@@ -1797,11 +1900,19 @@ mod layout {
             assert_eq!(c::TCP_KEEPIDLE, libc::TCP_KEEPIDLE);
             assert_eq!(c::MSG_NOSIGNAL, libc::MSG_NOSIGNAL);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         {
             assert_eq!(c::SO_NOSIGPIPE, libc::SO_NOSIGPIPE);
-            assert_eq!(c::SO_LINGER_SEC, libc::SO_LINGER_SEC);
-            assert_eq!(c::TCP_KEEPALIVE, libc::TCP_KEEPALIVE);
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(c::SO_LINGER_SEC, libc::SO_LINGER_SEC);
+                assert_eq!(c::TCP_KEEPALIVE, libc::TCP_KEEPALIVE);
+            }
+            #[cfg(target_os = "freebsd")]
+            {
+                assert_eq!(c::SO_LINGER_SEC, libc::SO_LINGER);
+                assert_eq!(c::TCP_KEEPALIVE, libc::TCP_KEEPIDLE);
+            }
             assert_eq!(c::F_SETFD, libc::F_SETFD);
             assert_eq!(c::FD_CLOEXEC, libc::FD_CLOEXEC);
         }
@@ -1820,7 +1931,7 @@ mod layout {
         assert_eq!(EPROTO, libc::EPROTO);
         assert_eq!(ENOTSOCK, libc::ENOTSOCK);
         assert_eq!(ENOPROTOOPT, libc::ENOPROTOOPT);
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(ENOTCONN, libc::ENOTCONN);
         assert_eq!(EOPNOTSUPP, libc::EOPNOTSUPP);
         assert_eq!(EADDRINUSE, libc::EADDRINUSE);
@@ -1893,6 +2004,12 @@ mod layout {
         {
             assert_eq!(c::SOL_LOCAL, libc::SOL_LOCAL);
             assert_eq!(c::LOCAL_PEERPID, libc::LOCAL_PEERPID);
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            assert_eq!(size_of::<Xucred>(), size_of::<libc::xucred>());
+            assert_eq!(c::SOL_LOCAL, libc::SOL_LOCAL);
+            assert_eq!(c::LOCAL_PEERCRED, libc::LOCAL_PEERCRED);
         }
         assert_eq!(size_of::<CmsgHdr>(), size_of::<libc::cmsghdr>());
         assert_eq!(
@@ -2077,7 +2194,7 @@ mod layout {
         assert_eq!(from, src.local_addr().unwrap());
         #[cfg(target_os = "linux")]
         assert_eq!(n, 100);
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(n, 10);
         let src6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
         src6.send_to(&[], b.local_addr().unwrap()).unwrap();
@@ -2203,7 +2320,8 @@ mod layout {
         let expected = if r.rlim_cur == libc::RLIM_INFINITY {
             None
         } else {
-            Some(r.rlim_cur)
+            #[allow(clippy::unnecessary_cast)] // i64 on FreeBSD
+            Some(r.rlim_cur as u64)
         };
         assert_eq!(descriptor_limit(), expected);
     }

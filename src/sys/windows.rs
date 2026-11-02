@@ -15,14 +15,15 @@ use std::io::{self, IoSlice};
 use std::mem::size_of;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::windows::io::{
-    AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, OwnedSocket, RawSocket,
+    AsRawHandle, AsRawSocket, AsSocket, BorrowedSocket, FromRawHandle, FromRawSocket, OwnedHandle,
+    OwnedSocket, RawSocket,
 };
 use std::sync::Once;
 use std::time::Duration;
 
 use super::{Interest, Ready, poll_millis, retry_interrupted};
 
-type Socket = usize;
+pub(super) type Socket = usize;
 
 /// Winsock error codes net-io classifies.
 pub(crate) mod errno {
@@ -70,7 +71,9 @@ pub(crate) fn classify_addr_error(e: &io::Error) -> super::AddrFailure {
     }
 }
 
-mod c {
+pub(super) mod c {
+    #[cfg(feature = "local")]
+    pub const AF_UNIX: i32 = 1;
     pub const AF_INET: i32 = 2;
     pub const AF_INET6: i32 = 23;
     pub const SOCK_STREAM: i32 = 1;
@@ -107,6 +110,7 @@ mod c {
     pub const HANDLE_FLAG_INHERIT: u32 = 0x1;
     pub const INVALID_SOCKET: usize = !0;
     pub const SOCKET_ERROR: i32 = -1;
+    pub const WSAEINTR: i32 = 10004;
     pub const WSAEWOULDBLOCK: i32 = 10035;
 }
 
@@ -155,7 +159,49 @@ struct WsaData {
     sz_system_status: [u8; 129],
 }
 
+/// `OVERLAPPED`. The kernel writes `internal` and `internal_high`.
+#[cfg(any(feature = "reactor", feature = "local"))]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct Overlapped {
+    pub(super) internal: usize,
+    pub(super) internal_high: usize,
+    pub(super) offset: u32,
+    pub(super) offset_high: u32,
+    pub(super) event: usize,
+}
+
+/// `WSAPROTOCOL_INFOW`.
+#[cfg(any(feature = "reactor", feature = "local"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct WsaProtocolInfo {
+    pub(super) service_flags1: u32,
+    service_flags2: u32,
+    service_flags3: u32,
+    service_flags4: u32,
+    provider_flags: u32,
+    provider_id: [u8; 16],
+    catalog_entry_id: u32,
+    chain_len: i32,
+    chain: [u32; 7],
+    version: i32,
+    address_family: i32,
+    max_sockaddr: i32,
+    min_sockaddr: i32,
+    socket_type: i32,
+    pub(super) i_protocol: i32,
+    protocol_max_offset: i32,
+    network_byte_order: i32,
+    security_scheme: i32,
+    message_size: u32,
+    provider_reserved: u32,
+    protocol: [u16; 256],
+}
+
 const _: () = assert!(size_of::<SockaddrIn>() == 16);
+#[cfg(any(feature = "reactor", feature = "local"))]
+const _: () = assert!(size_of::<WsaProtocolInfo>() == 628);
 const _: () = assert!(size_of::<SockaddrIn6>() == 28);
 const _: () = assert!(size_of::<Linger>() == 4);
 const _: () = assert!(size_of::<WsaPollFd>() == 16);
@@ -175,10 +221,15 @@ unsafe extern "system" {
     fn bind(s: Socket, name: *const c_void, len: i32) -> i32;
     fn listen(s: Socket, backlog: i32) -> i32;
     fn connect(s: Socket, name: *const c_void, len: i32) -> i32;
+    #[cfg(feature = "local")]
+    #[link_name = "accept"]
+    fn accept_raw(s: Socket, name: *mut c_void, len: *mut i32) -> Socket;
     fn setsockopt(s: Socket, level: i32, name: i32, value: *const u8, len: i32) -> i32;
     fn getsockopt(s: Socket, level: i32, name: i32, value: *mut u8, len: *mut i32) -> i32;
     fn WSAPoll(fds: *mut WsaPollFd, nfds: u32, timeout: i32) -> i32;
     fn WSAGetLastError() -> i32;
+    #[cfg(feature = "local")]
+    fn WSADuplicateSocketW(s: Socket, pid: u32, info: *mut WsaProtocolInfo) -> i32;
     #[cfg(feature = "udp")]
     fn recvfrom(
         s: Socket,
@@ -188,7 +239,7 @@ unsafe extern "system" {
         from: *mut c_void,
         from_len: *mut i32,
     ) -> i32;
-    #[cfg(feature = "udp")]
+    #[cfg(any(feature = "udp", feature = "local"))]
     fn WSAIoctl(
         s: Socket,
         code: u32,
@@ -202,9 +253,28 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+#[cfg(feature = "local")]
+#[link(name = "bcrypt")]
+unsafe extern "system" {
+    fn BCryptGenRandom(algorithm: *mut c_void, buffer: *mut u8, len: u32, flags: u32) -> i32;
+}
+
+#[cfg(feature = "local")]
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 2;
+#[cfg(feature = "local")]
+const FROM_PROTOCOL_INFO: i32 = -1;
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    fn CreateEventW(
+        attributes: *const c_void,
+        manual: i32,
+        initial: i32,
+        name: *const u16,
+    ) -> *mut c_void;
+    fn SetEvent(event: *mut c_void) -> i32;
+    pub(super) fn CancelIoEx(file: *mut c_void, overlapped: *mut c_void) -> i32;
     fn QueryPerformanceCounter(count: *mut i64) -> i32;
     fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
 }
@@ -240,11 +310,33 @@ impl<T: AsSocket> AsSock for T {
     }
 }
 
+/// A socket number as a borrowed socket.
+///
+/// # Safety
+///
+/// `s` is open for as long as the result is used.
+#[cfg(feature = "reactor")]
+pub(super) unsafe fn borrow(s: Socket) -> Sock<'static> {
+    // SAFETY: by this function's contract.
+    unsafe { BorrowedSocket::borrow_raw(s as RawSocket) }
+}
+
+/// Sets a socket-level option that takes no value.
+///
+/// # Safety
+///
+/// None beyond passing a number: a stale socket fails the call.
+#[cfg(feature = "reactor")]
+pub(super) unsafe fn setsockopt_empty(s: Socket, name: i32) -> io::Result<()> {
+    // SAFETY: a null value of length 0 is what these options take.
+    cvt(unsafe { setsockopt(s, c::SOL_SOCKET, name, std::ptr::null(), 0) }).map(drop)
+}
+
 pub(crate) fn raw_of(sock: Sock<'_>) -> RawSock {
     sock.as_raw_socket()
 }
 
-fn raw(sock: Sock<'_>) -> Socket {
+pub(super) fn raw(sock: Sock<'_>) -> Socket {
     // RawSocket is u64; SOCKET is pointer-sized, and both targets here are 64-bit.
     sock.as_raw_socket() as Socket
 }
@@ -266,7 +358,7 @@ static STARTUP: Once = Once::new();
 
 /// Winsock must be started before the first socket call. `WSAStartup` is
 /// reference counted, so this coexists with the standard library's own call.
-fn startup() {
+pub(super) fn startup() {
     STARTUP.call_once(|| {
         // SAFETY: WsaData is plain data; zeroed is a valid starting value that
         // WSAStartup overwrites. Version 2.2 is requested as Microsoft documents.
@@ -307,7 +399,7 @@ fn get_int(sock: Sock<'_>, level: i32, name: i32) -> io::Result<i32> {
     cvt(ret).map(|_| value)
 }
 
-fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> i32 {
+pub(super) fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> i32 {
     match addr {
         SocketAddr::V4(a) => {
             let sa = SockaddrIn {
@@ -692,6 +784,195 @@ pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io:
     })
 }
 
+/// The longest AF_UNIX path, terminator included.
+#[cfg(feature = "local")]
+pub(crate) const UNIX_PATH_MAX: usize = 108;
+
+#[cfg(feature = "local")]
+const SIO_AF_UNIX_GETPEERPID: u32 = 0x5800_0100;
+
+/// A `sockaddr_un`, and its length.
+#[cfg(feature = "local")]
+fn unix_addr(path: &[u8]) -> io::Result<([u8; 2 + UNIX_PATH_MAX], i32)> {
+    if path.is_empty() || path.len() >= UNIX_PATH_MAX || path.contains(&0) {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let mut addr = [0u8; 2 + UNIX_PATH_MAX];
+    addr[..2].copy_from_slice(&1u16.to_ne_bytes());
+    addr[2..2 + path.len()].copy_from_slice(path);
+    Ok((addr, (2 + path.len() + 1) as i32))
+}
+
+/// A new AF_UNIX stream socket.
+#[cfg(feature = "local")]
+pub(crate) fn unix_socket() -> io::Result<OwnedSocket> {
+    startup();
+    // SAFETY: a null protocol-info pointer creates a socket from the plain integers.
+    let s = unsafe {
+        WSASocketW(
+            c::AF_UNIX,
+            c::SOCK_STREAM,
+            0,
+            std::ptr::null_mut(),
+            0,
+            c::WSA_FLAG_OVERLAPPED | c::WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if s == c::INVALID_SOCKET {
+        return Err(last_error());
+    }
+    // SAFETY: `s` was just created, is open, and is owned by no one else.
+    Ok(unsafe { OwnedSocket::from_raw_socket(s as RawSocket) })
+}
+
+/// Binds and listens; the path names a new socket file.
+#[cfg(feature = "local")]
+pub(crate) fn unix_bind(sock: Sock<'_>, path: &[u8], backlog: u32) -> io::Result<()> {
+    let (addr, len) = unix_addr(path)?;
+    // SAFETY: `addr` holds a valid SOCKADDR_UN of `len` bytes and lives for the call.
+    cvt(unsafe { bind(raw(sock), addr.as_ptr().cast(), len) })?;
+    // SAFETY: `sock` is an open, bound stream socket.
+    cvt(unsafe { listen(raw(sock), clamp_int(backlog)) })?;
+    Ok(())
+}
+
+/// Connects to the socket at `path`.
+#[cfg(feature = "local")]
+pub(crate) fn unix_connect(sock: Sock<'_>, path: &[u8]) -> io::Result<()> {
+    let (addr, len) = unix_addr(path)?;
+    // SAFETY: as in `unix_bind`.
+    cvt(unsafe { connect(raw(sock), addr.as_ptr().cast(), len) }).map(drop)
+}
+
+/// One accept on a non-blocking AF_UNIX listener. std's `accept` cannot decode the
+/// peer's address, so this asks for none. Sockets start inheritable here.
+#[cfg(feature = "local")]
+pub(crate) fn unix_accept(listener: Sock<'_>) -> io::Result<OwnedSocket> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::Accept)?;
+    // SAFETY: `listener` is open; no address is asked for.
+    let s = unsafe { accept_raw(raw(listener), std::ptr::null_mut(), std::ptr::null_mut()) };
+    if s == c::INVALID_SOCKET {
+        return Err(last_error());
+    }
+    // SAFETY: `s` was just accepted, is open, and is owned by no one else.
+    let owned = unsafe { OwnedSocket::from_raw_socket(s as RawSocket) };
+    // SAFETY: the handle is open; clearing the flag is the call's documented use.
+    let ok = unsafe { SetHandleInformation(s as *mut c_void, c::HANDLE_FLAG_INHERIT, 0) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(owned)
+}
+
+/// The process at the other end of an AF_UNIX connection.
+#[cfg(feature = "local")]
+pub(crate) fn unix_peer_pid(sock: Sock<'_>) -> io::Result<u32> {
+    let (mut pid, mut returned) = (0u32, 0u32);
+    // SAFETY: `pid` is writable for the stated length; no overlapped operation.
+    cvt(unsafe {
+        WSAIoctl(
+            raw(sock),
+            SIO_AF_UNIX_GETPEERPID,
+            std::ptr::null(),
+            0,
+            (&raw mut pid).cast(),
+            size_of::<u32>() as u32,
+            &raw mut returned,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    Ok(pid)
+}
+
+/// How many bytes describe a socket for another process (`WSAPROTOCOL_INFOW`).
+#[cfg(feature = "local")]
+pub(crate) const SHARED_SOCKET: usize = size_of::<WsaProtocolInfo>();
+
+/// Describes `sock` for the process `pid`; the description works there alone.
+#[cfg(feature = "local")]
+pub(crate) fn share_socket(sock: Sock<'_>, pid: u32) -> io::Result<[u8; SHARED_SOCKET]> {
+    let mut out = [0u8; SHARED_SOCKET];
+    let mut info = std::mem::MaybeUninit::<WsaProtocolInfo>::zeroed();
+    // SAFETY: `info` is writable for its size, and `sock` is open for the call.
+    cvt(unsafe { WSADuplicateSocketW(raw(sock), pid, info.as_mut_ptr()) })?;
+    // SAFETY: the call filled it, and every field is plain data.
+    let bytes = unsafe { std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), SHARED_SOCKET) };
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+/// The socket a description from [`share_socket`] names. Windows hands back the same
+/// socket if a description is used twice, so the caller keeps each to one use.
+#[cfg(feature = "local")]
+pub(crate) fn socket_from_shared(blob: &[u8; SHARED_SOCKET]) -> io::Result<OwnedSocket> {
+    startup();
+    let mut info = std::mem::MaybeUninit::<WsaProtocolInfo>::uninit();
+    // SAFETY: `info` has room for the bytes, and any bytes are a valid WsaProtocolInfo.
+    unsafe {
+        std::ptr::copy_nonoverlapping(blob.as_ptr(), info.as_mut_ptr().cast::<u8>(), SHARED_SOCKET);
+    }
+    // SAFETY: the structure is live for the call; the kernel checks what it holds.
+    let s = unsafe {
+        WSASocketW(
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            info.as_mut_ptr().cast(),
+            0,
+            c::WSA_FLAG_OVERLAPPED | c::WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if s == c::INVALID_SOCKET {
+        return Err(last_error());
+    }
+    // SAFETY: `s` was just created, is open, and is owned by no one else.
+    Ok(unsafe { OwnedSocket::from_raw_socket(s as RawSocket) })
+}
+
+/// Bytes from the OS's preferred random source.
+#[cfg(feature = "local")]
+pub(crate) fn random_bytes(out: &mut [u8]) -> io::Result<()> {
+    // SAFETY: `out` is writable for its length; a null algorithm with this flag means
+    // the system's preferred source.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            out.as_mut_ptr(),
+            u32::try_from(out.len()).unwrap_or(u32::MAX),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::other("BCryptGenRandom failed"));
+    }
+    Ok(())
+}
+
+/// Waits until any of `socks` (at most 64) can write or has failed; bit `i` of the
+/// result stands for `socks[i]`, and 0 means the timeout passed. `WSAPoll` reports a
+/// refused connect through `POLLERR` and `POLLHUP`, which every call watches.
+pub(crate) fn wait_writable(socks: &[Sock<'_>], timeout: Duration) -> io::Result<u64> {
+    let mut fds: Vec<WsaPollFd> = socks
+        .iter()
+        .map(|s| WsaPollFd {
+            fd: raw(*s),
+            events: c::POLLWRNORM,
+            revents: 0,
+        })
+        .collect();
+    let ms = poll_millis(Some(timeout));
+    // SAFETY: `fds` is a live slice of initialized WSAPOLLFD structs whose sockets are
+    // open for the call (borrowed in `socks`).
+    retry_interrupted(|| cvt(unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, ms) }))?;
+    Ok(fds
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.revents != 0)
+        .fold(0, |mask, (i, _)| mask | (1 << i)))
+}
+
 /// Waits until `sock` is ready for `interest`, `wake` fires, or `timeout` passes.
 pub(crate) fn wait(
     sock: Sock<'_>,
@@ -721,7 +1002,12 @@ pub(crate) fn wait(
     let ms = poll_millis(timeout);
     // SAFETY: `fds` is a live array of `nfds` initialized WSAPOLLFD structs whose
     // sockets are open for the call.
-    let n = retry_interrupted(|| cvt(unsafe { WSAPoll(fds.as_mut_ptr(), nfds, ms) }))?;
+    let n = match retry_interrupted(|| cvt(unsafe { WSAPoll(fds.as_mut_ptr(), nfds, ms) })) {
+        Ok(n) => n,
+        // A kill's `CancelIoEx` ended the wait; the kill flag says why.
+        Err(e) if e.raw_os_error() == Some(c::WSAEINTR) => return Ok(Ready::Woken),
+        Err(e) => return Err(e),
+    };
     if n == 0 {
         return Ok(Ready::TimedOut);
     }
@@ -756,7 +1042,11 @@ pub(crate) fn wait_wake(wake: &Wake, timeout: Option<Duration>) -> io::Result<bo
 /// # Safety
 ///
 /// `raw` must be an open socket for the call.
-pub(crate) unsafe fn shutdown_read_raw(_raw: RawSock) {}
+pub(crate) unsafe fn shutdown_read_raw(raw: RawSock) {
+    // Not found is the usual answer: only a pipe's or a reactor's IO is overlapped.
+    // SAFETY: `raw` is open, by this function's contract; null means all operations.
+    let _ = unsafe { CancelIoEx(raw as usize as *mut c_void, std::ptr::null_mut()) };
+}
 
 fn clamp_int(n: u32) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
@@ -893,10 +1183,12 @@ pub(crate) fn descriptor_limit() -> Option<u64> {
     None
 }
 
-/// A wake-up channel: a loopback UDP socket connected to itself.
+/// A wake-up channel: a loopback UDP socket connected to itself, and an event for
+/// the waits that cannot take a socket (named pipes).
 #[derive(Debug)]
 pub(crate) struct Wake {
     socket: UdpSocket,
+    event: OwnedHandle,
     thread: std::sync::OnceLock<std::thread::Thread>,
 }
 
@@ -905,8 +1197,15 @@ impl Wake {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.connect(socket.local_addr()?)?;
         socket.set_nonblocking(true)?;
+        // SAFETY: no attributes, no name; an auto-reset event, not signaled.
+        let raw = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
         Ok(Wake {
             socket,
+            // SAFETY: `raw` was just returned, is open, and has no other owner.
+            event: unsafe { OwnedHandle::from_raw_handle(raw) },
             thread: std::sync::OnceLock::new(),
         })
     }
@@ -919,6 +1218,8 @@ impl Wake {
     /// Ends the current or next wait that includes this channel. Never blocks.
     pub(crate) fn wake(&self) {
         let _ = self.socket.send(&[1]);
+        // SAFETY: the event is open while `self` lives.
+        let _ = unsafe { SetEvent(self.event.as_raw_handle()) };
         if let Some(t) = self.thread.get() {
             t.unpark();
         }
@@ -927,6 +1228,18 @@ impl Wake {
     fn drain(&self) {
         let mut buf = [0u8; 64];
         while self.socket.recv(&mut buf).is_ok() {}
+    }
+
+    /// The event a wait on a pipe includes.
+    #[cfg(feature = "local")]
+    pub(super) fn event_raw(&self) -> *mut c_void {
+        self.event.as_raw_handle()
+    }
+
+    /// Consumes a wake seen through the event.
+    #[cfg(feature = "local")]
+    pub(super) fn take(&self) {
+        self.drain();
     }
 }
 

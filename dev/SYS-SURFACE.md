@@ -155,7 +155,9 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 | `CloseHandle` | kernel32 | | handleapi | 0.3 |
 | `GetCurrentProcessId` | kernel32 | fork-equivalent checks, hand-off target | processthreadsapi | 0.3 |
 | `CreateEventW`, `SetEvent`, `WaitForSingleObject` | kernel32 | overlapped pipe connect in the blocking driver | synchapi | 0.5 |
-| `CreateNamedPipeW`, `ConnectNamedPipe`, `DisconnectNamedPipe`, `WaitNamedPipeW`, `GetNamedPipeClientProcessId` | kernel32 | named pipes | namedpipeapi, winbase | 0.5 |
+| `CreateNamedPipeW`, `ConnectNamedPipe`, `DisconnectNamedPipe`, `WaitNamedPipeW`, `GetNamedPipeClientProcessId`, `GetNamedPipeServerProcessId` | kernel32 | named pipes | namedpipeapi, winbase | 0.5 |
+| `GetOverlappedResult`, `WaitForMultipleObjects`, `GetCurrentProcess` | kernel32 | overlapped pipe IO, waits, the token query | ioapiset, synchapi, processthreadsapi | 0.5 |
+| `OpenProcessToken`, `GetTokenInformation`, `ConvertSidToStringSidW` | advapi32 | the current user's SID for an owner-only pipe (D-114) | processthreadsapi, securitybaseapi, sddl | 0.5 |
 | `CreateFileW`, `ReadFile`, `WriteFile`, `FlushFileBuffers` | kernel32 | pipe clients and IO | fileapi | 0.5 |
 | `DeleteFileW`, `GetFileAttributesW` | kernel32 | AF_UNIX socket files | fileapi | 0.5 |
 | `LocalFree` | kernel32 | security descriptor from SDDL | winbase | 0.5 |
@@ -208,3 +210,7 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 3. Every function signature is checked in `tests/layout.rs` by assigning the dev-dependency's function to a pointer of net-io's declared type (a mismatch fails to compile).
 4. Every constant is compared with the dev-dependency's value.
 5. A function needed by a later version is declared in that version, not earlier (no unused unsafe surface), but it must already be on this list.
+
+## 0.5.0 as built
+
+Added: epoll (`epoll_create1`, `epoll_ctl`, `epoll_wait`, `eventfd`) on Linux; `kqueue`, `kevent` with `EVFILT_READ`, `EVFILT_WRITE`, `EVFILT_USER` on macOS and FreeBSD; on Windows every IOCP, pipe, AF_UNIX, and hand-off row above, except `FlushFileBuffers`, `DeleteFileW`, and `GetFileAttributesW`, which `std` covers. `SIO_AF_UNIX_GETPEERPID` is `0x58000100`. `FreeBSD` constants that differ from macOS: `AF_INET6` 28, `CLOCK_MONOTONIC` 4, `SO_NOSIGPIPE` 0x0800, linger through `SO_LINGER` in seconds, `TCP_KEEPIDLE` 256, `TCP_KEEPINTVL` 512, `TCP_KEEPCNT` 1024, `EPROTO` 92, `EOPNOTSUPP` 45, `EVFILT_USER` -11, `CMSG` alignment of `size_t`. `struct kevent` on FreeBSD has the four-word `ext` array. Each is checked against `libc` or `windows-sys` by a layout test.

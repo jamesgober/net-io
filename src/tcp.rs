@@ -430,6 +430,8 @@ pub struct ConnectOptions {
     local_addr: Option<SocketAddr>,
     tcp: TcpOptions,
     limits: Limits,
+    happy_eyeballs: bool,
+    attempt_delay: Duration,
 }
 
 impl Default for ConnectOptions {
@@ -439,6 +441,8 @@ impl Default for ConnectOptions {
             local_addr: None,
             tcp: TcpOptions::new().nodelay(true),
             limits: Limits::default(),
+            happy_eyeballs: false,
+            attempt_delay: Duration::from_millis(250),
         }
     }
 }
@@ -470,6 +474,22 @@ impl ConnectOptions {
     /// Limits for the connection.
     pub fn limits(mut self, limits: Limits) -> ConnectOptions {
         self.limits = limits;
+        self
+    }
+
+    /// Happy Eyeballs (RFC 8305, simplified because `std` resolution returns both
+    /// families at once): attempts overlap instead of waiting for each other, IPv6
+    /// first and the families interleaved, and the first established connection wins.
+    /// The total timeout still bounds everything; the others are reset.
+    pub fn happy_eyeballs(mut self, on: bool) -> ConnectOptions {
+        self.happy_eyeballs = on;
+        self
+    }
+
+    /// How long an attempt runs alone before the next one starts (250 ms; held to
+    /// 100 ms through 2 s). An attempt that fails starts the next at once.
+    pub fn attempt_delay(mut self, d: Duration) -> ConnectOptions {
+        self.attempt_delay = d.clamp(Duration::from_millis(100), Duration::from_secs(2));
         self
     }
 }
@@ -544,6 +564,9 @@ impl TcpConnection {
         addrs: &[SocketAddr],
         options: &ConnectOptions,
     ) -> Result<TcpConnection, NetError> {
+        if options.happy_eyeballs && addrs.len() > 1 {
+            return connect_racing(addrs, options);
+        }
         let start = Instant::now();
         let deadline = start + options.timeout;
         let mut last = NetError::NoAddresses;
@@ -591,7 +614,7 @@ impl TcpConnection {
             peer,
             Instant::now(),
         );
-        let limits = Limits::default().effective(DriverKind::Blocking);
+        let limits = Arc::new(Limits::default().effective(DriverKind::Blocking));
         Ok(TcpConnection::from_link(Link::new(
             sys::Stream::Tcp(stream),
             info,
@@ -605,6 +628,23 @@ impl TcpConnection {
 
     pub(crate) fn from_link(link: Link) -> TcpConnection {
         TcpConnection { link: Some(link) }
+    }
+
+    /// The process at an end of a named pipe.
+    #[cfg(all(windows, feature = "local"))]
+    pub(crate) fn pipe_pid(&self, server: bool) -> Result<u32, NetError> {
+        match &self.link_ref().stream {
+            sys::Stream::Pipe(p) => if server {
+                p.server_pid()
+            } else {
+                p.client_pid()
+            }
+            .map_err(|e| NetError::from_os("GetNamedPipeClientProcessId", e)),
+            _ => Err(NetError::Unsupported {
+                feature: "client_pid on a socket",
+                platform: std::env::consts::OS,
+            }),
+        }
     }
 
     pub(crate) fn take_link(&mut self) -> Option<Link> {
@@ -686,7 +726,7 @@ impl TcpConnection {
             });
         }
         let timeout = link.limits.read_timeout;
-        match sys::wait(link.stream.sock(), Interest::Read, None, Some(timeout)) {
+        match link.stream.wait(Interest::Read, None, Some(timeout)) {
             Ok(Ready::TimedOut) => {
                 return Err(NetError::TimedOut {
                     kind: TimeoutKind::Read,
@@ -912,11 +952,11 @@ fn unreachable_link() -> ! {
     std::process::abort()
 }
 
-fn connect_one(
+/// A non-blocking socket ready to connect to `addr`.
+fn dial_socket(
     addr: SocketAddr,
     options: &ConnectOptions,
-    attempt: Duration,
-) -> Result<TcpConnection, NetError> {
+) -> Result<std::net::TcpStream, NetError> {
     let owned = sys::tcp_socket(addr.is_ipv6()).map_err(|e| NetError::from_os("socket", e))?;
     let stream = std::net::TcpStream::from(owned);
     stream
@@ -926,6 +966,126 @@ fn connect_one(
     if let Some(local) = options.local_addr {
         sys::bind_to(stream.sock(), local).map_err(|e| bind_error(local, e))?;
     }
+    Ok(stream)
+}
+
+/// IPv6 first, then the families take turns.
+fn interleaved(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let (v6, v4): (Vec<_>, Vec<_>) = addrs.iter().copied().partition(SocketAddr::is_ipv6);
+    let (mut v6, mut v4) = (v6.into_iter(), v4.into_iter());
+    let mut out = Vec::with_capacity(addrs.len());
+    loop {
+        match (v6.next(), v4.next()) {
+            (None, None) => return out,
+            (a, b) => out.extend(a.into_iter().chain(b)),
+        }
+    }
+}
+
+/// At most this many attempts run at once, and never two start closer than this.
+const MAX_RACING: usize = 16;
+const RACE_SPACING: Duration = Duration::from_millis(10);
+
+/// Happy Eyeballs: see [`ConnectOptions::happy_eyeballs`]. Dropping a losing attempt
+/// resets it, so nothing lingers half open at the far end.
+fn connect_racing(
+    addrs: &[SocketAddr],
+    options: &ConnectOptions,
+) -> Result<TcpConnection, NetError> {
+    let ordered = interleaved(addrs);
+    let start = Instant::now();
+    let deadline = start + options.timeout;
+    let mut racing: Vec<(std::net::TcpStream, SocketAddr, Instant)> = Vec::new();
+    let mut queue = ordered.iter().copied();
+    let mut waiting = queue.next();
+    let mut next_at = start;
+    let mut last_start: Option<Instant> = None;
+    let mut last = NetError::NoAddresses;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let spaced = last_start.map_or(now, |t| t + RACE_SPACING);
+        if let Some(addr) = waiting.filter(|_| {
+            racing.len() < MAX_RACING && now >= spaced && (now >= next_at || racing.is_empty())
+        }) {
+            waiting = queue.next();
+            last_start = Some(now);
+            next_at = now + options.attempt_delay;
+            let stream = match dial_socket(addr, options) {
+                Ok(s) => s,
+                Err(e) => {
+                    last = e;
+                    next_at = now;
+                    continue;
+                }
+            };
+            match sys::connect_start(stream.sock(), addr) {
+                Ok(false) => return dialed(stream, addr, options),
+                Ok(true) => racing.push((stream, addr, now)),
+                Err(e) => {
+                    last = connect_error(addr, Duration::ZERO, e);
+                    next_at = now;
+                }
+            }
+            continue;
+        }
+        if racing.is_empty() && waiting.is_none() {
+            break;
+        }
+        let mut until = deadline;
+        if waiting.is_some() {
+            until = until.min(next_at.max(spaced).max(now + Duration::from_millis(1)));
+        }
+        let wait = until.saturating_duration_since(now);
+        if racing.is_empty() {
+            std::thread::sleep(wait);
+            continue;
+        }
+        let socks: Vec<_> = racing.iter().map(|(s, ..)| s.sock()).collect();
+        let ready = sys::wait_writable(&socks, wait).map_err(|e| NetError::from_os("poll", e))?;
+        drop(socks);
+        for i in (0..racing.len()).rev() {
+            if ready & (1 << i) == 0 {
+                continue;
+            }
+            let (stream, addr, began) = racing.swap_remove(i);
+            match sys::take_error(stream.sock()) {
+                Ok(None) => {
+                    for (loser, ..) in &racing {
+                        let _ = sys::set_linger(loser.sock(), Some(Duration::ZERO));
+                    }
+                    return dialed(stream, addr, options);
+                }
+                Ok(Some(e)) => {
+                    last = connect_error(addr, began.elapsed(), e);
+                    next_at = Instant::now();
+                }
+                Err(e) => last = NetError::from_os("getsockopt", e),
+            }
+        }
+    }
+    for (loser, ..) in &racing {
+        let _ = sys::set_linger(loser.sock(), Some(Duration::ZERO));
+    }
+    if matches!(last, NetError::NoAddresses) {
+        if let Some(addr) = ordered.first() {
+            last = NetError::ConnectTimeout {
+                addr: *addr,
+                after: options.timeout,
+            };
+        }
+    }
+    Err(last)
+}
+
+fn connect_one(
+    addr: SocketAddr,
+    options: &ConnectOptions,
+    attempt: Duration,
+) -> Result<TcpConnection, NetError> {
+    let stream = dial_socket(addr, options)?;
     let started = Instant::now();
     match sys::connect_start(stream.sock(), addr) {
         Ok(false) => {}
@@ -948,6 +1108,15 @@ fn connect_one(
         }
         Err(e) => return Err(connect_error(addr, started.elapsed(), e)),
     }
+    dialed(stream, addr, options)
+}
+
+/// A connection from a socket that just connected to `addr`.
+fn dialed(
+    stream: std::net::TcpStream,
+    addr: SocketAddr,
+    options: &ConnectOptions,
+) -> Result<TcpConnection, NetError> {
     sys::prepare_dialed(&stream).map_err(|e| NetError::from_os("ioctl", e))?;
     let local = stream
         .local_addr()
@@ -964,7 +1133,7 @@ fn connect_one(
     Ok(TcpConnection::from_link(Link::new(
         sys::Stream::Tcp(stream),
         info,
-        options.limits.effective(DriverKind::Blocking),
+        Arc::new(options.limits.effective(DriverKind::Blocking)),
         ClockRef::Monotonic,
         Arc::new(KillSlot::new()),
         WakeSource::Thread,
@@ -1147,5 +1316,82 @@ mod tests {
         let err = c.recv(&mut buf).unwrap_err();
         assert!(matches!(err, NetError::Killed { .. }), "{err:?}");
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_interleaved_starts_with_v6_and_takes_turns() {
+        let a = |t: &str| t.parse::<SocketAddr>().unwrap();
+        let (v4a, v4b, v4c) = (a("1.1.1.1:1"), a("2.2.2.2:1"), a("3.3.3.3:1"));
+        let (v6a, v6b) = (a("[::1]:1"), a("[::2]:1"));
+        assert_eq!(
+            interleaved(&[v4a, v4b, v4c, v6a, v6b]),
+            [v6a, v4a, v6b, v4b, v4c]
+        );
+        assert_eq!(interleaved(&[v4a, v4b]), [v4a, v4b]);
+        assert!(interleaved(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_attempt_delay_is_held_to_its_range() {
+        let low = ConnectOptions::new().attempt_delay(Duration::from_millis(1));
+        assert_eq!(low.attempt_delay, Duration::from_millis(100));
+        let high = ConnectOptions::new().attempt_delay(Duration::from_secs(9));
+        assert_eq!(high.attempt_delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_racing_a_refused_address_moves_on_at_once() {
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let options = ConnectOptions::new()
+            .happy_eyeballs(true)
+            .attempt_delay(Duration::from_secs(2));
+        let started = Instant::now();
+        let c = TcpConnection::connect_addrs(&[closed, live.local_addr().unwrap()], &options);
+        assert_eq!(c.unwrap().peer_addr(), live.local_addr().unwrap());
+        // Windows retries a refused connect for about 2 s before it reports it.
+        if cfg!(unix) {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "no attempt delay"
+            );
+        }
+    }
+
+    #[test]
+    fn test_racing_every_address_refused_reports_the_last() {
+        let closed: Vec<SocketAddr> = (0..2)
+            .map(|_| {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap()
+            })
+            .collect();
+        let options = ConnectOptions::new()
+            .timeout(Duration::from_secs(5))
+            .happy_eyeballs(true);
+        let e = TcpConnection::connect_addrs(&closed, &options).err();
+        assert!(
+            matches!(e, Some(NetError::ConnectionRefused { .. })),
+            "{e:?}"
+        );
+    }
+
+    /// A silent address (documentation range: nothing answers it) cannot hold the
+    /// connection up longer than the attempt delay.
+    #[test]
+    fn test_racing_a_silent_address_starts_the_next_after_the_delay() {
+        let silent: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let options = ConnectOptions::new()
+            .timeout(Duration::from_secs(5))
+            .happy_eyeballs(true)
+            .attempt_delay(Duration::from_millis(100));
+        let started = Instant::now();
+        let c = TcpConnection::connect_addrs(&[silent, live.local_addr().unwrap()], &options);
+        assert_eq!(c.unwrap().peer_addr(), live.local_addr().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

@@ -54,5 +54,7 @@ fn main() -> Result<(), net_io::NetError> {
 
 #[cfg(not(unix))]
 fn main() {
-    eprintln!("Unix domain sockets on Windows arrive in net-io 0.5.0");
+    // This example uses mode bits and `bind_atomic`; the Windows counterparts are
+    // NTFS ACLs and `UnixListener::bind`, or a named pipe (see `named_pipe.rs`).
+    eprintln!("see the named_pipe example");
 }

@@ -17,14 +17,14 @@
 
 #[cfg(not(any(
     all(
-        any(target_os = "linux", target_os = "macos"),
+        any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ),
     all(windows, any(target_arch = "x86_64", target_arch = "aarch64")),
 )))]
 compile_error!(
-    "net-io 0.3 declares its OS surface for x86_64 and aarch64 on Linux, macOS, and Windows; \
-     FreeBSD and the std-only fallback for other targets arrive in 0.5"
+    "net-io declares its OS surface for x86_64 and aarch64 on Linux, macOS, FreeBSD, and \
+     Windows; the std-only fallback for other targets arrives in 0.6"
 );
 
 #[cfg(unix)]
@@ -36,6 +36,36 @@ pub(crate) use unix::*;
 mod windows;
 #[cfg(windows)]
 pub(crate) use windows::*;
+
+#[cfg(all(feature = "reactor", unix))]
+mod poll;
+#[cfg(all(feature = "reactor", unix))]
+pub(crate) use poll::{PollEvent, Registered, WAKE_KEY};
+
+#[cfg(all(feature = "reactor", target_os = "linux"))]
+mod epoll;
+#[cfg(all(feature = "reactor", target_os = "linux"))]
+pub(crate) use epoll::{PollWaker, Poller};
+
+#[cfg(all(feature = "reactor", any(target_os = "macos", target_os = "freebsd")))]
+mod kqueue;
+#[cfg(all(feature = "reactor", any(target_os = "macos", target_os = "freebsd")))]
+pub(crate) use kqueue::{PollWaker, Poller};
+
+#[cfg(all(feature = "reactor", windows))]
+mod iocp;
+#[cfg(all(feature = "reactor", windows))]
+pub(crate) use iocp::{
+    Associated, Finished, InFlight, OpKind, PollWaker, Port, Started, is_aborted,
+};
+
+#[cfg(all(windows, feature = "local"))]
+mod pipe;
+#[cfg(all(windows, feature = "local"))]
+pub(crate) use pipe::{
+    Descriptor, PipeParams, PipeServer, PipeStream, is_name_taken, is_no_pipe, owner_sddl,
+    pipe_connect,
+};
 
 mod kill;
 
@@ -49,6 +79,8 @@ pub(crate) enum Stream {
     Tcp(TcpStream),
     #[cfg(all(unix, feature = "local"))]
     Unix(std::os::unix::net::UnixStream),
+    #[cfg(all(windows, feature = "local"))]
+    Pipe(PipeStream),
 }
 
 impl Stream {
@@ -57,6 +89,8 @@ impl Stream {
             Stream::Tcp(s) => (&mut &*s).read(buf),
             #[cfg(all(unix, feature = "local"))]
             Stream::Unix(s) => (&mut &*s).read(buf),
+            #[cfg(all(windows, feature = "local"))]
+            Stream::Pipe(p) => p.read(buf),
         }
     }
 
@@ -66,6 +100,8 @@ impl Stream {
             Stream::Tcp(s) => (&mut &*s).write(buf),
             #[cfg(all(unix, feature = "local"))]
             Stream::Unix(s) => (&mut &*s).write(buf),
+            #[cfg(all(windows, feature = "local"))]
+            Stream::Pipe(p) => p.write(buf),
         }
     }
 
@@ -75,6 +111,8 @@ impl Stream {
             Stream::Tcp(s) => (&mut &*s).write_vectored(bufs),
             #[cfg(all(unix, feature = "local"))]
             Stream::Unix(s) => (&mut &*s).write_vectored(bufs),
+            #[cfg(all(windows, feature = "local"))]
+            Stream::Pipe(p) => p.write_vectored(bufs),
         }
     }
 
@@ -84,6 +122,8 @@ impl Stream {
             Stream::Tcp(s) => s.set_read_timeout(timeout),
             #[cfg(all(unix, feature = "local"))]
             Stream::Unix(s) => s.set_read_timeout(timeout),
+            #[cfg(all(windows, feature = "local"))]
+            Stream::Pipe(_) => Ok(()),
         }
     }
 
@@ -92,6 +132,20 @@ impl Stream {
             Stream::Tcp(s) => s.shutdown(how),
             #[cfg(all(unix, feature = "local"))]
             Stream::Unix(s) => s.shutdown(how),
+            // No half-close: the peer sees the end of stream at the close.
+            #[cfg(all(windows, feature = "local"))]
+            Stream::Pipe(_) => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "reactor")]
+    pub(crate) fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_nonblocking(on),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(s) => s.set_nonblocking(on),
+            #[cfg(all(windows, feature = "local"))]
+            Stream::Pipe(_) => Ok(()),
         }
     }
 
@@ -101,6 +155,8 @@ impl Stream {
             Stream::Tcp(s) => Some(s),
             #[cfg(all(unix, feature = "local"))]
             Stream::Unix(_) => None,
+            #[cfg(all(windows, feature = "local"))]
+            Stream::Pipe(_) => None,
         }
     }
 
@@ -110,6 +166,8 @@ impl Stream {
             Stream::Tcp(s) => Some(s),
             #[cfg(all(unix, feature = "local"))]
             Stream::Unix(_) => None,
+            #[cfg(all(windows, feature = "local"))]
+            Stream::Pipe(_) => None,
         }
     }
 
@@ -119,6 +177,51 @@ impl Stream {
             Stream::Tcp(s) => s.peek(buf),
             #[cfg(all(unix, feature = "local"))]
             Stream::Unix(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            #[cfg(all(windows, feature = "local"))]
+            Stream::Pipe(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
+        }
+    }
+
+    /// Waits until this stream is ready for `interest`, `wake` fires, or `timeout`
+    /// passes.
+    pub(crate) fn wait(
+        &self,
+        interest: Interest,
+        wake: Option<&Wake>,
+        timeout: Option<Duration>,
+    ) -> io::Result<Ready> {
+        #[cfg(all(windows, feature = "local"))]
+        if let Stream::Pipe(p) = self {
+            return p.wait(interest, wake, timeout);
+        }
+        wait(self.sock(), interest, wake, timeout)
+    }
+
+    /// A reset instead of a FIN at close.
+    pub(crate) fn set_abortive(&self) {
+        #[cfg(all(windows, feature = "local"))]
+        if let Stream::Pipe(p) = self {
+            return p.set_abortive();
+        }
+        let _ = set_linger(self.sock(), Some(Duration::ZERO));
+    }
+
+    /// Whether a shutdown of the write side reaches the peer before the close. Where
+    /// it does not, a linger would only wait for a peer that waits for us.
+    pub(crate) fn half_closes(&self) -> bool {
+        #[cfg(all(windows, feature = "local"))]
+        if let Stream::Pipe(_) = self {
+            return false;
+        }
+        true
+    }
+
+    /// The pipe's raw handle, when this is a pipe.
+    #[cfg(all(windows, feature = "local", feature = "reactor"))]
+    pub(crate) fn pipe_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        match self {
+            Stream::Pipe(p) => Some(p.raw()),
+            _ => None,
         }
     }
 }
@@ -139,9 +242,13 @@ impl std::os::windows::io::AsSocket for Stream {
     fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
         match self {
             Stream::Tcp(s) => s.as_socket(),
+            #[cfg(feature = "local")]
+            Stream::Pipe(p) => p.as_sock(),
         }
     }
 }
+#[cfg(feature = "reactor")]
+pub(crate) use kill::KillSink;
 pub(crate) use kill::KillSlot;
 
 #[cfg(any(test, net_io_shim))]
