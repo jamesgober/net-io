@@ -185,6 +185,31 @@ fn test_system_calls_per_echo_round_trip() {
     }
 }
 
+/// A message that fills the read buffer can cost one more receive, the one that finds
+/// the socket empty: readiness cannot say there is no more without asking.
+#[test]
+fn test_system_calls_for_a_message_as_large_as_the_buffer() {
+    use net_io::__shim::{counted, start_counting, stop_counting};
+    let _shim = Shim::take();
+    let server = echo_server();
+    let mut c = client(addr(&server));
+    let body = vec![3u8; 16 * 1024];
+    for _ in 0..100 {
+        assert_eq!(round_trip(&mut c, &body), body);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    start_counting();
+    let rounds = 1000;
+    for _ in 0..rounds {
+        assert_eq!(round_trip(&mut c, &body), body);
+    }
+    stop_counting();
+    let calls = [Op::Recv, Op::Send, Op::Wait, Op::RecvTimeout].map(counted);
+    let per = calls.iter().sum::<u64>() as f64 / f64::from(rounds);
+    println!("16 KiB: {per:.2} system calls per round trip (recv, send, wait, timeout: {calls:?})");
+    assert!(per <= 4.01, "16 KiB: {per:.2} > 4");
+}
+
 /// Records every event.
 #[derive(Clone, Default)]
 struct Recorder(std::sync::Arc<Mutex<Vec<net_io::Event>>>);

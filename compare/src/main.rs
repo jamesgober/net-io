@@ -26,6 +26,7 @@ const STACKS: &[&str] = &[
     "monoio",
     "net-io-pool",
     "net-io",
+    "net-io-no-wipe",
 ];
 
 /// `(name, connections, message bytes)`.
@@ -37,14 +38,18 @@ const SHAPES: &[(&str, usize, usize)] = &[
     ("B-4 1,000 connections, 16 KiB", 1_000, 16 * 1024),
 ];
 
-/// A thread per connection does not get here: the shape would measure thread limits.
-fn stack_takes(stack: &str, connections: usize) -> bool {
-    connections <= 1_000 || !matches!(stack, "std" | "net-io-pool")
+/// A thread per connection does not get to 10,000: that would measure thread limits.
+/// The price of wiping shows where buffers fill.
+fn stack_takes(stack: &str, connections: usize, bytes: usize) -> bool {
+    match stack {
+        "std" | "net-io-pool" => connections <= 1_000,
+        "net-io-no-wipe" => bytes >= 16 * 1024,
+        _ => true,
+    }
 }
 
-/// The most descriptors one client thread can use before it needs another source
-/// address: an address has about 28,000 ephemeral ports.
-const PORTS_PER_SOURCE: usize = 20_000;
+/// Connections to one address before the next: an address has about 28,000 ports.
+const PORTS_PER_ADDRESS: usize = 20_000;
 
 const ROUNDS: usize = 3;
 const SECONDS: u64 = 4;
@@ -68,13 +73,17 @@ fn main() {
             );
             println!("{:.0} rt/s, p50 {} us, p99 {} us", r.rate, r.p50, r.p99);
         }
+        Some("idle") => {
+            let stacks: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+            idle(args[1].parse().expect("connections"), &stacks);
+        }
         _ => {
             accepts();
             table();
             idle(10_000, &IDLE_STACKS);
             let limit = descriptor_limit();
             if limit >= 230_000 {
-                idle(100_000, &["tokio", "net-io"]);
+                idle(100_000, &["net-io"]);
             } else {
                 println!("B-6 100,000 idle: skipped, the descriptor limit is {limit}");
             }
@@ -92,6 +101,12 @@ struct Measured {
     /// The server's CPU per round trip, user and system; 0 where `/proc` is missing.
     cpu_us: f64,
 }
+
+/// Per-worker listeners change the accept path and nothing else.
+#[cfg(target_os = "linux")]
+const ACCEPT_ONLY: [&str; 1] = ["net-io-per-worker"];
+#[cfg(not(target_os = "linux"))]
+const ACCEPT_ONLY: [&str; 0] = [];
 
 const IDLE_STACKS: [&str; 4] = [
     "mio",
@@ -145,18 +160,18 @@ fn descriptor_limit() -> u64 {
 }
 
 fn start(stack: &str, port: u16) -> Child {
-    start_with(stack, port, 16_384)
+    start_with(stack, "127.0.0.1", port, 16_384)
 }
 
-fn start_with(stack: &str, port: u16, capacity: usize) -> Child {
+fn start_with(stack: &str, ip: &str, port: u16, capacity: usize) -> Child {
     let exe = std::env::current_exe().expect("this binary");
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("{ip}:{port}");
     let child = Command::new(exe)
         .args(["server", stack, &addr, &capacity.to_string()])
         .stdout(Stdio::null())
         .spawn()
         .expect("spawn");
-    let target: SocketAddr = addr.parse().expect("addr");
+    let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let deadline = Instant::now() + Duration::from_secs(5);
     while std::net::TcpStream::connect(target).is_err() {
         assert!(Instant::now() < deadline, "{stack} did not start");
@@ -173,7 +188,7 @@ fn table() {
     let mut port = 19_000;
     for (name, conns, bytes) in SHAPES {
         let mut results: Vec<(&str, Measured)> = Vec::new();
-        for stack in STACKS.iter().filter(|s| stack_takes(s, *conns)) {
+        for stack in STACKS.iter().filter(|s| stack_takes(s, *conns, *bytes)) {
             port += 1;
             let mut child = start(stack, port);
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
@@ -229,7 +244,11 @@ fn accepts() {
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get() / 2);
     let mut port = 18_000;
     let mut results: Vec<(&str, Measured)> = Vec::new();
-    for stack in STACKS {
+    for stack in STACKS
+        .iter()
+        .filter(|s| **s != "net-io-no-wipe")
+        .chain(&ACCEPT_ONLY)
+    {
         port += 1;
         let mut child = start(stack, port);
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
@@ -300,13 +319,10 @@ fn accepts() {
 
 // ---- B-5, B-6: idle ----------------------------------------------------------
 
-fn idle_connection(addr: SocketAddr, nth: usize) -> std::io::Result<std::net::TcpStream> {
-    use socket2::{Domain, Socket, Type};
-    let source = std::net::Ipv4Addr::new(127, 0, 1, (nth / PORTS_PER_SOURCE) as u8 + 1);
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, None)?;
-    socket.bind(&SocketAddr::from((source, 0)).into())?;
-    socket.connect(&addr.into())?;
-    let mut s: std::net::TcpStream = socket.into();
+fn idle_connection(port: u16, nth: usize) -> std::io::Result<std::net::TcpStream> {
+    // All of 127/8 is this host, and each address has its own ephemeral ports.
+    let target = std::net::Ipv4Addr::new(127, 0, 1, (nth / PORTS_PER_ADDRESS) as u8 + 1);
+    let mut s = std::net::TcpStream::connect((target, port))?;
     s.write_all(b"hello")?;
     let mut b = [0u8; 5];
     s.read_exact(&mut b)?;
@@ -319,15 +335,14 @@ fn idle(connections: usize, stacks: &[&str]) {
     let mut port = 17_000 + (connections / 1_000) as u16;
     for stack in stacks {
         port += 1;
-        let mut child = start_with(stack, port, connections + 1_024);
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-        let first = idle_connection(addr, 0).expect("first connection");
+        let mut child = start_with(stack, "0.0.0.0", port, connections + 1_024);
+        let first = idle_connection(port, 0).expect("first connection");
         std::thread::sleep(Duration::from_millis(200));
         let base = resident(child.id());
         let mut held = Vec::with_capacity(connections);
         held.push(first);
         for nth in 1..connections {
-            match idle_connection(addr, nth) {
+            match idle_connection(port, nth) {
                 Ok(s) => held.push(s),
                 Err(_) => break,
             }
@@ -487,8 +502,10 @@ fn server(stack: &str, addr: SocketAddr, capacity: u32) {
         "tokio" => tokio_echo(addr),
         #[cfg(target_os = "linux")]
         "monoio" => monoio_echo(addr),
-        "net-io-pool" => net_io_echo(addr, net_io::DriverKind::Blocking, capacity),
-        "net-io" => net_io_echo(addr, net_io::DriverKind::Reactor, capacity),
+        "net-io-pool" => net_io_echo(addr, net_io::DriverKind::Blocking, capacity, true),
+        "net-io" => net_io_echo(addr, net_io::DriverKind::Reactor, capacity, true),
+        "net-io-no-wipe" => net_io_echo(addr, net_io::DriverKind::Reactor, capacity, false),
+        "net-io-per-worker" => net_io_per_worker(addr, capacity),
         other => panic!("unknown stack {other}"),
     }
 }
@@ -687,7 +704,33 @@ impl net_io::Session for Echo {
     }
 }
 
-fn net_io_echo(addr: SocketAddr, driver: net_io::DriverKind, cap: u32) {
+fn net_io_per_worker(addr: SocketAddr, cap: u32) {
+    use net_io::{
+        AllowAll, ConnectionInfo, Limits, ListenOptions, ListenerSpec, PrefixPolicy, ServerBuilder,
+    };
+    let limits = Limits::builder()
+        .max_connections(cap)
+        .max_per_source(cap, PrefixPolicy::DEFAULT)
+        .backlog(4_096)
+        .buffer_budget(1 << 31)
+        .build()
+        .expect("limits");
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp_with(
+            addr,
+            ListenOptions::new().per_worker(true),
+        ))
+        .driver(net_io::DriverKind::Reactor)
+        .limits(limits)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let _ = server.wait_for_stop();
+}
+
+fn net_io_echo(addr: SocketAddr, driver: net_io::DriverKind, cap: u32, wipe: bool) {
     use net_io::{AllowAll, ConnectionInfo, Limits, ListenerSpec, PrefixPolicy, ServerBuilder};
     let limits = Limits::builder()
         .max_connections(cap)
@@ -699,6 +742,7 @@ fn net_io_echo(addr: SocketAddr, driver: net_io::DriverKind, cap: u32) {
     let mut builder = ServerBuilder::new()
         .listener(ListenerSpec::tcp(addr))
         .driver(driver)
+        .wipe_buffers(wipe)
         .limits(limits);
     if driver == net_io::DriverKind::Blocking {
         builder = builder.workers(2_048);
