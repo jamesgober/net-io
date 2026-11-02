@@ -17,14 +17,14 @@
 
 #[cfg(not(any(
     all(
-        any(target_os = "linux", target_os = "macos"),
+        any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ),
     all(windows, any(target_arch = "x86_64", target_arch = "aarch64")),
 )))]
 compile_error!(
-    "net-io 0.3 declares its OS surface for x86_64 and aarch64 on Linux, macOS, and Windows; \
-     FreeBSD and the std-only fallback for other targets arrive in 0.5"
+    "net-io declares its OS surface for x86_64 and aarch64 on Linux, macOS, FreeBSD, and \
+     Windows; the std-only fallback for other targets arrives in 0.6"
 );
 
 #[cfg(unix)]

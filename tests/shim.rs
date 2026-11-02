@@ -127,7 +127,7 @@ fn test_system_calls_per_echo_round_trip() {
     use net_io::__shim::{counted, start_counting, stop_counting};
     let _shim = Shim::take();
     // Linux: recv, send. Windows and macOS wait first (D-052, D-083).
-    let budget = if cfg!(any(windows, target_os = "macos")) {
+    let budget = if cfg!(any(windows, not(target_os = "linux"))) {
         3.0
     } else {
         2.0
@@ -210,7 +210,7 @@ mod codes {
     pub const ENOBUFS: i32 = 105;
     pub const EBADF: i32 = 9;
 }
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 mod codes {
     pub const ENFILE: Option<i32> = Some(23);
     pub const ECONNABORTED: i32 = 53;
@@ -358,7 +358,7 @@ fn test_spurious_would_block_recovers_at_the_next_edge() {
 fn test_keepalive_timeout_is_an_io_error_not_a_deadline() {
     #[cfg(target_os = "linux")]
     const ETIMEDOUT: i32 = 110;
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     const ETIMEDOUT: i32 = 60;
     #[cfg(windows)]
     const ETIMEDOUT: i32 = 10060;
