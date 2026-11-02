@@ -582,7 +582,7 @@ mod tests {
             w.insert(1 + i * 700, i);
         }
         let got = drain(&mut w, hour);
-        let expired = (0..5_000u64).filter(|i| 1 + i * 700 <= hour).count();
+        let expired = (0..5_000u64).filter(|i| i * 700 < hour).count();
         assert_eq!(got.len(), expired);
         assert!(got.windows(2).all(|p| p[0] < p[1]), "in deadline order");
         assert_eq!(w.len(), 5_000 - expired);

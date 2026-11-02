@@ -10,7 +10,7 @@
 //! need; epoll and kqueue adapt by making the non-blocking call when readiness
 //! arrives. Cancellation always ends in exactly one completion.
 
-#[cfg(all(feature = "reactor", target_os = "linux"))]
+#[cfg(all(feature = "reactor", unix))]
 pub(crate) mod ready;
 
 use std::collections::VecDeque;
@@ -59,7 +59,7 @@ impl DriverKind {
 
     /// Whether this build has a reactor for this OS.
     pub(crate) const fn reactor_built() -> bool {
-        cfg!(all(feature = "reactor", target_os = "linux"))
+        cfg!(all(feature = "reactor", unix))
     }
 }
 
@@ -346,16 +346,16 @@ pub struct DriverWaker {
     pub(crate) inner: Arc<WakerInner>,
 }
 
-#[cfg(all(feature = "reactor", target_os = "linux"))]
+#[cfg(all(feature = "reactor", unix))]
 pub(crate) type WakerInner = crate::sys::PollWaker;
-#[cfg(not(all(feature = "reactor", target_os = "linux")))]
+#[cfg(not(all(feature = "reactor", unix)))]
 #[derive(Debug)]
 pub(crate) struct WakerInner;
 
 impl DriverWaker {
     /// Ends the current or next wait. Cheap to call repeatedly.
     pub fn wake(&self) {
-        #[cfg(all(feature = "reactor", target_os = "linux"))]
+        #[cfg(all(feature = "reactor", unix))]
         self.inner.wake();
     }
 }

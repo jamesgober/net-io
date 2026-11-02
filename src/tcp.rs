@@ -591,7 +591,7 @@ impl TcpConnection {
             peer,
             Instant::now(),
         );
-        let limits = Limits::default().effective(DriverKind::Blocking);
+        let limits = Arc::new(Limits::default().effective(DriverKind::Blocking));
         Ok(TcpConnection::from_link(Link::new(
             sys::Stream::Tcp(stream),
             info,
@@ -964,7 +964,7 @@ fn connect_one(
     Ok(TcpConnection::from_link(Link::new(
         sys::Stream::Tcp(stream),
         info,
-        options.limits.effective(DriverKind::Blocking),
+        Arc::new(options.limits.effective(DriverKind::Blocking)),
         ClockRef::Monotonic,
         Arc::new(KillSlot::new()),
         WakeSource::Thread,

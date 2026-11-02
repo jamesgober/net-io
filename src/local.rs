@@ -666,7 +666,7 @@ impl UnixConnection {
         info: ConnectionInfo,
         phase: Phase,
     ) -> UnixConnection {
-        let limits = Limits::default().effective(DriverKind::Blocking);
+        let limits = Arc::new(Limits::default().effective(DriverKind::Blocking));
         UnixConnection {
             inner: TcpConnection::from_link(Link::new(
                 sys::Stream::Unix(stream),

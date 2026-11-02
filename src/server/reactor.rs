@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use super::Sessions;
 use super::engine::{
     CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP, CMD_SHED,
-    CMD_SWEEP, Engine, Job, ListenerConf, ListenerProxy, RegisteredConn, Shared, record_close,
+    CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, record_close,
 };
 use crate::addr::PrefixKey;
 use crate::buf::{Buffer, BufferPool};
@@ -47,7 +47,7 @@ use crate::sys::{self, AsSock, KillSink, KillSlot};
 use crate::wheel::{Ticks, TimerId, Wheel};
 
 /// The driver this build's reactor runs on.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(unix)]
 pub(crate) type Backend = crate::driver::ready::ReadyDriver;
 
 /// How many expired timers one loop iteration handles, so IO keeps moving after
@@ -125,7 +125,6 @@ enum Sending {
 /// The PROXY handshake in progress.
 struct ProxyWait {
     parser: crate::proxy_parse::ProxyParser,
-    settings: ListenerProxy,
     buffer: Option<Buffer>,
 }
 
@@ -172,6 +171,8 @@ struct Reactor<F: SessionFactory, G: Gate> {
     wheel: Wheel,
     ticks: Ticks,
     pool: BufferPool,
+    // Boxed so that a connection holds one pointer, and it travels without a copy.
+    #[allow(clippy::vec_box)]
     outputs: Vec<Box<Output>>,
     completer: Completer,
     view: ControlView,
@@ -308,7 +309,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
             .slot_pool
             .pop()
             .unwrap_or_else(|| Arc::new(KillSlot::new()));
-        let limits = listener.limits;
+        let limits = listener.limits.clone();
         let mut link = Link::new(
             stream,
             info,
@@ -402,7 +403,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
                     return self.close(index, CloseReason::ProxyUntrusted);
                 }
                 c.link.begin_handshake(accepted + timeout);
-                let limits = c.link.limits;
+                let limits = *c.link.limits;
                 let need = 16 + u32::from(limits.proxy_header_max);
                 let class = if need <= SizeClass::SMALL.bytes() {
                     SizeClass::SMALL
@@ -421,7 +422,6 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
                 let Some(c) = self.conn(index) else { return };
                 c.proxy = Some(Box::new(ProxyWait {
                     parser,
-                    settings,
                     buffer: Some(buffer),
                 }));
                 return self.proxy_read(index);
@@ -439,7 +439,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
                 }
                 Err(_) => return self.close(index, CloseReason::TlsFailed),
             };
-            let limits = c.link.limits;
+            let limits = *c.link.limits;
             let Some(cin) = self.pool.take(limits.read_class_max) else {
                 return self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
             };
@@ -1714,4 +1714,22 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
 enum Flushed {
     Done,
     Waiting,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An idle connection's state: the 512-byte target (`docs/API.md`).
+    #[test]
+    fn test_idle_connection_state_size() {
+        let size = size_of::<Conn<()>>();
+        eprintln!(
+            "Conn {size}, Link {}, ConnectionInfo {}",
+            size_of::<Link>(),
+            size_of::<ConnectionInfo>()
+        );
+        // 512 is the goal (register R-18); this keeps it from growing meanwhile.
+        assert!(size <= 900, "{size} bytes per idle connection");
+    }
 }

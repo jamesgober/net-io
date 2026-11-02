@@ -967,7 +967,7 @@ impl ListenerProxy {
 /// their limits and give their cap slots back where they took them.
 pub(crate) struct ListenerConf {
     id: ListenerId,
-    pub(crate) limits: Effective,
+    pub(crate) limits: Arc<Effective>,
     tcp: TcpOptions,
     /// `Some` when the listener requires a PROXY header.
     #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
@@ -1098,7 +1098,7 @@ fn bind_listener(
         })?;
     let conf = Arc::new(ListenerConf {
         id,
-        limits: lim,
+        limits: Arc::new(lim),
         tcp,
         proxy,
         tls: spec.tls,
@@ -1234,6 +1234,9 @@ impl<W, G: Gate> Engine<W, G> {
     }
 
     /// The least-loaded worker takes the connection. A full inbox refuses.
+    // A refused job goes straight back to its caller, on the path a flood takes;
+    // a `Box` here would allocate there.
+    #[allow(clippy::result_large_err)]
     fn hand_to_worker(&self, job: Job<G::Ticket>) -> Result<(), Job<G::Ticket>> {
         let shared = &self.shared;
         let idx = shared
@@ -1816,6 +1819,7 @@ impl<W, G: Gate> Engine<W, G> {
         Ok(event_id)
     }
 
+    #[allow(clippy::result_large_err)]
     fn hand_over(&self, job: Job<G::Ticket>) -> Result<(), Job<G::Ticket>> {
         #[cfg(feature = "reactor")]
         if self.shared.reactor {
@@ -2001,7 +2005,7 @@ impl<G: Gate> Worker<G> {
             }
             Err(_) => return Err(CloseReason::TlsFailed),
         };
-        let lim = link.limits;
+        let lim = *link.limits;
         let Some(cin) = self.pool.take(lim.read_class_max) else {
             return Err(CloseReason::Limit(crate::error::LimitKind::BufferBudget));
         };
@@ -2035,7 +2039,7 @@ impl<G: Gate> Worker<G> {
         if !proxy.is_trusted(&link.info) {
             return Err(CloseReason::ProxyUntrusted);
         }
-        let lim = link.limits;
+        let lim = *link.limits;
         // The header must fit the buffer: at most 16 fixed bytes plus the body limit.
         let need = 16 + u32::from(lim.proxy_header_max);
         let class = if need <= SizeClass::SMALL.bytes() {
@@ -2111,7 +2115,7 @@ impl<G: Gate> Worker<G> {
             source,
         } = job;
         let shared = self.shared.clone();
-        let limits = listener.limits;
+        let limits = listener.limits.clone();
         info.worker = WorkerId(self.idx as u16);
         let mut cell = self.gate_cell.take().unwrap_or_else(|| {
             Box::new(GateCell {
@@ -2438,7 +2442,7 @@ pub(crate) fn proxy_resolved(
     real: Option<SocketAddr>,
     facts_pool: &mut Vec<Arc<ProxyFacts>>,
 ) -> Result<(), CloseReason> {
-    let lim = link.limits;
+    let lim = *link.limits;
     // LOCAL (the proxy itself) and UNKNOWN keep the socket's addresses.
     if let Some(real) = real {
         // The per-source slot moves from the proxy to the real client.

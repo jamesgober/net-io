@@ -37,10 +37,20 @@ mod windows;
 #[cfg(windows)]
 pub(crate) use windows::*;
 
+#[cfg(all(feature = "reactor", unix))]
+mod poll;
+#[cfg(all(feature = "reactor", unix))]
+pub(crate) use poll::{PollEvent, Registered, WAKE_KEY};
+
 #[cfg(all(feature = "reactor", target_os = "linux"))]
 mod epoll;
 #[cfg(all(feature = "reactor", target_os = "linux"))]
-pub(crate) use epoll::{PollEvent, PollWaker, Poller, Registered};
+pub(crate) use epoll::{PollWaker, Poller};
+
+#[cfg(all(feature = "reactor", any(target_os = "macos", target_os = "freebsd")))]
+mod kqueue;
+#[cfg(all(feature = "reactor", any(target_os = "macos", target_os = "freebsd")))]
+pub(crate) use kqueue::{PollWaker, Poller};
 
 mod kill;
 

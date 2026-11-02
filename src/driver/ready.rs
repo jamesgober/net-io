@@ -77,13 +77,6 @@ impl ReadyDriver {
         })
     }
 
-    fn reg(&mut self, token: Token) -> Option<&mut Reg> {
-        self.regs
-            .get_mut(token.index())
-            .and_then(Option::as_mut)
-            .filter(|r| r.token == token.0)
-    }
-
     fn try_recv(reg: &mut Reg, local: &mut VecDeque<Completion>) {
         let token = Token(reg.token);
         match std::mem::take(&mut reg.recv) {

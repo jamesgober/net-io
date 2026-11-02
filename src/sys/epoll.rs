@@ -3,15 +3,15 @@
 //! References: `epoll(7)`, `epoll_ctl(2)`, `epoll_wait(2)`, `eventfd(2)`.
 //! Layout and constants are checked against `libc` by the tests below.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::c_int;
 use std::fs::File;
-use std::io::{self, IoSlice, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::{Sock, poll_millis};
+use super::{PollEvent, Registered, Sock, WAKE_KEY, poll_millis};
 
 const EPOLL_CLOEXEC: c_int = 0o2_000_000;
 const EPOLL_CTL_ADD: c_int = 1;
@@ -24,7 +24,6 @@ const EPOLLRDHUP: u32 = 0x2000;
 const EPOLLET: u32 = 1 << 31;
 const EFD_CLOEXEC: c_int = 0o2_000_000;
 const EFD_NONBLOCK: c_int = 0o4_000;
-const MSG_DONTWAIT: c_int = 0x40;
 
 /// `struct epoll_event`: packed on x86_64, naturally aligned elsewhere.
 #[repr(C)]
@@ -40,79 +39,16 @@ unsafe extern "C" {
     fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut EpollEvent) -> c_int;
     fn epoll_wait(epfd: c_int, events: *mut EpollEvent, max: c_int, timeout: c_int) -> c_int;
     fn eventfd(init: u32, flags: c_int) -> c_int;
-    fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize;
 }
 
-/// The key the wake channel reports under; no token uses it.
-pub(crate) const WAKE_KEY: u64 = u64::MAX;
 /// How many events one wait returns.
-pub(crate) const EVENTS: usize = 256;
+const EVENTS: usize = 256;
 
 fn cvt(ret: c_int) -> io::Result<c_int> {
     if ret == -1 {
         Err(io::Error::last_os_error())
     } else {
         Ok(ret)
-    }
-}
-
-/// One readiness report.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PollEvent {
-    pub(crate) key: u64,
-    pub(crate) readable: bool,
-    pub(crate) writable: bool,
-    /// The peer hung up (or the socket failed): no later edge will come.
-    pub(crate) hangup: bool,
-}
-
-/// A registered socket: opaque, used only between `register` and `deregister`,
-/// while the caller keeps the socket open (the `Driver` contract).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Registered(RawFd);
-
-impl Registered {
-    /// One receive that never blocks.
-    pub(crate) fn recv(self, buf: &mut [u8]) -> io::Result<usize> {
-        #[cfg(any(test, net_io_shim))]
-        let buf = match super::shim::io(super::shim::Op::Recv, buf.len())? {
-            Some(n) => &mut buf[..n],
-            None => buf,
-        };
-        // SAFETY: `buf` is writable for its length and lives for the call. The
-        // descriptor is open by the `Driver` contract; a stale number can only
-        // make recv(2) fail or read another socket's bytes into `buf`.
-        let n = unsafe {
-            recv(
-                self.0,
-                buf.as_mut_ptr().cast::<c_void>(),
-                buf.len(),
-                MSG_DONTWAIT,
-            )
-        };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(n.unsigned_abs())
-        }
-    }
-
-    fn sock(self) -> Sock<'static> {
-        // SAFETY: open between `register` and `deregister` by the `Driver` contract.
-        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
-    }
-
-    /// One vectored send that never blocks.
-    pub(crate) fn send_vectored(self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        super::send_vectored_sock(self.sock(), bufs)
-    }
-
-    pub(crate) fn connect_start(self, addr: std::net::SocketAddr) -> io::Result<bool> {
-        super::connect_start(self.sock(), addr)
-    }
-
-    pub(crate) fn take_error(self) -> io::Result<Option<io::Error>> {
-        super::take_error(self.sock())
     }
 }
 
@@ -189,7 +125,7 @@ impl Poller {
         };
         // SAFETY: both descriptors are open; `reg` is a live epoll_event.
         cvt(unsafe { epoll_ctl(self.epoll.as_raw_fd(), EPOLL_CTL_ADD, raw, &raw mut reg) })?;
-        Ok(Registered(raw))
+        Ok(Registered::new(raw))
     }
 
     pub(crate) fn remove(&self, reg: Registered) -> io::Result<()> {
@@ -200,7 +136,7 @@ impl Poller {
             epoll_ctl(
                 self.epoll.as_raw_fd(),
                 EPOLL_CTL_DEL,
-                reg.0,
+                reg.raw(),
                 &raw mut unused,
             )
         })
@@ -280,7 +216,6 @@ mod tests {
         assert_eq!(EPOLLET, libc::EPOLLET as u32);
         assert_eq!(EFD_CLOEXEC, libc::EFD_CLOEXEC);
         assert_eq!(EFD_NONBLOCK, libc::EFD_NONBLOCK);
-        assert_eq!(MSG_DONTWAIT, libc::MSG_DONTWAIT);
     }
 
     #[test]

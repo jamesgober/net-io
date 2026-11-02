@@ -68,7 +68,7 @@ pub(crate) enum Got {
 pub(crate) struct Link {
     pub(crate) stream: sys::Stream,
     pub(crate) info: ConnectionInfo,
-    pub(crate) limits: Effective,
+    pub(crate) limits: Arc<Effective>,
     clock: ClockRef,
     phase: Phase,
     progress_at: Instant,
@@ -92,8 +92,8 @@ pub(crate) struct Link {
     auto_phase: bool,
     /// Bytes went out since the last bytes came in.
     replied: bool,
-    /// The idle timeout from the limits, restored when an override is cleared.
-    base_idle: Duration,
+    /// The idle timeout in force: the limits' value, or this connection's override.
+    idle_timeout: Duration,
     /// While a PROXY (or TLS) handshake runs: its deadline replaces the phase's.
     handshake_deadline: Option<Instant>,
     /// Bytes read past a handshake, served before the socket (the buffer returns
@@ -104,7 +104,7 @@ pub(crate) struct Link {
     /// unsent tail of a partial send), so a byte-counting gate counts each once.
     approved: usize,
     /// TLS on this connection (feature `tls`).
-    tls: Option<TlsLayer>,
+    tls: Option<Box<TlsLayer>>,
 }
 
 /// TLS on a connection: the engine's session and its two buffers.
@@ -171,7 +171,7 @@ impl Link {
     pub(crate) fn new(
         stream: sys::Stream,
         info: ConnectionInfo,
-        limits: Effective,
+        limits: Arc<Effective>,
         clock: ClockRef,
         slot: Arc<KillSlot>,
         wake: WakeSource,
@@ -182,8 +182,9 @@ impl Link {
         if let WakeSource::Fixed(w) = &wake {
             slot.set_wake(Some(w.clone()));
         }
-        let rate_in = Rate::new(limits.min_rate, now);
-        let rate_out = Rate::new(limits.min_rate, now);
+        let rate_in = Rate::new(&limits.min_rate, now);
+        let rate_out = Rate::new(&limits.min_rate, now);
+        let idle_timeout = limits.idle_timeout;
         let mut link = Link {
             stream,
             info,
@@ -208,7 +209,7 @@ impl Link {
             likely_more: false,
             auto_phase: phase == Phase::Idle,
             replied: false,
-            base_idle: limits.idle_timeout,
+            idle_timeout,
             handshake_deadline: None,
             pending: None,
             pending_at: 0,
@@ -269,11 +270,11 @@ impl Link {
 
     pub(crate) fn set_limits(&mut self, limits: Effective) {
         let now = self.now();
-        let in_active = self.rate_in.is_active();
-        self.limits = limits;
-        self.base_idle = limits.idle_timeout;
-        self.rate_in = Rate::new(limits.min_rate, now);
-        self.rate_out = Rate::new(limits.min_rate, now);
+        let in_active = self.rate_in.is_active(&self.limits.min_rate);
+        self.idle_timeout = limits.idle_timeout;
+        self.rate_in = Rate::new(&limits.min_rate, now);
+        self.rate_out = Rate::new(&limits.min_rate, now);
+        self.limits = Arc::new(limits);
         if in_active {
             self.rate_in.activate(now);
         }
@@ -290,7 +291,7 @@ impl Link {
     ) {
         cin.set_len(0);
         cout.set_len(0);
-        self.tls = Some(TlsLayer {
+        self.tls = Some(Box::new(TlsLayer {
             session,
             cin,
             start: 0,
@@ -302,7 +303,7 @@ impl Link {
             event: None,
             data_from: 0,
             data_to: 0,
-        });
+        }));
     }
 
     /// Whether TLS is on this connection.
@@ -659,7 +660,7 @@ impl Link {
     /// This connection's idle timeout from its next idle wait on (`None`: the
     /// limits' value again). At least one tick.
     pub(crate) fn set_idle_timeout(&mut self, timeout: Option<Duration>) {
-        self.limits.idle_timeout = timeout.map_or(self.base_idle, |t| t.max(self.limits.tick));
+        self.idle_timeout = timeout.map_or(self.limits.idle_timeout, |t| t.max(self.limits.tick));
     }
 
     pub(crate) fn killed(&self) -> Option<KillReason> {
@@ -765,7 +766,7 @@ impl Link {
             if self.exchange_deadline.is_some_and(|d| now >= d) {
                 return Err(self.timed_out(TimeoutKind::Exchange));
             }
-            if self.rate_in.too_slow(now) {
+            if self.rate_in.too_slow(&self.limits.min_rate, now) {
                 return Err(self.fail(
                     CloseReason::SlowPeer {
                         direction: Direction::In,
@@ -779,7 +780,7 @@ impl Link {
             if let Some(d) = self.exchange_deadline {
                 until = until.min(d);
             }
-            if let Some(c) = self.rate_in.next_check(now) {
+            if let Some(c) = self.rate_in.next_check(&self.limits.min_rate, now) {
                 until = until.min(c);
             }
             let timeout = until
@@ -913,7 +914,7 @@ impl Link {
             if self.exchange_deadline.is_some_and(|d| now >= d) {
                 return Err(self.timed_out(TimeoutKind::Exchange));
             }
-            if self.rate_out.too_slow(now) {
+            if self.rate_out.too_slow(&self.limits.min_rate, now) {
                 return Err(self.fail(
                     CloseReason::SlowPeer {
                         direction: Direction::Out,
@@ -927,7 +928,7 @@ impl Link {
             if let Some(d) = self.exchange_deadline {
                 until = until.min(d);
             }
-            if let Some(c) = self.rate_out.next_check(now) {
+            if let Some(c) = self.rate_out.next_check(&self.limits.min_rate, now) {
                 until = until.min(c);
             }
             let timeout = until
@@ -1249,10 +1250,7 @@ impl Link {
     fn read_deadline(&self) -> (Instant, TimeoutKind) {
         match (self.handshake_deadline, self.phase) {
             (Some(d), _) => (d, TimeoutKind::Handshake),
-            (None, Phase::Idle) => (
-                self.progress_at + self.limits.idle_timeout,
-                TimeoutKind::Idle,
-            ),
+            (None, Phase::Idle) => (self.progress_at + self.idle_timeout, TimeoutKind::Idle),
             (None, _) => (
                 self.progress_at + self.limits.read_timeout,
                 TimeoutKind::Read,
@@ -1267,7 +1265,7 @@ impl Link {
         if let Some(d) = self.exchange_deadline {
             until = until.min(d);
         }
-        if let Some(c) = self.rate_in.next_check(now) {
+        if let Some(c) = self.rate_in.next_check(&self.limits.min_rate, now) {
             until = until.min(c);
         }
         until
@@ -1284,7 +1282,7 @@ impl Link {
         if self.exchange_deadline.is_some_and(|d| now >= d) {
             return Err(self.timed_out(TimeoutKind::Exchange));
         }
-        if self.rate_in.too_slow(now) {
+        if self.rate_in.too_slow(&self.limits.min_rate, now) {
             return Err(self.fail(
                 CloseReason::SlowPeer {
                     direction: Direction::In,
@@ -1304,7 +1302,7 @@ impl Link {
         if let Some(d) = self.exchange_deadline {
             until = until.min(d);
         }
-        if let Some(c) = self.rate_out.next_check(now) {
+        if let Some(c) = self.rate_out.next_check(&self.limits.min_rate, now) {
             until = until.min(c);
         }
         until
@@ -1320,7 +1318,7 @@ impl Link {
         if self.exchange_deadline.is_some_and(|d| now >= d) {
             return Err(self.timed_out(TimeoutKind::Exchange));
         }
-        if self.rate_out.too_slow(now) {
+        if self.rate_out.too_slow(&self.limits.min_rate, now) {
             return Err(self.fail(
                 CloseReason::SlowPeer {
                     direction: Direction::Out,
