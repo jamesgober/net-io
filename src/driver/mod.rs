@@ -51,10 +51,15 @@ impl DriverKind {
     /// The driver `Auto` resolves to in this build.
     pub(crate) fn resolve(self) -> DriverKind {
         match self {
-            DriverKind::Auto if cfg!(feature = "reactor") => DriverKind::Reactor,
+            DriverKind::Auto if DriverKind::reactor_built() => DriverKind::Reactor,
             DriverKind::Auto => DriverKind::Blocking,
             other => other,
         }
+    }
+
+    /// Whether this build has a reactor for this OS.
+    pub(crate) const fn reactor_built() -> bool {
+        cfg!(all(feature = "reactor", target_os = "linux"))
     }
 }
 
@@ -286,6 +291,26 @@ impl SendChunks {
     #[must_use]
     pub fn pending(&self) -> usize {
         self.chunks.iter().map(|c| c.remaining().len()).sum()
+    }
+
+    /// Marks `n` bytes of the front chunks sent; `true` when bytes remain.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn advance(&mut self, mut n: usize) -> bool {
+        while let Some(front) = self.chunks.front_mut() {
+            let rem = front.remaining().len();
+            if n < rem {
+                match front {
+                    Chunk::Pooled(_, off) | Chunk::Static(_, off) => *off += n,
+                }
+                return true;
+            }
+            if self.chunks.len() == 1 {
+                return false;
+            }
+            n -= rem;
+            self.chunks.pop_front();
+        }
+        false
     }
 
     /// The first buffer back, for a send built with [`SendChunks::from_buffer`].

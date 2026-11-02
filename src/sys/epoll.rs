@@ -62,6 +62,8 @@ pub(crate) struct PollEvent {
     pub(crate) key: u64,
     pub(crate) readable: bool,
     pub(crate) writable: bool,
+    /// The peer hung up (or the socket failed): no later edge will come.
+    pub(crate) hangup: bool,
 }
 
 /// A registered socket: opaque, used only between `register` and `deregister`,
@@ -232,15 +234,20 @@ impl Poller {
             let EpollEventBox(ev) = self.buf[i];
             let (events, key) = (ev.events, ev.data);
             if key == WAKE_KEY {
-                self.wake.pending.store(false, Ordering::Release);
+                // Read first, then clear: a wake after the read and before the clear
+                // is covered, since the caller checks its flags after this wait. The
+                // other order loses it: the read eats the wake, `pending` stays set,
+                // and no later wake writes.
                 let mut scratch = [0u8; 8];
                 let _ = (&self.wake.event).read(&mut scratch);
+                self.wake.pending.store(false, Ordering::Release);
                 continue;
             }
             f(PollEvent {
                 key,
                 readable: events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR) != 0,
                 writable: events & (EPOLLOUT | EPOLLHUP | EPOLLERR) != 0,
+                hangup: events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR) != 0,
             });
         }
         Ok(())

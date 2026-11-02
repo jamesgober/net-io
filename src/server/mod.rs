@@ -1,6 +1,8 @@
 //! The server: listeners, workers, the door, drain, and shutdown.
 
 mod engine;
+#[cfg(feature = "reactor")]
+mod reactor;
 mod source;
 
 use std::any::TypeId;
@@ -302,6 +304,13 @@ pub struct Sessions<F> {
     pub(crate) factory: F,
 }
 
+#[cfg(feature = "reactor")]
+impl<F> Sessions<F> {
+    pub(crate) fn factory(&self) -> &F {
+        &self.factory
+    }
+}
+
 /// What `ServerBuilder::handler` produces; programs never name it.
 pub struct BlockingHandler<H> {
     pub(crate) handler: H,
@@ -527,17 +536,28 @@ where
     /// `InvalidConfig` (`field` names the method), bind errors, `Unsupported` for a
     /// driver this version does not have.
     pub fn build(self) -> Result<Server, NetError> {
-        let driver = match self.driver.resolve() {
-            DriverKind::Blocking => DriverKind::Blocking,
-            other => {
+        // A handler holds its worker for the whole connection (blocking pool only).
+        let requested = match self.driver {
+            DriverKind::Auto if <W as engine::Serve>::BLOCKING_ONLY => DriverKind::Blocking,
+            other => other,
+        };
+        let driver = match requested.resolve() {
+            DriverKind::Reactor if <W as engine::Serve>::BLOCKING_ONLY => {
+                return Err(invalid("driver", ConfigReason::Inconsistent));
+            }
+            DriverKind::Reactor if !DriverKind::reactor_built() => {
                 return Err(NetError::Unsupported {
-                    feature: match other {
-                        DriverKind::Uring => "the io_uring driver (after 1.0.0)",
-                        _ => "the reactor driver (0.5.0)",
-                    },
+                    feature: "the reactor driver",
                     platform: std::env::consts::OS,
                 });
             }
+            DriverKind::Uring => {
+                return Err(NetError::Unsupported {
+                    feature: "the io_uring driver (after 1.0.0)",
+                    platform: std::env::consts::OS,
+                });
+            }
+            kind => kind,
         };
         if self.listeners.is_empty() {
             return Err(invalid("listener", ConfigReason::Missing));
@@ -545,7 +565,14 @@ where
         if self.listeners.len() > 64 {
             return Err(invalid("listener", ConfigReason::TooLarge { max: 64 }));
         }
-        let workers = self.workers.unwrap_or(128);
+        let workers = self.workers.unwrap_or_else(|| {
+            if driver == DriverKind::Reactor {
+                std::thread::available_parallelism()
+                    .map_or(4, |n| u16::try_from(n.get()).unwrap_or(4096).min(4096))
+            } else {
+                128
+            }
+        });
         if workers == 0 {
             return Err(invalid("workers", ConfigReason::Zero));
         }
@@ -561,12 +588,15 @@ where
                 names.push(n.clone());
             }
         }
-        // On the blocking driver an unset global cap is one connection per worker.
+        // On the blocking driver an unset global cap is one connection per worker;
+        // on the reactor the default, but never more than the descriptors allow.
         let limits = if self.limits.max_connections().is_none() {
-            self.limits
-                .to_builder()
-                .max_connections(u32::from(workers))
-                .build()?
+            let cap = if driver == DriverKind::Reactor {
+                reactor_default_cap(workers)
+            } else {
+                u32::from(workers)
+            };
+            self.limits.to_builder().max_connections(cap).build()?
         } else {
             self.limits.clone()
         };
@@ -593,6 +623,20 @@ where
             wipe: self.wipe,
             clock: self.clock,
         })
+    }
+}
+
+/// The reactor's default global cap: 10,000, less where the process's descriptor
+/// limit would not hold it.
+fn reactor_default_cap(workers: u16) -> u32 {
+    let wanted = 10_000u32;
+    match crate::sys::descriptor_limit() {
+        Some(have) => {
+            let spare = u64::from(workers).saturating_mul(2) + 64;
+            let room = have.saturating_sub(spare).clamp(16, u64::from(wanted));
+            u32::try_from(room).unwrap_or(wanted)
+        }
+        None => wanted,
     }
 }
 

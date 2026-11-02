@@ -42,6 +42,9 @@ struct Reg {
     socket: Registered,
     readable: bool,
     writable: bool,
+    /// The peer hung up: reads must go on until the end of stream, because no
+    /// new edge will report it.
+    hangup: bool,
     recv: Recv,
     out: Out,
     close: bool,
@@ -99,7 +102,7 @@ impl ReadyDriver {
                     Ok(n) => {
                         let len = buffer.len() + n;
                         buffer.set_len(len);
-                        if n < room && n > 0 {
+                        if n < room && n > 0 && !reg.hangup {
                             // Short read: the socket is drained; the next arrival
                             // raises a new edge.
                             reg.readable = false;
@@ -110,6 +113,7 @@ impl ReadyDriver {
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         reg.readable = false;
+                        reg.hangup = false;
                         reg.recv = Recv::Into(buffer);
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {
@@ -189,6 +193,7 @@ impl ReadyDriver {
         };
         reg.readable |= e.readable;
         reg.writable |= e.writable;
+        reg.hangup |= e.hangup;
         ReadyDriver::try_recv(reg, local);
         ReadyDriver::try_send(reg, local);
     }
@@ -213,6 +218,7 @@ impl Driver for ReadyDriver {
             socket: registered,
             readable: false,
             writable: true,
+            hangup: false,
             recv: Recv::None,
             out: Out::None,
             close: false,

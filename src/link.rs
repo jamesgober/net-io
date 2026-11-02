@@ -1345,6 +1345,12 @@ impl Link {
         }
     }
 
+    /// Whether the PROXY handshake already ran.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn proxy_done(&self) -> bool {
+        self.info.proxy.is_some()
+    }
+
     /// Bytes read past a handshake, into `buf`; 0 when none are left.
     #[cfg(feature = "reactor")]
     pub(crate) fn take_read_ahead(&mut self, buf: &mut [u8]) -> usize {
