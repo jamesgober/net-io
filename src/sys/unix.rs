@@ -1128,6 +1128,28 @@ pub(crate) fn wait_wake(wake: &Wake, timeout: Option<Duration>) -> io::Result<bo
     Ok(n > 0)
 }
 
+/// Waits until any of `socks` (at most 64) can write or has failed; bit `i` of the
+/// result stands for `socks[i]`, and 0 means the timeout passed.
+pub(crate) fn wait_writable(socks: &[Sock<'_>], timeout: Duration) -> io::Result<u64> {
+    let mut fds: Vec<PollFd> = socks
+        .iter()
+        .map(|s| PollFd {
+            fd: s.as_raw_fd(),
+            events: c::POLLOUT,
+            revents: 0,
+        })
+        .collect();
+    let ms = poll_millis(Some(timeout));
+    // SAFETY: `fds` is a live slice of initialized pollfd structs whose descriptors are
+    // open for the call (borrowed in `socks`).
+    retry_interrupted(|| cvt(unsafe { poll(fds.as_mut_ptr(), fds.len() as Nfds, ms) }))?;
+    Ok(fds
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.revents != 0)
+        .fold(0, |mask, (i, _)| mask | 1 << i))
+}
+
 /// Shuts the read side of a raw socket. Used only by the kill guard.
 ///
 /// # Safety

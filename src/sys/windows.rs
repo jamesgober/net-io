@@ -110,6 +110,7 @@ pub(super) mod c {
     pub const HANDLE_FLAG_INHERIT: u32 = 0x1;
     pub const INVALID_SOCKET: usize = !0;
     pub const SOCKET_ERROR: i32 = -1;
+    pub const WSAEINTR: i32 = 10004;
     pub const WSAEWOULDBLOCK: i32 = 10035;
 }
 
@@ -947,6 +948,29 @@ pub(crate) fn random_bytes(out: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Waits until any of `socks` (at most 64) can write or has failed; bit `i` of the
+/// result stands for `socks[i]`, and 0 means the timeout passed. `WSAPoll` reports a
+/// refused connect through `POLLERR` and `POLLHUP`, which every call watches.
+pub(crate) fn wait_writable(socks: &[Sock<'_>], timeout: Duration) -> io::Result<u64> {
+    let mut fds: Vec<WsaPollFd> = socks
+        .iter()
+        .map(|s| WsaPollFd {
+            fd: raw(*s),
+            events: c::POLLWRNORM,
+            revents: 0,
+        })
+        .collect();
+    let ms = poll_millis(Some(timeout));
+    // SAFETY: `fds` is a live slice of initialized WSAPOLLFD structs whose sockets are
+    // open for the call (borrowed in `socks`).
+    retry_interrupted(|| cvt(unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, ms) }))?;
+    Ok(fds
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.revents != 0)
+        .fold(0, |mask, (i, _)| mask | 1 << i))
+}
+
 /// Waits until `sock` is ready for `interest`, `wake` fires, or `timeout` passes.
 pub(crate) fn wait(
     sock: Sock<'_>,
@@ -976,7 +1000,12 @@ pub(crate) fn wait(
     let ms = poll_millis(timeout);
     // SAFETY: `fds` is a live array of `nfds` initialized WSAPOLLFD structs whose
     // sockets are open for the call.
-    let n = retry_interrupted(|| cvt(unsafe { WSAPoll(fds.as_mut_ptr(), nfds, ms) }))?;
+    let n = match retry_interrupted(|| cvt(unsafe { WSAPoll(fds.as_mut_ptr(), nfds, ms) })) {
+        Ok(n) => n,
+        // A kill's `CancelIoEx` ended the wait; the kill flag says why.
+        Err(e) if e.raw_os_error() == Some(c::WSAEINTR) => return Ok(Ready::Woken),
+        Err(e) => return Err(e),
+    };
     if n == 0 {
         return Ok(Ready::TimedOut);
     }
