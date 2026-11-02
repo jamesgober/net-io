@@ -77,6 +77,7 @@ pub(crate) const CMD_LISTENER_SWEEP: u32 = 8;
 #[cfg(feature = "reactor")]
 pub(crate) const CMD_LISTENER_KILL: u32 = 16;
 /// Deadlines shrank or returned: every waiting connection looks again.
+#[cfg(feature = "reactor")]
 pub(crate) const CMD_PRESSURE: u32 = 32;
 
 /// How many admitted connections wait for one reactor worker before new ones are

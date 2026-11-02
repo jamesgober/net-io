@@ -21,7 +21,8 @@ pub fn client(addr: SocketAddr) -> TcpStream {
     let s = TcpStream::connect(addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
-    s.set_nodelay(true).expect("nodelay");
+    // A server that already closed makes this fail on the BSDs: the test will see that.
+    let _ = s.set_nodelay(true);
     s
 }
 

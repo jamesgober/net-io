@@ -25,6 +25,22 @@ use crate::tls::{TlsError, TlsEvent, TlsFailure, TlsSession};
 pub(crate) enum ClockRef {
     Monotonic,
     Custom(Arc<dyn Clock>),
+    /// The time of this reactor turn: one clock read per trip through the OS, however
+    /// many connections and deadlines the turn touches. Off a worker's thread, the
+    /// clock itself.
+    #[cfg(feature = "reactor")]
+    Turn,
+}
+
+#[cfg(feature = "reactor")]
+thread_local! {
+    static TURN: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// A new reactor turn: reads the clock for it.
+#[cfg(feature = "reactor")]
+pub(crate) fn begin_turn() {
+    TURN.with(|t| t.set(Some(Instant::now())));
 }
 
 impl ClockRef {
@@ -33,6 +49,8 @@ impl ClockRef {
         match self {
             ClockRef::Monotonic => Instant::now(),
             ClockRef::Custom(c) => c.now(),
+            #[cfg(feature = "reactor")]
+            ClockRef::Turn => TURN.with(std::cell::Cell::get).unwrap_or_else(Instant::now),
         }
     }
 }

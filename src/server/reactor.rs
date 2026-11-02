@@ -41,7 +41,7 @@ use crate::gate::{ErasedGate, Gate, GateCell, guarded};
 use crate::id::WorkerId;
 use crate::info::{ConnectionInfo, Lane};
 use crate::limits::SizeClass;
-use crate::link::{ClockRef, Link, TlsNext, WakeSource};
+use crate::link::{ClockRef, Link, TlsNext, WakeSource, begin_turn};
 use crate::proxy::ProxyFacts;
 use crate::session::{Input, Output, Phase, Session, SessionContext, SessionFactory, Step};
 use crate::sys::{self, AsSock, KillSink, KillSlot};
@@ -237,7 +237,10 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
             shared: ws.completer.clone(),
         },
         view: ControlView::new(),
-        clock: engine.clock.clone(),
+        clock: match engine.clock {
+            ClockRef::Monotonic => ClockRef::Turn,
+            ref other => other.clone(),
+        },
         notes,
         slot_pool: Vec::new(),
         cells: Vec::new(),
@@ -250,6 +253,7 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
 impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     fn main(&mut self) {
         loop {
+            begin_turn();
             self.take_inbox();
             self.run_commands();
             self.take_kills();
@@ -271,6 +275,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 self.close_all(CloseReason::Shutdown);
                 return;
             }
+            begin_turn();
             for c in done.drain() {
                 self.on_completion(c);
             }
@@ -299,8 +304,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         // Buffers free on any worker, and nothing wakes this one for them.
         let starved = !self.starved.is_empty();
         match self.clock {
-            ClockRef::Monotonic if !starved => timer,
-            ClockRef::Monotonic => {
+            ClockRef::Monotonic | ClockRef::Turn if !starved => timer,
+            ClockRef::Monotonic | ClockRef::Turn => {
                 let cap = STARVED_RETRY;
                 Some(timer.map_or(cap, |t| t.min(cap)))
             }

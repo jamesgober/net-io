@@ -131,12 +131,12 @@ fn load(addr: SocketAddr, conns: usize, bytes: usize, time: Duration) -> Measure
     let threads = std::thread::available_parallelism()
         .map_or(2, |n| n.get() / 2)
         .clamp(1, conns);
-    let warm = Instant::now() + Duration::from_millis(WARM_MS);
-    let until = warm + time;
+    let ready = std::sync::Arc::new(std::sync::Barrier::new(threads));
     let handles: Vec<_> = (0..threads)
         .map(|t| {
             let share = conns / threads + usize::from(t < conns % threads);
-            std::thread::spawn(move || drive(addr, share, bytes, warm, until))
+            let ready = ready.clone();
+            std::thread::spawn(move || drive(addr, share, bytes, time, &ready))
         })
         .collect();
     let mut samples = Vec::new();
@@ -167,8 +167,8 @@ fn drive(
     addr: SocketAddr,
     conns: usize,
     bytes: usize,
-    warm: Instant,
-    until: Instant,
+    time: Duration,
+    ready: &std::sync::Barrier,
 ) -> (u64, Vec<u32>) {
     let mut poll = Poll::new().expect("poll");
     let mut all: Vec<Conn> = Vec::with_capacity(conns);
@@ -178,7 +178,11 @@ fn drive(
         s.set_nonblocking(true).expect("nonblocking");
         let mut stream = TcpStream::from_std(s);
         poll.registry()
-            .register(&mut stream, Token(i), Interest::READABLE | Interest::WRITABLE)
+            .register(
+                &mut stream,
+                Token(i),
+                Interest::READABLE | Interest::WRITABLE,
+            )
             .expect("register");
         all.push(Conn {
             stream,
@@ -187,6 +191,10 @@ fn drive(
             started: Instant::now(),
         });
     }
+    // Connecting is not timed: a small backlog makes it slow for some stacks.
+    ready.wait();
+    let warm = Instant::now() + Duration::from_millis(WARM_MS);
+    let until = warm + time;
     let out = vec![7u8; bytes];
     let mut buf = vec![0u8; bytes.max(4096)];
     let mut events = Events::with_capacity(1024);
@@ -310,7 +318,10 @@ fn monoio_echo(addr: SocketAddr) {
                                     Ok(n) if n > 0 => n,
                                     _ => return,
                                 };
-                                let (w, mut b) = s.write_all(monoio::buf::Slice::new(b, 0, n)).await.map_into();
+                                let (w, mut b) = s
+                                    .write_all(monoio::buf::Slice::new(b, 0, n))
+                                    .await
+                                    .map_into();
                                 if w.is_err() {
                                     return;
                                 }
@@ -349,8 +360,7 @@ fn mio_echo(addr: SocketAddr) {
     for _ in 0..threads {
         let (tx, rx) = std::sync::mpsc::channel::<std::net::TcpStream>();
         let poll = Poll::new().expect("poll");
-        let waker =
-            std::sync::Arc::new(mio::Waker::new(poll.registry(), WAKE).expect("waker"));
+        let waker = std::sync::Arc::new(mio::Waker::new(poll.registry(), WAKE).expect("waker"));
         senders.push((tx, waker));
         std::thread::spawn(move || mio_loop(poll, &rx));
     }
@@ -425,6 +435,19 @@ impl net_io::Session for Echo {
         cx: &mut net_io::SessionContext<'_>,
         input: &mut net_io::Input,
     ) -> net_io::Step {
+        // No copy: the filled buffer becomes the output, and an empty one the input.
+        let class = input.class();
+        if input.bytes().len() >= 1024 {
+            if let Some(mut swapped) = cx.buffers().take(class) {
+                if input.swap(&mut swapped).is_ok() {
+                    return match cx.output().push_buffer(swapped) {
+                        Ok(()) => net_io::Step::Write,
+                        Err(_) => net_io::Step::Close,
+                    };
+                }
+                cx.release(swapped);
+            }
+        }
         let taken = cx.output().push_partial(input.bytes());
         input.consume(taken);
         net_io::Step::Write

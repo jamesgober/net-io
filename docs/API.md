@@ -1,7 +1,7 @@
 # net-io - API Reference
 
 > Reference for every public item in `net-io`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.5.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; items marked with a later version than the current release are specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.6.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; items marked with a later version than the current release are specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -127,7 +127,7 @@ Every cost is a target. Numbers marked **[est.]** are estimates that a benchmark
 | Windows | 10 1809 / Server 2019 (AF_UNIX from 1803, `TCP_KEEPIDLE` and `TCP_KEEPINTVL` from 1709, `TCP_KEEPCNT` from 1703) | `Unsupported`; keepalive falls back to `SIO_KEEPALIVE_VALS` |
 | FreeBSD | 13 (in CI from `0.5.0`) | `Unsupported` |
 
-Targets with hand-written OS declarations: `x86_64` and `aarch64` on `linux-gnu`, `linux-musl`, `apple-darwin`, `unknown-freebsd`, `pc-windows-msvc`, `pc-windows-gnu`. On any other target the crate stops at a compile error that says so; the std-only fallback arrives in `0.6.0` (D-119).
+Targets with hand-written OS declarations: `x86_64` and `aarch64` on `linux-gnu`, `linux-musl`, `apple-darwin`, `unknown-freebsd`, `pc-windows-msvc`, `pc-windows-gnu`. On any other target the crate stops at a compile error that says so (D-132).
 
 Items that exist on one platform family only carry `#[cfg(unix)]` or `#[cfg(windows)]` in their signature. Each such item has a documented counterpart or a documented reason why there is none (see `docs/PLATFORM-NOTES.md`, from `0.3.0`).
 
@@ -1134,7 +1134,7 @@ A connected TCP socket that carries its own limits: every read honours the curre
 | `send` | gate check, then one system call; may write less than `buf` | `TimedOut`, `SlowPeer { Out }`, `BrokenPipe`, `ConnectionReset`, `EgressDenied`, `Killed` | gate check + 1 system call | P0 | 1 | `0.3.0` |
 | `send_all` | loops from the exact offset until done, the deadline passes, or the gate denies; the gate check runs before each write (a retry after the socket was full is not checked again, D-074) | as `send` | 1 system call per chunk | P0 | 1 | `0.3.0` |
 | `send_vectored`, `send_all_vectored` | up to 64 slices per system call; `send_all_vectored` advances the slices in place (no copy) | as `send` | 1 system call per 64 slices | P1 | 2 | `0.3.0` |
-| `send_file` | `sendfile` (Linux, macOS, FreeBSD) or `TransmitFile` (Windows) in chunks, a gate check before each chunk; falls back to read-and-write internally where zero copy is unavailable | as `send`; `FileTruncated { sent }` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
+| `send_file` | `sendfile` (Linux, macOS, FreeBSD) in 1 MiB chunks, a gate check before each; `TransmitFile` for `push_file` on the Windows reactor; falls back to read-and-write internally where zero copy is unavailable (TLS, pipes, Unix sockets off Linux, a held connection on Windows) | as `send`; `FileTruncated { sent }` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
 | `shutdown` | half-close: `Write` sends FIN and keeps reading; `Read` stops reading; repeated calls are no-ops | `Closed`, `Os` | 1 system call | P0 | 1 | `0.3.0` |
 | `close` | graceful: FIN, then reads and discards up to 64 KiB for up to 2 s so unread input does not cause an RST that destroys the last response, then close | `TimedOut`, `Os` | flush plus linger | P0 | 1 | `0.3.0` |
 | `abort` | `SO_LINGER {on, 0}` and close: RST, kernel resources freed at once | none surfaced | 2 system calls | P0 | 1 | `0.3.0` |
@@ -1224,6 +1224,7 @@ impl ListenOptions {
     pub fn defer_accept(self, wait: Option<Duration>) -> Self;   // P2, 0.6.0
     pub fn fast_open(self, queue: Option<u32>) -> Self;          // P2, 0.6.0
     pub fn incoming_cpu(self, cpu: Option<u32>) -> Self;         // P2, 0.6.0
+    pub fn per_worker(self, on: bool) -> Self;                   // P2, 0.6.0: one reuse-port socket per reactor worker (Linux)
     pub fn tcp_options(self, options: TcpOptions) -> Self; // applied to every accepted socket
 }
 impl Default for ListenOptions;
@@ -1319,14 +1320,15 @@ Errors: `Unsupported { feature, platform }` (never silent, except options marked
 | `defer_accept` | `TCP_DEFER_ACCEPT` | `Unsupported` | accept filter (P3) | `Unsupported` | off | P2 | `0.6.0` |
 | `fast_open` (server) | `TCP_FASTOPEN` | `TCP_FASTOPEN` | `TCP_FASTOPEN` | `TCP_FASTOPEN` (1607+) | off | P2 | `0.6.0` |
 | `incoming_cpu` | `SO_INCOMING_CPU` (set 4.4+) | `Unsupported` | `Unsupported` | `Unsupported` | off | P2 | `0.6.0` |
+| `per_worker` | a `SO_REUSEPORT` group, one socket and accept thread per reactor worker; not with the hand-off | `Unsupported` | `Unsupported` | `Unsupported` | off | P2 | `0.6.0` |
 | `user_timeout` | `TCP_USER_TIMEOUT` | `Unsupported` | `Unsupported` | `TCP_MAXRT` (seconds) | off | P2 | `0.6.0` |
 | `ttl` | `IP_TTL` / `IPV6_UNICAST_HOPS` | yes | yes | yes | OS default | P2 | `0.3.0` |
 | `notsent_lowat` | `TCP_NOTSENT_LOWAT` | yes | `Unsupported` | `Unsupported` | off | P3 | after `1.0.0` |
 | `quickack` | `TCP_QUICKACK` (re-applied after reads, not sticky) | `Unsupported` | `Unsupported` | `Unsupported` | off | P3 | after `1.0.0` |
 | `dscp` | `IP_TOS` / `IPV6_TCLASS` | yes | yes | hint (ignored without a QoS policy) | unset | P3 | after `1.0.0` |
 | client fast open | `TCP_FASTOPEN_CONNECT` | `connectx` | `TCP_FASTOPEN` | `ConnectEx` with data | off | P3 | after `1.0.0` |
-| no `SIGPIPE` | `MSG_NOSIGNAL` on every send | `SO_NOSIGPIPE` on every socket | `MSG_NOSIGNAL` | n/a | always | P0 | `0.3.0` |
-| close-on-exec / not inheritable | `SOCK_CLOEXEC`, `accept4` | `FD_CLOEXEC` right after creation (a documented window) | `SOCK_CLOEXEC`, `accept4` | `WSA_FLAG_NO_HANDLE_INHERIT` | always | P0 | `0.3.0` |
+| no `SIGPIPE` | `MSG_NOSIGNAL` on every send | `SO_NOSIGPIPE` on every socket | `SO_NOSIGPIPE` on every socket | n/a | always | P0 | `0.3.0` |
+| close-on-exec / not inheritable | `SOCK_CLOEXEC`, `accept4` | `FD_CLOEXEC` right after creation (a documented window) | as macOS | `WSA_FLAG_NO_HANDLE_INHERIT` | always | P0 | `0.3.0` |
 
 ---
 
@@ -1543,6 +1545,7 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
     pub fn trusted_proxies(self, proxies: TrustedProxies) -> Self;
     pub fn control<C: ControlLine>(self, line: Arc<C>) -> Self;
     pub fn placement(self, placement: Placement) -> Self;               // P2, 0.6.0: Off (default), PinPerCore, Explicit(Vec<usize>)
+    pub fn udp_sessions<F: UdpSessionFactory>(self, factory: F) -> /* UDP only, or Self beside sessions or a handler */; // P2, 0.6.0
     pub fn wipe_buffers(self, on: bool) -> Self;                         // default true
     pub fn clock<K: Clock>(self, clock: Arc<K>) -> Self;                 // tests
     pub fn build(self) -> Result<Server, NetError>
@@ -1555,7 +1558,7 @@ pub struct BlockingHandler<H> { /* the handler */ }           // what `handler` 
 pub trait Workload: sealed::Sealed + Send + Sync + 'static {}  // implemented by Sessions<F> and BlockingHandler<H> only
 ```
 
-A builder without a gate or without `sessions`/`handler` has no `build` method: forgetting either is a compile error that names the missing part (`the trait Gate is not implemented for NoGate`), not a run-time surprise. `build` validates everything else before it binds anything (limits resolved for the driver, caps against the descriptor limit, worker count, trusted proxies present when any listener requires PROXY, a TLS acceptor present when any listener has TLS on), then binds or adopts the listeners and starts the workers with the **door closed**. `Server` is not generic: the factory, gate, sink, and acceptor types live inside the workers, so the type a program holds stays `Server`.
+A builder without a gate or without `sessions`/`handler`/`udp_sessions` has no `build` method: forgetting either is a compile error that names the missing part (`the trait Gate is not implemented for NoGate`), not a run-time surprise. `build` validates everything else before it binds anything (limits resolved for the driver, caps against the descriptor limit, worker count, trusted proxies present when any listener requires PROXY, a TLS acceptor present when any listener has TLS on), then binds or adopts the listeners and starts the workers with the **door closed**. `Server` is not generic: the factory, gate, sink, and acceptor types live inside the workers, so the type a program holds stays `Server`.
 
 | Item | Behaviour | Errors | Grade | Tier | Version |
 |---|---|---|---|---|---|
@@ -1565,7 +1568,7 @@ A builder without a gate or without `sessions`/`handler` has no `build` method: 
 | `tls` | | | P0 | 2 | `0.4.0` |
 | `trusted_proxies` | required when any listener has `ProxyMode::Required` | `InvalidConfig { field: "trusted_proxies", reason: Missing }` | P0 | 2 | `0.4.0` |
 | `control` | | | P1 | 2 | `0.3.0` |
-| `placement` | worker CPU placement | `Unsupported` on macOS for pinning | P2 | 2 | `0.6.0` |
+| `placement` | worker CPU placement: `PinPerCore` puts worker `n` on CPU `n`, `Explicit` on the listed CPUs in turn; a pin that fails leaves the worker unpinned | `Unsupported` on macOS, `InvalidConfig` for an empty list | P2 | 2 | `0.6.0` |
 | `wipe_buffers` | zero the used part of every buffer when it returns to a pool (on by default; turn off only for traffic that never carries secrets) | | P1 | 2 | `0.3.0` |
 | `clock` | inject a [`ManualClock`](#time) | | P2 | 3 | `0.3.0` |
 
@@ -2184,7 +2187,7 @@ pub trait Driver: Send {
     Close { token: Token, abortive: bool },
     Nop { token: Token },
 }
-#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum OperationKind { Accept, Receive, Send, Connect, Close, Nop }   // SendFile with send_file, 0.6.0
+#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum OperationKind { Accept, Receive, Send, SendFile, Connect, Close, Nop }
 #[non_exhaustive] pub struct Completion { pub token: Token, pub kind: OperationKind, pub result: Result<usize, OsErrorClass>, pub buffer: Option<Buffer>, pub chunks: Option<SendChunks> }
 pub struct Completions { /* fixed capacity, 256 entries; wait never allocates */ }
 pub struct SendChunks { /* up to 64 chunks: pool buffers, &'static slices; taken from Output */ }
@@ -2252,7 +2255,8 @@ pub struct UdpBudget { pub datagrams_per_sec: u32, pub bytes_per_sec: u32, pub b
 impl UdpBudget { pub const SOURCE_DEFAULT: UdpBudget; }   // 1,000 datagrams/s, 1 MB/s, burst 100
 
 // P2, 0.6.0: batches and multicast
-pub struct DatagramBuffer<'a> { pub buf: &'a mut [u8], pub datagram: Option<Datagram> }   // filled by recv_batch
+pub struct DatagramBuffer<'a> { pub buf: &'a mut [u8], pub datagram: Option<Datagram> }   // filled by recv_batch; None when not filled or over budget
+impl<'a> DatagramBuffer<'a> { pub fn new(buf: &'a mut [u8]) -> Self; }
 pub struct OutgoingDatagram<'a> { pub bytes: &'a [u8], pub to: SocketAddr }
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MulticastInterface { Any, V4(Ipv4Addr), V6Index(u32) }
@@ -2267,7 +2271,8 @@ impl UdpContext<'_> {
     pub fn mark_verified(&mut self, peer: SocketAddr);
     pub fn now(&self) -> Instant;
 }
-// ListenerSpec::udp(addr, options) with ServerBuilder::udp_sessions(factory) runs them on the reactor workers
+pub trait UdpSessionFactory: Send + Sync + 'static { fn open(&self, listener: &ListenerInfo) -> Box<dyn UdpSession>; }  // any Fn(&ListenerInfo) -> impl UdpSession
+// ListenerSpec::udp(addr, options) with ServerBuilder::udp_sessions(factory): one thread per listener, which owns the socket
 ```
 
 UDP source addresses are trivially spoofed, so the socket protects others and itself by default:
@@ -2282,9 +2287,9 @@ UDP source addresses are trivially spoofed, so the socket protects others and it
 | `mark_verified` | the protocol proved the peer can receive (a cookie, a handshake); lifts the guard for it | | O(1) | P1 | 2 | `0.4.0` |
 | source table | bounded (default 65,536 entries, about 130 bytes each [est.], 8.5 MiB full) with CLOCK eviction of unverified entries (one insertion looks at most 64 entries); when nothing can be evicted, unknown sources share one overflow budget the size of a source budget and get no send allowance (strangers lose first, verified peers keep their entries) | | O(1) | P1 | 2 | `0.4.0` |
 | `recv_batch`, `send_batch` | `recvmmsg` / `sendmmsg` on Linux, a loop elsewhere | | 1 system call per batch on Linux | P2 | 3 | `0.6.0` |
-| packet info (`destination`) | `IP_PKTINFO`, `IPV6_RECVPKTINFO` | `Unsupported` | ancillary data parse | P2 | 3 | `0.6.0` |
+| packet info (`destination`) | `IP_PKTINFO`, `IPV6_RECVPKTINFO` (`IP_RECVDSTADDR` on FreeBSD); not reported by `recv_batch` | `Unsupported` on Windows | ancillary data parse | P2 | 3 | `0.6.0` |
 | `join_multicast` | IPv4 and IPv6 groups | `Os` | | P2 | 2 | `0.6.0` |
-| `UdpSession`, `UdpContext`, `ListenerSpec::udp`, `ServerBuilder::udp_sessions` | datagrams driven like connections on the reactor: the same guard and budgets, the same events and drain | as `send_to` | per datagram: one dispatch | P2 | 3 | `0.6.0` |
+| `UdpSession`, `UdpContext`, `ListenerSpec::udp`, `ServerBuilder::udp_sessions` | a thread per listener owns the socket, so the guard needs no lock (D-127): the same budgets, the door, stop, and drain. On a builder with no TCP work the server is UDP only, and a TCP listener fails `build` | as `send_to` | per datagram: one dispatch | P2 | 3 | `0.6.0` |
 | GSO, GRO | `UDP_SEGMENT`, `UDP_GRO` (Linux) | `Unsupported` | | P3 | 3 | after `1.0.0` |
 
 The amplification factor defaults to 1 (decision D-034); a QUIC implementation sets 3 for its own handshake, as RFC 9000 allows.

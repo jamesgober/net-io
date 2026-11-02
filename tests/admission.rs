@@ -122,8 +122,12 @@ fn test_lockdown_leaves_the_allowed_listener_open() {
     control.set(ControlState::Lockdown, None);
     // The control line is read before an accept batch: let one connection see it.
     assert!(eventually(WAIT, || {
-        let mut c = client(public);
+        // A refusal can reach a BSD client inside `connect`.
+        let Ok(mut c) = TcpStream::connect(public) else {
+            return true;
+        };
         let _ = c.write_all(b"x");
+        let _ = c.set_read_timeout(Some(WAIT));
         let mut b = [0u8; 1];
         !matches!(c.read(&mut b), Ok(n) if n > 0)
     }));

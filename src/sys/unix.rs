@@ -825,7 +825,7 @@ fn destination_in(control: &[u8]) -> Option<std::net::IpAddr> {
         if len < size_of::<CmsgHdr>() {
             return None;
         }
-        let data = control.get(at + size_of::<CmsgHdr>()..at + len)?;
+        let data = control.get(at + cmsg_align_any(size_of::<CmsgHdr>())..at + len)?;
         if level == c::IPPROTO_IP && ty == c::IP_PKTINFO_TYPE {
             let octets: [u8; 4] = data
                 .get(c::PKTINFO_ADDR_AT..c::PKTINFO_ADDR_AT + 4)?
