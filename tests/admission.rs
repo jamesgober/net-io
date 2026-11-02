@@ -197,3 +197,44 @@ fn test_placement() {
         assert!(matches!(empty, Err(NetError::InvalidConfig { .. })));
     }
 }
+
+/// One socket per worker: the group answers on one port, and each socket feeds its
+/// own worker.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_per_worker_listeners() {
+    let spec = ListenerSpec::tcp_with("127.0.0.1:0", net_io::ListenOptions::new().per_worker(true));
+    let limits = Limits::builder()
+        .max_per_source(64, PrefixPolicy::DEFAULT)
+        .build()
+        .expect("limits");
+    let server = ServerBuilder::new()
+        .listener(spec)
+        .driver(DriverKind::Reactor)
+        .workers(4)
+        .limits(limits)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let mut conns: Vec<TcpStream> = (0..32).map(|_| client(addr(&server))).collect();
+    for c in &mut conns {
+        assert_eq!(round_trip(c, b"ok"), b"ok");
+    }
+    assert!(server.release_listeners().is_err(), "a group stays put");
+    drop(conns);
+    drop(server);
+}
+
+#[test]
+fn test_per_worker_is_refused_where_it_cannot_work() {
+    let spec = ListenerSpec::tcp_with("127.0.0.1:0", net_io::ListenOptions::new().per_worker(true));
+    let built = ServerBuilder::new()
+        .listener(spec)
+        .driver(DriverKind::Blocking)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(AllowAll)
+        .build();
+    assert!(built.is_err());
+}

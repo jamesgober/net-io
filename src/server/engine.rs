@@ -285,7 +285,26 @@ impl CompleterTarget for WorkerTarget {
 }
 
 /// The non-generic state `Server` and `ServerHandle` share with the threads.
+/// How many workers there are and where they run: what a listener group is built from.
+#[derive(Clone, Debug)]
+struct Layout {
+    workers: u16,
+    placement: super::Placement,
+}
+
+impl Layout {
+    /// The CPU worker `i` runs on, when it is pinned.
+    fn cpu_of(&self, i: usize) -> Option<usize> {
+        match &self.placement {
+            super::Placement::Off => None,
+            super::Placement::PinPerCore => Some(i),
+            super::Placement::Explicit(cpus) => Some(cpus[i % cpus.len()]),
+        }
+    }
+}
+
 pub(crate) struct Shared {
+    layout: Layout,
     /// Adaptive deadlines, when set.
     pressure: Option<crate::limits::Pressure>,
     /// Open connections passed `pressure.high` and have not yet fallen below `low`.
@@ -359,7 +378,7 @@ type AdoptFn = Box<
 
 /// Starts the accept thread of one listener.
 type SpawnAccept = Box<
-    dyn Fn(Arc<ListenerConf>, Arc<ListenerRuntime>) -> std::io::Result<JoinHandle<()>>
+    dyn Fn(Arc<ListenerConf>, Arc<ListenerRuntime>, usize) -> std::io::Result<JoinHandle<()>>
         + Send
         + Sync,
 >;
@@ -492,7 +511,10 @@ impl Shared {
         };
         for e in self.lock_listeners().iter_mut() {
             if e.thread.is_none() {
-                e.thread = Some(spawn(e.conf.clone(), e.runtime.clone())?);
+                e.thread = Some(spawn(e.conf.clone(), e.runtime.clone(), 0)?);
+                for (i, s) in e.siblings.iter_mut().enumerate() {
+                    s.thread = Some(spawn(e.conf.clone(), s.runtime.clone(), i + 1)?);
+                }
             }
         }
         Ok(())
@@ -508,6 +530,11 @@ impl Shared {
         for mut e in entries {
             if let Some(t) = e.thread.take() {
                 let _ = t.join();
+            }
+            for s in &mut e.siblings {
+                if let Some(t) = s.thread.take() {
+                    let _ = t.join();
+                }
             }
         }
     }
@@ -543,6 +570,12 @@ impl Shared {
         let list = self.lock_listeners();
         let mut out = Vec::with_capacity(list.len());
         for e in list.iter() {
+            if !e.siblings.is_empty() {
+                return Err(NetError::Unsupported {
+                    feature: "handing off a per-worker listener",
+                    platform: std::env::consts::OS,
+                });
+            }
             let info = e.runtime.info();
             let sock = e
                 .runtime
@@ -574,18 +607,19 @@ impl Shared {
                 max: u64::from(u16::MAX),
             },
         })?);
-        let (mut entry, info) = bind_listener(spec, id, &self.base_limits, self.driver)?;
+        let (mut entry, info) =
+            bind_listener(spec, id, &self.base_limits, self.driver, &self.layout)?;
         let Some(spawn) = self.spawn_accept.get() else {
             return Err(NetError::ShuttingDown);
         };
-        entry.thread = Some(
-            spawn(entry.conf.clone(), entry.runtime.clone()).map_err(|e| {
-                NetError::DriverSetup {
-                    driver: DriverKind::Blocking,
-                    source: e,
-                }
-            })?,
-        );
+        let setup = |e| NetError::DriverSetup {
+            driver: DriverKind::Blocking,
+            source: e,
+        };
+        entry.thread = Some(spawn(entry.conf.clone(), entry.runtime.clone(), 0).map_err(setup)?);
+        for (i, s) in entry.siblings.iter_mut().enumerate() {
+            s.thread = Some(spawn(entry.conf.clone(), s.runtime.clone(), i + 1).map_err(setup)?);
+        }
         self.lock_listeners().push(entry);
         self.event(Event::ListenerOpened {
             listener: id,
@@ -619,12 +653,18 @@ impl Shared {
             conf,
             runtime,
             thread,
+            siblings,
         } = entry;
         conf.door.store(false, Ordering::Release);
         conf.removed.store(true, Ordering::Release);
         conf.wake.wake();
         if let Some(t) = thread {
             let _ = t.join();
+        }
+        for s in siblings {
+            if let Some(t) = s.thread {
+                let _ = t.join();
+            }
         }
         drop(runtime);
         self.event(Event::ListenerClosed { listener: id });
@@ -1034,7 +1074,7 @@ pub(crate) struct ListenerConf {
     /// Set by `remove_listener` and at shutdown: the accept thread ends and
     /// queued connections close with `Drained`.
     pub(crate) removed: AtomicBool,
-    wake: Arc<Wake>,
+    wake: Wakes,
 }
 
 #[cfg(feature = "reactor")]
@@ -1049,6 +1089,30 @@ struct ListenerEntry {
     conf: Arc<ListenerConf>,
     runtime: Arc<ListenerRuntime>,
     thread: Option<JoinHandle<()>>,
+    /// The other sockets of a per-worker group, one for each worker after the first.
+    siblings: Vec<Sibling>,
+}
+
+struct Sibling {
+    runtime: Arc<ListenerRuntime>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// The wake channels of a listener's accept threads, one each: a wake is read by
+/// whoever reads it, so threads cannot share a channel.
+struct Wakes(Vec<Arc<Wake>>);
+
+impl Wakes {
+    fn wake(&self) {
+        for w in &self.0 {
+            w.wake();
+        }
+    }
+}
+
+thread_local! {
+    /// On an accept thread of a per-worker group: the worker it feeds.
+    static FEEDS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Binds (or adopts) the socket of `spec` and builds its settings.
@@ -1057,7 +1121,21 @@ fn bind_listener(
     id: ListenerId,
     base: &Limits,
     driver: DriverKind,
+    layout: &Layout,
 ) -> Result<(ListenerEntry, ListenerInfo), NetError> {
+    let per_worker = spec.options.is_some_and(|o| o.per_worker);
+    if per_worker && !cfg!(target_os = "linux") {
+        return Err(NetError::Unsupported {
+            feature: "per-worker listeners",
+            platform: std::env::consts::OS,
+        });
+    }
+    if per_worker && driver.resolve() != DriverKind::Reactor {
+        return Err(NetError::InvalidConfig {
+            field: "per_worker",
+            reason: crate::error::ConfigReason::Inconsistent,
+        });
+    }
     let lim = base.overlay(&spec.limits).effective(driver);
     let proxy = match spec.proxy {
         ProxyMode::Required { versions } => Some(ListenerProxy {
@@ -1066,6 +1144,7 @@ fn bind_listener(
         }),
         _ => None,
     };
+    let group_options = spec.options;
     let (runtime, info, tcp) = 'bound: {
         if let Some(handle) = spec.adopt {
             let name = spec.name.clone();
@@ -1183,12 +1262,37 @@ fn bind_listener(
         let tcp = *listener.tcp_options();
         (ListenerRuntime::Tcp(listener), info, tcp)
     };
-    let wake = Wake::new()
-        .map(Arc::new)
+    let threads = if per_worker {
+        usize::from(layout.workers)
+    } else {
+        1
+    };
+    let mut siblings = Vec::with_capacity(threads.saturating_sub(1));
+    if let (true, Some(options), Some(local)) =
+        (per_worker, group_options, info.local.socket_addr())
+    {
+        for i in 1..threads {
+            let cpu = layout.cpu_of(i).and_then(|c| u32::try_from(c).ok());
+            let params = options.incoming_cpu(cpu).params();
+            let socket =
+                sys::tcp_listener(local, &params).map_err(|e| crate::tcp::bind_error(local, e))?;
+            let mut l = TcpListener::finish(socket, options, id, spec.name.clone())?;
+            l.set_proxy_mode(spec.proxy);
+            l.set_tls(spec.tls);
+            siblings.push(Sibling {
+                runtime: Arc::new(ListenerRuntime::Tcp(l)),
+                thread: None,
+            });
+        }
+    }
+    let wakes = (0..threads)
+        .map(|_| Wake::new().map(Arc::new))
+        .collect::<std::io::Result<Vec<_>>>()
         .map_err(|e| NetError::DriverSetup {
             driver: DriverKind::Blocking,
             source: e,
         })?;
+    let wake = Wakes(wakes);
     let conf = Arc::new(ListenerConf {
         id,
         limits: Arc::new(lim),
@@ -1209,6 +1313,7 @@ fn bind_listener(
             conf,
             runtime: Arc::new(runtime),
             thread: None,
+            siblings,
         },
         info,
     ))
@@ -1363,12 +1468,14 @@ impl<W, G: Gate> Engine<W, G> {
     #[allow(clippy::result_large_err)]
     fn hand_to_worker(&self, job: Job<G::Ticket>) -> Result<(), Job<G::Ticket>> {
         let shared = &self.shared;
-        let idx = shared
-            .workers
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, w)| w.load.load(Ordering::Relaxed))
-            .map_or(0, |(i, _)| i);
+        let idx = FEEDS.with(std::cell::Cell::get).unwrap_or_else(|| {
+            shared
+                .workers
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, w)| w.load.load(Ordering::Relaxed))
+                .map_or(0, |(i, _)| i)
+        });
         {
             let mut inbox = self.inboxes[idx]
                 .0
@@ -1395,11 +1502,15 @@ where
     let driver = cfg.driver;
     let reactor = driver == DriverKind::Reactor;
     let limits = cfg.limits.effective(driver);
+    let layout = Layout {
+        workers: cfg.workers,
+        placement: cfg.placement.clone(),
+    };
     let mut entries = Vec::with_capacity(cfg.listeners.len());
     let mut infos = Vec::with_capacity(cfg.listeners.len());
     for (i, spec) in cfg.listeners.into_iter().enumerate() {
         let id = ListenerId(u16::try_from(i).unwrap_or(u16::MAX));
-        let (entry, info) = bind_listener(spec, id, &cfg.limits, driver)?;
+        let (entry, info) = bind_listener(spec, id, &cfg.limits, driver, &layout)?;
         entries.push(entry);
         infos.push(info);
     }
@@ -1433,6 +1544,7 @@ where
     let queue_capacity = limits.completion_queue as usize;
     let next_listener = u32::try_from(infos.len()).unwrap_or(u32::MAX);
     let shared = Arc::new_cyclic(|weak: &Weak<Shared>| Shared {
+        layout: layout.clone(),
         pressure: limits.pressure,
         pressured: AtomicBool::new(false),
         #[cfg(feature = "udp")]
@@ -1549,16 +1661,15 @@ where
         },
     ));
     let weak = Arc::downgrade(&engine);
-    let _ = shared.spawn_accept.set(Box::new(move |conf, rt| {
+    let _ = shared.spawn_accept.set(Box::new(move |conf, rt, slot| {
         let Some(e) = weak.upgrade() else {
             return Err(std::io::Error::other("the server stopped"));
         };
         std::thread::Builder::new()
             .name(format!("net-io-accept-{}", conf.id.0))
-            .spawn(move || accept_loop(&e, &conf, &rt))
+            .spawn(move || accept_loop(&e, &conf, &rt, slot))
     }));
 
-    let cfg_placement = cfg.placement;
     let mut threads = Vec::with_capacity(usize::from(cfg.workers));
     let spawn_error = |e: std::io::Error| NetError::DriverSetup {
         driver: DriverKind::Blocking,
@@ -1567,11 +1678,7 @@ where
     let mut failure = None;
     for i in 0..usize::from(cfg.workers) {
         let e = engine.clone();
-        let cpu = match &cfg_placement {
-            super::Placement::Off => None,
-            super::Placement::PinPerCore => Some(i),
-            super::Placement::Explicit(cpus) => Some(cpus[i % cpus.len()]),
-        };
+        let cpu = layout.cpu_of(i);
         match std::thread::Builder::new()
             .name(format!("net-io-worker-{i}"))
             .stack_size(WORKER_STACK)
@@ -1632,7 +1739,7 @@ fn udp_loop(
     };
     let mut session = factory.open(info);
     let mut socket = socket.lock().unwrap_or_else(PoisonError::into_inner);
-    let wake = conf.wake.clone();
+    let wake = conf.wake.0[0].clone();
     let mut buf = vec![0u8; 65_536];
     loop {
         if shared.stopping.load(Ordering::Acquire)
@@ -1669,13 +1776,17 @@ fn accept_loop<W: super::Workload, G: Gate>(
     engine: &Arc<Engine<W, G>>,
     conf: &Arc<ListenerConf>,
     rt: &ListenerRuntime,
+    slot: usize,
 ) {
     let shared = &engine.shared;
     #[cfg(feature = "udp")]
     if let ListenerRuntime::Udp(socket, info) = rt {
         return udp_loop(shared, conf, socket, info);
     }
-    let wake = conf.wake.clone();
+    let wake = conf.wake.0[slot].clone();
+    if conf.wake.0.len() > 1 {
+        FEEDS.with(|f| f.set(Some(slot)));
+    }
     let batch = conf.limits.accept_batch;
     let mut acceptor = Acceptor::new();
     let mut ids = IdBlock::new();

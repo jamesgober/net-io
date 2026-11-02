@@ -215,6 +215,7 @@ pub struct ListenOptions {
     pub(crate) defer_accept: Option<Duration>,
     pub(crate) fast_open: Option<u32>,
     pub(crate) incoming_cpu: Option<u32>,
+    pub(crate) per_worker: bool,
     pub(crate) tcp: TcpOptions,
 }
 
@@ -230,6 +231,7 @@ impl Default for ListenOptions {
             defer_accept: None,
             fast_open: None,
             incoming_cpu: None,
+            per_worker: false,
             tcp: TcpOptions::new().nodelay(true),
         }
     }
@@ -301,6 +303,19 @@ impl ListenOptions {
     /// listener per CPU.
     pub fn incoming_cpu(mut self, cpu: Option<u32>) -> ListenOptions {
         self.incoming_cpu = cpu;
+        self
+    }
+
+    /// One socket and one accept thread per reactor worker, in a `SO_REUSEPORT` group
+    /// (Linux; `Unsupported` elsewhere, `InvalidConfig` on the blocking driver). Each
+    /// feeds its own worker, so no connection crosses to another worker, and no accept
+    /// thread is a bottleneck; with `ServerBuilder::placement` each socket also takes
+    /// the connections its worker's CPU received. Costs: a socket and a thread per
+    /// worker, the kernel's hash decides the balance, and such a listener cannot be
+    /// handed off: closing one socket of a group resets what is queued on it.
+    pub fn per_worker(mut self, on: bool) -> ListenOptions {
+        self.per_worker = on;
+        self.reuse_port = self.reuse_port || on;
         self
     }
 
