@@ -1,0 +1,22 @@
+# Benchmarks against other stacks. Never published, and not part of the crate: the
+# competitors are dependencies of this tool alone.
+[package]
+name = "net-io-compare"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+net-io = { path = ".." }
+mio = { version = "1", features = ["net", "os-poll"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+monoio = "0.2"
+
+[profile.release]
+debug = false
+lto = "thin"
+codegen-units = 1

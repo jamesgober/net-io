@@ -33,7 +33,7 @@ documentation = "https://docs.rs/net-io"
 authors = ["James Gober <me@jamesgober.com>"]
 
 # Kept out of the published crate
-exclude = ["fuzz/"]
+exclude = ["fuzz/", "compare/"]
 
 [package.metadata.docs.rs]
 all-features = true

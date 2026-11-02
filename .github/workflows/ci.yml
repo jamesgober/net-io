@@ -170,6 +170,21 @@ jobs:
       - name: Timers
         run: cargo test --release --lib bench_wheel -- --ignored --nocapture
 
+  compare:
+    name: Against other stacks (not a gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compare
+      - name: The table
+        working-directory: compare
+        run: |
+          ulimit -n 30000
+          cargo run --release
+
   loom:
     name: Loom models
     runs-on: ubuntu-latest
