@@ -1163,11 +1163,8 @@ impl Link {
     /// through the reactor's `TransmitFile`.
     pub(crate) fn sends_files_directly(&self) -> bool {
         self.tls.is_none()
-            && match self.info.transport {
-                Transport::Tcp => true,
-                Transport::Unix => cfg!(target_os = "linux"),
-                _ => false,
-            }
+            && (self.info.transport == Transport::Tcp
+                || (self.info.transport == Transport::Unix && cfg!(target_os = "linux")))
     }
 
     /// Sends `len` bytes of `file` from `offset`, a gate check before each chunk; returns

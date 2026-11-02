@@ -137,6 +137,18 @@ mod c {
     pub const SOCK_DGRAM: c_int = 2;
     #[cfg(feature = "udp")]
     pub const MSG_TRUNC: c_int = 0x20;
+    #[cfg(feature = "udp")]
+    pub const MSG_WAITFORONE: c_int = 0x10000;
+    #[cfg(feature = "udp")]
+    pub const IP_RECVPKTINFO: c_int = 8;
+    #[cfg(feature = "udp")]
+    pub const IP_PKTINFO_TYPE: c_int = 8;
+    #[cfg(feature = "udp")]
+    pub const PKTINFO_ADDR_AT: usize = 8;
+    #[cfg(feature = "udp")]
+    pub const IPV6_RECVPKTINFO: c_int = 49;
+    #[cfg(feature = "udp")]
+    pub const IPV6_PKTINFO_TYPE: c_int = 50;
     pub const SOCK_CLOEXEC: c_int = 0o2_000_000;
     pub const SOL_SOCKET: c_int = 1;
     pub const SO_REUSEADDR: c_int = 2;
@@ -203,6 +215,25 @@ mod c {
     pub const SOCK_DGRAM: c_int = 2;
     #[cfg(feature = "udp")]
     pub const MSG_TRUNC: c_int = 0x10;
+    #[cfg(all(feature = "udp", target_os = "macos"))]
+    pub const IP_RECVPKTINFO: c_int = 26;
+    #[cfg(all(feature = "udp", target_os = "macos"))]
+    pub const IP_PKTINFO_TYPE: c_int = 26;
+    #[cfg(all(feature = "udp", target_os = "macos"))]
+    pub const PKTINFO_ADDR_AT: usize = 8;
+    /// `IP_RECVDSTADDR`: FreeBSD's record is the address alone.
+    #[cfg(all(feature = "udp", target_os = "freebsd"))]
+    pub const IP_RECVPKTINFO: c_int = 7;
+    #[cfg(all(feature = "udp", target_os = "freebsd"))]
+    pub const IP_PKTINFO_TYPE: c_int = 7;
+    #[cfg(all(feature = "udp", target_os = "freebsd"))]
+    pub const PKTINFO_ADDR_AT: usize = 0;
+    #[cfg(all(feature = "udp", target_os = "macos"))]
+    pub const IPV6_RECVPKTINFO: c_int = 61;
+    #[cfg(all(feature = "udp", target_os = "freebsd"))]
+    pub const IPV6_RECVPKTINFO: c_int = 36;
+    #[cfg(feature = "udp")]
+    pub const IPV6_PKTINFO_TYPE: c_int = 46;
     pub const SOL_SOCKET: c_int = 0xffff;
     pub const SO_ACCEPTCONN: c_int = 0x2;
     pub const SO_REUSEADDR: c_int = 0x4;
@@ -433,8 +464,18 @@ unsafe extern "C" {
     fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int;
     #[cfg(target_os = "linux")]
     fn syscall(num: std::ffi::c_long, ...) -> std::ffi::c_long;
-    #[cfg(any(feature = "local", all(feature = "udp", not(target_os = "linux"))))]
+    #[cfg(any(feature = "local", feature = "udp"))]
     fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
+    #[cfg(all(feature = "udp", target_os = "linux"))]
+    fn recvmmsg(
+        fd: c_int,
+        msgs: *mut MmsgHdr,
+        count: std::ffi::c_uint,
+        flags: c_int,
+        timeout: *mut c_void,
+    ) -> c_int;
+    #[cfg(all(feature = "udp", target_os = "linux"))]
+    fn sendmmsg(fd: c_int, msgs: *mut MmsgHdr, count: std::ffi::c_uint, flags: c_int) -> c_int;
     #[cfg(all(feature = "udp", target_os = "linux"))]
     fn recvfrom(
         fd: c_int,
@@ -603,6 +644,205 @@ fn udp_socket(v6: bool) -> io::Result<OwnedFd> {
         cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
     }
     Ok(owned)
+}
+
+/// `struct mmsghdr`: one message of a batch.
+#[cfg(all(feature = "udp", target_os = "linux"))]
+#[repr(C)]
+struct MmsgHdr {
+    hdr: MsgHdr,
+    len: std::ffi::c_uint,
+}
+
+/// The most messages one batch system call carries.
+#[cfg(all(feature = "udp", target_os = "linux"))]
+pub(crate) const BATCH_MAX: usize = 64;
+
+/// One datagram of a received batch.
+#[cfg(all(feature = "udp", target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Incoming {
+    pub len: usize,
+    pub from: SocketAddr,
+    pub truncated: bool,
+}
+
+/// Fills `bufs` from one `recvmmsg`: it waits for the first datagram, then takes what
+/// is ready. Returns how many arrived; `out` holds them in order. A datagram the
+/// kernel gave no address for is skipped by the caller through `None`.
+#[cfg(all(feature = "udp", target_os = "linux"))]
+pub(crate) fn udp_recv_many(
+    sock: Sock<'_>,
+    bufs: &mut [&mut [u8]],
+    out: &mut [Option<Incoming>],
+) -> io::Result<usize> {
+    #[repr(C, align(8))]
+    struct Addrs([[u8; 128]; BATCH_MAX]);
+    let count = bufs.len().min(out.len()).min(BATCH_MAX);
+    let mut addrs = Addrs([[0; 128]; BATCH_MAX]);
+    let mut iovs = [(std::ptr::null_mut::<u8>(), 0usize); BATCH_MAX];
+    // SAFETY: an all-zero `mmsghdr` is valid: null pointers and zero lengths.
+    let mut msgs: [MmsgHdr; BATCH_MAX] = unsafe { std::mem::zeroed() };
+    for i in 0..count {
+        iovs[i] = (bufs[i].as_mut_ptr(), bufs[i].len());
+        msgs[i].hdr.msg_name = addrs.0[i].as_mut_ptr().cast();
+        msgs[i].hdr.msg_namelen = 128;
+        msgs[i].hdr.msg_iov = (&raw const iovs[i]).cast();
+        msgs[i].hdr.msg_iovlen = 1;
+    }
+    // SAFETY: the first `count` messages point at live `iovs`, `addrs`, and at buffers
+    // writable for their lengths; `(ptr, len)` has the layout of `struct iovec`.
+    let n = cvt(unsafe {
+        recvmmsg(
+            sock.as_raw_fd(),
+            msgs.as_mut_ptr(),
+            count as std::ffi::c_uint,
+            c::MSG_WAITFORONE | c::MSG_TRUNC,
+            std::ptr::null_mut(),
+        )
+    })?;
+    let n = n.unsigned_abs() as usize;
+    for i in 0..n {
+        let len = msgs[i].len as usize;
+        out[i] = decode_addr(&addrs.0[i], msgs[i].hdr.msg_namelen).map(|from| Incoming {
+            len,
+            from,
+            truncated: msgs[i].hdr.msg_flags & c::MSG_TRUNC != 0,
+        });
+    }
+    Ok(n)
+}
+
+/// Sends the first of `datagrams` (at most [`BATCH_MAX`]) in one `sendmmsg`; returns how
+/// many went.
+#[cfg(all(feature = "udp", target_os = "linux"))]
+pub(crate) fn udp_send_many(
+    sock: Sock<'_>,
+    datagrams: &[(&[u8], SocketAddr)],
+) -> io::Result<usize> {
+    let count = datagrams.len().min(BATCH_MAX);
+    let mut addrs = [[0u8; 28]; BATCH_MAX];
+    let mut iovs = [(std::ptr::null::<u8>(), 0usize); BATCH_MAX];
+    // SAFETY: an all-zero `mmsghdr` is valid: null pointers and zero lengths.
+    let mut msgs: [MmsgHdr; BATCH_MAX] = unsafe { std::mem::zeroed() };
+    for i in 0..count {
+        let (bytes, to) = datagrams[i];
+        let len = encode_addr(to, &mut addrs[i]);
+        iovs[i] = (bytes.as_ptr(), bytes.len());
+        msgs[i].hdr.msg_name = addrs[i].as_mut_ptr().cast();
+        msgs[i].hdr.msg_namelen = len;
+        msgs[i].hdr.msg_iov = (&raw const iovs[i]).cast();
+        msgs[i].hdr.msg_iovlen = 1;
+    }
+    // SAFETY: as in `udp_recv_many`; the kernel only reads what these messages point at.
+    let n = cvt(unsafe {
+        sendmmsg(
+            sock.as_raw_fd(),
+            msgs.as_mut_ptr(),
+            count as std::ffi::c_uint,
+            c::MSG_NOSIGNAL,
+        )
+    })?;
+    Ok(n.unsigned_abs() as usize)
+}
+
+/// Asks for each datagram's destination address.
+#[cfg(feature = "udp")]
+pub(crate) fn udp_packet_info(sock: Sock<'_>, v6: bool) -> io::Result<()> {
+    if v6 {
+        set_int(sock, c::IPPROTO_IPV6, c::IPV6_RECVPKTINFO, 1)
+    } else {
+        set_int(sock, c::IPPROTO_IP, c::IP_RECVPKTINFO, 1)
+    }
+}
+
+/// One datagram with the address it was sent to: as [`udp_recv_from`], through
+/// `recvmsg` and its ancillary data.
+#[cfg(feature = "udp")]
+pub(crate) fn udp_recv_with_destination(
+    sock: Sock<'_>,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, bool, Option<std::net::IpAddr>)> {
+    #[repr(C, align(8))]
+    struct Control([u8; 128]);
+    let mut addr = AddrBuf([0; 128]);
+    let mut control = Control([0; 128]);
+    let mut iov = [io::IoSliceMut::new(buf)];
+    let mut msg = MsgHdr {
+        msg_name: addr.0.as_mut_ptr().cast::<c_void>(),
+        msg_namelen: 128,
+        msg_iov: iov.as_mut_ptr().cast::<IoSlice<'static>>(),
+        msg_iovlen: 1,
+        msg_control: control.0.as_mut_ptr().cast::<c_void>(),
+        msg_controllen: 128,
+        msg_flags: 0,
+    };
+    #[cfg(target_os = "linux")]
+    let flags = c::MSG_TRUNC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    // SAFETY: `msg` points at `addr`, `control`, and one iovec over `buf`; all live for
+    // the call; `sock` is open.
+    let n = unsafe { recvmsg(sock.as_raw_fd(), &raw mut msg, flags) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let from = decode_addr(&addr.0, msg.msg_namelen)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    #[allow(clippy::unnecessary_cast)] // u32 off Linux
+    let used = (msg.msg_controllen as usize).min(control.0.len());
+    let destination = destination_in(&control.0[..used]);
+    Ok((
+        n.unsigned_abs(),
+        from,
+        msg.msg_flags & c::MSG_TRUNC != 0,
+        destination,
+    ))
+}
+
+/// Walks the control messages for a packet-info record. Lengths are the kernel's, and
+/// checked against the bytes it reported.
+#[cfg(feature = "udp")]
+fn destination_in(control: &[u8]) -> Option<std::net::IpAddr> {
+    let mut at = 0;
+    while at + size_of::<CmsgHdr>() <= control.len() {
+        let word =
+            |o: usize| -> Option<[u8; 4]> { control.get(at + o..at + o + 4)?.try_into().ok() };
+        // On Linux `cmsg_len` is a `size_t`, whose low half comes first on these targets.
+        let len = u32::from_ne_bytes(word(0)?) as usize;
+        let level = i32::from_ne_bytes(word(CMSG_LEVEL_AT)?);
+        let ty = i32::from_ne_bytes(word(CMSG_LEVEL_AT + 4)?);
+        if len < size_of::<CmsgHdr>() {
+            return None;
+        }
+        let data = control.get(at + size_of::<CmsgHdr>()..at + len)?;
+        if level == c::IPPROTO_IP && ty == c::IP_PKTINFO_TYPE {
+            let octets: [u8; 4] = data
+                .get(c::PKTINFO_ADDR_AT..c::PKTINFO_ADDR_AT + 4)?
+                .try_into()
+                .ok()?;
+            return Some(std::net::IpAddr::from(octets));
+        }
+        if level == c::IPPROTO_IPV6 && ty == c::IPV6_PKTINFO_TYPE {
+            let octets: [u8; 16] = data.get(..16)?.try_into().ok()?;
+            return Some(std::net::IpAddr::from(octets));
+        }
+        at += cmsg_align_any(len);
+    }
+    None
+}
+
+#[cfg(feature = "udp")]
+const CMSG_LEVEL_AT: usize = size_of::<CmsgHdr>() - 8;
+
+#[cfg(feature = "udp")]
+const fn cmsg_align_any(n: usize) -> usize {
+    let to = if cfg!(target_os = "macos") {
+        4
+    } else {
+        size_of::<usize>()
+    };
+    (n + to - 1) & !(to - 1)
 }
 
 /// Creates and binds a UDP socket; `IPV6_V6ONLY` as asked for IPv6 addresses.
@@ -1595,7 +1835,7 @@ struct Ucred {
 }
 
 /// `struct cmsghdr` (`cmsg(3)`): Linux uses `size_t` for the length.
-#[cfg(all(feature = "local", target_os = "linux"))]
+#[cfg(all(any(feature = "local", feature = "udp"), target_os = "linux"))]
 #[repr(C)]
 struct CmsgHdr {
     cmsg_len: usize,
@@ -1604,7 +1844,7 @@ struct CmsgHdr {
 }
 
 /// `struct cmsghdr` on macOS: `socklen_t` for the length.
-#[cfg(all(feature = "local", not(target_os = "linux")))]
+#[cfg(all(any(feature = "local", feature = "udp"), not(target_os = "linux")))]
 #[repr(C)]
 struct CmsgHdr {
     cmsg_len: u32,

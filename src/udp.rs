@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, SocketAddr, SocketAddrV6, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use crate::addr::normalize;
@@ -60,6 +60,7 @@ pub struct UdpOptions {
     global: Option<UdpBudget>,
     table: u32,
     ipv6_only: bool,
+    packet_info: bool,
 }
 
 impl Default for UdpOptions {
@@ -79,6 +80,7 @@ impl UdpOptions {
             global: None,
             table: 65_536,
             ipv6_only: true,
+            packet_info: false,
         }
     }
 
@@ -117,6 +119,16 @@ impl UdpOptions {
 
     /// `IPV6_V6ONLY` for an IPv6 address (on by default). Off, an IPv6 socket also
     /// receives IPv4; sources are reported as IPv4 and replies to them work.
+    /// Reports each datagram's destination address in [`Datagram::destination`], for a
+    /// socket bound to a wildcard that must answer from the address it was asked on.
+    /// One `recvmsg` per datagram instead of `recvfrom`. Unix only: `bind_with` fails
+    /// with `Unsupported` on Windows, and `recv_batch` does not fill it.
+    pub fn packet_info(mut self, on: bool) -> UdpOptions {
+        self.packet_info = on;
+        self
+    }
+
+    /// `IPV6_V6ONLY` for IPv6 addresses (on by default).
     pub fn ipv6_only(mut self, on: bool) -> UdpOptions {
         self.ipv6_only = on;
         self
@@ -428,7 +440,66 @@ pub struct UdpSocket {
     read_timeout: Option<Duration>,
     peer: Option<SocketAddr>,
     v6: bool,
+    #[cfg_attr(windows, allow(dead_code))]
+    packet_info: bool,
     stats: UdpStats,
+}
+
+/// A receive buffer of a batch; [`UdpSocket::recv_batch`] fills `datagram`.
+///
+/// ```
+/// let mut bytes = [0u8; 1500];
+/// let slot = net_io::DatagramBuffer::new(&mut bytes);
+/// assert!(slot.datagram.is_none());
+/// ```
+#[derive(Debug)]
+pub struct DatagramBuffer<'a> {
+    /// Where the bytes land.
+    pub buf: &'a mut [u8],
+    /// What arrived; `None` for a slot not filled, or dropped over budget.
+    pub datagram: Option<Datagram>,
+}
+
+impl<'a> DatagramBuffer<'a> {
+    /// An empty slot over `buf`.
+    #[must_use]
+    pub fn new(buf: &'a mut [u8]) -> DatagramBuffer<'a> {
+        DatagramBuffer {
+            buf,
+            datagram: None,
+        }
+    }
+}
+
+/// One datagram of a batch to send.
+///
+/// ```
+/// let d = net_io::OutgoingDatagram { bytes: b"hi", to: "127.0.0.1:9".parse().unwrap() };
+/// assert_eq!(d.bytes.len(), 2);
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct OutgoingDatagram<'a> {
+    /// The bytes.
+    pub bytes: &'a [u8],
+    /// The destination.
+    pub to: SocketAddr,
+}
+
+/// Which interface joins a multicast group.
+///
+/// ```
+/// let any = net_io::MulticastInterface::Any;
+/// # let _ = any;
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MulticastInterface {
+    /// The one the OS picks.
+    Any,
+    /// The IPv4 interface with this address.
+    V4(Ipv4Addr),
+    /// The IPv6 interface with this index.
+    V6Index(u32),
 }
 
 impl UdpSocket {
@@ -459,15 +530,28 @@ impl UdpSocket {
             })?
             .collect();
         let mut last = NetError::NoAddresses;
+        if options.packet_info && !cfg!(unix) {
+            return Err(NetError::Unsupported {
+                feature: "UDP packet info",
+                platform: std::env::consts::OS,
+            });
+        }
+        let packet_info = options.packet_info;
         for a in addrs {
             match sys::udp_bind(a, options.ipv6_only) {
                 Ok(inner) => {
+                    #[cfg(unix)]
+                    if packet_info {
+                        sys::udp_packet_info(inner.sock(), a.is_ipv6())
+                            .map_err(|e| NetError::from_os("setsockopt", e))?;
+                    }
                     return Ok(UdpSocket {
                         inner,
                         guard: Guard::new(options, Instant::now()),
                         read_timeout: None,
                         peer: None,
                         v6: a.is_ipv6(),
+                        packet_info,
                         stats: UdpStats::default(),
                     });
                 }
@@ -487,7 +571,7 @@ impl UdpSocket {
     pub fn recv_from(&mut self, buf: &mut [u8]) -> Result<Datagram, NetError> {
         let deadline = self.read_timeout.map(|t| Instant::now() + t);
         loop {
-            let (len, from, truncated) = match sys::udp_recv_from(self.inner.sock(), buf) {
+            let (len, from, truncated, destination) = match self.recv_one(buf) {
                 Ok(got) => got,
                 Err(e) => match e.kind() {
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
@@ -510,15 +594,7 @@ impl UdpSocket {
                 },
             };
             let from = crate::addr::normalize_socket(from);
-            let mut overflow = false;
-            let admitted = self
-                .guard
-                .admit(from.ip(), len, Instant::now(), &mut overflow);
-            if overflow {
-                self.stats.overflow += 1;
-            }
-            if !admitted {
-                self.stats.dropped += 1;
+            if !self.admit(from, len, truncated) {
                 if past(deadline) {
                     return Err(NetError::TimedOut {
                         kind: TimeoutKind::Read,
@@ -526,17 +602,236 @@ impl UdpSocket {
                 }
                 continue;
             }
-            self.stats.received += 1;
-            if truncated {
-                self.stats.truncated += 1;
-            }
             return Ok(Datagram {
                 len,
                 from,
                 truncated,
-                destination: None,
+                destination,
             });
         }
+    }
+
+    fn recv_one(
+        &mut self,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, bool, Option<IpAddr>)> {
+        #[cfg(unix)]
+        if self.packet_info {
+            return sys::udp_recv_with_destination(self.inner.sock(), buf);
+        }
+        let (len, from, truncated) = sys::udp_recv_from(self.inner.sock(), buf)?;
+        Ok((len, from, truncated, None))
+    }
+
+    /// Charges a datagram to its source and counts it.
+    fn admit(&mut self, from: SocketAddr, len: usize, truncated: bool) -> bool {
+        let mut overflow = false;
+        let admitted = self
+            .guard
+            .admit(from.ip(), len, Instant::now(), &mut overflow);
+        if overflow {
+            self.stats.overflow += 1;
+        }
+        if !admitted {
+            self.stats.dropped += 1;
+            return false;
+        }
+        self.stats.received += 1;
+        if truncated {
+            self.stats.truncated += 1;
+        }
+        true
+    }
+
+    /// Waits for a datagram, then takes what else is ready, up to `slots.len()`
+    /// (64 at most). Each datagram passes the budgets as in [`UdpSocket::recv_from`]:
+    /// one that does not leaves its slot's `datagram` at `None`, so walk every slot.
+    /// One system call on Linux (`recvmmsg`), a loop elsewhere. Returns how many
+    /// slots hold a datagram. Packet info is not reported here.
+    ///
+    /// # Errors
+    ///
+    /// As [`UdpSocket::recv_from`].
+    pub fn recv_batch(&mut self, slots: &mut [DatagramBuffer<'_>]) -> Result<usize, NetError> {
+        for slot in slots.iter_mut() {
+            slot.datagram = None;
+        }
+        if slots.is_empty() {
+            return Ok(0);
+        }
+        self.recv_many(slots)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recv_many(&mut self, slots: &mut [DatagramBuffer<'_>]) -> Result<usize, NetError> {
+        let count = slots.len().min(sys::BATCH_MAX);
+        let mut got = [None; sys::BATCH_MAX];
+        let n = loop {
+            let received = {
+                let mut bufs: [&mut [u8]; sys::BATCH_MAX] = std::array::from_fn(|_| &mut [][..]);
+                for (b, slot) in bufs.iter_mut().zip(slots.iter_mut()).take(count) {
+                    *b = &mut *slot.buf;
+                }
+                sys::udp_recv_many(self.inner.sock(), &mut bufs[..count], &mut got)
+            };
+            match received {
+                Ok(n) => break n,
+                Err(e) => match e.kind() {
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                        return Err(NetError::TimedOut {
+                            kind: TimeoutKind::Read,
+                        });
+                    }
+                    io::ErrorKind::Interrupted => {}
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => {
+                        self.stats.icmp_errors += 1;
+                    }
+                    _ => return Err(NetError::from_os("recvmmsg", e)),
+                },
+            }
+        };
+        let mut filled = 0;
+        for (slot, r) in slots.iter_mut().zip(got.iter()).take(n) {
+            let Some(r) = r else { continue };
+            let from = crate::addr::normalize_socket(r.from);
+            if self.admit(from, r.len, r.truncated) {
+                slot.datagram = Some(Datagram {
+                    len: r.len,
+                    from,
+                    truncated: r.truncated,
+                    destination: None,
+                });
+                filled += 1;
+            }
+        }
+        Ok(filled)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn recv_many(&mut self, slots: &mut [DatagramBuffer<'_>]) -> Result<usize, NetError> {
+        let (first, rest) = match slots.split_first_mut() {
+            Some(parts) => parts,
+            None => return Ok(0),
+        };
+        first.datagram = Some(self.recv_from(first.buf)?);
+        let mut filled = 1;
+        self.inner
+            .set_nonblocking(true)
+            .map_err(|e| NetError::from_os("ioctl", e))?;
+        for slot in rest.iter_mut().take(63) {
+            match self.recv_from(slot.buf) {
+                Ok(d) => {
+                    slot.datagram = Some(d);
+                    filled += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        self.inner
+            .set_nonblocking(false)
+            .map_err(|e| NetError::from_os("ioctl", e))?;
+        Ok(filled)
+    }
+
+    /// Sends from the front of `datagrams`, each under the guard of
+    /// [`UdpSocket::send_to`], until one is refused or the OS takes no more. One system
+    /// call per 64 on Linux (`sendmmsg`), a loop elsewhere. Returns how many went.
+    ///
+    /// # Errors
+    ///
+    /// `Limit { which: Amplification }` when the first is refused, `Os`.
+    pub fn send_batch(&mut self, datagrams: &[OutgoingDatagram<'_>]) -> Result<usize, NetError> {
+        let mut sent = 0;
+        while sent < datagrams.len() {
+            match self.send_some(&datagrams[sent..]) {
+                Ok(0) => break,
+                Ok(n) => sent += n,
+                Err(e) if sent == 0 => return Err(e),
+                Err(_) => break,
+            }
+        }
+        Ok(sent)
+    }
+
+    /// The guard's prefix of `datagrams`. Charged before the send, so a short send
+    /// leaves the peer's allowance smaller, never larger.
+    fn charge(&mut self, datagrams: &[OutgoingDatagram<'_>]) -> Result<usize, NetError> {
+        let now = Instant::now();
+        let mut allowed = 0;
+        for d in datagrams.iter().take(64) {
+            let ip = normalize(d.to.ip());
+            if !self.guard.may_send(ip, d.bytes.len(), now) {
+                self.stats.refused += 1;
+                break;
+            }
+            self.guard.sent(ip, d.bytes.len());
+            allowed += 1;
+        }
+        if allowed == 0 && !datagrams.is_empty() {
+            return Err(NetError::Limit {
+                which: LimitKind::Amplification,
+            });
+        }
+        Ok(allowed)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_some(&mut self, datagrams: &[OutgoingDatagram<'_>]) -> Result<usize, NetError> {
+        let allowed = self.charge(datagrams)?;
+        let mut wire = [(&[][..], SocketAddr::from(([0, 0, 0, 0], 0))); sys::BATCH_MAX];
+        for (w, d) in wire.iter_mut().zip(datagrams.iter().take(allowed)) {
+            *w = (d.bytes, self.wire(d.to));
+        }
+        let n = sys::udp_send_many(self.inner.sock(), &wire[..allowed])
+            .map_err(|e| NetError::from_os("sendmmsg", e))?;
+        self.stats.sent += n as u64;
+        Ok(n)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn send_some(&mut self, datagrams: &[OutgoingDatagram<'_>]) -> Result<usize, NetError> {
+        let allowed = self.charge(datagrams)?;
+        let mut n = 0;
+        for d in &datagrams[..allowed] {
+            let wire = self.wire(d.to);
+            if let Err(e) = self.inner.send_to(d.bytes, wire) {
+                if n == 0 {
+                    return Err(NetError::from_os("sendto", e));
+                }
+                break;
+            }
+            self.stats.sent += 1;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Joins a multicast group. Datagrams to the group then pass the same budgets as
+    /// any other; a reply to a group member is still under the amplification guard.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidConfig` when the interface's family is not the group's, `Os`.
+    pub fn join_multicast(
+        &self,
+        group: IpAddr,
+        interface: MulticastInterface,
+    ) -> Result<(), NetError> {
+        let result = match (group, interface) {
+            (IpAddr::V4(g), MulticastInterface::Any) => {
+                self.inner.join_multicast_v4(&g, &Ipv4Addr::UNSPECIFIED)
+            }
+            (IpAddr::V4(g), MulticastInterface::V4(i)) => self.inner.join_multicast_v4(&g, &i),
+            (IpAddr::V6(g), MulticastInterface::Any) => self.inner.join_multicast_v6(&g, 0),
+            (IpAddr::V6(g), MulticastInterface::V6Index(i)) => self.inner.join_multicast_v6(&g, i),
+            _ => {
+                return Err(NetError::InvalidConfig {
+                    field: "interface",
+                    reason: ConfigReason::Inconsistent,
+                });
+            }
+        };
+        result.map_err(|e| NetError::from_os("setsockopt", e))
     }
 
     /// Receives from the connected peer (see [`UdpSocket::connect`]).
@@ -635,6 +930,17 @@ impl UdpSocket {
         Ok(())
     }
 
+    /// Receives never wait: a server's thread waits in `poll` with its wake channel.
+    pub(crate) fn set_nonblocking(&self) -> Result<(), NetError> {
+        self.inner
+            .set_nonblocking(true)
+            .map_err(|e| NetError::from_os("ioctl", e))
+    }
+
+    pub(crate) fn raw_sock(&self) -> sys::Sock<'_> {
+        self.inner.sock()
+    }
+
     /// The bound address.
     ///
     /// # Errors
@@ -663,6 +969,70 @@ impl UdpSocket {
             }
             other => other,
         }
+    }
+}
+
+/// A datagram protocol run by a server: one per UDP listener, called on that listener's
+/// thread, so it needs no locks of its own. Budgets and the amplification guard apply
+/// before it sees a datagram and on every reply.
+///
+/// ```
+/// use std::net::SocketAddr;
+/// use net_io::{UdpContext, UdpSession};
+/// struct Echo;
+/// impl UdpSession for Echo {
+///     fn on_datagram(&mut self, cx: &mut UdpContext<'_>, from: SocketAddr, bytes: &[u8]) {
+///         let _ = cx.send_to(bytes, from);
+///     }
+/// }
+/// ```
+pub trait UdpSession: Send + 'static {
+    /// One datagram that passed its budgets.
+    fn on_datagram(&mut self, cx: &mut UdpContext<'_>, from: SocketAddr, bytes: &[u8]);
+}
+
+/// What a [`UdpSession`] may do during a call.
+#[derive(Debug)]
+pub struct UdpContext<'a> {
+    pub(crate) socket: &'a mut UdpSocket,
+}
+
+impl UdpContext<'_> {
+    /// Sends a datagram under the guard of [`UdpSocket::send_to`].
+    ///
+    /// # Errors
+    ///
+    /// As [`UdpSocket::send_to`].
+    pub fn send_to(&mut self, bytes: &[u8], to: SocketAddr) -> Result<usize, NetError> {
+        self.socket.send_to(bytes, to)
+    }
+
+    /// As [`UdpSocket::mark_verified`].
+    pub fn mark_verified(&mut self, peer: SocketAddr) {
+        self.socket.mark_verified(peer);
+    }
+
+    /// The time.
+    #[must_use]
+    pub fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// Makes the [`UdpSession`] of each UDP listener; any
+/// `Fn(&ListenerInfo) -> impl UdpSession` is one.
+pub trait UdpSessionFactory: Send + Sync + 'static {
+    /// The session for this listener.
+    fn open(&self, listener: &crate::tcp::ListenerInfo) -> Box<dyn UdpSession>;
+}
+
+impl<F, S> UdpSessionFactory for F
+where
+    F: Fn(&crate::tcp::ListenerInfo) -> S + Send + Sync + 'static,
+    S: UdpSession,
+{
+    fn open(&self, listener: &crate::tcp::ListenerInfo) -> Box<dyn UdpSession> {
+        Box::new(self(listener))
     }
 }
 
@@ -917,5 +1287,110 @@ mod tests {
         assert!(d.from.is_ipv4(), "normalized: {}", d.from);
         s.send_to(b"ok", d.from).unwrap();
         assert_eq!(c.recv(&mut buf).unwrap(), 2);
+    }
+
+    fn verified_pair() -> (UdpSocket, UdpSocket) {
+        let mut a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (aa, ba) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+        a.mark_verified(ba);
+        b.mark_verified(aa);
+        a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn test_batches_cross_in_one_call_each() {
+        let (mut a, mut b) = verified_pair();
+        let to = b.local_addr().unwrap();
+        let bodies: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i; 1 + usize::from(i)]).collect();
+        let out: Vec<_> = bodies
+            .iter()
+            .map(|b| OutgoingDatagram { bytes: b, to })
+            .collect();
+        assert_eq!(a.send_batch(&out).unwrap(), 10);
+        std::thread::sleep(Duration::from_millis(50));
+        let mut store = vec![[0u8; 64]; 16];
+        let mut seen = 0;
+        while seen < 10 {
+            let mut slots: Vec<_> = store.iter_mut().map(|b| DatagramBuffer::new(b)).collect();
+            let n = b.recv_batch(&mut slots).unwrap();
+            assert!(n > 0);
+            for slot in &slots {
+                if let Some(d) = slot.datagram {
+                    assert_eq!(d.from, a.local_addr().unwrap());
+                    assert_eq!(&slot.buf[..d.len], &bodies[seen][..]);
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(a.stats().sent, 10);
+        assert_eq!(b.stats().received, 10);
+    }
+
+    /// An unverified peer's allowance holds across a batch: what got through is what
+    /// the guard allows, and a batch cannot spend it twice.
+    #[test]
+    fn test_batch_send_stays_under_the_guard() {
+        let mut server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = client.local_addr().unwrap();
+        client
+            .send_to(&[0u8; 100], server.local_addr().unwrap())
+            .unwrap();
+        let mut buf = [0u8; 200];
+        server.recv_from(&mut buf).unwrap();
+        let big = [1u8; 40];
+        let out = [OutgoingDatagram { bytes: &big, to }; 4];
+        assert_eq!(
+            server.send_batch(&out).unwrap(),
+            2,
+            "100 bytes of allowance"
+        );
+        assert!(matches!(
+            server.send_batch(&out),
+            Err(NetError::Limit {
+                which: LimitKind::Amplification
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_packet_info_reports_the_destination() {
+        let mut server =
+            UdpSocket::bind_with("0.0.0.0:0", UdpOptions::new().packet_info(true)).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let port = server.local_addr().unwrap().port();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.send_to(b"hi", ("127.0.0.1", port)).unwrap();
+        let mut buf = [0u8; 16];
+        let d = server.recv_from(&mut buf).unwrap();
+        assert_eq!(d.len, 2);
+        assert_eq!(d.destination, Some("127.0.0.1".parse().unwrap()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_packet_info_is_refused_on_windows() {
+        assert!(matches!(
+            UdpSocket::bind_with("127.0.0.1:0", UdpOptions::new().packet_info(true)),
+            Err(NetError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn test_multicast_join_checks_the_family() {
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let group: IpAddr = "239.1.2.3".parse().unwrap();
+        assert!(matches!(
+            socket.join_multicast(group, MulticastInterface::V6Index(1)),
+            Err(NetError::InvalidConfig { .. })
+        ));
+        // A host without a multicast route refuses; a broken family check would not.
+        let _ = socket.join_multicast(group, MulticastInterface::Any);
     }
 }

@@ -122,6 +122,8 @@ pub(crate) struct Config<W, G, S> {
     pub control: Option<Arc<dyn ControlLine>>,
     pub wipe: bool,
     pub clock: Option<Arc<dyn Clock>>,
+    #[cfg(feature = "udp")]
+    pub udp: Option<Arc<dyn crate::udp::UdpSessionFactory>>,
 }
 
 /// One worker's counters. The worker is the only writer; `seq` makes a reader's
@@ -281,6 +283,9 @@ impl CompleterTarget for WorkerTarget {
 
 /// The non-generic state `Server` and `ServerHandle` share with the threads.
 pub(crate) struct Shared {
+    /// Makes the session of each UDP listener.
+    #[cfg(feature = "udp")]
+    udp: Option<Arc<dyn crate::udp::UdpSessionFactory>>,
     /// The reactor runs this server (the blocking pool otherwise).
     #[cfg(feature = "reactor")]
     pub(crate) reactor: bool,
@@ -1061,6 +1066,30 @@ fn bind_listener(
                 }
             }
         }
+        #[cfg(feature = "udp")]
+        if let Some(options) = spec.udp {
+            let addrs = spec.addrs.clone().map_err(|text| NetError::Os {
+                op: "resolve",
+                source: std::io::Error::other(text),
+            })?;
+            let socket = crate::udp::UdpSocket::bind_with(&addrs[..], options)?;
+            socket.set_nonblocking()?;
+            let local = socket.local_addr()?;
+            let info = ListenerInfo {
+                id,
+                name: spec.name.clone(),
+                local: crate::info::Endpoint::Ip(local),
+                backlog: None,
+                transport: Transport::Udp,
+                proxy: ProxyMode::Off,
+                tls: false,
+            };
+            break 'bound (
+                ListenerRuntime::Udp(Mutex::new(socket), info.clone()),
+                info,
+                TcpOptions::default(),
+            );
+        }
         #[cfg(all(windows, feature = "local"))]
         if let Some((path, options)) = spec.unix {
             let mut listener = crate::local_windows::UnixListener::bind_with(&path, options)?;
@@ -1185,8 +1214,12 @@ impl<T> Job<T> {
     }
 }
 
+// Listeners are few, and each lives as long as its thread.
+#[allow(clippy::large_enum_variant)]
 enum ListenerRuntime {
     Tcp(TcpListener),
+    #[cfg(feature = "udp")]
+    Udp(Mutex<crate::udp::UdpSocket>, ListenerInfo),
     #[cfg(all(unix, feature = "local"))]
     Unix(UnixListener),
     #[cfg(all(windows, feature = "local"))]
@@ -1206,6 +1239,8 @@ impl ListenerRuntime {
             ListenerRuntime::AfUnix(l) => l.std().sock(),
             #[cfg(all(windows, feature = "local"))]
             ListenerRuntime::Pipe(_) => return,
+            #[cfg(feature = "udp")]
+            ListenerRuntime::Udp(..) => return,
         };
         let _ = sys::wait(sock, Interest::Read, Some(wake), None);
     }
@@ -1219,6 +1254,8 @@ impl ListenerRuntime {
             ListenerRuntime::AfUnix(l) => l.info(),
             #[cfg(all(windows, feature = "local"))]
             ListenerRuntime::Pipe(l) => l.info(),
+            #[cfg(feature = "udp")]
+            ListenerRuntime::Udp(_, info) => info,
         }
     }
 
@@ -1237,6 +1274,8 @@ impl ListenerRuntime {
             ListenerRuntime::AfUnix(_) | ListenerRuntime::Pipe(_) => {
                 Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
             }
+            #[cfg(feature = "udp")]
+            ListenerRuntime::Udp(..) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }
 }
@@ -1362,6 +1401,8 @@ where
     let queue_capacity = limits.completion_queue as usize;
     let next_listener = u32::try_from(infos.len()).unwrap_or(u32::MAX);
     let shared = Arc::new_cyclic(|weak: &Weak<Shared>| Shared {
+        #[cfg(feature = "udp")]
+        udp: cfg.udp,
         pid: std::process::id(),
         door: AtomicBool::new(false),
         draining: AtomicBool::new(false),
@@ -1525,6 +1566,57 @@ where
     })
 }
 
+// ---- UDP ------------------------------------------------------------------
+
+/// Datagrams read per wait, so a flood cannot keep this loop from a stop.
+#[cfg(feature = "udp")]
+const UDP_TURN: usize = 64;
+
+/// One UDP listener: its thread owns the socket, so the guard needs no lock on the data
+/// path. The door gates reading, and a closed door leaves datagrams in the kernel.
+#[cfg(feature = "udp")]
+fn udp_loop(
+    shared: &Arc<Shared>,
+    conf: &Arc<ListenerConf>,
+    socket: &Mutex<crate::udp::UdpSocket>,
+    info: &ListenerInfo,
+) {
+    let Some(factory) = shared.udp.as_ref() else {
+        return;
+    };
+    let mut session = factory.open(info);
+    let mut socket = socket.lock().unwrap_or_else(PoisonError::into_inner);
+    let wake = conf.wake.clone();
+    let mut buf = vec![0u8; 65_536];
+    loop {
+        if shared.stopping.load(Ordering::Acquire)
+            || shared.draining.load(Ordering::Acquire)
+            || conf.removed.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if !shared.door.load(Ordering::Acquire) || !conf.door.load(Ordering::Acquire) {
+            let _ = sys::wait_wake(&wake, None);
+            continue;
+        }
+        let _ = sys::wait(socket.raw_sock(), Interest::Read, Some(&wake), None);
+        for _ in 0..UDP_TURN {
+            let Ok(d) = socket.recv_from(&mut buf) else {
+                break;
+            };
+            let mut cx = crate::udp::UdpContext {
+                socket: &mut socket,
+            };
+            let bytes = &buf[..d.len.min(65_536)];
+            let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.on_datagram(&mut cx, d.from, bytes);
+            }));
+            // A session that panics loses this datagram, and the socket goes on.
+            let _ = called;
+        }
+    }
+}
+
 // ---- accept ---------------------------------------------------------------
 
 fn accept_loop<W: super::Workload, G: Gate>(
@@ -1533,6 +1625,10 @@ fn accept_loop<W: super::Workload, G: Gate>(
     rt: &ListenerRuntime,
 ) {
     let shared = &engine.shared;
+    #[cfg(feature = "udp")]
+    if let ListenerRuntime::Udp(socket, info) = rt {
+        return udp_loop(shared, conf, socket, info);
+    }
     let wake = conf.wake.clone();
     let batch = conf.limits.accept_batch;
     let mut acceptor = Acceptor::new();
@@ -1600,6 +1696,8 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     }
                     other => other.without_conn(),
                 },
+                #[cfg(feature = "udp")]
+                ListenerRuntime::Udp(..) => return,
                 #[cfg(all(windows, feature = "local"))]
                 ListenerRuntime::AfUnix(l) => match acceptor.accept_af_unix(l.std()) {
                     Accepted::Conn(stream) => {
@@ -2048,6 +2146,9 @@ pub trait Serve: Send + Sync + Sized + 'static {
     /// Whether this workload needs a thread per connection (a blocking handler).
     const BLOCKING_ONLY: bool;
 
+    /// Whether this server has no TCP work at all.
+    const UDP_ONLY: bool = false;
+
     /// Serves one admitted connection on a worker.
     fn serve<G: Gate>(&self, w: &mut Worker<G>, job: Job<G::Ticket>);
 
@@ -2442,6 +2543,15 @@ where
         let (info, _) = w.end(link, reason, listener, source);
         w.recycle(info);
     }
+}
+
+#[cfg(feature = "udp")]
+impl Serve for super::UdpOnly {
+    // The pool never gets a job: there is nothing for a reactor to run.
+    const BLOCKING_ONLY: bool = true;
+    const UDP_ONLY: bool = true;
+
+    fn serve<G: Gate>(&self, _w: &mut Worker<G>, _job: Job<G::Ticket>) {}
 }
 
 impl<F: SessionFactory> Serve for Sessions<F> {

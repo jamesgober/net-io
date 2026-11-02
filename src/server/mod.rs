@@ -166,6 +166,8 @@ pub struct ListenerSpec {
     pub(crate) unix: Option<(PathBuf, LocalOptions)>,
     #[cfg(all(windows, feature = "local"))]
     pub(crate) pipe: Option<(String, crate::pipe::PipeOptions)>,
+    #[cfg(feature = "udp")]
+    pub(crate) udp: Option<crate::udp::UdpOptions>,
     pub(crate) adopt: Option<ListenerHandle>,
 }
 
@@ -186,6 +188,8 @@ impl ListenerSpec {
             unix: None,
             #[cfg(all(windows, feature = "local"))]
             pipe: None,
+            #[cfg(feature = "udp")]
+            udp: None,
             adopt: None,
         }
     }
@@ -194,6 +198,24 @@ impl ListenerSpec {
     pub fn tcp_with<A: ToSocketAddrs>(addr: A, options: ListenOptions) -> ListenerSpec {
         ListenerSpec {
             options: Some(options),
+            ..ListenerSpec::tcp(addr)
+        }
+    }
+
+    /// A UDP socket served by the [`UdpSession`](crate::UdpSession) that
+    /// `ServerBuilder::udp_sessions` makes (feature `udp`). A thread of its own reads
+    /// it, with the door and a stop like any listener, and the socket's budgets and
+    /// amplification guard apply.
+    ///
+    /// ```
+    /// use net_io::{ListenerSpec, UdpOptions};
+    /// let spec = ListenerSpec::udp("0.0.0.0:5353", UdpOptions::new());
+    /// # let _ = spec;
+    /// ```
+    #[cfg(feature = "udp")]
+    pub fn udp<A: ToSocketAddrs>(addr: A, options: crate::udp::UdpOptions) -> ListenerSpec {
+        ListenerSpec {
+            udp: Some(options),
             ..ListenerSpec::tcp(addr)
         }
     }
@@ -242,6 +264,8 @@ impl ListenerSpec {
             unix: Some((path.into(), options)),
             #[cfg(all(windows, feature = "local"))]
             pipe: None,
+            #[cfg(feature = "udp")]
+            udp: None,
             adopt: None,
         }
     }
@@ -273,6 +297,8 @@ impl ListenerSpec {
             unix: None,
             #[cfg(all(windows, feature = "local"))]
             pipe: None,
+            #[cfg(feature = "udp")]
+            udp: None,
             adopt: Some(handle),
         }
     }
@@ -320,6 +346,12 @@ impl ListenerSpec {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoWork;
 
+/// What `ServerBuilder::udp_sessions` produces when a server has no TCP work; programs
+/// never name it.
+#[cfg(feature = "udp")]
+#[derive(Debug)]
+pub struct UdpOnly;
+
 /// The unset gate (no `build` exists for it): name `AllowAll` to run without a gate.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoGate;
@@ -354,6 +386,11 @@ pub(crate) mod sealed {
 
 /// What runs per connection: [`Sessions`] or a [`BlockingHandler`]. Sealed.
 pub trait Workload: sealed::Sealed + engine::Serve + Send + Sync + 'static {}
+
+#[cfg(feature = "udp")]
+impl sealed::Sealed for UdpOnly {}
+#[cfg(feature = "udp")]
+impl Workload for UdpOnly {}
 
 impl<F: SessionFactory> sealed::Sealed for Sessions<F> {}
 impl<F: SessionFactory> Workload for Sessions<F> {}
@@ -405,6 +442,8 @@ pub struct ServerBuilder<W = NoWork, G = NoGate, S = NoopSink, T = NoTls> {
     wipe: bool,
     clock: Option<Arc<dyn Clock>>,
     trusted: Option<Arc<TrustedProxies>>,
+    #[cfg(feature = "udp")]
+    udp: Option<Arc<dyn crate::udp::UdpSessionFactory>>,
 }
 
 impl ServerBuilder {
@@ -423,6 +462,8 @@ impl ServerBuilder {
             wipe: true,
             clock: None,
             trusted: None,
+            #[cfg(feature = "udp")]
+            udp: None,
         }
     }
 }
@@ -451,6 +492,8 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
             wipe,
             clock,
             trusted,
+            #[cfg(feature = "udp")]
+            udp,
         } = self;
         let (work, gate, sink, tls) = f(work, gate, sink, tls);
         ServerBuilder {
@@ -466,6 +509,8 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
             wipe,
             clock,
             trusted,
+            #[cfg(feature = "udp")]
+            udp,
         }
     }
 
@@ -547,6 +592,51 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
     }
 }
 
+#[cfg(feature = "udp")]
+impl<G, S, T> ServerBuilder<NoWork, G, S, T> {
+    /// Serves UDP listeners only; a TCP listener then fails `build`. One thread per
+    /// listener, and no worker pool.
+    ///
+    /// ```no_run
+    /// use std::net::SocketAddr;
+    /// use net_io::{AllowAll, ListenerInfo, ListenerSpec, ServerBuilder, UdpContext, UdpOptions, UdpSession};
+    /// struct Echo;
+    /// impl UdpSession for Echo {
+    ///     fn on_datagram(&mut self, cx: &mut UdpContext<'_>, from: SocketAddr, bytes: &[u8]) {
+    ///         let _ = cx.send_to(bytes, from);
+    ///     }
+    /// }
+    /// let server = ServerBuilder::new()
+    ///     .listener(ListenerSpec::udp("0.0.0.0:7000", UdpOptions::new()))
+    ///     .udp_sessions(|_: &ListenerInfo| Echo)
+    ///     .gate(AllowAll)
+    ///     .build()?;
+    /// server.open_door()?;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn udp_sessions<F>(self, factory: F) -> ServerBuilder<UdpOnly, G, S, T>
+    where
+        F: crate::udp::UdpSessionFactory,
+    {
+        let mut b = self.map(|_, g, s, t| (UdpOnly, g, s, t));
+        b.udp = Some(Arc::new(factory));
+        b.workers.get_or_insert(1);
+        b
+    }
+}
+
+#[cfg(feature = "udp")]
+impl<W: Workload, G, S, T> ServerBuilder<W, G, S, T> {
+    /// Serves the UDP listeners beside this server's TCP work.
+    pub fn udp_sessions<F>(mut self, factory: F) -> Self
+    where
+        F: crate::udp::UdpSessionFactory,
+    {
+        self.udp = Some(Arc::new(factory));
+        self
+    }
+}
+
 impl<W, G, S, T> ServerBuilder<W, G, S, T>
 where
     W: Workload,
@@ -608,6 +698,17 @@ where
         let mut listeners = self.listeners;
         let has_tls = TypeId::of::<T>() != TypeId::of::<NoTls>();
         let mut names = Vec::new();
+        #[cfg(feature = "udp")]
+        for spec in &listeners {
+            if (spec.udp.is_some() && self.udp.is_none())
+                || (spec.udp.is_none() && <W as engine::Serve>::UDP_ONLY)
+            {
+                return Err(invalid("udp_sessions", ConfigReason::Inconsistent));
+            }
+            if spec.udp.is_some() && (spec.tls || spec.proxy != ProxyMode::Off) {
+                return Err(invalid("udp", ConfigReason::Inconsistent));
+            }
+        }
         for spec in &mut listeners {
             check_spec(spec, self.trusted.as_ref(), has_tls, &names)?;
             if let Some(n) = &spec.name {
@@ -648,6 +749,8 @@ where
             control: self.control,
             wipe: self.wipe,
             clock: self.clock,
+            #[cfg(feature = "udp")]
+            udp: self.udp,
         })
     }
 }

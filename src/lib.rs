@@ -184,7 +184,7 @@ pub use proxy_parse::{
 };
 pub use server::{
     AdoptSpec, BlockingHandler, DoorState, DrainReport, ListenerSpec, NoGate, NoWork, Server,
-    ServerBuilder, ServerHandle, Sessions, Stats, Workload,
+    ServerBuilder, ServerHandle, Sessions, Stats, UdpOnly, Workload,
 };
 pub use session::{
     Input, Output, OutputFull, Phase, Session, SessionContext, SessionFactory, Step, SwapError,
@@ -197,7 +197,10 @@ pub use tls::{
 };
 pub use trusted::TrustedProxies;
 #[cfg(feature = "udp")]
-pub use udp::{Datagram, UdpBudget, UdpOptions, UdpSocket, UdpStats};
+pub use udp::{
+    Datagram, DatagramBuffer, MulticastInterface, OutgoingDatagram, UdpBudget, UdpContext,
+    UdpOptions, UdpSession, UdpSessionFactory, UdpSocket, UdpStats,
+};
 
 /// Crate version string, populated by Cargo at build time.
 ///
