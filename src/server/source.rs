@@ -117,4 +117,26 @@ mod tests {
         t.release(key("1.1.1.1"));
         assert_eq!(t.live(), 0);
     }
+
+    /// The cost of T-1 and T-22: one source taken and released in a full table.
+    #[test]
+    #[ignore = "a benchmark"]
+    fn bench_source() {
+        let t = SourceTable::new(1 << 20, 16);
+        let keys: Vec<PrefixKey> = (0..10_000u32)
+            .map(|i| key(&format!("10.{}.{}.1", i >> 8, i & 0xFF)))
+            .collect();
+        for k in &keys {
+            assert!(t.acquire(*k));
+        }
+        let rounds = 10_000_000usize;
+        let started = std::time::Instant::now();
+        for i in 0..rounds {
+            let k = keys[i % keys.len()];
+            std::hint::black_box(t.acquire(k));
+            t.release(k);
+        }
+        let ns = started.elapsed().as_nanos() as f64 / rounds as f64;
+        println!("Source table, acquire and release: {ns:.1} ns");
+    }
 }

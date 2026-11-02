@@ -171,8 +171,8 @@ jobs:
         run: |
           ulimit -n 30000
           cargo bench --bench lifecycle
-      - name: Timers
-        run: cargo test --release --lib bench_wheel -- --ignored --nocapture
+      - name: Timers and security costs
+        run: cargo test --release --lib bench_ -- --ignored --nocapture
 
   compare:
     name: Against other stacks (not a gate)

@@ -132,23 +132,29 @@ fn test_system_calls_per_echo_round_trip() {
     } else {
         2.0
     };
-    let blocking = net_io::serve("127.0.0.1:0", |conn: &mut net_io::TcpConnection| {
-        let mut buf = [0u8; 512];
-        loop {
-            let n = conn.recv(&mut buf)?;
-            if n == 0 {
-                return Ok(());
-            }
-            conn.send_all(&buf[..n])?;
-        }
-    })
-    .expect("serve");
-    let sessions = echo_server();
-    for (name, server) in [("blocking handler", &blocking), ("sessions", &sessions)] {
-        let mut c = client(addr(server));
+    for name in ["blocking handler", "sessions"] {
+        // One server at a time: the count is process-wide, and a worker still starting
+        // makes its first wait inside the other server's measurement.
+        let server = if name == "sessions" {
+            echo_server()
+        } else {
+            net_io::serve("127.0.0.1:0", |conn: &mut net_io::TcpConnection| {
+                let mut buf = [0u8; 512];
+                loop {
+                    let n = conn.recv(&mut buf)?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    conn.send_all(&buf[..n])?;
+                }
+            })
+            .expect("serve")
+        };
+        let mut c = client(addr(&server));
         for _ in 0..100 {
             assert_eq!(round_trip(&mut c, &[1u8; 64]), [1u8; 64]);
         }
+        std::thread::sleep(std::time::Duration::from_millis(200));
         start_counting();
         let rounds = 1000;
         for _ in 0..rounds {

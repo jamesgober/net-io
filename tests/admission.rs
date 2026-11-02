@@ -230,6 +230,61 @@ fn test_per_worker_listeners() {
     drop(server);
 }
 
+/// T-19: connections opening and closing as fast as a few clients can drive them
+/// leave an established connection served. An accept takes a bounded batch per wake.
+#[test]
+fn test_accept_storm_leaves_established_connections_served() {
+    const STORM: Duration = Duration::from_secs(1);
+    for &driver in DRIVERS {
+        let limits = Limits::builder()
+            .max_connections(4_096)
+            .max_per_source(4_096, PrefixPolicy::DEFAULT)
+            .build()
+            .expect("limits");
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .limits(limits)
+            .sessions(|_: &ConnectionInfo| Echo)
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let target = addr(&server);
+        let mut c = client(target);
+        assert_eq!(round_trip(&mut c, b"ready"), b"ready");
+        let until = Instant::now() + STORM;
+        let storm: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let mut opened = 0u64;
+                    while Instant::now() < until {
+                        if TcpStream::connect(target).is_ok() {
+                            opened += 1;
+                        } else {
+                            // Out of ports on this OS: the storm has made its point.
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    opened
+                })
+            })
+            .collect();
+        let mut slowest = Duration::ZERO;
+        while Instant::now() < until {
+            let started = Instant::now();
+            assert_eq!(round_trip(&mut c, b"still here"), b"still here");
+            slowest = slowest.max(started.elapsed());
+        }
+        let opened: u64 = storm.into_iter().map(|t| t.join().expect("storm")).sum();
+        assert!(opened > 100, "{driver:?}: only {opened} connections");
+        assert!(
+            slowest < Duration::from_millis(500),
+            "{driver:?}: a round trip took {slowest:?} during {opened} connects"
+        );
+    }
+}
+
 #[test]
 fn test_per_worker_is_refused_where_it_cannot_work() {
     let spec = ListenerSpec::tcp_with("127.0.0.1:0", net_io::ListenOptions::new().per_worker(true));

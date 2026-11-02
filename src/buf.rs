@@ -303,4 +303,21 @@ mod tests {
         let b = pool.take(SizeClass::SMALL).unwrap();
         assert!(b.is_empty());
     }
+
+    /// The cost of T-16: `cargo test --release --lib bench_ -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark"]
+    fn bench_wipe() {
+        for (name, used) in [("2 KiB", 2048), ("16 KiB", 16 * 1024)] {
+            let mut b = Buffer::new(SizeClass::MEDIUM);
+            let rounds = 1_000_000u32;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                b.set_len(used);
+                b.wipe();
+            }
+            let ns = started.elapsed().as_nanos() as f64 / f64::from(rounds);
+            println!("Wipe {name}: {ns:.1} ns");
+        }
+    }
 }

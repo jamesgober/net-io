@@ -37,7 +37,13 @@ The driver is the reactor's real interface (D-005). On epoll and kqueue, `ReadyD
 
 An idle connection holds no buffer. It waits with `ReceiveZero`; when that completes the worker takes a pool buffer and receives. When the session consumed everything, the buffer goes back. A connection whose read finds the buffer budget spent pauses on a list, oldest first, and TCP pushes back on its peer.
 
-A connection has one timer, at its nearest deadline. Moving it is lazy: the wheel keeps the entry where it is and looks again when it fires, so an exchange costs one comparison.
+An output keeps one free buffer between sends and gives the rest to the worker's pool the moment a send completes, so a session that moves its input to its output with `Input::swap` and `push_buffer` allocates nothing, however long it runs.
+
+A connection has one timer, at its nearest deadline. Moving it is lazy: the wheel keeps the entry where it is and looks again when it fires, so an exchange costs one comparison. The clock is read once per trip through the OS, however many connections a turn touches.
+
+Accepting takes one thread per listener, or with `ListenOptions::per_worker` on Linux one `SO_REUSEPORT` socket and thread per worker, each feeding its own worker. A file in an output travels as its own operation: `sendfile` on Unix, `TransmitFile` on IOCP, with the gate checking 1 MiB at a time. TLS, pipes, and Unix sockets read the file into buffers instead.
+
+A UDP listener is a thread of its own, not a reactor worker. The thread owns the socket, so the amplification guard stays lock-free and a `UdpSession` needs no synchronization; the door, stop, and drain apply as they do on TCP.
 
 ## Ownership on Windows
 
