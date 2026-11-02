@@ -151,6 +151,8 @@ pub use error::{
 pub use events::{CoalescedKind, Event, EventSink, NoopSink};
 pub use gate::{AdmitStage, Admitted, AllowAll, Denial, Gate, KillHandle, Refusal, WriteCheck};
 pub use handoff::{HandoffError, HandoffPeer, ListenerHandle};
+#[cfg(all(windows, feature = "local"))]
+pub use handoff::{SharedListeners, receive_shared, share_listeners};
 #[cfg(all(unix, feature = "local"))]
 pub use handoff::{recv_listeners, send_listeners};
 pub use id::{ConnectionId, ListenerId, WorkerId};

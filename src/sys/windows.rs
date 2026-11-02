@@ -220,6 +220,8 @@ unsafe extern "system" {
     fn getsockopt(s: Socket, level: i32, name: i32, value: *mut u8, len: *mut i32) -> i32;
     fn WSAPoll(fds: *mut WsaPollFd, nfds: u32, timeout: i32) -> i32;
     fn WSAGetLastError() -> i32;
+    #[cfg(feature = "local")]
+    fn WSADuplicateSocketW(s: Socket, pid: u32, info: *mut WsaProtocolInfo) -> i32;
     #[cfg(feature = "udp")]
     fn recvfrom(
         s: Socket,
@@ -242,6 +244,17 @@ unsafe extern "system" {
         completion: *mut c_void,
     ) -> i32;
 }
+
+#[cfg(feature = "local")]
+#[link(name = "bcrypt")]
+unsafe extern "system" {
+    fn BCryptGenRandom(algorithm: *mut c_void, buffer: *mut u8, len: u32, flags: u32) -> i32;
+}
+
+#[cfg(feature = "local")]
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 2;
+#[cfg(feature = "local")]
+const FROM_PROTOCOL_INFO: i32 = -1;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -761,6 +774,70 @@ pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io:
         }
         stream.write_vectored(bufs)
     })
+}
+
+/// How many bytes describe a socket for another process (`WSAPROTOCOL_INFOW`).
+#[cfg(feature = "local")]
+pub(crate) const SHARED_SOCKET: usize = size_of::<WsaProtocolInfo>();
+
+/// Describes `sock` for the process `pid`; the description works there alone.
+#[cfg(feature = "local")]
+pub(crate) fn share_socket(sock: Sock<'_>, pid: u32) -> io::Result<[u8; SHARED_SOCKET]> {
+    let mut out = [0u8; SHARED_SOCKET];
+    let mut info = std::mem::MaybeUninit::<WsaProtocolInfo>::zeroed();
+    // SAFETY: `info` is writable for its size, and `sock` is open for the call.
+    cvt(unsafe { WSADuplicateSocketW(raw(sock), pid, info.as_mut_ptr()) })?;
+    // SAFETY: the call filled it, and every field is plain data.
+    let bytes = unsafe { std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), SHARED_SOCKET) };
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+/// The socket a description from [`share_socket`] names. Windows hands back the same
+/// socket if a description is used twice, so the caller keeps each to one use.
+#[cfg(feature = "local")]
+pub(crate) fn socket_from_shared(blob: &[u8; SHARED_SOCKET]) -> io::Result<OwnedSocket> {
+    startup();
+    let mut info = std::mem::MaybeUninit::<WsaProtocolInfo>::uninit();
+    // SAFETY: `info` has room for the bytes, and any bytes are a valid WsaProtocolInfo.
+    unsafe {
+        std::ptr::copy_nonoverlapping(blob.as_ptr(), info.as_mut_ptr().cast::<u8>(), SHARED_SOCKET);
+    }
+    // SAFETY: the structure is live for the call; the kernel checks what it holds.
+    let s = unsafe {
+        WSASocketW(
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            info.as_mut_ptr().cast(),
+            0,
+            c::WSA_FLAG_OVERLAPPED | c::WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if s == c::INVALID_SOCKET {
+        return Err(last_error());
+    }
+    // SAFETY: `s` was just created, is open, and is owned by no one else.
+    Ok(unsafe { OwnedSocket::from_raw_socket(s as RawSocket) })
+}
+
+/// Bytes from the OS's preferred random source.
+#[cfg(feature = "local")]
+pub(crate) fn random_bytes(out: &mut [u8]) -> io::Result<()> {
+    // SAFETY: `out` is writable for its length; a null algorithm with this flag means
+    // the system's preferred source.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            out.as_mut_ptr(),
+            u32::try_from(out.len()).unwrap_or(u32::MAX),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::other("BCryptGenRandom failed"));
+    }
+    Ok(())
 }
 
 /// Waits until `sock` is ready for `interest`, `wake` fires, or `timeout` passes.

@@ -607,13 +607,16 @@ impl TcpConnection {
         TcpConnection { link: Some(link) }
     }
 
-    /// The process at the other end of a named pipe.
+    /// The process at an end of a named pipe.
     #[cfg(all(windows, feature = "local"))]
-    pub(crate) fn pipe_client_pid(&self) -> Result<u32, NetError> {
+    pub(crate) fn pipe_pid(&self, server: bool) -> Result<u32, NetError> {
         match &self.link_ref().stream {
-            sys::Stream::Pipe(p) => p
-                .client_pid()
-                .map_err(|e| NetError::from_os("GetNamedPipeClientProcessId", e)),
+            sys::Stream::Pipe(p) => if server {
+                p.server_pid()
+            } else {
+                p.client_pid()
+            }
+            .map_err(|e| NetError::from_os("GetNamedPipeClientProcessId", e)),
             _ => Err(NetError::Unsupported {
                 feature: "client_pid on a socket",
                 platform: std::env::consts::OS,

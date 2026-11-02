@@ -451,7 +451,12 @@ impl PipeConnection {
     ///
     /// `Closed`, `Os`.
     pub fn client_pid(&self) -> Result<u32, NetError> {
-        self.inner.pipe_client_pid()
+        self.inner.pipe_pid(false)
+    }
+
+    /// The process at the far end, whichever end this is.
+    pub(crate) fn peer_pid(&self) -> Result<u32, NetError> {
+        self.inner.pipe_pid(self.info().origin == Origin::Dialed)
     }
 }
 

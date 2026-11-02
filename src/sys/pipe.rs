@@ -95,6 +95,7 @@ unsafe extern "system" {
     ) -> Handle;
     fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
     fn GetNamedPipeClientProcessId(pipe: Handle, pid: *mut u32) -> i32;
+    fn GetNamedPipeServerProcessId(pipe: Handle, pid: *mut u32) -> i32;
     fn ReadFile(
         file: Handle,
         buffer: *mut u8,
@@ -435,7 +436,17 @@ impl PipeStream {
         self.abortive.store(true, Ordering::Relaxed);
     }
 
-    /// The process at the other end.
+    /// The process that created the pipe's server end.
+    pub(crate) fn server_pid(&self) -> io::Result<u32> {
+        let mut pid = 0u32;
+        // SAFETY: the handle is open; `pid` is written during the call.
+        if unsafe { GetNamedPipeServerProcessId(self.raw(), &raw mut pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(pid)
+    }
+
+    /// The process that opened the pipe's client end.
     pub(crate) fn client_pid(&self) -> io::Result<u32> {
         let mut pid = 0u32;
         // SAFETY: the handle is open; `pid` is written during the call.
