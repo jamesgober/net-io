@@ -44,6 +44,9 @@ pub(crate) enum WakeSource {
     Fixed(Arc<Wake>),
     /// The calling thread's channel, registered around each wait.
     Thread,
+    /// None: a reactor worker never waits on one connection.
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    Reactor,
 }
 
 thread_local! {
@@ -117,6 +120,11 @@ pub(crate) struct TlsLayer {
     cout: Buffer,
     done: bool,
     eof: bool,
+    /// What the engine reported last, not acted on yet.
+    event: Option<Ev>,
+    /// The input range of the last engine step: plaintext must lie inside it.
+    data_from: usize,
+    data_to: usize,
 }
 
 /// What one round of the TLS engine produced.
@@ -127,7 +135,24 @@ enum Pump {
     Woken,
 }
 
+/// What the TLS machine needs next. Both drivers run the same machine: the
+/// blocking driver sends and reads in place, the reactor through operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TlsNext {
+    /// `cout` holds records to send.
+    Transmit,
+    /// The engine wants more ciphertext.
+    NeedInput,
+    /// Plaintext is ready to deliver.
+    Plain,
+    /// The handshake just finished.
+    Handshaken,
+    /// The stream ended.
+    Eof,
+}
+
 /// The engine's event, without the borrow of the input.
+#[derive(Clone, Copy)]
 enum Ev {
     NeedInput,
     Transmit,
@@ -274,6 +299,9 @@ impl Link {
             cout,
             done: false,
             eof: false,
+            event: None,
+            data_from: 0,
+            data_to: 0,
         });
     }
 
@@ -343,11 +371,55 @@ impl Link {
     /// alerts, tickets) go out at once.
     fn tls_pump(&mut self, t: &mut TlsLayer) -> Result<Pump, NetError> {
         loop {
+            match self.tls_advance(t)? {
+                TlsNext::Plain => return Ok(Pump::Plain),
+                TlsNext::Handshaken => return Ok(Pump::Handshaken),
+                TlsNext::Eof => return Ok(Pump::Eof),
+                TlsNext::Transmit => self.send_raw_all(t.cout.as_slice())?,
+                TlsNext::NeedInput => {
+                    if let Some(p) = self.tls_fill(t)? {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One turn of the TLS machine: runs the engine until something outside it
+    /// has to happen. Does no IO.
+    fn tls_advance(&mut self, t: &mut TlsLayer) -> Result<TlsNext, NetError> {
+        loop {
             if t.plain_at < t.plain_end {
-                return Ok(Pump::Plain);
+                return Ok(TlsNext::Plain);
             }
             if t.eof {
-                return Ok(Pump::Eof);
+                return Ok(TlsNext::Eof);
+            }
+            if let Some(ev) = t.event.take() {
+                match ev {
+                    Ev::NeedInput => return Ok(TlsNext::NeedInput),
+                    Ev::Transmit | Ev::OutputFull => {}
+                    Ev::Handshaken => {
+                        t.done = true;
+                        if let Some(info) = t.session.info() {
+                            self.info.tls = Some(Arc::new(info));
+                        }
+                        return Ok(TlsNext::Handshaken);
+                    }
+                    Ev::Data(off, len) => {
+                        // The plaintext must lie inside the input the engine was given.
+                        if off < t.data_from || off.saturating_add(len) > t.data_to {
+                            return Err(self.tls_error(TlsError::new(TlsFailure::State, 0, None)));
+                        }
+                        t.plain_at = off;
+                        t.plain_end = off + len;
+                    }
+                    Ev::Closed => {
+                        t.eof = true;
+                        return Ok(TlsNext::Eof);
+                    }
+                }
+                continue;
             }
             let start = t.start;
             let end = t.cin.len();
@@ -378,46 +450,41 @@ impl Link {
                 Err(e) => return Err(self.tls_error(e)),
             };
             t.start = (start + consumed).min(end);
+            t.data_from = start;
+            t.data_to = end;
+            if matches!(ev, Ev::OutputFull) && written == 0 {
+                return Err(self.tls_error(TlsError::new(TlsFailure::OutputFull, 0, None)));
+            }
+            t.event = Some(ev);
             if written > 0 {
                 t.cout.set_len(written.min(t.cout.capacity()));
-                self.send_raw_all(t.cout.as_slice())?;
-            }
-            match ev {
-                Ev::NeedInput => {
-                    if let Some(p) = self.tls_fill(t)? {
-                        return Ok(p);
-                    }
-                }
-                Ev::Transmit => {}
-                Ev::Handshaken => {
-                    t.done = true;
-                    if let Some(info) = t.session.info() {
-                        self.info.tls = Some(Arc::new(info));
-                    }
-                    return Ok(Pump::Handshaken);
-                }
-                Ev::Data(off, len) => {
-                    // The plaintext must lie inside the input the engine was given.
-                    if off < start || off.saturating_add(len) > end {
-                        return Err(self.tls_error(TlsError::new(TlsFailure::State, 0, None)));
-                    }
-                    t.plain_at = off;
-                    t.plain_end = off + len;
-                }
-                Ev::OutputFull if written == 0 => {
-                    return Err(self.tls_error(TlsError::new(TlsFailure::OutputFull, 0, None)));
-                }
-                Ev::OutputFull => {}
-                Ev::Closed => {
-                    t.eof = true;
-                    return Ok(Pump::Eof);
-                }
+                return Ok(TlsNext::Transmit);
             }
         }
     }
 
     /// Reads more ciphertext after compacting the input. `Some` ends the pump.
     fn tls_fill(&mut self, t: &mut TlsLayer) -> Result<Option<Pump>, NetError> {
+        self.tls_make_room(t)?;
+        let len = t.cin.len();
+        match self.read_raw(t.cin.spare())? {
+            Got::Data(n) => {
+                t.cin.set_len(len + n);
+                Ok(None)
+            }
+            Got::Eof => {
+                // An unclean end (no close_notify) still ends the stream; the
+                // protocol above decides whether its message was complete.
+                let _ = t.session.on_transport_closed();
+                t.eof = true;
+                Ok(Some(Pump::Eof))
+            }
+            Got::Woken => Ok(Some(Pump::Woken)),
+        }
+    }
+
+    /// Compacts the ciphertext input and checks there is room for more.
+    fn tls_make_room(&mut self, t: &mut TlsLayer) -> Result<(), NetError> {
         if t.start > 0 {
             let len = t.cin.len();
             t.cin.as_mut_slice().copy_within(t.start..len, 0);
@@ -435,21 +502,7 @@ impl Link {
                 },
             ));
         }
-        let len = t.cin.len();
-        match self.read_raw(t.cin.spare())? {
-            Got::Data(n) => {
-                t.cin.set_len(len + n);
-                Ok(None)
-            }
-            Got::Eof => {
-                // An unclean end (no close_notify) still ends the stream; the
-                // protocol above decides whether its message was complete.
-                let _ = t.session.on_transport_closed();
-                t.eof = true;
-                Ok(Some(Pump::Eof))
-            }
-            Got::Woken => Ok(Some(Pump::Woken)),
-        }
+        Ok(())
     }
 
     /// The plaintext one vectored TLS write takes: whole records that fit the
@@ -482,6 +535,21 @@ impl Link {
         let Some(mut t) = self.tls.take() else {
             return Ok(0);
         };
+        let r = match self.tls_encrypt(&mut t, bufs, take) {
+            Ok(taken) => self.send_raw_all(t.cout.as_slice()).map(|()| taken),
+            Err(e) => Err(e),
+        };
+        self.tls = Some(t);
+        r
+    }
+
+    /// Encrypts up to `take` plaintext bytes from `bufs` into `cout`.
+    fn tls_encrypt(
+        &mut self,
+        t: &mut TlsLayer,
+        bufs: &[IoSlice<'_>],
+        take: usize,
+    ) -> Result<usize, NetError> {
         t.cout.set_len(0);
         let mut taken = 0;
         let mut failed = None;
@@ -504,12 +572,10 @@ impl Link {
                 s = &s[chunk..];
             }
         }
-        let r = match failed {
+        match failed {
             Some(e) => Err(self.tls_error(e)),
-            None => self.send_raw_all(t.cout.as_slice()).map(|()| taken),
-        };
-        self.tls = Some(t);
-        r
+            None => Ok(taken),
+        }
     }
 
     /// Sends `close_notify` once, without waiting (a graceful close).
@@ -644,6 +710,7 @@ impl Link {
                 self.slot.set_wake(None);
                 r
             }
+            WakeSource::Reactor => Err(io::Error::from(io::ErrorKind::Unsupported)),
         }
     }
 
@@ -691,19 +758,7 @@ impl Link {
                 return Ok(Got::Eof);
             }
             let now = self.now();
-            let (op_deadline, op_kind) = match (self.handshake_deadline, self.phase) {
-                (Some(d), _) => (d, TimeoutKind::Handshake),
-                (None, phase) => match phase {
-                    Phase::Idle => (
-                        self.progress_at + self.limits.idle_timeout,
-                        TimeoutKind::Idle,
-                    ),
-                    _ => (
-                        self.progress_at + self.limits.read_timeout,
-                        TimeoutKind::Read,
-                    ),
-                },
-            };
+            let (op_deadline, op_kind) = self.read_deadline();
             if now >= op_deadline {
                 return Err(self.timed_out(op_kind));
             }
@@ -1132,6 +1187,312 @@ impl Link {
             Some(k) => CloseReason::Killed(k),
             None => self.terminal.unwrap_or(fallback),
         }
+    }
+
+    // ---- the reactor: the same bookkeeping, without waiting -----------------------
+
+    /// Puts the socket in non-blocking mode.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
+        self.stream.set_nonblocking(true)
+    }
+
+    /// Bytes arrived (the reactor made the call).
+    #[cfg(feature = "reactor")]
+    pub(crate) fn note_received(&mut self, n: usize) {
+        let now = self.now();
+        self.bytes_in += n as u64;
+        self.progress_at = now;
+        if self.phase == Phase::Idle {
+            self.phase = Phase::Receiving;
+            self.rate_in.activate(now);
+        }
+        self.rate_in.record(now, n);
+    }
+
+    /// Ciphertext arrived: it counts for the rate and the deadline; the plaintext
+    /// starts the exchange when it is delivered.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn note_cipher(&mut self, n: usize) {
+        let now = self.now();
+        self.bytes_in += n as u64;
+        self.progress_at = now;
+        self.rate_in.record(now, n);
+    }
+
+    /// Bytes left (the reactor made the call).
+    #[cfg(feature = "reactor")]
+    pub(crate) fn note_sent(&mut self, n: usize) {
+        self.sent(n);
+    }
+
+    /// Before a send: the output deadline starts, a dead connection stops here,
+    /// and the gate is asked about the bytes it has not approved.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn check_send(&mut self, bytes: usize) -> Result<(), NetError> {
+        let now = self.now();
+        self.rate_out.activate(now);
+        if self.phase == Phase::Idle {
+            self.progress_at = now;
+        }
+        self.check_terminal()?;
+        self.gate_check(bytes.saturating_sub(self.approved))
+    }
+
+    /// After a send of `n` out of `total` offered: the tail stays approved.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn sent_of(&mut self, total: usize, n: usize) {
+        self.approved = total.saturating_sub(n);
+    }
+
+    /// The deadline that applies to a wait for input, and its kind.
+    fn read_deadline(&self) -> (Instant, TimeoutKind) {
+        match (self.handshake_deadline, self.phase) {
+            (Some(d), _) => (d, TimeoutKind::Handshake),
+            (None, Phase::Idle) => (
+                self.progress_at + self.limits.idle_timeout,
+                TimeoutKind::Idle,
+            ),
+            (None, _) => (
+                self.progress_at + self.limits.read_timeout,
+                TimeoutKind::Read,
+            ),
+        }
+    }
+
+    /// When a wait for input must look at the clock again.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn read_timer(&self, now: Instant) -> Instant {
+        let mut until = self.read_deadline().0;
+        if let Some(d) = self.exchange_deadline {
+            until = until.min(d);
+        }
+        if let Some(c) = self.rate_in.next_check(now) {
+            until = until.min(c);
+        }
+        until
+    }
+
+    /// The checks of a wait for input, at the time its timer fired.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn read_check(&mut self, now: Instant) -> Result<(), NetError> {
+        self.check_terminal()?;
+        let (deadline, kind) = self.read_deadline();
+        if now >= deadline {
+            return Err(self.timed_out(kind));
+        }
+        if self.exchange_deadline.is_some_and(|d| now >= d) {
+            return Err(self.timed_out(TimeoutKind::Exchange));
+        }
+        if self.rate_in.too_slow(now) {
+            return Err(self.fail(
+                CloseReason::SlowPeer {
+                    direction: Direction::In,
+                },
+                NetError::SlowPeer {
+                    direction: Direction::In,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// When a wait for room to write must look at the clock again.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn write_timer(&self, now: Instant) -> Instant {
+        let mut until = self.progress_at + self.limits.write_timeout;
+        if let Some(d) = self.exchange_deadline {
+            until = until.min(d);
+        }
+        if let Some(c) = self.rate_out.next_check(now) {
+            until = until.min(c);
+        }
+        until
+    }
+
+    /// The checks of a wait for room to write, at the time its timer fired.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn write_check(&mut self, now: Instant) -> Result<(), NetError> {
+        self.check_terminal()?;
+        if now >= self.progress_at + self.limits.write_timeout {
+            return Err(self.timed_out(TimeoutKind::Write));
+        }
+        if self.exchange_deadline.is_some_and(|d| now >= d) {
+            return Err(self.timed_out(TimeoutKind::Exchange));
+        }
+        if self.rate_out.too_slow(now) {
+            return Err(self.fail(
+                CloseReason::SlowPeer {
+                    direction: Direction::Out,
+                },
+                NetError::SlowPeer {
+                    direction: Direction::Out,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records an OS failure class as the close reason.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn note_failure(&mut self, class: OsErrorClass) {
+        let reason = match class {
+            OsErrorClass::Reset | OsErrorClass::Aborted => CloseReason::PeerReset,
+            other => CloseReason::Io(other),
+        };
+        if self.terminal.is_none() {
+            self.terminal = Some(reason);
+        }
+    }
+
+    /// Bytes read past a handshake, into `buf`; 0 when none are left.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn take_read_ahead(&mut self, buf: &mut [u8]) -> usize {
+        let n = self.read_pending(buf);
+        if n > 0 {
+            let now = self.now();
+            self.progress_at = now;
+            if self.phase == Phase::Idle {
+                self.phase = Phase::Receiving;
+                self.rate_in.activate(now);
+            }
+        }
+        n
+    }
+
+    /// Whether bytes read past a handshake are waiting.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn has_read_ahead(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|p| self.pending_at < p.len())
+    }
+
+    /// One turn of the TLS machine.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_next(&mut self) -> Result<TlsNext, NetError> {
+        let Some(mut t) = self.tls.take() else {
+            return Ok(TlsNext::Eof);
+        };
+        let r = self.tls_advance(&mut t);
+        self.tls = Some(t);
+        r
+    }
+
+    /// The records to send; give the buffer back with [`Link::tls_put_cout`].
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_take_cout(&mut self) -> Option<Buffer> {
+        let t = self.tls.as_mut()?;
+        Some(std::mem::replace(&mut t.cout, Buffer::placeholder()))
+    }
+
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_put_cout(&mut self, buffer: Buffer) {
+        if let Some(t) = self.tls.as_mut() {
+            t.cout = buffer;
+        }
+    }
+
+    /// The ciphertext input, compacted, for a receive; `tls_put_cin` gives it back.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_take_cin(&mut self) -> Result<Option<Buffer>, NetError> {
+        let Some(mut t) = self.tls.take() else {
+            return Ok(None);
+        };
+        let r = self.tls_make_room(&mut t);
+        let cin = r.map(|()| std::mem::replace(&mut t.cin, Buffer::placeholder()));
+        self.tls = Some(t);
+        cin.map(Some)
+    }
+
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_put_cin(&mut self, buffer: Buffer) {
+        if let Some(t) = self.tls.as_mut() {
+            t.cin = buffer;
+        }
+    }
+
+    /// The transport ended under TLS.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_transport_closed(&mut self) {
+        if let Some(t) = self.tls.as_mut() {
+            let _ = t.session.on_transport_closed();
+            t.eof = true;
+        }
+    }
+
+    /// Copies plaintext into `buf` (the machine said `Plain`).
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_deliver(&mut self, buf: &mut [u8]) -> usize {
+        let Some(t) = self.tls.as_mut() else {
+            return 0;
+        };
+        let have = &t.cin.as_slice()[t.plain_at..t.plain_end];
+        let n = have.len().min(buf.len());
+        buf[..n].copy_from_slice(&have[..n]);
+        t.plain_at += n;
+        let now = self.now();
+        self.progress_at = now;
+        if self.phase == Phase::Idle {
+            self.phase = Phase::Receiving;
+            self.rate_in.activate(now);
+        }
+        n
+    }
+
+    /// Encrypts up to one budget of plaintext into the output buffer.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_seal(
+        &mut self,
+        bufs: &[IoSlice<'_>],
+        take: usize,
+    ) -> Result<usize, NetError> {
+        let Some(mut t) = self.tls.take() else {
+            return Ok(0);
+        };
+        let r = self.tls_encrypt(&mut t, bufs, take);
+        self.tls = Some(t);
+        r
+    }
+
+    /// The plaintext one sealed write may take.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_write_budget(&self) -> usize {
+        self.tls_budget()
+    }
+
+    /// The gate check for a sealed write.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn check_seal(&mut self, bytes: usize) -> Result<(), NetError> {
+        let now = self.now();
+        self.rate_out.activate(now);
+        self.check_terminal()?;
+        self.gate_check(bytes)
+    }
+
+    /// A graceful close on the reactor: FIN now. `true` when unread input may
+    /// still arrive, so the socket must linger to protect the last response.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn begin_graceful_close(&mut self, readable: bool) -> bool {
+        self.tls_close_notify();
+        let _ = self.stream.shutdown(Shutdown::Write);
+        !self.peer_closed && (self.phase != Phase::Idle || readable)
+    }
+
+    /// Closes the socket after the driver let go of it.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn finish_reactor(mut self, reason: CloseReason) -> CloseReason {
+        if reason.is_abortive() {
+            let _ = sys::set_linger(self.stream.sock(), Some(Duration::ZERO));
+        }
+        self.slot.begin_close();
+        if let Some(mut gate) = self.gate.take() {
+            gate.close(&self.info, reason);
+        }
+        let Link { stream, slot, .. } = self;
+        drop(stream);
+        slot.uninstall();
+        reason
     }
 
     /// Closes the connection with `reason`, gracefully (FIN, then a bounded linger

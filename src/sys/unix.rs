@@ -987,12 +987,12 @@ pub(crate) fn send(stream: &super::Stream, buf: &[u8]) -> io::Result<usize> {
             Some(n) => &buf[..n],
             None => buf,
         };
-        send_once(stream, buf)
+        send_once(stream.sock(), buf)
     })
 }
 
 /// One `send` system call with net-io's flags.
-fn send_once(stream: &super::Stream, buf: &[u8]) -> io::Result<usize> {
+fn send_once(sock: Sock<'_>, buf: &[u8]) -> io::Result<usize> {
     #[cfg(target_os = "linux")]
     let flags = c::MSG_DONTWAIT | c::MSG_NOSIGNAL;
     #[cfg(target_os = "macos")]
@@ -1003,7 +1003,7 @@ fn send_once(stream: &super::Stream, buf: &[u8]) -> io::Result<usize> {
         // keep a closed peer from raising SIGPIPE.
         let n = unsafe {
             c_send(
-                stream.sock().as_raw_fd(),
+                sock.as_raw_fd(),
                 buf.as_ptr().cast::<c_void>(),
                 buf.len(),
                 flags,
@@ -1022,6 +1022,11 @@ pub(crate) const MAX_SLICES: usize = 64;
 
 /// One vectored send that never blocks (at most [`MAX_SLICES`] slices).
 pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+    send_vectored_sock(stream.sock(), bufs)
+}
+
+/// As [`send_vectored`], on a borrowed socket.
+pub(crate) fn send_vectored_sock(sock: Sock<'_>, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
     let bufs = &bufs[..bufs.len().min(MAX_SLICES)];
     #[cfg(target_os = "linux")]
     let flags = c::MSG_DONTWAIT | c::MSG_NOSIGNAL;
@@ -1037,7 +1042,7 @@ pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io:
                 .find(|b| !b.is_empty())
                 .map_or(&[][..], |b| &b[..]);
             // Straight to the system call: this send already took its fault.
-            return send_once(stream, &first[..n.min(first.len())]);
+            return send_once(sock, &first[..n.min(first.len())]);
         }
         let msg = MsgHdr {
             msg_name: std::ptr::null_mut(),
@@ -1054,7 +1059,7 @@ pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io:
         // SAFETY: `IoSlice` is documented as ABI-compatible with `struct iovec` on Unix;
         // `bufs` (at most 64 slices) and the bytes they point to live for the call;
         // `msg` carries no name and no control data. MSG_DONTWAIT keeps the call from blocking.
-        let n = unsafe { sendmsg(stream.sock().as_raw_fd(), &raw const msg, flags) };
+        let n = unsafe { sendmsg(sock.as_raw_fd(), &raw const msg, flags) };
         if n < 0 {
             Err(io::Error::last_os_error())
         } else {

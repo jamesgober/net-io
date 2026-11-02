@@ -37,6 +37,11 @@ mod windows;
 #[cfg(windows)]
 pub(crate) use windows::*;
 
+#[cfg(all(feature = "reactor", target_os = "linux"))]
+mod epoll;
+#[cfg(all(feature = "reactor", target_os = "linux"))]
+pub(crate) use epoll::{PollEvent, PollWaker, Poller, Registered};
+
 mod kill;
 
 use std::io::{self, IoSlice, Read, Write};
@@ -92,6 +97,15 @@ impl Stream {
             Stream::Tcp(s) => s.shutdown(how),
             #[cfg(all(unix, feature = "local"))]
             Stream::Unix(s) => s.shutdown(how),
+        }
+    }
+
+    #[cfg(feature = "reactor")]
+    pub(crate) fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_nonblocking(on),
+            #[cfg(all(unix, feature = "local"))]
+            Stream::Unix(s) => s.set_nonblocking(on),
         }
     }
 

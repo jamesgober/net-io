@@ -33,6 +33,12 @@ fn gen_of(state: u64) -> u32 {
     (state >> GEN_SHIFT) as u32
 }
 
+/// Hears kills for a reactor worker: the connection's table index goes on the
+/// worker's list and its loop wakes.
+pub(crate) trait KillSink: Send + Sync + std::fmt::Debug {
+    fn killed(&self, index: u32);
+}
+
 /// One connection's kill state: generation, flags, the kill reason, the raw socket,
 /// and the wake channel its owner waits on.
 #[derive(Debug)]
@@ -40,6 +46,7 @@ pub(crate) struct KillSlot {
     state: AtomicU64,
     raw: AtomicU64,
     wake: Mutex<Option<Arc<Wake>>>,
+    sink: Mutex<Option<(Arc<dyn KillSink>, u32)>>,
 }
 
 impl KillSlot {
@@ -48,6 +55,24 @@ impl KillSlot {
             state: AtomicU64::new(0),
             raw: AtomicU64::new(0),
             wake: Mutex::new(None),
+            sink: Mutex::new(None),
+        }
+    }
+
+    /// Where a reactor worker hears about kills of this connection.
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    pub(crate) fn set_sink(&self, sink: Arc<dyn KillSink>, index: u32) {
+        *self.sink.lock().unwrap_or_else(PoisonError::into_inner) = Some((sink, index));
+    }
+
+    fn tell_sink(&self) {
+        let sink = self
+            .sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some((sink, index)) = sink {
+            sink.killed(index);
         }
     }
 
@@ -96,6 +121,7 @@ impl KillSlot {
             if let Some(w) = wake {
                 w.wake();
             }
+            self.tell_sink();
         })
     }
 

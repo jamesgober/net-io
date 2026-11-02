@@ -136,7 +136,10 @@ pub use addr::{AddrError, Cidr, PrefixKey, PrefixPolicy, normalize, normalize_so
 pub use buf::{Buffer, BufferPool, PoolStats};
 pub use completer::{Completer, PostError};
 pub use control::{ControlLine, ControlState, NoControl, SimpleControl};
-pub use driver::DriverKind;
+pub use driver::{
+    BorrowedSocket, Completion, Completions, Driver, DriverKind, DriverWaker, Operation,
+    OperationKind, Rejected, SendChunks, Token,
+};
 pub use error::{
     CloseReason, ConfigReason, Direction, ErrorClass, KillReason, LimitKind, NetError,
     OsErrorClass, RefusalCause, TimeoutKind,

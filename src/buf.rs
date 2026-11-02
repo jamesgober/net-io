@@ -31,6 +31,17 @@ impl Buffer {
         Buffer::new(class)
     }
 
+    /// An empty stand-in that owns no memory, left where a buffer travels with a
+    /// driver operation.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn placeholder() -> Buffer {
+        Buffer {
+            data: Box::default(),
+            len: 0,
+            class: SizeClass::SMALL,
+        }
+    }
+
     fn new(class: SizeClass) -> Buffer {
         Buffer {
             data: vec![0u8; class.bytes() as usize].into_boxed_slice(),

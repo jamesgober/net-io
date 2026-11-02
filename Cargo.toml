@@ -47,7 +47,7 @@ path = "src/lib.rs"
 # FEATURE FLAGS
 # #################################
 [features]
-default = ["proxy", "udp", "local", "tls"]
+default = ["proxy", "udp", "local", "tls", "reactor"]
 # PROXY protocol parser and server integration.
 proxy = []
 # UDP socket, amplification guard, source budgets.
@@ -56,6 +56,8 @@ udp = []
 local = []
 # The TLS seam's server integration (no TLS code; an engine plugs in).
 tls = []
+# The reactor driver: epoll, kqueue, IOCP.
+reactor = []
 
 
 # DEPENDENCIES
