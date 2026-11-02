@@ -31,6 +31,8 @@ use crate::info::{Endpoint, Origin, PeerCredentials, Transport, UnixPath};
 use crate::limits::Limits;
 #[cfg(unix)]
 use crate::link::{ClockRef, Got, Link, WakeSource};
+#[cfg(windows)]
+use crate::local_windows::{UnixConnection, UnixListener};
 #[cfg(unix)]
 use crate::opts::LocalOptions;
 #[cfg(windows)]
@@ -893,6 +895,7 @@ macro_rules! inside {
 macro_rules! inside {
     ($kind:ident, $this:expr, $v:ident => $body:expr) => {
         match $this {
+            $kind::Unix($v) => $body,
             $kind::Pipe($v) => $body,
         }
     };
@@ -903,7 +906,6 @@ macro_rules! inside {
 #[derive(Debug)]
 pub enum LocalListener {
     /// A Unix domain socket.
-    #[cfg(unix)]
     Unix(UnixListener),
     /// A named pipe.
     #[cfg(windows)]
@@ -917,11 +919,11 @@ impl LocalListener {
     ///
     /// As `UnixListener::accept`.
     pub fn accept(&self) -> Result<(LocalConnection, ConnectionInfo), NetError> {
-        #[cfg(unix)]
-        let wrap = LocalConnection::Unix;
-        #[cfg(windows)]
-        let wrap = LocalConnection::Pipe;
-        inside!(LocalListener, self, l => l.accept().map(|(c, info)| (wrap(c), info)))
+        match self {
+            LocalListener::Unix(l) => l.accept().map(|(c, info)| (LocalConnection::Unix(c), info)),
+            #[cfg(windows)]
+            LocalListener::Pipe(l) => l.accept().map(|(c, info)| (LocalConnection::Pipe(c), info)),
+        }
     }
 }
 
@@ -930,7 +932,6 @@ impl LocalListener {
 #[derive(Debug)]
 pub enum LocalConnection {
     /// A Unix domain socket.
-    #[cfg(unix)]
     Unix(UnixConnection),
     /// A named pipe.
     #[cfg(windows)]

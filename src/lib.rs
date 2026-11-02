@@ -87,6 +87,8 @@ mod limits;
 mod link;
 #[cfg(feature = "local")]
 mod local;
+#[cfg(all(windows, feature = "local"))]
+mod local_windows;
 mod opts;
 #[cfg(all(windows, feature = "local"))]
 mod pipe;
@@ -167,6 +169,8 @@ pub use limits::{Limits, LimitsBuilder, MinRate, Pressure, SizeClass};
 pub use local::{Descriptors, UnixConnection, UnixListener};
 #[cfg(feature = "local")]
 pub use local::{LocalConnection, LocalListener};
+#[cfg(all(windows, feature = "local"))]
+pub use local_windows::{UnixConnection, UnixListener};
 pub use opts::{Keepalive, Linger, ListenOptions, LocalOptions, SocketOptions, TcpOptions};
 #[cfg(all(windows, feature = "local"))]
 pub use pipe::{PipeConnection, PipeListener, PipeOptions, PipeSecurity};
@@ -325,8 +329,8 @@ where
 
 /// Opens a local IPC listener: on Unix, a Unix domain socket at the path `name`
 /// with mode `0600` (only the owner may connect; [`LocalOptions`] and
-/// `UnixListener::bind_with` for more). On Windows, named pipes arrive in
-/// `0.5.0`; until then this returns `Unsupported`.
+/// `UnixListener::bind_with` for more). On Windows, the named pipe
+/// `\\\\.\\pipe\\<name>`, owner only, remote clients rejected.
 ///
 /// # Errors
 ///

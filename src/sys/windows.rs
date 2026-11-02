@@ -72,6 +72,8 @@ pub(crate) fn classify_addr_error(e: &io::Error) -> super::AddrFailure {
 }
 
 pub(super) mod c {
+    #[cfg(feature = "local")]
+    pub const AF_UNIX: i32 = 1;
     pub const AF_INET: i32 = 2;
     pub const AF_INET6: i32 = 23;
     pub const SOCK_STREAM: i32 = 1;
@@ -216,6 +218,9 @@ unsafe extern "system" {
     fn bind(s: Socket, name: *const c_void, len: i32) -> i32;
     fn listen(s: Socket, backlog: i32) -> i32;
     fn connect(s: Socket, name: *const c_void, len: i32) -> i32;
+    #[cfg(feature = "local")]
+    #[link_name = "accept"]
+    fn accept_raw(s: Socket, name: *mut c_void, len: *mut i32) -> Socket;
     fn setsockopt(s: Socket, level: i32, name: i32, value: *const u8, len: i32) -> i32;
     fn getsockopt(s: Socket, level: i32, name: i32, value: *mut u8, len: *mut i32) -> i32;
     fn WSAPoll(fds: *mut WsaPollFd, nfds: u32, timeout: i32) -> i32;
@@ -231,7 +236,7 @@ unsafe extern "system" {
         from: *mut c_void,
         from_len: *mut i32,
     ) -> i32;
-    #[cfg(feature = "udp")]
+    #[cfg(any(feature = "udp", feature = "local"))]
     fn WSAIoctl(
         s: Socket,
         code: u32,
@@ -774,6 +779,108 @@ pub(crate) fn send_vectored(stream: &super::Stream, bufs: &[IoSlice<'_>]) -> io:
         }
         stream.write_vectored(bufs)
     })
+}
+
+/// The longest AF_UNIX path, terminator included.
+#[cfg(feature = "local")]
+pub(crate) const UNIX_PATH_MAX: usize = 108;
+
+#[cfg(feature = "local")]
+const SIO_AF_UNIX_GETPEERPID: u32 = 0x5800_0100;
+
+/// A `sockaddr_un`, and its length.
+#[cfg(feature = "local")]
+fn unix_addr(path: &[u8]) -> io::Result<([u8; 2 + UNIX_PATH_MAX], i32)> {
+    if path.is_empty() || path.len() >= UNIX_PATH_MAX || path.contains(&0) {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let mut addr = [0u8; 2 + UNIX_PATH_MAX];
+    addr[..2].copy_from_slice(&1u16.to_ne_bytes());
+    addr[2..2 + path.len()].copy_from_slice(path);
+    Ok((addr, (2 + path.len() + 1) as i32))
+}
+
+/// A new AF_UNIX stream socket.
+#[cfg(feature = "local")]
+pub(crate) fn unix_socket() -> io::Result<OwnedSocket> {
+    startup();
+    // SAFETY: a null protocol-info pointer creates a socket from the plain integers.
+    let s = unsafe {
+        WSASocketW(
+            c::AF_UNIX,
+            c::SOCK_STREAM,
+            0,
+            std::ptr::null_mut(),
+            0,
+            c::WSA_FLAG_OVERLAPPED | c::WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if s == c::INVALID_SOCKET {
+        return Err(last_error());
+    }
+    // SAFETY: `s` was just created, is open, and is owned by no one else.
+    Ok(unsafe { OwnedSocket::from_raw_socket(s as RawSocket) })
+}
+
+/// Binds and listens; the path names a new socket file.
+#[cfg(feature = "local")]
+pub(crate) fn unix_bind(sock: Sock<'_>, path: &[u8], backlog: u32) -> io::Result<()> {
+    let (addr, len) = unix_addr(path)?;
+    // SAFETY: `addr` holds a valid SOCKADDR_UN of `len` bytes and lives for the call.
+    cvt(unsafe { bind(raw(sock), addr.as_ptr().cast(), len) })?;
+    // SAFETY: `sock` is an open, bound stream socket.
+    cvt(unsafe { listen(raw(sock), clamp_int(backlog)) })?;
+    Ok(())
+}
+
+/// Connects to the socket at `path`.
+#[cfg(feature = "local")]
+pub(crate) fn unix_connect(sock: Sock<'_>, path: &[u8]) -> io::Result<()> {
+    let (addr, len) = unix_addr(path)?;
+    // SAFETY: as in `unix_bind`.
+    cvt(unsafe { connect(raw(sock), addr.as_ptr().cast(), len) }).map(drop)
+}
+
+/// One accept on a non-blocking AF_UNIX listener. std's `accept` cannot decode the
+/// peer's address, so this asks for none. Sockets start inheritable here.
+#[cfg(feature = "local")]
+pub(crate) fn unix_accept(listener: Sock<'_>) -> io::Result<OwnedSocket> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::Accept)?;
+    // SAFETY: `listener` is open; no address is asked for.
+    let s = unsafe { accept_raw(raw(listener), std::ptr::null_mut(), std::ptr::null_mut()) };
+    if s == c::INVALID_SOCKET {
+        return Err(last_error());
+    }
+    // SAFETY: `s` was just accepted, is open, and is owned by no one else.
+    let owned = unsafe { OwnedSocket::from_raw_socket(s as RawSocket) };
+    // SAFETY: the handle is open; clearing the flag is the call's documented use.
+    let ok = unsafe { SetHandleInformation(s as *mut c_void, c::HANDLE_FLAG_INHERIT, 0) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(owned)
+}
+
+/// The process at the other end of an AF_UNIX connection.
+#[cfg(feature = "local")]
+pub(crate) fn unix_peer_pid(sock: Sock<'_>) -> io::Result<u32> {
+    let (mut pid, mut returned) = (0u32, 0u32);
+    // SAFETY: `pid` is writable for the stated length; no overlapped operation.
+    cvt(unsafe {
+        WSAIoctl(
+            raw(sock),
+            SIO_AF_UNIX_GETPEERPID,
+            std::ptr::null(),
+            0,
+            (&raw mut pid).cast(),
+            size_of::<u32>() as u32,
+            &raw mut returned,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    Ok(pid)
 }
 
 /// How many bytes describe a socket for another process (`WSAPROTOCOL_INFOW`).

@@ -87,6 +87,23 @@ impl Acceptor {
         }
     }
 
+    /// One accept on an AF_UNIX listener on Windows.
+    #[cfg(all(windows, feature = "local"))]
+    pub(crate) fn accept_af_unix(&mut self, listener: &TcpListener) -> Accepted<TcpStream> {
+        let accepted = sys::unix_accept(listener.sock()).and_then(|s| {
+            let stream = TcpStream::from(s);
+            stream.set_nonblocking(true)?;
+            Ok(stream)
+        });
+        match accepted {
+            Ok(stream) => {
+                self.backoff = BACKOFF_START;
+                Accepted::Conn(stream)
+            }
+            Err(e) => self.failed(e, |_| {}),
+        }
+    }
+
     /// One accept on a Unix listener, with the same discipline as TCP.
     #[cfg(all(unix, feature = "local"))]
     pub(crate) fn accept_unix(

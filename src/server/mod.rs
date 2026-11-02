@@ -216,10 +216,10 @@ impl ListenerSpec {
         }
     }
 
-    /// A Unix domain socket listener at `path` (feature `local`, Unix; Windows
-    /// AF_UNIX arrives in `0.5.0`). The socket file gets `options`' mode and
-    /// owner before it listens, and is removed at shutdown if it is still the
-    /// file this server created. Connections carry `Transport::Unix`, the peer's
+    /// A Unix domain socket listener at `path` (feature `local`; on Windows, AF_UNIX,
+    /// where NTFS ACLs replace `options`' mode and owner). The socket file gets
+    /// `options`' mode and owner before it listens, and is removed at shutdown if it
+    /// is still the file this server created. Connections carry `Transport::Unix`, the peer's
     /// credentials, and no IP address: the per-source cap does not apply, and a
     /// `BlockingHandler` receives them as a `TcpConnection` whose `peer_addr` is
     /// unspecified. With `proxy`, every peer is trusted: the socket file's
@@ -720,13 +720,9 @@ fn check_spec(
             .adopt
             .as_ref()
             .is_some_and(|h| h.kind() == crate::info::Transport::Unix);
-    if unix && !cfg!(all(unix, feature = "local")) {
+    if unix && !cfg!(feature = "local") {
         return Err(NetError::Unsupported {
-            feature: if cfg!(unix) {
-                "Unix domain sockets (the `local` feature)"
-            } else {
-                "Unix domain sockets on Windows (0.5.0)"
-            },
+            feature: "Unix domain sockets (the `local` feature)",
             platform: std::env::consts::OS,
         });
     }

@@ -1051,6 +1051,19 @@ fn bind_listener(
             }
         }
         #[cfg(all(windows, feature = "local"))]
+        if let Some((path, options)) = spec.unix {
+            let mut listener = crate::local_windows::UnixListener::bind_with(&path, options)?;
+            listener.set_identity(id, spec.name.clone());
+            listener.set_proxy_mode(spec.proxy);
+            listener.set_tls(spec.tls);
+            let info = listener.info().clone();
+            break 'bound (
+                ListenerRuntime::AfUnix(listener),
+                info,
+                TcpOptions::default(),
+            );
+        }
+        #[cfg(all(windows, feature = "local"))]
         if let Some((name, options)) = spec.pipe {
             let mut listener = crate::pipe::PipeListener::create_with(&name, options)?;
             listener.set_identity(id, spec.name.clone());
@@ -1166,6 +1179,8 @@ enum ListenerRuntime {
     #[cfg(all(unix, feature = "local"))]
     Unix(UnixListener),
     #[cfg(all(windows, feature = "local"))]
+    AfUnix(crate::local_windows::UnixListener),
+    #[cfg(all(windows, feature = "local"))]
     Pipe(crate::pipe::PipeListener),
 }
 
@@ -1177,6 +1192,8 @@ impl ListenerRuntime {
             #[cfg(all(unix, feature = "local"))]
             ListenerRuntime::Unix(l) => std::os::fd::AsFd::as_fd(l.std()),
             #[cfg(all(windows, feature = "local"))]
+            ListenerRuntime::AfUnix(l) => l.std().sock(),
+            #[cfg(all(windows, feature = "local"))]
             ListenerRuntime::Pipe(_) => return,
         };
         let _ = sys::wait(sock, Interest::Read, Some(wake), None);
@@ -1187,6 +1204,8 @@ impl ListenerRuntime {
             ListenerRuntime::Tcp(l) => l.info(),
             #[cfg(all(unix, feature = "local"))]
             ListenerRuntime::Unix(l) => l.info(),
+            #[cfg(all(windows, feature = "local"))]
+            ListenerRuntime::AfUnix(l) => l.info(),
             #[cfg(all(windows, feature = "local"))]
             ListenerRuntime::Pipe(l) => l.info(),
         }
@@ -1204,7 +1223,9 @@ impl ListenerRuntime {
                 Ok(dup)
             }
             #[cfg(all(windows, feature = "local"))]
-            ListenerRuntime::Pipe(_) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+            ListenerRuntime::AfUnix(_) | ListenerRuntime::Pipe(_) => {
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+            }
         }
     }
 }
@@ -1566,6 +1587,14 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     other => other.without_conn(),
                 },
                 #[cfg(all(windows, feature = "local"))]
+                ListenerRuntime::AfUnix(l) => match acceptor.accept_af_unix(l.std()) {
+                    Accepted::Conn(stream) => {
+                        engine.admit_af_unix(l, stream, conf, &mut ids, &view, &mut coalescer);
+                        continue;
+                    }
+                    other => other.without_conn(),
+                },
+                #[cfg(all(windows, feature = "local"))]
                 ListenerRuntime::Pipe(l) => match l.accept_or_wake(&wake) {
                     Ok(Some(stream)) => {
                         engine.admit_pipe(l, stream, conf, &mut ids, &view, &mut coalescer);
@@ -1714,6 +1743,32 @@ impl<W, G: Gate> Engine<W, G> {
                     at,
                 ))
             },
+        );
+    }
+
+    /// An AF_UNIX client on Windows: no address, so no per-source cap.
+    #[cfg(all(windows, feature = "local"))]
+    fn admit_af_unix(
+        &self,
+        listener: &crate::local_windows::UnixListener,
+        stream: TcpStream,
+        conf: &Arc<ListenerConf>,
+        ids: &mut IdBlock,
+        view: &ControlView,
+        co: &mut Coalescer,
+    ) {
+        let next = &mut || ids.issue();
+        let stage = AdmitStage::Accept;
+        let _ = self.admit_one(
+            sys::Stream::Tcp(stream),
+            None,
+            None,
+            conf,
+            next,
+            view,
+            co,
+            stage,
+            |stream, cid, at| stream.tcp().map(|s| listener.info_of(s, cid, at)),
         );
     }
 
