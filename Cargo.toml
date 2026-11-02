@@ -114,6 +114,11 @@ required-features = ["udp"]
 name    = "echo"
 harness = false
 
+[[bench]]
+name              = "lifecycle"
+harness           = false
+required-features = ["proxy", "reactor"]
+
 
 # LINTS
 # #################################

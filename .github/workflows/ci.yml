@@ -167,6 +167,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Echo
         run: cargo bench --bench echo
+      - name: Lifecycle
+        run: |
+          ulimit -n 30000
+          cargo bench --bench lifecycle
       - name: Timers
         run: cargo test --release --lib bench_wheel -- --ignored --nocapture
 
@@ -182,7 +186,7 @@ jobs:
       - name: The table
         working-directory: compare
         run: |
-          ulimit -n 30000
+          ulimit -n 300000 || ulimit -n 30000
           cargo run --release
 
   loom:

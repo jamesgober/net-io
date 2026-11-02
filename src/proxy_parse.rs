@@ -583,22 +583,25 @@ fn parse_v1_line(line: &[u8]) -> Result<ProxyHeader<'static>, ProxyError> {
         _ => return Err(ProxyError::V1Syntax { at: offset(base) }),
     };
     let address = |text: &[u8]| -> Result<IpAddr, ProxyError> {
-        let (mine, other) = if v6 {
-            (
-                parse_ipv6(text).map(IpAddr::V6),
-                parse_ipv4(text).map(IpAddr::V4),
-            )
+        let mine = if v6 {
+            parse_ipv6(text).map(IpAddr::V6)
         } else {
-            (
-                parse_ipv4(text).map(IpAddr::V4),
-                parse_ipv6(text).map(IpAddr::V6),
-            )
+            parse_ipv4(text).map(IpAddr::V4)
         };
-        match (mine, other) {
-            (Some(ip), _) => Ok(ip),
-            (None, Some(_)) => Err(ProxyError::FamilyMismatch),
-            (None, None) => Err(ProxyError::V1BadAddress),
+        if let Some(ip) = mine {
+            return Ok(ip);
         }
+        // Only a failure pays for the other family, to name the error.
+        let other = if v6 {
+            parse_ipv4(text).is_some()
+        } else {
+            parse_ipv6(text).is_some()
+        };
+        Err(if other {
+            ProxyError::FamilyMismatch
+        } else {
+            ProxyError::V1BadAddress
+        })
     };
     let src = address(fields[1])?;
     let dst = address(fields[2])?;
