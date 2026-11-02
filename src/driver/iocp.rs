@@ -139,6 +139,19 @@ impl IocpDriver {
         }
     }
 
+    /// Moves what finished without the port into `out`.
+    pub(crate) fn take_local(&mut self, out: &mut Completions) -> usize {
+        let mut n = 0;
+        while out.has_room() {
+            let Some(c) = self.local.pop_front() else {
+                break;
+            };
+            out.push(c);
+            n += 1;
+        }
+        n
+    }
+
     fn reg(&mut self, token: Token) -> Option<&mut Reg> {
         self.regs
             .get_mut(token.index())
@@ -255,15 +268,7 @@ impl Driver for IocpDriver {
         } else {
             self.skipped += 1;
         }
-        let mut n = 0;
-        while out.has_room() {
-            let Some(c) = self.local.pop_front() else {
-                break;
-            };
-            out.push(c);
-            n += 1;
-        }
-        Ok(n)
+        Ok(self.take_local(out))
     }
 
     fn cancel(&mut self, token: Token, which: OperationKind) -> Result<(), NetError> {

@@ -95,6 +95,10 @@ name              = "unix_socket"
 required-features = ["local"]
 
 [[example]]
+name              = "named_pipe"
+required-features = ["local"]
+
+[[example]]
 name              = "handoff_restart"
 required-features = ["local"]
 

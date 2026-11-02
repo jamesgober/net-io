@@ -701,4 +701,32 @@ mod tests {
             }
         }
     }
+
+    /// B-8: `cargo test --release --lib bench_wheel -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark"]
+    fn bench_wheel() {
+        const N: u64 = 1_000_000;
+        let mut w = Wheel::with_capacity(N as usize);
+        let t = std::time::Instant::now();
+        let ids: Vec<_> = (0..N).map(|i| w.insert(1_000 + i % 100_000, i)).collect();
+        let insert = t.elapsed();
+        let t = std::time::Instant::now();
+        for (i, id) in ids.iter().enumerate() {
+            std::hint::black_box(w.reschedule(*id, 200_000 + i as u64 % 100_000));
+        }
+        let extend = t.elapsed();
+        let t = std::time::Instant::now();
+        for id in &ids {
+            std::hint::black_box(w.cancel(*id));
+        }
+        let cancel = t.elapsed();
+        let per = |d: std::time::Duration| d.as_nanos() as f64 / N as f64;
+        println!(
+            "B-8 ns per operation: insert {:.1}, lazy extend {:.1}, cancel {:.1}",
+            per(insert),
+            per(extend),
+            per(cancel)
+        );
+    }
 }

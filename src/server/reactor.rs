@@ -53,6 +53,9 @@ pub(crate) type Backend = crate::driver::ready::ReadyDriver;
 #[cfg(windows)]
 pub(crate) type Backend = crate::driver::iocp::IocpDriver;
 
+/// How many rounds of finished-at-once completions run between looks at the OS.
+const LOCAL_ROUNDS: usize = 16;
+
 /// How often a worker with paused connections looks for a free buffer.
 const STARVED_RETRY: Duration = Duration::from_millis(10);
 
@@ -170,9 +173,11 @@ struct Slot<S> {
 }
 
 /// One worker.
-struct Reactor<F: SessionFactory, G: Gate> {
-    engine: Arc<Engine<Sessions<F>, G>>,
-    shared: Arc<Shared>,
+// Borrowed, not `Arc`: every worker would write the same reference count on every
+// clone, and that line would cross the cores with each event.
+struct Reactor<'a, F: SessionFactory, G: Gate> {
+    engine: &'a Engine<Sessions<F>, G>,
+    shared: &'a Shared,
     idx: usize,
     driver: Backend,
     slots: Vec<Slot<F::Session>>,
@@ -201,7 +206,7 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
     let Some(driver) = engine.take_driver(idx) else {
         return;
     };
-    let shared = engine.shared.clone();
+    let shared: &Shared = &engine.shared;
     let ws = &shared.workers[idx];
     let start = engine.clock.now();
     let notes = Arc::new(KillNotes {
@@ -209,8 +214,8 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         waker: driver.waker(),
     });
     let mut r = Reactor {
-        engine: engine.clone(),
-        shared: shared.clone(),
+        engine,
+        shared,
         idx,
         driver,
         slots: Vec::new(),
@@ -235,7 +240,7 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
     r.main();
 }
 
-impl<F: SessionFactory, G: Gate> Reactor<F, G> {
+impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     fn main(&mut self) {
         loop {
             self.take_inbox();
@@ -261,6 +266,16 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
             }
             for c in done.drain() {
                 self.on_completion(c);
+            }
+            // What those finished at once needs no trip through the OS or the checks
+            // above; bounded, so a chatty connection cannot hold them off.
+            for _ in 0..LOCAL_ROUNDS {
+                if self.driver.take_local(&mut done) == 0 {
+                    break;
+                }
+                for c in done.drain() {
+                    self.on_completion(c);
+                }
             }
             self.done = Some(done);
         }
@@ -334,7 +349,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
 
     fn start(&mut self, job: Job<G::Ticket>) {
         let (stream, mut info, ticket, listener, source) = job.into_parts();
-        let shared = self.shared.clone();
+        let shared = self.shared;
         info.worker = WorkerId(self.idx as u16);
         let index = match self.free.pop() {
             Some(i) => i,
@@ -510,7 +525,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
     }
 
     fn open_session(&mut self, index: u32) {
-        let engine = self.engine.clone();
+        let engine = self.engine;
         let factory = engine.work.factory();
         let Some(c) = self.conn(index) else { return };
         match guarded(|| factory.open(&c.link.info)) {
@@ -546,7 +561,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
     #[cfg(feature = "proxy")]
     fn proxy_data(&mut self, index: u32, mut buffer: Buffer, n: usize) {
         use crate::proxy_parse::{ProxyAddress, ProxyCommand, ProxyProgress};
-        let shared = self.shared.clone();
+        let shared = self.shared;
         let Some(c) = self.slots[index as usize].conn.as_mut() else {
             return;
         };
@@ -589,7 +604,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
                 c.proxy = None;
                 c.link.end_handshake(Some((buffer, consumed)));
                 let result = super::engine::proxy_resolved(
-                    &shared,
+                    shared,
                     &mut c.link,
                     &c.listener,
                     &mut c.source,
@@ -1511,6 +1526,9 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
+        if list.is_empty() {
+            return;
+        }
         for index in &list {
             let index = *index;
             let Some(c) = self.conn(index) else { continue };
@@ -1538,9 +1556,12 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
     }
 
     fn take_posted(&mut self) {
-        let shared = self.shared.clone();
+        let shared = self.shared;
         let ws = &shared.workers[self.idx];
-        ws.completer.wake_pending.store(false, Ordering::Release);
+        // Read first: this runs on every turn, and a write would own the line.
+        if ws.completer.wake_pending.load(Ordering::Acquire) {
+            ws.completer.wake_pending.store(false, Ordering::Release);
+        }
         while let Some(p) = ws.completer.ring.pop() {
             match shared.conn_index(p.connection, self.idx as u32) {
                 Some(index) => self.posted(index, p.token, p.value),
@@ -1567,12 +1588,12 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
     }
 
     fn run_commands(&mut self) {
-        let shared = self.shared.clone();
+        let shared = self.shared;
         let ws = &shared.workers[self.idx];
-        let cmd = ws.cmd.swap(0, Ordering::AcqRel);
-        if cmd == 0 {
+        if ws.cmd.load(Ordering::Acquire) == 0 {
             return;
         }
+        let cmd = ws.cmd.swap(0, Ordering::AcqRel);
         if cmd & CMD_SWEEP != 0 {
             self.sweep(|_| true, CloseReason::Drained);
         }
@@ -1713,7 +1734,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
 
     /// Closes the socket, frees the slot, tells everyone. Exactly once per connection.
     fn finish(&mut self, index: u32, reason: CloseReason, registered: bool) {
-        let shared = self.shared.clone();
+        let shared = self.shared;
         let ws = &shared.workers[self.idx];
         let Some(mut c) = self.slots[index as usize].conn.take() else {
             return;
@@ -1769,7 +1790,7 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
         self.open -= 1;
         ws.load.fetch_sub(1, Ordering::Relaxed);
         shared.release(&c.listener, c.source);
-        record_close(&shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
+        record_close(shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
         if let Some(mut session) = c.session.take() {
             let _ = guarded(|| session.on_close(&info, reason));
         }

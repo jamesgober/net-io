@@ -16,13 +16,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use net_io::{
-    AdmitStage, Admitted, ConnectionInfo, Denial, Gate, GateTag, Input, Lane, ListenerSpec,
-    NetError, Refusal, ServerBuilder, Session, SessionContext, Step, TcpConnection, WriteCheck,
+    AdmitStage, Admitted, AllowAll, ConnectionInfo, Denial, DriverKind, Gate, GateTag, Input, Lane,
+    Limits, ListenerSpec, NetError, PrefixPolicy, Refusal, ServerBuilder, Session, SessionContext,
+    Step, TcpConnection, WriteCheck,
 };
 
 const WARM: usize = 2_000;
 const ROUNDS: usize = 20_000;
 const ROUNDS_OF: usize = 7;
+const MANY: [usize; 2] = [64, 256];
+const MANY_ROUNDS: usize = 2_000;
+const CLIENT_THREADS: usize = 8;
 const MSG: usize = 64;
 
 struct Echo;
@@ -123,7 +127,120 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
+/// Round trips per second over `many` connections at once, shared among a few client
+/// threads: one client thread per connection would take the CPU from a reactor's
+/// fewer threads and measure the scheduler.
+fn measure_many(addr: SocketAddr, many: usize) -> f64 {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(CLIENT_THREADS));
+    let threads: Vec<_> = (0..CLIENT_THREADS)
+        .map(|_| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut conns: Vec<TcpStream> = (0..many / CLIENT_THREADS)
+                    .map(|_| {
+                        let c = TcpStream::connect(addr).expect("connect");
+                        c.set_nodelay(true).expect("nodelay");
+                        c
+                    })
+                    .collect();
+                let mut buf = [1u8; MSG];
+                barrier.wait();
+                for _ in 0..MANY_ROUNDS {
+                    for c in &mut conns {
+                        c.write_all(&buf).expect("write");
+                    }
+                    for c in &mut conns {
+                        c.read_exact(&mut buf).expect("read");
+                    }
+                }
+            })
+        })
+        .collect();
+    let start = Instant::now();
+    for t in threads {
+        t.join().expect("client");
+    }
+    (many / CLIENT_THREADS * CLIENT_THREADS * MANY_ROUNDS) as f64 / start.elapsed().as_secs_f64()
+}
+
+/// This process's CPU time so far (Linux; elsewhere 0, and the line is skipped).
+fn cpu_seconds() -> f64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0.0;
+    };
+    let after = stat.rsplit(')').next().unwrap_or("");
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let ticks = |i: usize| {
+        fields
+            .get(i)
+            .and_then(|f| f.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    (ticks(11) + ticks(12)) / 100.0
+}
+
+fn many_connections(many: usize) {
+    let workers: u16 = std::env::var("NET_IO_BENCH_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() as u16));
+    let reactor = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(DriverKind::Reactor)
+        .workers(workers)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    reactor.open_door().expect("open");
+    let pool = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(DriverKind::Blocking)
+        .workers(2 * many as u16)
+        .limits(
+            Limits::builder()
+                .max_per_source(2 * many as u32, PrefixPolicy::DEFAULT)
+                .build()
+                .expect("limits"),
+        )
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    pool.open_door().expect("open");
+    let ip = |s: &net_io::Server| s.listeners()[0].local.socket_addr().expect("ip");
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    let (mut cpu_a, mut cpu_b) = (0.0, 0.0);
+    for _ in 0..ROUNDS_OF {
+        let t0 = cpu_seconds();
+        b.push(measure_many(ip(&pool), many));
+        let t1 = cpu_seconds();
+        a.push(measure_many(ip(&reactor), many));
+        let t2 = cpu_seconds();
+        cpu_b += t1 - t0;
+        cpu_a += t2 - t1;
+    }
+    let (a, b) = (median(a), median(b));
+    let trips = (many / CLIENT_THREADS * CLIENT_THREADS * MANY_ROUNDS * ROUNDS_OF) as f64;
+    if cpu_a > 0.0 {
+        println!(
+            "CPU per round trip, both ends: blocking {:.1} us, reactor {:.1} us",
+            cpu_b / trips * 1e6,
+            cpu_a / trips * 1e6
+        );
+    }
+    println!("B-1 echo, {MSG} B, {many} connections at once (loopback, medians)");
+    println!("net-io blocking pool        {b:>9.0} rt/s");
+    println!(
+        "net-io reactor              {a:>9.0} rt/s  {:.2}x blocking",
+        a / b
+    );
+}
+
 fn main() {
+    for many in MANY {
+        many_connections(many);
+    }
     // Start every server first, then measure them in rotating order over several
     // rounds and report medians: on a multi-die CPU, where the scheduler places the
     // client and server threads moves single runs by 2x, in either direction.
@@ -136,12 +253,21 @@ fn main() {
         .build()
         .expect("build");
     gated.open_door().expect("open");
+    let pool = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(DriverKind::Blocking)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    pool.open_door().expect("open");
     let ip = |s: &net_io::Server| s.listeners()[0].local.socket_addr().expect("ip");
     let targets = [
         ("std thread per connection", std_echo()),
         ("net-io blocking handler", ip(&blocking)),
         ("net-io sessions (AllowAll)", ip(&sessions)),
         ("net-io sessions (one atomic)", ip(&gated)),
+        ("net-io sessions (blocking)", ip(&pool)),
     ];
     let mut results: Vec<Vec<(f64, Duration, Duration)>> = vec![Vec::new(); targets.len()];
     for round in 0..ROUNDS_OF {

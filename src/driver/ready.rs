@@ -169,6 +169,19 @@ impl ReadyDriver {
         }
     }
 
+    /// Moves what finished without the OS into `out`.
+    pub(crate) fn take_local(&mut self, out: &mut Completions) -> usize {
+        let mut n = 0;
+        while out.has_room() {
+            let Some(c) = self.local.pop_front() else {
+                break;
+            };
+            out.push(c);
+            n += 1;
+        }
+        n
+    }
+
     fn on_event(regs: &mut [Option<Reg>], local: &mut VecDeque<Completion>, e: PollEvent) {
         let token = Token(e.key);
         let Some(reg) = regs
@@ -296,15 +309,7 @@ impl Driver for ReadyDriver {
         } else {
             self.skipped += 1;
         }
-        let mut n = 0;
-        while out.has_room() {
-            let Some(c) = self.local.pop_front() else {
-                break;
-            };
-            out.push(c);
-            n += 1;
-        }
-        Ok(n)
+        Ok(self.take_local(out))
     }
 
     fn cancel(&mut self, token: Token, which: OperationKind) -> Result<(), NetError> {

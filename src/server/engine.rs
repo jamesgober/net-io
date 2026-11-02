@@ -208,6 +208,9 @@ impl WorkerStats {
     }
 }
 
+// Aligned past a cache line and its prefetched neighbour: each worker writes its own
+// counters on every event, and must not take the next worker's line with it.
+#[repr(align(128))]
 pub(crate) struct WorkerShared {
     slot: Arc<KillSlot>,
     wake: Arc<Wake>,
@@ -234,6 +237,11 @@ pub(crate) struct WorkerShared {
     #[cfg(feature = "reactor")]
     pub(crate) waker: OnceLock<DriverWaker>,
 }
+
+/// A worker's inbox, on cache lines of its own: its owner locks it on every turn.
+#[cfg(feature = "reactor")]
+#[repr(align(128))]
+struct Inbox<T>(Mutex<VecDeque<T>>);
 
 /// Where the reactor finds an open connection by id.
 #[cfg(feature = "reactor")]
@@ -1243,7 +1251,7 @@ pub(crate) struct Engine<W, G: Gate> {
     pub(crate) limits: Effective,
     /// One bounded inbox per reactor worker.
     #[cfg(feature = "reactor")]
-    inboxes: Vec<Mutex<VecDeque<Job<G::Ticket>>>>,
+    inboxes: Vec<Inbox<Job<G::Ticket>>>,
     /// Each reactor worker's driver, until its thread takes it.
     #[cfg(feature = "reactor")]
     drivers: Mutex<Vec<Option<Backend>>>,
@@ -1261,6 +1269,7 @@ impl<W, G: Gate> Engine<W, G> {
 
     pub(crate) fn next_inbox(&self, idx: usize) -> Option<Job<G::Ticket>> {
         self.inboxes[idx]
+            .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pop_front()
@@ -1268,6 +1277,7 @@ impl<W, G: Gate> Engine<W, G> {
 
     pub(crate) fn inbox_empty(&self, idx: usize) -> bool {
         self.inboxes[idx]
+            .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .is_empty()
@@ -1287,6 +1297,7 @@ impl<W, G: Gate> Engine<W, G> {
             .map_or(0, |(i, _)| i);
         {
             let mut inbox = self.inboxes[idx]
+                .0
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if inbox.len() >= INBOX_MAX {
@@ -1431,7 +1442,7 @@ where
         shared: shared.clone(),
         #[cfg(feature = "reactor")]
         inboxes: (0..backends.len())
-            .map(|_| Mutex::new(VecDeque::new()))
+            .map(|_| Inbox(Mutex::new(VecDeque::new())))
             .collect(),
         #[cfg(feature = "reactor")]
         drivers: Mutex::new(backends),
