@@ -1,5 +1,7 @@
 //! Reactor behaviour the blocking driver has no counterpart for.
 
+#![cfg(feature = "reactor")]
+
 mod common;
 
 use std::io::Write;

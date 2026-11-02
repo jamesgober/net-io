@@ -48,7 +48,7 @@ fn test_echo_through_the_public_interface() {
     let mut pool = BufferPool::standalone(1 << 20);
     let mut done = Completions::new();
     let (mut client, server) = pair();
-    let token = Token(1 << 32 | 3);
+    let token = Token((1 << 32) | 3);
     driver.register(borrowed(&server), token).expect("register");
 
     client.write_all(b"ping").expect("write");

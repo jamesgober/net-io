@@ -210,7 +210,7 @@ mod codes {
     pub const ENOBUFS: i32 = 105;
     pub const EBADF: i32 = 9;
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod codes {
     pub const ENFILE: Option<i32> = Some(23);
     pub const ECONNABORTED: i32 = 53;
@@ -358,7 +358,7 @@ fn test_spurious_would_block_recovers_at_the_next_edge() {
 fn test_keepalive_timeout_is_an_io_error_not_a_deadline() {
     #[cfg(target_os = "linux")]
     const ETIMEDOUT: i32 = 110;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     const ETIMEDOUT: i32 = 60;
     #[cfg(windows)]
     const ETIMEDOUT: i32 = 10060;

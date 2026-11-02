@@ -13,6 +13,52 @@
 
 ---
 
+## [0.5.0] - 2026-11-02
+
+Feature complete: the reactor on every platform, and Windows as a full peer of
+Unix for local sockets and restarts.
+
+### Added
+
+- The reactor: one event loop per worker on epoll (Linux), kqueue (macOS,
+  FreeBSD), and I/O completion ports (Windows). `DriverKind::Auto` now picks it
+  for sessions; a `BlockingHandler` stays on the pool. Sessions, PROXY, TLS,
+  drain, kill, control-line sheds, and `Completer` all run on it.
+- The timing wheel: six levels, lazy extension, tickless, never early.
+- `new_reactor_driver` and the public `Driver` interface (Tier 3, unstable until
+  1.0): register, submit, wait, cancel, deregister, a waker, and operations that
+  own their buffers until the completion hands them back.
+- Windows named pipes: `PipeListener`, `PipeConnection`, `PipeOptions`,
+  `PipeSecurity`, `ListenerSpec::pipe`, and `listen_local` / `connect_local` on
+  Windows. Owner-only by default, remote clients always rejected, a name another
+  process took is an error, and pipes have the limits, deadlines, kill handle,
+  and gate of a socket on both drivers.
+- AF_UNIX on Windows: `UnixListener`, `UnixConnection`, `ListenerSpec::unix`.
+- The Windows hand-off: `share_listeners`, `SharedListeners`, `receive_shared`,
+  with a nonce that makes each hand-off work once.
+- Happy Eyeballs: `ConnectOptions::happy_eyeballs` and `attempt_delay`.
+- FreeBSD, tested in a VM in CI.
+- `docs/ARCHITECTURE.md`, and the examples `named_pipe` and `offload_completer`.
+
+### Changed
+
+- An idle reactor connection holds no buffer, in any phase: an empty input goes
+  back to the pool. `Limits` and rate settings are shared between connections,
+  and TLS state is boxed, so a connection's state is 848 bytes.
+- An empty buffer budget pauses a reactor connection's reads instead of closing
+  it: TCP pushes back on the peer, and the read deadline keeps running. Setting
+  up a PROXY or TLS handshake on an empty budget still closes with
+  `Limit(BufferBudget)`, since nothing has been accepted yet.
+- `Operation::Close { abortive }` is honoured on every driver.
+- A kill cancels overlapped IO on Windows.
+
+### Fixed
+
+- `descriptor_limit` no longer takes an unlimited macOS or FreeBSD descriptor limit
+  for a number.
+
+---
+
 ## [0.4.0] - 2026-10-29
 
 Edges: everything around the TCP core that a real deployment meets. Behind a

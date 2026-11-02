@@ -343,6 +343,7 @@ mod loom_tests {
                 state: AtomicU64::new((1 << GEN_SHIFT) | ACTIVE),
                 raw: AtomicU64::new(3),
                 wake: Mutex::new(None),
+                sink: Mutex::new(None),
             });
             let closed = loom::sync::Arc::new(AtomicBool::new(false));
             let (s2, c2) = (slot.clone(), closed.clone());

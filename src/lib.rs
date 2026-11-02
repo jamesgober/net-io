@@ -45,10 +45,12 @@
 //!
 //! ## Status
 //!
-//! `0.4.0`: TCP, Unix domain sockets, and UDP on the blocking driver (Linux,
-//! macOS, Windows; Unix sockets and hand-off on Unix), the PROXY protocol, the
-//! TLS seam on listeners, systemd and FastCGI inheritance, and listener
-//! hand-off. The reactor and Windows named pipes arrive in `0.5.0`.
+//! `0.5.0`: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
+//! Linux, macOS, FreeBSD, and Windows. TCP, Unix domain sockets (AF_UNIX on
+//! Windows), Windows named pipes, and UDP; the PROXY protocol, the TLS seam,
+//! systemd and FastCGI inheritance, listener hand-off on Unix and Windows, and
+//! the public [`Driver`] interface. Performance work and the remaining P2 items
+//! come in `0.6.0`.
 
 #![doc(html_root_url = "https://docs.rs/net-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]

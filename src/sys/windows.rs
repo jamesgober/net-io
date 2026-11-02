@@ -172,6 +172,7 @@ pub(super) struct Overlapped {
 }
 
 /// `WSAPROTOCOL_INFOW`.
+#[cfg(any(feature = "reactor", feature = "local"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct WsaProtocolInfo {
@@ -199,6 +200,7 @@ pub(super) struct WsaProtocolInfo {
 }
 
 const _: () = assert!(size_of::<SockaddrIn>() == 16);
+#[cfg(any(feature = "reactor", feature = "local"))]
 const _: () = assert!(size_of::<WsaProtocolInfo>() == 628);
 const _: () = assert!(size_of::<SockaddrIn6>() == 28);
 const _: () = assert!(size_of::<Linger>() == 4);
@@ -968,7 +970,7 @@ pub(crate) fn wait_writable(socks: &[Sock<'_>], timeout: Duration) -> io::Result
         .iter()
         .enumerate()
         .filter(|(_, f)| f.revents != 0)
-        .fold(0, |mask, (i, _)| mask | 1 << i))
+        .fold(0, |mask, (i, _)| mask | (1 << i)))
 }
 
 /// Waits until `sock` is ready for `interest`, `wake` fires, or `timeout` passes.

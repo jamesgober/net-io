@@ -143,6 +143,31 @@ Exit: 10,000 idle connections held on each OS with bounded memory, and throughpu
 | Completeness | every P0 and P1 item shipped |
 | Docs | `docs/ARCHITECTURE.md` draft; examples `named_pipe.rs`, `offload_completer.rs` |
 
+Done:
+- [x] The timing wheel: six levels, lazy extension, tickless, never early; cases 53 to 60; B-8 (D-105).
+- [x] The reactor on epoll, kqueue, and IOCP with sessions, PROXY, TLS, drain, kill, sheds, and `Completer` (D-103 to D-112).
+- [x] `Driver` public, with `new_reactor_driver` (D-121).
+- [x] Reads pause on an empty buffer budget, case 11 (D-111).
+- [x] Windows: named pipes (D-113, D-114), AF_UNIX (D-115), the hand-off (D-116); cases 62 to 66, 68, 69, 86 to 89, 104, 105.
+- [x] Happy Eyeballs (D-117); FreeBSD in CI (D-118); ASan and TSan jobs; every suite on the pool with `net_io_force_blocking` (D-120).
+- [x] `docs/ARCHITECTURE.md` draft; examples `named_pipe`, `offload_completer`.
+
+Exit criteria, as met:
+
+| Criterion | Status |
+|---|---|
+| 10,000 idle connections held on each OS with bounded memory | `tests/idle.rs`: 1,730 bytes of heap each on Linux, 1,840 on Windows, no read buffers; the `idle` CI job runs it on Linux, macOS, and Windows. Kernel memory per socket is the OS's |
+| Throughput at or above the blocking driver for active connections | Windows: met, 1.11x at 64 connections and 1.63x at 256. Linux: **missed** on the only machine measured, a WSL2 guest under load 45 to 65 (0.25x at 64); one connection costs 8.5 us against 7.8 us. See register R-20; the `bench` CI job records a quiet-runner number with each change |
+| Windows hand-off refuses zero connections under load | `windows_handoff::handoff_between_processes_refuses_nothing_under_load`, in CI |
+| Every P0 and P1 item in `docs/API.md` and tested | yes, except `send_file` and what the API marks for later |
+
+Moved to a later version (anti-deferral record):
+
+| Item | To | Reason |
+|---|---|---|
+| Std-only fallback for other targets | 0.6 | D-119: needs a cfg alias across about 70 sites and a CI run of its own; no consumer needs another target; the compile error says so |
+| Linux throughput at many connections | 0.6 | it is the 0.6 milestone's subject, and it needs a machine that is not shared to measure (R-20) |
+
 ## v0.6.0 - Optimisation
 Exit: every benchmark meets the 1.2x gate against the best Rust competitor at equal or stronger security, or the miss is recorded with James's written decision; no regression over 5% between 0.5 and 0.6 baselines; every P2 item shipped or moved here with a reason.
 
@@ -210,7 +235,7 @@ Every entry is revisited in the 0.9.x polish milestone. Add an entry in the same
 | R-3 | 0.3 | missed target | B-2 goal of 1.2x the std thread-per-connection server | 0.3 baseline at parity within noise; goal moved to 0.6 | 0.6 harness, then 0.9.x |
 | R-4 | 0.3 | platform note | Windows send-buffer autotuning lets a peer that never reads absorb tens of MiB before the write timeout; operators must set `ListenOptions::send_buffer` | documented in `docs/PLATFORM-NOTES.md` | consider a bounded default for internet-facing listeners |
 | R-5 | 0.3 | platform note | Windows: each worker's wake channel holds one loopback UDP port; many servers in one process can hit `WSAENOBUFS` | documented | reactor (0.5) wake mechanism |
-| R-6 | 0.3 | deferred | timing wheel, appendix A cases 53 to 60, benchmark B-8, case 11 (reads pause on an empty budget), FreeBSD and the std-only fallback | moved to 0.5 (D-063, D-064) | 0.5 |
+| R-6 | 0.3 | deferred | timing wheel, appendix A cases 53 to 60, benchmark B-8, case 11 (reads pause on an empty budget), FreeBSD and the std-only fallback | all done in 0.5 except the fallback (D-119) | fallback at 0.6 |
 | R-7 | 0.4 | platform note | macOS has no atomic close-on-exec for accepted, received, or inherited descriptors (a fork plus exec on another thread can inherit one) | documented | check current macOS for a race-free option |
 | R-8 | 0.4 | platform note | a refusal that writes bytes is followed by RST; Windows discards unread bytes on RST, so a Windows peer may not see the refusal | documented; the RST is deliberate (threat T-44) | measure a FIN close under refusal floods; decide |
 | R-9 | 0.4 | platform note | UDP truncation reports the copied length on macOS and Windows (the real length only on Linux) | documented | check `recvmsg` options on current OS versions |
@@ -221,6 +246,14 @@ Every entry is revisited in the 0.9.x polish milestone. Add an entry in the same
 | R-14 | 0.4 | missed criterion | TLS served through tls-net was not built against 0.4 here; net-io's side is tested with a test engine | tls-net's release step | integration test with the published tls-net |
 | R-15 | 0.4 | missed criterion | FastCGI descriptor 0 tested by emulating `mod_fcgid`, not under a real FastCGI manager | no manager on the build host | run under `mod_fcgid` or `spawn-fcgi` once |
 | R-16 | 0.4 | deferred | hash-flooding chain test for the per-source tables (threat T-22) | `std` keyed SipHash in use | 0.7 hardening |
-| R-17 | 0.4 | deferred | Windows hand-off, edge cases 104 and 105 | scheduled | 0.5 |
+| R-17 | 0.4 | deferred | Windows hand-off, edge cases 104 and 105 | closed in 0.5 (D-116) | closed |
 | R-18 | 0.5 | missed target | an idle reactor connection's state is 848 bytes on 64-bit Linux, against the 512-byte estimate (1,384 before limits and rate settings were shared and TLS state boxed) | what remains is state read at the next event: boxing it adds one allocation per connection and a pointer per event, and no buffer is held while idle, so 10,000 idle connections cost about 8.5 MB here plus the kernel's sockets | retry at the 0.9 tuning pass with measured allocation cost |
 | R-19 | 0.5 | deferred | the reactor's accept path keeps one accept thread per listener; `EPOLLEXCLUSIVE` (one listener in every worker's epoll) is not done | a socket crosses threads once per connection; admission is shared with the blocking driver | measure against B-1 at 0.6 |
+| R-20 | 0.5 | missed criterion | reactor throughput below the blocking pool on Linux at many connections: 0.25x at 64 on a WSL2 guest under load 45 to 65. CPU per round trip 31 us against 11 us with 32 workers, 17 us with 4 | hypothesis: epoll wakes without the synchronous hint on kernels before 6.13, so a worker runs on another, busy CPU. Method at 0.6: measure on a quiet Linux host and on 6.13 or later, then try a short poll before sleeping, `SO_INCOMING_CPU` placement, and `EPOLLEXCLUSIVE`, each with its CPU cost when idle | 0.6, first item |
+| R-21 | 0.5 | missed target | B-8: timer insert 26 to 30 ns (target 20), lazy extend 4 to 5 ns (target 2) | measured under load; not visible in B-2 | 0.6 harness |
+| R-22 | 0.5 | missed target | Windows reactor: 4 system calls per round trip (target 3): the zero-byte receive after each exchange | one idle buffer saved per connection; hypothesis: keep a real receive pending for a connection active in the last tick, cancelling on the idle timer, with its cost in pinned buffers | 0.6 |
+| R-23 | 0.5 | accepted gap | pipe and Windows AF_UNIX listeners cannot be handed off; `release_listeners` reports `Unsupported` for them | a pipe has no socket to duplicate; a new process can create the next instance under the same name, which needs its own overlap design | revisit with a consumer |
+| R-24 | 0.5 | accepted gap | FreeBSD `peer_credentials` gives no pid | `xucred::cr_pid` exists from 13; D-118 | 0.9.x |
+| R-25 | 0.5 | accepted gap | a pipe on the reactor writes one chunk per system call (no gather) | IPC volume; short sends are handled | measure at 0.6 |
+| R-26 | 0.5 | platform note | Windows AF_UNIX: a replaced socket file is removed by the old listener's `Drop` (no identity check; std has no stable file id) | documented | re-check with `GetFileInformationByHandle` at 0.9.x |
+| R-27 | 0.5 | deferred | std-only fallback for other targets (D-119) | moved from 0.5 | 0.6 |

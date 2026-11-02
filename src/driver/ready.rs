@@ -570,7 +570,7 @@ mod tests {
     fn test_stale_token_events_and_deregister() {
         let mut d = ReadyDriver::new(8).unwrap();
         let (mut c, s) = pair();
-        let old = Token(1 << 32 | 6);
+        let old = Token((1 << 32) | 6);
         d.register(s.as_fd(), old).unwrap();
         d.submit(Operation::ReceiveZero { token: old }).unwrap();
         d.deregister(old).unwrap();
@@ -581,7 +581,7 @@ mod tests {
             0
         );
         // The same slot under a new generation does not answer to the old token.
-        d.register(s.as_fd(), Token(2 << 32 | 6)).unwrap();
+        d.register(s.as_fd(), Token((2 << 32) | 6)).unwrap();
         assert!(d.submit(Operation::ReceiveZero { token: old }).is_err());
     }
 

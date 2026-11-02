@@ -1,8 +1,10 @@
 //! An idle connection on the reactor costs state, not buffers.
 //!
 //! Its own test binary: it installs an allocator that tracks live bytes. The count
-//! is `NET_IO_IDLE_CONNECTIONS` (default 400, within a stock descriptor limit); the
-//! `Idle connections` CI job runs 10,000 under a raised limit.
+//! is `NET_IO_IDLE_CONNECTIONS` (default 100, within a stock descriptor limit); the
+//! `idle` CI job runs 10,000 under a raised limit.
+
+#![cfg(feature = "reactor")]
 
 mod common;
 
@@ -59,7 +61,7 @@ fn test_idle_connections_hold_no_buffers() {
     let count: u32 = std::env::var("NET_IO_IDLE_CONNECTIONS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(400);
+        .unwrap_or(100);
     let limits = Limits::builder()
         .max_connections(count + 16)
         .max_per_source(count + 16, PrefixPolicy::DEFAULT)

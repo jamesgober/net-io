@@ -10,6 +10,9 @@
 //! need; epoll and kqueue adapt by making the non-blocking call when readiness
 //! arrives. Cancellation always ends in exactly one completion.
 
+// Without the reactor only the vocabulary is left, for the public interface.
+#![cfg_attr(not(feature = "reactor"), allow(dead_code, unused_imports))]
+
 #[cfg(all(feature = "reactor", windows))]
 pub(crate) mod iocp;
 #[cfg(all(feature = "reactor", unix))]

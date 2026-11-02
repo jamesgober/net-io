@@ -359,10 +359,12 @@ impl Shared {
         }
     }
 
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
     pub(crate) fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)
     }
 
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
     pub(crate) fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Acquire)
     }
@@ -961,6 +963,7 @@ pub(crate) struct ListenerProxy {
 impl ListenerProxy {
     /// A TCP peer must be a trusted proxy; on a Unix socket listener the file's
     /// permissions already decided who may connect.
+    #[cfg_attr(not(any(feature = "reactor", feature = "proxy")), allow(dead_code))]
     pub(crate) fn is_trusted(&self, info: &ConnectionInfo) -> bool {
         match (&self.trusted, info.peer.socket_addr()) {
             (Some(list), Some(peer)) => list.contains(peer.ip()),

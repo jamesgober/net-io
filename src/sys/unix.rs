@@ -1176,7 +1176,7 @@ pub(crate) fn wait_writable(socks: &[Sock<'_>], timeout: Duration) -> io::Result
         .iter()
         .enumerate()
         .filter(|(_, f)| f.revents != 0)
-        .fold(0, |mask, (i, _)| mask | 1 << i))
+        .fold(0, |mask, (i, _)| mask | (1 << i)))
 }
 
 /// Shuts the read side of a raw socket. Used only by the kill guard.
@@ -2271,6 +2271,7 @@ mod layout {
         let expected = if r.rlim_cur == libc::RLIM_INFINITY {
             None
         } else {
+            #[allow(clippy::unnecessary_cast)] // i64 on FreeBSD
             Some(r.rlim_cur as u64)
         };
         assert_eq!(descriptor_limit(), expected);

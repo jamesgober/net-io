@@ -505,8 +505,8 @@ mod tests {
         for mut d in both() {
             let (_c, s) = pair();
             let (_c2, s2) = pair();
-            let old = Token(7 | 1 << 32);
-            let new = Token(7 | 2 << 32);
+            let old = Token(7 | (1 << 32));
+            let new = Token(7 | (2 << 32));
             d.register(s.as_socket(), old).unwrap();
             d.submit(Operation::Receive {
                 token: old,

@@ -37,7 +37,7 @@ Costs are estimates (`[est.]`) until measured in `0.6.0`. Test names are `tests/
 | T-15 | a partial response leaking before a denial | denial bytes only before the response started | none | `close_reasons::reason_egress_denied` |
 | T-16 | residual request data in reused buffers | wipe on release (default on) | 50 to 100 ns per 2 KiB [est.] | `src/buf.rs::test_pool_reuses_and_wipes` |
 | T-17 | kill races (double close, reused descriptor) | a closing flag set by compare-and-swap; only the owner closes; generations | one CAS per close | `src/sys/kill.rs` loom models, `edge::edge_129_kill_from_many_threads_closes_once` |
-| T-18 | use after free on cancelled completions (IOCP, io_uring) | buffers owned until the completion is reaped | none | 0.5 (IOCP), after 1.0 (io_uring) |
+| T-18 | use after free on cancelled completions (IOCP, io_uring) | an operation and its buffers are owned by the kernel until the packet is dequeued | none | `src/driver/iocp.rs::test_cancel_completes_once_with_the_buffer`, `test_stale_packet_is_dropped`, `test_blocked_send_cancels_with_its_chunks`; io_uring after 1.0 |
 | T-19 | an accept storm starving established connections | accept batch per wake-up | none | load test in 0.6 |
 | T-20 | an offload flood filling completion queues | bounded ring, `Full`, park deadline | none | `src/completer.rs::test_ring_many_producers_never_exceeds_capacity` |
 | T-21 | the event sink as a bottleneck | coalescing above 1,000 events per second per kind | one counter | `src/events.rs::test_coalescer_folds_above_threshold` |
@@ -49,7 +49,7 @@ Costs are estimates (`[est.]`) until measured in `0.6.0`. Test names are `tests/
 | T-27 | a pipe client impersonated by a malicious server | `SECURITY_SQOS_PRESENT` with identification level | none | 0.5 |
 | T-28 | remote access to a local pipe | `PIPE_REJECT_REMOTE_CLIENTS` always | none | 0.5 |
 | T-29 | hand-off channel abuse | peer uid and pid, magic, version, length, CRC32C, descriptor count, per-descriptor verification against the manifest address, all or nothing | under 1 ms per hand-off [est.] | `src/handoff.rs::test_count_mismatch_truncation_timeout_and_peer`, `src/handoff.rs::test_address_must_match_the_manifest`, `src/handoff.rs::test_manifest_rejects_damage`; fuzz target `manifest` |
-| T-30 | Windows hand-off to the wrong process, or a replayed hand-off | target pid, pipe client pid, single-use nonce | one lookup per hand-off | 0.5 |
+| T-30 | Windows hand-off to the wrong process, or a replayed hand-off | target pid, the pipe's far-end pid, single-use nonce | one lookup per hand-off | `src/handoff.rs::test_a_hand_off_works_once`, `test_wrong_peer_and_bad_checksum` |
 | T-31 | descriptor leak into child processes | close-on-exec on every socket and every received or inherited descriptor | none (macOS window documented below) | `src/sys/unix.rs::test_descriptors_cross_a_socket_pair` (received descriptors are close-on-exec), `leak::test_no_descriptor_leaks` |
 | T-32 | `SIGPIPE` killing the process | `MSG_NOSIGNAL` (Linux), `SO_NOSIGPIPE` (macOS) | none | `edge::edge_21_22_peer_gone_mid_write_is_peer_reset_without_a_signal` |
 | T-33 | systemd variables meant for another process | `LISTEN_PID`, `LISTEN_PIDFDID`, per-descriptor checks before any is taken | none | `src/inherit.rs::test_systemd_protocol`, `cross_process::systemd_socket_activation_with_the_real_tool`; fuzz target `systemd_env` |
@@ -83,3 +83,14 @@ Costs are estimates (`[est.]`) until measured in `0.6.0`. Test names are `tests/
 - Set `trusted_proxies` per listener to exactly the proxies in front of it.
 - Keep buffer wiping on (the default) unless measurements show it matters and no secrets pass through.
 - Send net-io's events to a sink that alerts on `DescriptorPressure`, `ListenerFailed`, and floods of `Refused`.
+
+## Reactor and Windows additions (0.5)
+
+| Measure | Cost | Test |
+|---|---|---|
+| An idle connection pins no buffer, in any phase, so a silent peer costs state only | one more system call per wake-up on Windows; none on epoll or kqueue | `tests/idle.rs`, `tests/reactor.rs` |
+| An empty buffer budget pauses reads instead of failing the connection; the read deadline keeps running | one list entry; a 10 ms retry on that worker while anything waits | `reactor::test_buffer_budget_pauses_reading` |
+| A listener never joins a completion port (D-016), enforced by the driver | one `getsockopt` per registration [est. under 1 us] | `src/driver/iocp.rs::test_listener_is_refused` |
+| Named pipes reject remote clients, are owner-only by default, and detect a squatter through the first instance | one token query per listener | `src/pipe.rs::test_name_in_use_and_next_instance`, `test_security_keeps_this_user_out_when_told_to` |
+| A pipe server can identify a client and cannot impersonate it | none | by the client's `SECURITY_IDENTIFICATION` flag |
+| Windows AF_UNIX refuses mode and owner options rather than ignoring them | none | `windows_unix::test_options_that_do_not_apply_are_refused` |
