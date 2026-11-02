@@ -98,6 +98,8 @@ pub(super) mod c {
     pub const SO_TYPE: i32 = 0x1008;
     pub const TCP_NODELAY: i32 = 0x1;
     pub const TCP_KEEPIDLE: i32 = 3;
+    pub const TCP_MAXRT: i32 = 5;
+    pub const TCP_FASTOPEN: i32 = 15;
     pub const TCP_KEEPCNT: i32 = 16;
     pub const TCP_KEEPINTVL: i32 = 17;
     pub const IP_TTL: i32 = 4;
@@ -595,6 +597,9 @@ pub(crate) struct ListenParams {
     pub send_buffer: Option<u32>,
     pub receive_buffer: Option<u32>,
     pub backlog: u32,
+    pub defer_accept: Option<Duration>,
+    pub fast_open: Option<u32>,
+    pub incoming_cpu: Option<u32>,
 }
 
 /// Creates, configures, binds, and listens. Without `reuse_address`, the socket
@@ -605,6 +610,9 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
             io::ErrorKind::Unsupported,
             "SO_REUSEPORT does not exist on Windows",
         ));
+    }
+    if p.defer_accept.is_some() || p.incoming_cpu.is_some() {
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
     }
     let s = tcp_socket(addr.is_ipv6())?;
     if p.reuse_address {
@@ -629,9 +637,17 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
     bind_to(s.as_socket(), addr)?;
     // SAFETY: `s` is an open, bound stream socket.
     cvt(unsafe { listen(raw(s.as_socket()), clamp_int(p.backlog)) })?;
+    if p.fast_open.is_some() {
+        set_int(s.as_socket(), c::IPPROTO_TCP, c::TCP_FASTOPEN, 1)?;
+    }
     let listener = TcpListener::from(s);
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+/// `TCP_MAXRT`: how long sent bytes may stay unacknowledged, in whole seconds.
+pub(crate) fn set_user_timeout(sock: Sock<'_>, timeout: Duration) -> io::Result<()> {
+    set_int(sock, c::IPPROTO_TCP, c::TCP_MAXRT, secs(timeout).max(1))
 }
 
 /// Binds `sock` to `addr`.
@@ -1410,6 +1426,9 @@ mod layout {
             send_buffer: None,
             receive_buffer: None,
             backlog: 16,
+            defer_accept: None,
+            fast_open: None,
+            incoming_cpu: None,
         };
         let l = tcp_listener("127.0.0.1:0".parse().unwrap(), &p).unwrap();
         assert!(is_listening_stream(l.as_socket()).unwrap());

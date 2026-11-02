@@ -67,7 +67,7 @@ pub(crate) fn bind_error(addr: SocketAddr, e: io::Error) -> NetError {
         AddrFailure::NotAvailable => NetError::AddrNotAvailable { addr },
         AddrFailure::Permission => NetError::PermissionDenied { what: "bind" },
         _ if e.kind() == io::ErrorKind::Unsupported => NetError::Unsupported {
-            feature: "SO_REUSEPORT",
+            feature: "a listen option this OS does not have",
             platform: std::env::consts::OS,
         },
         _ => NetError::Bind { addr, source: e },
@@ -1393,5 +1393,44 @@ mod tests {
         let c = TcpConnection::connect_addrs(&[silent, live.local_addr().unwrap()], &options);
         assert_eq!(c.unwrap().peer_addr(), live.local_addr().unwrap());
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_listen_options_that_an_os_lacks_are_refused() {
+        let bind = |o: ListenOptions| TcpListener::bind_with("127.0.0.1:0", o);
+        let defer = ListenOptions::new().defer_accept(Some(Duration::from_secs(1)));
+        let cpu = ListenOptions::new().incoming_cpu(Some(0));
+        if cfg!(target_os = "linux") {
+            assert!(bind(defer).is_ok());
+            assert!(bind(cpu).is_ok());
+        } else {
+            assert!(matches!(bind(defer), Err(NetError::Unsupported { .. })));
+            assert!(matches!(bind(cpu), Err(NetError::Unsupported { .. })));
+        }
+    }
+
+    /// Fast open is off by default on some hosts, and off means refused or ignored,
+    /// never a broken listener.
+    #[test]
+    fn test_fast_open_listener_still_accepts() {
+        let options = ListenOptions::new().fast_open(Some(16));
+        if let Ok(l) = TcpListener::bind_with("127.0.0.1:0", options) {
+            let addr = l.local_addr().unwrap();
+            let _c = TcpConnection::connect(addr).unwrap();
+            assert!(l.accept().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_user_timeout_where_the_os_has_it() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let options = ConnectOptions::new()
+            .tcp_options(TcpOptions::new().user_timeout(Duration::from_secs(5)));
+        let c = TcpConnection::connect_with(l.local_addr().unwrap(), options);
+        if cfg!(any(target_os = "linux", windows)) {
+            assert!(c.is_ok());
+        } else {
+            assert!(matches!(c, Err(NetError::Unsupported { .. })));
+        }
     }
 }

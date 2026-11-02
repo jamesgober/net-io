@@ -155,6 +155,10 @@ mod c {
     pub const IPV6_UNICAST_HOPS: c_int = 16;
     pub const IPV6_V6ONLY: c_int = 26;
     pub const TCP_NODELAY: c_int = 1;
+    pub const SO_INCOMING_CPU: c_int = 49;
+    pub const TCP_DEFER_ACCEPT: c_int = 9;
+    pub const TCP_USER_TIMEOUT: c_int = 18;
+    pub const TCP_FASTOPEN: c_int = 23;
     pub const TCP_KEEPIDLE: c_int = 4;
     pub const TCP_KEEPINTVL: c_int = 5;
     pub const TCP_KEEPCNT: c_int = 6;
@@ -224,6 +228,10 @@ mod c {
     pub const IPV6_UNICAST_HOPS: c_int = 4;
     pub const IPV6_V6ONLY: c_int = 27;
     pub const TCP_NODELAY: c_int = 0x1;
+    #[cfg(target_os = "macos")]
+    pub const TCP_FASTOPEN: c_int = 0x105;
+    #[cfg(target_os = "freebsd")]
+    pub const TCP_FASTOPEN: c_int = 1025;
     #[cfg(target_os = "macos")]
     pub const TCP_KEEPALIVE: c_int = 0x10;
     #[cfg(target_os = "macos")]
@@ -689,6 +697,9 @@ pub(crate) struct ListenParams {
     pub send_buffer: Option<u32>,
     pub receive_buffer: Option<u32>,
     pub backlog: u32,
+    pub defer_accept: Option<Duration>,
+    pub fast_open: Option<u32>,
+    pub incoming_cpu: Option<u32>,
 }
 
 /// Creates, configures, binds, and listens, in the order `docs/API.md` gives.
@@ -714,13 +725,75 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
     if let Some(n) = p.receive_buffer {
         set_int(fd.as_fd(), c::SOL_SOCKET, c::SO_RCVBUF, clamp_int(n))?;
     }
+    set_incoming_cpu(fd.as_fd(), p.incoming_cpu)?;
     bind_to(fd.as_fd(), addr)?;
     // SAFETY: `fd` is an open, bound stream socket; listen(2) takes an int backlog.
     cvt(unsafe { listen(fd.as_raw_fd(), clamp_int(p.backlog)) })?;
+    set_defer_accept(fd.as_fd(), p.defer_accept)?;
+    if let Some(queue) = p.fast_open {
+        set_fast_open(fd.as_fd(), queue)?;
+    }
     let listener = TcpListener::from(fd);
     // Listeners are always non-blocking: accepts wait in poll with a wake channel.
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+/// `SO_INCOMING_CPU`: connections to a reuse-port group go to the listener on the
+/// CPU that received them.
+#[cfg(target_os = "linux")]
+fn set_incoming_cpu(sock: Sock<'_>, cpu: Option<u32>) -> io::Result<()> {
+    match cpu {
+        Some(cpu) => set_int(sock, c::SOL_SOCKET, c::SO_INCOMING_CPU, clamp_int(cpu)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_incoming_cpu(_sock: Sock<'_>, cpu: Option<u32>) -> io::Result<()> {
+    match cpu {
+        Some(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
+        None => Ok(()),
+    }
+}
+
+/// `TCP_DEFER_ACCEPT`: `accept` returns once bytes arrive, or after `wait`.
+#[cfg(target_os = "linux")]
+fn set_defer_accept(sock: Sock<'_>, wait: Option<Duration>) -> io::Result<()> {
+    match wait {
+        Some(d) => set_int(sock, c::IPPROTO_TCP, c::TCP_DEFER_ACCEPT, secs(d)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_defer_accept(_sock: Sock<'_>, wait: Option<Duration>) -> io::Result<()> {
+    match wait {
+        Some(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
+        None => Ok(()),
+    }
+}
+
+/// Server fast open: a queue length on Linux, on or off on the BSDs.
+fn set_fast_open(sock: Sock<'_>, queue: u32) -> io::Result<()> {
+    let value = if cfg!(target_os = "linux") {
+        clamp_int(queue)
+    } else {
+        c_int::from(queue != 0)
+    };
+    set_int(sock, c::IPPROTO_TCP, c::TCP_FASTOPEN, value)
+}
+
+/// `TCP_USER_TIMEOUT`: how long sent bytes may stay unacknowledged.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_user_timeout(sock: Sock<'_>, timeout: Duration) -> io::Result<()> {
+    let ms = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
+    set_int(sock, c::IPPROTO_TCP, c::TCP_USER_TIMEOUT, ms)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn set_user_timeout(_sock: Sock<'_>, _timeout: Duration) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// Binds `sock` to `addr`.
@@ -1884,6 +1957,13 @@ mod layout {
         assert_eq!(c::TCP_NODELAY, libc::TCP_NODELAY);
         assert_eq!(c::TCP_KEEPINTVL, libc::TCP_KEEPINTVL);
         assert_eq!(c::TCP_KEEPCNT, libc::TCP_KEEPCNT);
+        assert_eq!(c::TCP_FASTOPEN, libc::TCP_FASTOPEN);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(c::SO_INCOMING_CPU, libc::SO_INCOMING_CPU);
+            assert_eq!(c::TCP_DEFER_ACCEPT, libc::TCP_DEFER_ACCEPT);
+            assert_eq!(c::TCP_USER_TIMEOUT, libc::TCP_USER_TIMEOUT);
+        }
         assert_eq!(c::MSG_DONTWAIT, libc::MSG_DONTWAIT);
         assert_eq!(c::POLLIN, libc::POLLIN);
         assert_eq!(c::POLLOUT, libc::POLLOUT);
@@ -2358,6 +2438,9 @@ mod layout {
             send_buffer: Some(64 * 1024),
             receive_buffer: None,
             backlog: 16,
+            defer_accept: None,
+            fast_open: None,
+            incoming_cpu: None,
         };
         let l = tcp_listener("127.0.0.1:0".parse().unwrap(), &p).unwrap();
         assert!(is_listening_stream(l.as_fd()).unwrap());
