@@ -437,7 +437,7 @@ impl net_io::Session for Echo {
     ) -> net_io::Step {
         // No copy: the filled buffer becomes the output, and an empty one the input.
         let class = input.class();
-        if input.bytes().len() >= 1024 {
+        if input.bytes().len() >= 8 * 1024 && cx.output().is_empty() {
             if let Some(mut swapped) = cx.buffers().take(class) {
                 if input.swap(&mut swapped).is_ok() {
                     return match cx.output().push_buffer(swapped) {

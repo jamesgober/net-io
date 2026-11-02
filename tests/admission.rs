@@ -7,7 +7,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{addr, client, eventually, round_trip};
+use common::{DRIVERS, addr, client, eventually, round_trip};
 use net_io::{
     AdmitStage, Admitted, AllowAll, ConnectionInfo, ControlState, Denial, DriverKind, Gate,
     GateTag, Input, Lane, Limits, ListenerSpec, NetError, Placement, PrefixPolicy, Pressure,
@@ -15,7 +15,6 @@ use net_io::{
 };
 
 const WAIT: Duration = Duration::from_secs(5);
-const DRIVERS: [DriverKind; 2] = [DriverKind::Blocking, DriverKind::Reactor];
 
 struct Echo;
 
@@ -49,7 +48,7 @@ impl Gate for InLane {
 
 #[test]
 fn test_lane_reserve_keeps_slots_for_the_more_important() {
-    for driver in DRIVERS {
+    for &driver in DRIVERS {
         let limits = Limits::builder()
             .max_connections(4)
             .lane_reserve(Lane(0), 3)
@@ -137,7 +136,7 @@ fn test_lockdown_leaves_the_allowed_listener_open() {
 
 #[test]
 fn test_pressure_shrinks_idle_deadlines_and_lets_go() {
-    for driver in DRIVERS {
+    for &driver in DRIVERS {
         let limits = Limits::builder()
             .max_connections(10)
             .max_per_source(10, PrefixPolicy::DEFAULT)
@@ -204,7 +203,7 @@ fn test_placement() {
 
 /// One socket per worker: the group answers on one port, and each socket feeds its
 /// own worker.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "reactor"))]
 #[test]
 fn test_per_worker_listeners() {
     let spec = ListenerSpec::tcp_with("127.0.0.1:0", net_io::ListenOptions::new().per_worker(true));

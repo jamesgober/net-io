@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use common::{addr, eventually};
+use common::{DRIVERS, addr, eventually};
 use net_io::{
-    AdmitStage, Admitted, AllowAll, CloseReason, ConnectionInfo, Denial, DriverKind, Gate, GateTag,
-    Input, Lane, ListenerSpec, NetError, OsErrorClass, Refusal, ServerBuilder, Session,
-    SessionContext, Step, TcpListener, WriteCheck,
+    AdmitStage, Admitted, AllowAll, CloseReason, ConnectionInfo, Denial, Gate, GateTag, Input,
+    Lane, ListenerSpec, NetError, OsErrorClass, Refusal, ServerBuilder, Session, SessionContext,
+    Step, TcpListener, WriteCheck,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -124,7 +124,7 @@ fn expected_reply(len: usize) -> Vec<u8> {
 
 #[test]
 fn test_push_file_on_both_drivers() {
-    for driver in [DriverKind::Blocking, DriverKind::Reactor] {
+    for &driver in DRIVERS {
         // Past one operation's 1 MiB, so the chunks and the partial sends show.
         let len = (5 << 20) / 2;
         let temp = Temp::new(len);
@@ -152,7 +152,7 @@ fn test_push_file_on_both_drivers() {
 
 #[test]
 fn test_push_file_that_ends_early_resets_on_both_drivers() {
-    for driver in [DriverKind::Blocking, DriverKind::Reactor] {
+    for &driver in DRIVERS {
         let temp = Temp::new(1000);
         let file = Arc::new(temp.open());
         let server = ServerBuilder::new()
@@ -208,7 +208,7 @@ impl Gate for Counting {
 /// A byte-counting gate sees each file byte once, whatever the partial sends do.
 #[test]
 fn test_gate_counts_file_bytes_once_on_both_drivers() {
-    for driver in [DriverKind::Blocking, DriverKind::Reactor] {
+    for &driver in DRIVERS {
         let len = 2 << 20;
         let temp = Temp::new(len);
         let file = Arc::new(temp.open());

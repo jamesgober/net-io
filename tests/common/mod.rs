@@ -6,7 +6,14 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use net_io::Server;
+use net_io::{DriverKind, Server};
+
+/// Every driver this build has.
+pub const DRIVERS: &[DriverKind] = if cfg!(feature = "reactor") {
+    &[DriverKind::Blocking, DriverKind::Reactor]
+} else {
+    &[DriverKind::Blocking]
+};
 
 /// The address of a server's first listener.
 pub fn addr(server: &Server) -> SocketAddr {
