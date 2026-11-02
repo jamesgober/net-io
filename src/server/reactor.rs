@@ -416,6 +416,13 @@ impl<F: SessionFactory, G: Gate> Reactor<F, G> {
             let Some(c) = self.slots[index as usize].conn.as_ref() else {
                 return Ok(());
             };
+            #[cfg(all(windows, feature = "local"))]
+            if let Some(handle) = c.link.stream.pipe_handle() {
+                return self
+                    .driver
+                    .register_pipe(handle, token)
+                    .map_err(std::io::Error::from);
+            }
             self.driver
                 .register(c.link.stream.sock(), token)
                 .map_err(std::io::Error::from)

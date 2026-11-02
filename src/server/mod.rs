@@ -164,6 +164,8 @@ pub struct ListenerSpec {
     pub(crate) trusted: Option<Arc<TrustedProxies>>,
     pub(crate) tls: bool,
     pub(crate) unix: Option<(PathBuf, LocalOptions)>,
+    #[cfg(all(windows, feature = "local"))]
+    pub(crate) pipe: Option<(String, crate::pipe::PipeOptions)>,
     pub(crate) adopt: Option<ListenerHandle>,
 }
 
@@ -182,6 +184,8 @@ impl ListenerSpec {
             trusted: None,
             tls: false,
             unix: None,
+            #[cfg(all(windows, feature = "local"))]
+            pipe: None,
             adopt: None,
         }
     }
@@ -191,6 +195,24 @@ impl ListenerSpec {
         ListenerSpec {
             options: Some(options),
             ..ListenerSpec::tcp(addr)
+        }
+    }
+
+    /// A named pipe listener on `\\\\.\\pipe\\<name>` (feature `local`, Windows).
+    /// Remote clients are always rejected, and connections carry `Transport::Pipe`,
+    /// the client's pid, and no IP address: the per-source cap does not apply. With
+    /// `proxy`, every peer is trusted: the pipe's security decides who may connect.
+    ///
+    /// ```no_run
+    /// use net_io::{ListenerSpec, PipeOptions};
+    /// let spec = ListenerSpec::pipe("myapp-control", PipeOptions::new());
+    /// # let _ = spec;
+    /// ```
+    #[cfg(all(windows, feature = "local"))]
+    pub fn pipe(name: &str, options: crate::pipe::PipeOptions) -> ListenerSpec {
+        ListenerSpec {
+            pipe: Some((name.to_owned(), options)),
+            ..ListenerSpec::tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
         }
     }
 
@@ -218,6 +240,8 @@ impl ListenerSpec {
             trusted: None,
             tls: false,
             unix: Some((path.into(), options)),
+            #[cfg(all(windows, feature = "local"))]
+            pipe: None,
             adopt: None,
         }
     }
@@ -247,6 +271,8 @@ impl ListenerSpec {
             trusted: None,
             tls: false,
             unix: None,
+            #[cfg(all(windows, feature = "local"))]
+            pipe: None,
             adopt: Some(handle),
         }
     }

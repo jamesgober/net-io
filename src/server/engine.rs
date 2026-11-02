@@ -1050,6 +1050,15 @@ fn bind_listener(
                 }
             }
         }
+        #[cfg(all(windows, feature = "local"))]
+        if let Some((name, options)) = spec.pipe {
+            let mut listener = crate::pipe::PipeListener::create_with(&name, options)?;
+            listener.set_identity(id, spec.name.clone());
+            listener.set_proxy_mode(spec.proxy);
+            listener.set_tls(spec.tls);
+            let info = listener.info().clone();
+            break 'bound (ListenerRuntime::Pipe(listener), info, TcpOptions::default());
+        }
         #[cfg(all(unix, feature = "local"))]
         if let Some((path, options)) = spec.unix {
             let mut listener = UnixListener::bind_with(&path, options)?;
@@ -1156,15 +1165,21 @@ enum ListenerRuntime {
     Tcp(TcpListener),
     #[cfg(all(unix, feature = "local"))]
     Unix(UnixListener),
+    #[cfg(all(windows, feature = "local"))]
+    Pipe(crate::pipe::PipeListener),
 }
 
 impl ListenerRuntime {
-    fn sock(&self) -> sys::Sock<'_> {
-        match self {
+    /// Until a connection waits, or `wake` fires. A pipe's accept does this itself.
+    fn wait(&self, wake: &sys::Wake) {
+        let sock = match self {
             ListenerRuntime::Tcp(l) => l.std().sock(),
             #[cfg(all(unix, feature = "local"))]
             ListenerRuntime::Unix(l) => std::os::fd::AsFd::as_fd(l.std()),
-        }
+            #[cfg(all(windows, feature = "local"))]
+            ListenerRuntime::Pipe(_) => return,
+        };
+        let _ = sys::wait(sock, Interest::Read, Some(wake), None);
     }
 
     fn info(&self) -> &ListenerInfo {
@@ -1172,6 +1187,8 @@ impl ListenerRuntime {
             ListenerRuntime::Tcp(l) => l.info(),
             #[cfg(all(unix, feature = "local"))]
             ListenerRuntime::Unix(l) => l.info(),
+            #[cfg(all(windows, feature = "local"))]
+            ListenerRuntime::Pipe(l) => l.info(),
         }
     }
 
@@ -1186,6 +1203,8 @@ impl ListenerRuntime {
                 l.keep_file();
                 Ok(dup)
             }
+            #[cfg(all(windows, feature = "local"))]
+            ListenerRuntime::Pipe(_) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }
 }
@@ -1546,6 +1565,17 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     }
                     other => other.without_conn(),
                 },
+                #[cfg(all(windows, feature = "local"))]
+                ListenerRuntime::Pipe(l) => match l.accept_or_wake(&wake) {
+                    Ok(Some(stream)) => {
+                        engine.admit_pipe(l, stream, conf, &mut ids, &view, &mut coalescer);
+                        continue;
+                    }
+                    // The wake: the top of the loop decides what it meant.
+                    Ok(None) => break,
+                    // Out of instances or handles: the same pause as out of descriptors.
+                    Err(_) => acceptor.pause(),
+                },
             };
             match outcome {
                 Accepted::Conn(()) => {}
@@ -1554,7 +1584,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     class,
                 }),
                 Accepted::Again => {
-                    let _ = sys::wait(rt.sock(), Interest::Read, Some(&wake), None);
+                    rt.wait(&wake);
                     break;
                 }
                 Accepted::Pause(backoff) => {
@@ -1683,6 +1713,36 @@ impl<W, G: Gate> Engine<W, G> {
                     credentials,
                     at,
                 ))
+            },
+        );
+    }
+
+    /// A named pipe client: no address, so no per-source cap.
+    #[cfg(all(windows, feature = "local"))]
+    fn admit_pipe(
+        &self,
+        listener: &crate::pipe::PipeListener,
+        stream: sys::PipeStream,
+        conf: &Arc<ListenerConf>,
+        ids: &mut IdBlock,
+        view: &ControlView,
+        co: &mut Coalescer,
+    ) {
+        let stream = sys::Stream::Pipe(stream);
+        let next = &mut || ids.issue();
+        let stage = AdmitStage::Accept;
+        let _ = self.admit_one(
+            stream,
+            None,
+            None,
+            conf,
+            next,
+            view,
+            co,
+            stage,
+            |stream, cid, at| match stream {
+                sys::Stream::Pipe(p) => Some(listener.info_of(p, cid, at)),
+                _ => None,
             },
         );
     }

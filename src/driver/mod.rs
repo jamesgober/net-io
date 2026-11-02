@@ -365,6 +365,38 @@ impl DriverWaker {
     }
 }
 
+/// The reactor driver for this OS: epoll, kqueue, or an I/O completion port.
+/// `capacity` sizes its tables for that many sockets; they grow past it.
+///
+/// One per worker. A token's low 32 bits index a table the driver keeps, so keep
+/// them small and dense, and put a generation in the high 32 bits to catch a
+/// completion for a slot that moved on. On Windows a listener cannot be registered
+/// and `Operation::Accept` is refused (accept from a thread of your own, D-016).
+///
+/// ```
+/// # fn main() -> Result<(), net_io::NetError> {
+/// use std::time::Duration;
+/// use net_io::{Completions, Operation, Token};
+/// let mut driver = net_io::new_reactor_driver(16)?;
+/// driver.submit(Operation::Nop { token: Token(1) }).expect("a no-op is always taken");
+/// let mut done = Completions::new();
+/// assert_eq!(driver.wait(&mut done, Some(Duration::from_secs(1)))?, 1);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// `DriverSetup` when the OS refuses the queue.
+#[cfg(feature = "reactor")]
+pub fn new_reactor_driver(capacity: usize) -> Result<Box<dyn Driver>, NetError> {
+    #[cfg(unix)]
+    let driver = ready::ReadyDriver::new(capacity)?;
+    #[cfg(windows)]
+    let driver = iocp::IocpDriver::new(capacity)?;
+    Ok(Box::new(driver))
+}
+
 /// A driver: one per worker, used from one thread. See the module docs.
 ///
 /// Unstable until `1.0.0`. A socket must stay open from [`Driver::register`] until

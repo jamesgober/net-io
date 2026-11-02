@@ -104,6 +104,32 @@ impl IocpDriver {
         Ok(IocpDriver::on(port, capacity))
     }
 
+    /// As `register`, for a named pipe: a pipe is not a socket, so it has no place
+    /// in the public signature.
+    #[cfg(feature = "local")]
+    pub(crate) fn register_pipe(
+        &mut self,
+        handle: std::os::windows::io::RawHandle,
+        token: Token,
+    ) -> Result<(), NetError> {
+        let i = token.index();
+        if i >= self.regs.len() {
+            self.regs.resize_with(i + 1, || None);
+        }
+        let socket = self
+            .port
+            .associate_pipe(handle)
+            .map_err(|e| NetError::from_os("CreateIoCompletionPort", e))?;
+        self.regs[i] = Some(Reg {
+            token: token.0,
+            socket,
+            recv: None,
+            out: None,
+            close: false,
+        });
+        Ok(())
+    }
+
     fn on(port: Port, capacity: usize) -> IocpDriver {
         IocpDriver {
             port,

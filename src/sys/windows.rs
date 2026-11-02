@@ -15,7 +15,8 @@ use std::io::{self, IoSlice};
 use std::mem::size_of;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::windows::io::{
-    AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, OwnedSocket, RawSocket,
+    AsRawHandle, AsRawSocket, AsSocket, BorrowedSocket, FromRawHandle, FromRawSocket, OwnedHandle,
+    OwnedSocket, RawSocket,
 };
 use std::sync::Once;
 use std::time::Duration;
@@ -155,6 +156,18 @@ struct WsaData {
     sz_system_status: [u8; 129],
 }
 
+/// `OVERLAPPED`. The kernel writes `internal` and `internal_high`.
+#[cfg(any(feature = "reactor", feature = "local"))]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct Overlapped {
+    pub(super) internal: usize,
+    pub(super) internal_high: usize,
+    pub(super) offset: u32,
+    pub(super) offset_high: u32,
+    pub(super) event: usize,
+}
+
 /// `WSAPROTOCOL_INFOW`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -233,6 +246,14 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    fn CreateEventW(
+        attributes: *const c_void,
+        manual: i32,
+        initial: i32,
+        name: *const u16,
+    ) -> *mut c_void;
+    fn SetEvent(event: *mut c_void) -> i32;
+    pub(super) fn CancelIoEx(file: *mut c_void, overlapped: *mut c_void) -> i32;
     fn QueryPerformanceCounter(count: *mut i64) -> i32;
     fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
 }
@@ -806,7 +827,11 @@ pub(crate) fn wait_wake(wake: &Wake, timeout: Option<Duration>) -> io::Result<bo
 /// # Safety
 ///
 /// `raw` must be an open socket for the call.
-pub(crate) unsafe fn shutdown_read_raw(_raw: RawSock) {}
+pub(crate) unsafe fn shutdown_read_raw(raw: RawSock) {
+    // Not found is the usual answer: only a pipe's or a reactor's IO is overlapped.
+    // SAFETY: `raw` is open, by this function's contract; null means all operations.
+    let _ = unsafe { CancelIoEx(raw as usize as *mut c_void, std::ptr::null_mut()) };
+}
 
 fn clamp_int(n: u32) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
@@ -943,10 +968,12 @@ pub(crate) fn descriptor_limit() -> Option<u64> {
     None
 }
 
-/// A wake-up channel: a loopback UDP socket connected to itself.
+/// A wake-up channel: a loopback UDP socket connected to itself, and an event for
+/// the waits that cannot take a socket (named pipes).
 #[derive(Debug)]
 pub(crate) struct Wake {
     socket: UdpSocket,
+    event: OwnedHandle,
     thread: std::sync::OnceLock<std::thread::Thread>,
 }
 
@@ -955,8 +982,15 @@ impl Wake {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.connect(socket.local_addr()?)?;
         socket.set_nonblocking(true)?;
+        // SAFETY: no attributes, no name; an auto-reset event, not signaled.
+        let raw = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
         Ok(Wake {
             socket,
+            // SAFETY: `raw` was just returned, is open, and has no other owner.
+            event: unsafe { OwnedHandle::from_raw_handle(raw) },
             thread: std::sync::OnceLock::new(),
         })
     }
@@ -969,6 +1003,8 @@ impl Wake {
     /// Ends the current or next wait that includes this channel. Never blocks.
     pub(crate) fn wake(&self) {
         let _ = self.socket.send(&[1]);
+        // SAFETY: the event is open while `self` lives.
+        let _ = unsafe { SetEvent(self.event.as_raw_handle()) };
         if let Some(t) = self.thread.get() {
             t.unpark();
         }
@@ -977,6 +1013,18 @@ impl Wake {
     fn drain(&self) {
         let mut buf = [0u8; 64];
         while self.socket.recv(&mut buf).is_ok() {}
+    }
+
+    /// The event a wait on a pipe includes.
+    #[cfg(feature = "local")]
+    pub(super) fn event_raw(&self) -> *mut c_void {
+        self.event.as_raw_handle()
+    }
+
+    /// Consumes a wake seen through the event.
+    #[cfg(feature = "local")]
+    pub(super) fn take(&self) {
+        self.drain();
     }
 }
 

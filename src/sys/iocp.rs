@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::windows::{self as win, Socket, WsaProtocolInfo, c};
+use super::windows::{self as win, Overlapped, Socket, WsaProtocolInfo, c};
 use super::{MAX_SLICES, Sock};
 use crate::buf::Buffer;
 use crate::driver::SendChunks;
@@ -38,6 +38,7 @@ const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 2;
 const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
 const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
 const XP1_IFS_HANDLES: u32 = 0x0002_0000;
+const ERROR_BROKEN_PIPE: i32 = 109;
 const WSAEINVAL: i32 = 10022;
 const WSAENOBUFS: i32 = 10055;
 /// `WSAID_CONNECTEX`, by its fields.
@@ -52,17 +53,6 @@ const WSAID_CONNECTEX: Guid = Guid {
 const ENTRIES: usize = 256;
 /// The key of a wake packet; sockets use 0.
 const WAKE_KEY: usize = usize::MAX;
-
-/// `OVERLAPPED`. The kernel writes `internal` and `internal_high`.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Overlapped {
-    internal: usize,
-    internal_high: usize,
-    offset: u32,
-    offset_high: u32,
-    event: usize,
-}
 
 /// `OVERLAPPED_ENTRY`.
 #[repr(C)]
@@ -119,8 +109,27 @@ unsafe extern "system" {
         key: usize,
         overlapped: *mut Overlapped,
     ) -> i32;
-    fn CancelIoEx(file: Handle, overlapped: *mut Overlapped) -> i32;
     fn SetFileCompletionNotificationModes(file: Handle, flags: u8) -> i32;
+    fn ReadFile(
+        file: Handle,
+        buffer: *mut u8,
+        len: u32,
+        read: *mut u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
+    fn WriteFile(
+        file: Handle,
+        buffer: *const u8,
+        len: u32,
+        written: *mut u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
+    fn GetOverlappedResult(
+        file: Handle,
+        overlapped: *const Overlapped,
+        transferred: *mut u32,
+        wait: i32,
+    ) -> i32;
 }
 
 #[link(name = "ws2_32")]
@@ -185,6 +194,7 @@ struct Op {
     token: u64,
     socket: Socket,
     kind: OpKind,
+    pipe: bool,
     buffer: Option<Buffer>,
     chunks: Option<SendChunks>,
     addr: [u8; 28],
@@ -220,11 +230,16 @@ pub(crate) struct Associated {
     socket: Socket,
     /// A call that succeeds at once queues no packet.
     skip: bool,
+    /// A named pipe's handle: `ReadFile` and `WriteFile` instead of Winsock.
+    pipe: bool,
 }
 
 impl Associated {
     /// A reset instead of a FIN at close.
     pub(crate) fn set_abortive(self) {
+        if self.pipe {
+            return;
+        }
         // SAFETY: open between `register` and `deregister` by the `Driver` contract.
         let sock = unsafe { win::borrow(self.socket) };
         let _ = super::set_linger(sock, Some(Duration::ZERO));
@@ -358,7 +373,37 @@ impl Port {
                     FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
                 )
             } != 0;
-        Ok(Associated { socket, skip })
+        Ok(Associated {
+            socket,
+            skip,
+            pipe: false,
+        })
+    }
+
+    /// Puts a named pipe on this port.
+    #[cfg(feature = "local")]
+    pub(crate) fn associate_pipe(
+        &self,
+        handle: std::os::windows::io::RawHandle,
+    ) -> io::Result<Associated> {
+        // SAFETY: `handle` is open for the call and `port` is a completion port.
+        let ret = unsafe { CreateIoCompletionPort(handle, self.port.as_raw_handle(), 0, 0) };
+        if ret.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above; the flags are documented for any file handle.
+        let skip = self.skip
+            && unsafe {
+                SetFileCompletionNotificationModes(
+                    handle,
+                    FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
+                )
+            } != 0;
+        Ok(Associated {
+            socket: handle as Socket,
+            skip,
+            pipe: true,
+        })
     }
 
     fn op(&mut self, on: Associated, token: u64, kind: OpKind) -> Box<Op> {
@@ -368,6 +413,7 @@ impl Port {
                 token: 0,
                 socket: 0,
                 kind,
+                pipe: false,
                 buffer: None,
                 chunks: None,
                 addr: [0; 28],
@@ -377,6 +423,7 @@ impl Port {
         op.token = token;
         op.socket = on.socket;
         op.kind = kind;
+        op.pipe = on.pipe;
         op
     }
 
@@ -390,6 +437,13 @@ impl Port {
     unsafe fn reclaim(&mut self, raw: *mut Op, result: io::Result<usize>) -> Finished {
         // SAFETY: by this function's contract.
         let mut op = unsafe { Box::from_raw(raw) };
+        // A pipe reports the end of stream as an error.
+        let result = match result {
+            Err(e) if e.raw_os_error() == Some(ERROR_BROKEN_PIPE) && op.kind == OpKind::Receive => {
+                Ok(0)
+            }
+            other => other,
+        };
         if op.kind == OpKind::Connect && result.is_ok() {
             // SAFETY: an option that takes no value; a closed socket makes it fail.
             let _ = unsafe { win::setsockopt_empty(op.socket, SO_UPDATE_CONNECT_CONTEXT) };
@@ -473,15 +527,31 @@ impl Port {
                 buf,
             };
             let mut flags = 0u32;
-            WSARecv(
-                on.socket,
-                &raw const wsa,
-                1,
-                &raw mut moved,
-                &raw mut flags,
-                &raw mut (*raw).overlapped,
-                std::ptr::null_mut(),
-            )
+            if on.pipe {
+                // The kernel writes nothing for length 0, but wants a pointer.
+                let buf = if buf.is_null() {
+                    std::ptr::NonNull::<u8>::dangling().as_ptr()
+                } else {
+                    buf
+                };
+                win_ret(ReadFile(
+                    on.socket as Handle,
+                    buf,
+                    wsa.len,
+                    &raw mut moved,
+                    &raw mut (*raw).overlapped,
+                ))
+            } else {
+                WSARecv(
+                    on.socket,
+                    &raw const wsa,
+                    1,
+                    &raw mut moved,
+                    &raw mut flags,
+                    &raw mut (*raw).overlapped,
+                    std::ptr::null_mut(),
+                )
+            }
         };
         // SAFETY: `ret` is the result of the call above.
         unsafe { self.started(on, raw, ret, moved) }
@@ -523,15 +593,28 @@ impl Port {
                 }
                 None => n,
             };
-            WSASend(
-                on.socket,
-                slices.as_ptr().cast(),
-                n as u32,
-                &raw mut moved,
-                0,
-                &raw mut (*raw).overlapped,
-                std::ptr::null_mut(),
-            )
+            if on.pipe {
+                // No gather on a pipe: one slice per call, and the reactor sends the rest.
+                let first = slices[..n].iter().find(|s| !s.is_empty()).copied();
+                let first = first.unwrap_or(slices[0]);
+                win_ret(WriteFile(
+                    on.socket as Handle,
+                    first.as_ptr(),
+                    u32::try_from(first.len()).unwrap_or(u32::MAX),
+                    &raw mut moved,
+                    &raw mut (*raw).overlapped,
+                ))
+            } else {
+                WSASend(
+                    on.socket,
+                    slices.as_ptr().cast(),
+                    n as u32,
+                    &raw mut moved,
+                    0,
+                    &raw mut (*raw).overlapped,
+                    std::ptr::null_mut(),
+                )
+            }
         };
         // SAFETY: `ret` is the result of the call above.
         unsafe { self.started(on, raw, ret, moved) }
@@ -605,14 +688,14 @@ impl Port {
         };
         // SAFETY: the return values are mapped to the Winsock convention `started`
         // reads, and the call above just ran on this thread.
-        Ok(unsafe { self.started(on, raw, i32::from(ok == 0).wrapping_neg(), 0) })
+        Ok(unsafe { self.started(on, raw, win_ret(ok), 0) })
     }
 
     /// Asks the kernel to end an operation; it still finishes exactly once.
     pub(crate) fn cancel(&self, on: Associated, op: InFlight) -> io::Result<()> {
         // SAFETY: the pointer is only compared; `socket` is open by the `Driver`
         // contract.
-        let ok = unsafe { CancelIoEx(on.socket as Handle, op.0 as *mut Overlapped) };
+        let ok = unsafe { win::CancelIoEx(on.socket as Handle, op.0 as *mut c_void) };
         if ok != 0 {
             return Ok(());
         }
@@ -683,7 +766,13 @@ impl Port {
     }
 }
 
-/// The Winsock error of a failed operation.
+/// A `BOOL` result in the Winsock convention; the error stays in the same slot
+/// (`WSAGetLastError` reads `GetLastError`).
+fn win_ret(ok: i32) -> i32 {
+    if ok != 0 { 0 } else { -1 }
+}
+
+/// The error of a failed operation.
 ///
 /// # Safety
 ///
@@ -693,6 +782,15 @@ unsafe fn op_error(raw: *const Op) -> io::Error {
     // SAFETY: by this function's contract; a closed socket reports its own error, which
     // nobody reads because the connection is gone.
     unsafe {
+        if (*raw).pipe {
+            GetOverlappedResult(
+                (*raw).socket as Handle,
+                &raw const (*raw).overlapped,
+                &raw mut bytes,
+                0,
+            );
+            return io::Error::from_raw_os_error(WSAGetLastError());
+        }
         WSAGetOverlappedResult(
             (*raw).socket,
             &raw const (*raw).overlapped,

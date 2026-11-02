@@ -8,8 +8,9 @@ use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 #[cfg(unix)]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -32,6 +33,8 @@ use crate::limits::Limits;
 use crate::link::{ClockRef, Got, Link, WakeSource};
 #[cfg(unix)]
 use crate::opts::LocalOptions;
+#[cfg(windows)]
+use crate::pipe::{PipeConnection, PipeListener};
 #[cfg(unix)]
 use crate::proxy::ProxyMode;
 #[cfg(unix)]
@@ -886,20 +889,25 @@ macro_rules! inside {
     };
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 macro_rules! inside {
     ($kind:ident, $this:expr, $v:ident => $body:expr) => {
-        match *$this {}
+        match $this {
+            $kind::Pipe($v) => $body,
+        }
     };
 }
 
-/// A local IPC listener: a Unix domain socket (a Windows named pipe from `0.5.0`).
+/// A local IPC listener: a Unix domain socket, or a Windows named pipe.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum LocalListener {
     /// A Unix domain socket.
     #[cfg(unix)]
     Unix(UnixListener),
+    /// A named pipe.
+    #[cfg(windows)]
+    Pipe(PipeListener),
 }
 
 impl LocalListener {
@@ -909,22 +917,26 @@ impl LocalListener {
     ///
     /// As `UnixListener::accept`.
     pub fn accept(&self) -> Result<(LocalConnection, ConnectionInfo), NetError> {
-        inside!(LocalListener, self, l => l
-            .accept()
-            .map(|(c, info)| (LocalConnection::Unix(c), info)))
+        #[cfg(unix)]
+        let wrap = LocalConnection::Unix;
+        #[cfg(windows)]
+        let wrap = LocalConnection::Pipe;
+        inside!(LocalListener, self, l => l.accept().map(|(c, info)| (wrap(c), info)))
     }
 }
 
-/// A local IPC connection: a Unix domain socket (a Windows named pipe from `0.5.0`).
+/// A local IPC connection: a Unix domain socket, or a Windows named pipe.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum LocalConnection {
     /// A Unix domain socket.
     #[cfg(unix)]
     Unix(UnixConnection),
+    /// A named pipe.
+    #[cfg(windows)]
+    Pipe(PipeConnection),
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 impl LocalConnection {
     /// One receive; `Ok(0)` means the peer closed its side.
     ///
@@ -1021,25 +1033,15 @@ impl Write for LocalConnection {
     }
 }
 
-/// Unsupported until named pipes arrive (`0.5.0`).
-#[cfg(not(unix))]
-fn unsupported() -> NetError {
-    NetError::Unsupported {
-        feature: "local sockets (Windows named pipes arrive in 0.5.0)",
-        platform: std::env::consts::OS,
-    }
-}
-
 /// Opens a local IPC listener (see [`crate::listen_local`]).
 pub(crate) fn listen(name: &str) -> Result<LocalListener, NetError> {
     #[cfg(unix)]
     {
         UnixListener::bind(name).map(LocalListener::Unix)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = name;
-        Err(unsupported())
+        PipeListener::create(name).map(LocalListener::Pipe)
     }
 }
 
@@ -1049,10 +1051,9 @@ pub(crate) fn connect(name: &str) -> Result<LocalConnection, NetError> {
     {
         UnixConnection::connect(name).map(LocalConnection::Unix)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = name;
-        Err(unsupported())
+        PipeConnection::connect(name, Duration::from_secs(10)).map(LocalConnection::Pipe)
     }
 }
 

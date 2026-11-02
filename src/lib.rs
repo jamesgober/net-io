@@ -88,6 +88,8 @@ mod link;
 #[cfg(feature = "local")]
 mod local;
 mod opts;
+#[cfg(all(windows, feature = "local"))]
+mod pipe;
 mod proxy;
 #[cfg(feature = "proxy")]
 mod proxy_parse;
@@ -136,6 +138,8 @@ pub use addr::{AddrError, Cidr, PrefixKey, PrefixPolicy, normalize, normalize_so
 pub use buf::{Buffer, BufferPool, PoolStats};
 pub use completer::{Completer, PostError};
 pub use control::{ControlLine, ControlState, NoControl, SimpleControl};
+#[cfg(feature = "reactor")]
+pub use driver::new_reactor_driver;
 pub use driver::{
     BorrowedSocket, Completion, Completions, Driver, DriverKind, DriverWaker, Operation,
     OperationKind, Rejected, SendChunks, Token,
@@ -162,6 +166,8 @@ pub use local::{Descriptors, UnixConnection, UnixListener};
 #[cfg(feature = "local")]
 pub use local::{LocalConnection, LocalListener};
 pub use opts::{Keepalive, Linger, ListenOptions, LocalOptions, SocketOptions, TcpOptions};
+#[cfg(all(windows, feature = "local"))]
+pub use pipe::{PipeConnection, PipeListener, PipeOptions, PipeSecurity};
 pub use proxy::{ProxyError, ProxyFacts, ProxyMode, ProxyVersions};
 #[cfg(feature = "proxy")]
 pub use proxy_parse::{

@@ -47,6 +47,14 @@ pub(crate) struct Acceptor {
 }
 
 impl Acceptor {
+    /// Backs off for a resource shortage seen outside `accept`.
+    #[cfg(all(windows, feature = "local"))]
+    pub(crate) fn pause(&mut self) -> Accepted<()> {
+        let d = self.backoff;
+        self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+        Accepted::Pause(d)
+    }
+
     pub(crate) fn new() -> Acceptor {
         Acceptor {
             #[cfg(unix)]

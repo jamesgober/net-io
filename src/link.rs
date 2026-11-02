@@ -703,11 +703,11 @@ impl Link {
     /// Runs a wait with the right wake channel registered.
     fn wait(&self, interest: Interest, timeout: Duration) -> io::Result<Ready> {
         match &self.wake {
-            WakeSource::Fixed(w) => sys::wait(self.stream.sock(), interest, Some(w), Some(timeout)),
+            WakeSource::Fixed(w) => self.stream.wait(interest, Some(w), Some(timeout)),
             WakeSource::Thread => {
                 let w = thread_wake();
                 self.slot.set_wake(w.clone());
-                let r = sys::wait(self.stream.sock(), interest, w.as_deref(), Some(timeout));
+                let r = self.stream.wait(interest, w.as_deref(), Some(timeout));
                 self.slot.set_wake(None);
                 r
             }
@@ -1480,14 +1480,14 @@ impl Link {
     pub(crate) fn begin_graceful_close(&mut self, readable: bool) -> bool {
         self.tls_close_notify();
         let _ = self.stream.shutdown(Shutdown::Write);
-        !self.peer_closed && (self.phase != Phase::Idle || readable)
+        self.stream.half_closes() && !self.peer_closed && (self.phase != Phase::Idle || readable)
     }
 
     /// Closes the socket after the driver let go of it.
     #[cfg(feature = "reactor")]
     pub(crate) fn finish_reactor(mut self, reason: CloseReason) -> CloseReason {
         if reason.is_abortive() {
-            let _ = sys::set_linger(self.stream.sock(), Some(Duration::ZERO));
+            self.stream.set_abortive();
         }
         self.slot.begin_close();
         if let Some(mut gate) = self.gate.take() {
@@ -1529,7 +1529,7 @@ impl Link {
             }
         }
         if reason.is_abortive() {
-            let _ = sys::set_linger(self.stream.sock(), Some(Duration::ZERO));
+            self.stream.set_abortive();
         }
         // No kill can start after this, and one in flight finishes first.
         self.slot.begin_close();
@@ -1545,7 +1545,7 @@ impl Link {
     /// Closes without the linger: never blocks (used when a connection is dropped).
     pub(crate) fn finish_quick(mut self, reason: CloseReason) -> CloseReason {
         if reason.is_abortive() {
-            let _ = sys::set_linger(self.stream.sock(), Some(Duration::ZERO));
+            self.stream.set_abortive();
         } else {
             let _ = self.stream.shutdown(Shutdown::Write);
         }
@@ -1594,7 +1594,7 @@ impl Link {
     /// turn into an RST that destroys the last response. Returns `true` if killed meanwhile.
     fn linger_gracefully(&mut self) -> bool {
         let _ = self.stream.shutdown(Shutdown::Write);
-        if self.peer_closed {
+        if self.peer_closed || !self.stream.half_closes() {
             return false;
         }
         // Between exchanges with nothing unread there is nothing to protect from a
