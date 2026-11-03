@@ -2655,6 +2655,7 @@ impl<G: Gate> Worker<G> {
         self.output.reset();
         ws.current.store(0, Ordering::Release);
         ws.listener.store(NO_LISTENER, Ordering::Release);
+        count_drained(&shared, reason);
         shared.release(&listener, source);
         record_close(&shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
         shared.busy.fetch_sub(1, Ordering::AcqRel);
@@ -2789,6 +2790,18 @@ impl<F: SessionFactory> Serve for Sessions<F> {
 }
 
 /// Counts one close and tells the event sink. Both drivers end here.
+/// Counts a close for a running drain's report. Before the connection is released:
+/// a drain ends when the last one is, and reads its report then.
+pub(crate) fn count_drained(shared: &Shared, reason: CloseReason) {
+    if shared.draining.load(Ordering::Acquire) {
+        if reason == CloseReason::DrainDeadline {
+            shared.drained_killed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            shared.drained_graceful.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 pub(crate) fn record_close(
     shared: &Shared,
     ws: &WorkerShared,
@@ -2828,13 +2841,6 @@ pub(crate) fn record_close(
         }),
         CloseReason::SessionPanicked => shared.event(Event::SessionPanicked { id: info.id }),
         _ => {}
-    }
-    if shared.draining.load(Ordering::Acquire) {
-        if reason == CloseReason::DrainDeadline {
-            shared.drained_killed.fetch_add(1, Ordering::Relaxed);
-        } else {
-            shared.drained_graceful.fetch_add(1, Ordering::Relaxed);
-        }
     }
     shared.event(Event::Closed {
         id: info.id,

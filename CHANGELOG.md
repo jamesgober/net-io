@@ -62,6 +62,9 @@ competitor harness, and the benchmarks B-1 to B-14 with their numbers.
 
 ### Fixed
 
+- `Server::drain` on the reactor could report a connection it killed at the
+  deadline as neither killed nor graceful: the drain could finish between the
+  connection's release and its count.
 - A buffer moved into an `Output` with `push_buffer` was never handed back, so an
   echo that swapped its input allocated 16 KiB per round trip and ran at a
   fiftieth of the copying echo's rate. An output now keeps one spare and returns

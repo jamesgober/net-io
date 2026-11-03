@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 use super::Sessions;
 use super::engine::{
     CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP, CMD_PRESSURE,
-    CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, record_close,
+    CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, count_drained,
+    record_close,
 };
 use crate::addr::PrefixKey;
 use crate::buf::{Buffer, BufferPool};
@@ -1918,6 +1919,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         self.free.push(index);
         self.open -= 1;
         ws.load.fetch_sub(1, Ordering::Relaxed);
+        count_drained(shared, reason);
         shared.release(&c.listener, c.source);
         record_close(shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
         if let Some(mut session) = c.session.take() {
