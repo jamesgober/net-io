@@ -64,7 +64,7 @@ The full plan:
 
 ```toml
 [dependencies]
-net-io = "0.3"
+net-io = "0.6"
 ```
 
 The simplest server (the full API is in [`docs/API.md`](./docs/API.md); `examples/` has a sans-IO session, kill and drain, and a gate):

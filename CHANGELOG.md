@@ -13,6 +13,62 @@
 
 ---
 
+## [0.6.0] - 2026-11-03
+
+Optimisation: the P2 options, files and UDP batches on both drivers, the
+competitor harness, and the benchmarks B-1 to B-14 with their numbers.
+
+### Added
+
+- Listener and socket options: `ListenOptions::defer_accept`, `fast_open`,
+  `incoming_cpu`, and `user_timeout`. An option the OS lacks fails with
+  `Unsupported`. Fast open is off by default: its first data can be replayed.
+- `ListenOptions::per_worker` (Linux): one `SO_REUSEPORT` socket and accept
+  thread per reactor worker, each feeding its own worker.
+- Files: `TcpConnection::send_file` and `Output::push_file`, by `sendfile` on
+  Unix and `TransmitFile` on the Windows reactor, reading in pieces where those
+  do not apply. The gate checks every MiB. A file that ends early fails the
+  connection with `FileTruncated` and the count sent.
+- UDP: `recv_batch` and `send_batch` with `DatagramBuffer` and
+  `OutgoingDatagram` (`recvmmsg` and `sendmmsg` on Linux), packet info on Unix
+  (`UdpOptions::packet_info`), `join_multicast` with `MulticastInterface`, and
+  `UdpSession`, `UdpContext`, `ListenerSpec::udp`, and
+  `ServerBuilder::udp_sessions` for UDP on a server.
+- Adaptive deadlines (`Pressure`): handshake and idle deadlines shrink as the
+  server fills, with hysteresis.
+- `Limits::lane_reserve`: slots kept for the lanes before a given lane.
+- `ListenerSpec::lockdown_allowed`, `Placement` for worker pinning, and the
+  PROXY encoders `encode_v1` and `encode_v2`.
+- `compare/`: an unpublished harness that runs one load generator against
+  `std`, `mio`, `tokio`, `monoio`, and both net-io drivers.
+- `benches/lifecycle.rs`: PROXY parsing, post to wake, kill to reset, and drain.
+
+### Changed
+
+- The reactor reads the clock once per turn, not once per event.
+- On kqueue the write filter exists only while a send or connect waits, so an
+  ACK no longer wakes the loop: 3 system calls per round trip on macOS.
+- Parsing a PROXY v1 line tries the other address family only to name an error:
+  87 ns per header, from 345.
+
+### Security
+
+- The reactor did not apply the minimum transfer rate to a peer that sent more
+  often than the check interval (1 s by default): each arrival moved the check
+  later, so a client sending one byte every 40 ms after an opening burst kept its
+  connection for as long as it kept sending. The rate is now checked on every
+  arrival and every send completion. The blocking pool was not affected. Affects
+  0.5.0 with the reactor, the default driver for sessions.
+
+### Fixed
+
+- A buffer moved into an `Output` with `push_buffer` was never handed back, so an
+  echo that swapped its input allocated 16 KiB per round trip and ran at a
+  fiftieth of the copying echo's rate. An output now keeps one spare and returns
+  the rest to the pool when a send completes.
+
+---
+
 ## [0.5.0] - 2026-11-02
 
 Feature complete: the reactor on every platform, and Windows as a full peer of

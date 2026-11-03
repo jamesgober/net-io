@@ -172,6 +172,33 @@ Exit: every benchmark meets the 1.2x gate against the best Rust competitor at eq
 
 Items: `compare/` harness; B-1 to B-14 in `docs/PERFORMANCE.md`; P2 items: `SO_REUSEPORT` per-worker listeners, `incoming_cpu`, `defer_accept`, server `fast_open`, `user_timeout`, `send_file` / `Output::push_file`, UDP `recv_batch` / `send_batch` (`DatagramBuffer`, `OutgoingDatagram`), packet info, multicast (`MulticastInterface`), `UdpSession` / `UdpContext` / `ListenerSpec::udp`, `Placement`, adaptive deadlines (`Pressure`), `lane_reserve`, `ListenerSpec::lockdown_allowed`, `encode_v1` / `encode_v2`, FastCGI on Windows if OD-26 says so.
 
+Done:
+- [x] Listener and socket options `defer_accept`, `fast_open`, `incoming_cpu`, `user_timeout` (D-122).
+- [x] Files: `send_file`, `Output::push_file`, `sendfile` and `TransmitFile` (D-123, D-124).
+- [x] UDP batches, packet info on Unix, multicast, `UdpSession` listeners (D-125 to D-127).
+- [x] `Pressure`, `lane_reserve`, `lockdown_allowed`, `Placement`, `encode_v1` / `encode_v2` (D-128 to D-130).
+- [x] Per-worker `SO_REUSEPORT` listeners on Linux (D-131); the std-only fallback moved after 1.0 (D-132).
+- [x] `compare/` and B-1 to B-14 in `docs/PERFORMANCE.md` (D-133); `benches/lifecycle.rs`.
+- [x] The 16 KiB stall found and fixed, with the test that would have caught it (D-134); kqueue's write filter only while asked (D-135).
+- [x] The accept storm test T-19, bounded so it never empties the port range (D-136).
+
+Exit criteria, as met:
+
+| Criterion | Status |
+|---|---|
+| Every benchmark meets the 1.2x gate, or the miss is recorded with James's written decision | Missed, R-30: see `docs/PERFORMANCE.md`. James's decision: PENDING |
+| No regression over 5% between 0.5 and 0.6 | Met: `cargo bench --bench echo` from the v0.5.0 tag and from this branch, alternated three times on the build host. Medians: B-1 reactor +4% at 64 connections and +2% at 256, CPU per round trip -6% and +3%; B-2 p50 within 0.2 us on every stack (worst +1.4%). `docs/PERFORMANCE.md` |
+| Every P2 item shipped or moved here with a reason | Shipped, except packet info on Windows (D-126) and FastCGI on Windows (OD-26, below) |
+
+Moved to a later version (anti-deferral record):
+
+| Item | To | Reason |
+|---|---|---|
+| Std-only fallback for other targets | after 1.0 | D-132 |
+| Packet info on Windows | after 1.0, on request | D-126: needs `WSARecvMsg` through an extension pointer; no consumer asks |
+| FastCGI on Windows | OD-26-DECISION | OD-26 |
+| Physical-core pinning, open-loop generator, B-6 competitor row | 0.9.x | R-28, R-29, R-33 |
+
 ## v0.7.0 - Hardening
 Exit: zero open findings of severity medium or above; the soak shows no memory, descriptor, or handle growth and no stuck connection.
 
@@ -231,7 +258,7 @@ Every entry is revisited in the 0.9.x polish milestone. Add an entry in the same
 |---|---|---|---|---|---|
 | R-1 | 0.3 | missed target | macOS: 3 system calls per keep-alive round trip, against 2 on Linux (a `poll` before every receive, D-083) | measured; the Linux model does not hold on macOS | reactor (0.5) and the 0.9.x performance pass |
 | R-2 | 0.3 | missed target | Windows: 3 system calls per round trip (`WSAPoll` before every receive, D-052) | measured; required by Microsoft's documented timeout semantics | IOCP reactor (0.5) and the 0.9.x performance pass |
-| R-3 | 0.3 | missed target | B-2 goal of 1.2x the std thread-per-connection server | 0.3 baseline at parity within noise; goal moved to 0.6 | 0.6 harness, then 0.9.x |
+| R-3 | 0.3 | closed | B-2 goal of 1.2x the std thread-per-connection server | 0.6 replaced it with the competitor gate: on CI, B-2 std is 1.07x tokio and net-io's reactor 0.94x to 1.01x; one connection on loopback measures the kernel. Carried by R-30 | closed into R-30 |
 | R-4 | 0.3 | platform note | Windows send-buffer autotuning lets a peer that never reads absorb tens of MiB before the write timeout; operators must set `ListenOptions::send_buffer` | documented in `docs/PLATFORM-NOTES.md` | consider a bounded default for internet-facing listeners |
 | R-5 | 0.3 | platform note | Windows: each worker's wake channel holds one loopback UDP port; many servers in one process can hit `WSAENOBUFS` | documented | reactor (0.5) wake mechanism |
 | R-6 | 0.3 | deferred | timing wheel, appendix A cases 53 to 60, benchmark B-8, case 11 (reads pause on an empty budget), FreeBSD and the std-only fallback | all done in 0.5 except the fallback (D-119) | fallback at 0.6 |
@@ -246,13 +273,19 @@ Every entry is revisited in the 0.9.x polish milestone. Add an entry in the same
 | R-15 | 0.4 | missed criterion | FastCGI descriptor 0 tested by emulating `mod_fcgid`, not under a real FastCGI manager | no manager on the build host | run under `mod_fcgid` or `spawn-fcgi` once |
 | R-16 | 0.4 | deferred | hash-flooding chain test for the per-source tables (threat T-22) | `std` keyed SipHash in use | 0.7 hardening |
 | R-17 | 0.4 | deferred | Windows hand-off, edge cases 104 and 105 | closed in 0.5 (D-116) | closed |
-| R-18 | 0.5 | missed target | an idle reactor connection's state is 848 bytes on 64-bit Linux, against the 512-byte estimate (1,384 before limits and rate settings were shared and TLS state boxed) | what remains is state read at the next event: boxing it adds one allocation per connection and a pointer per event, and no buffer is held while idle, so 10,000 idle connections cost about 8.5 MB here plus the kernel's sockets | retry at the 0.9 tuning pass with measured allocation cost |
-| R-19 | 0.5 | deferred | the reactor's accept path keeps one accept thread per listener; `EPOLLEXCLUSIVE` (one listener in every worker's epoll) is not done | a socket crosses threads once per connection; admission is shared with the blocking driver | measure against B-1 at 0.6 |
-| R-20 | 0.5 | open question | reactor throughput depends on the host. GitHub's Ubuntu runner: 1.16x the pool at 64 connections, 1.20x at 256, and less CPU per round trip (15 us against 18). A WSL2 guest under load 45 to 65: 0.25x, 31 us against 11 with 32 workers | hypothesis: epoll wakes without the synchronous hint on kernels before 6.13, so on a busy host a worker waits for a CPU where a blocked thread would not. Method at 0.6: a dedicated Linux host, then 6.13 or later, then a short poll before sleeping and `SO_INCOMING_CPU` placement, each with its CPU cost when idle | 0.6 |
-| R-21 | 0.5 | closed | B-8: on a quiet host insert 17.0 ns, lazy extend 1.5 ns, cancel 2.3 ns, within the targets (26 to 30, 4 to 5, and 5 to 6 ns on the loaded build host) | met on the CI runner | closed |
-| R-22 | 0.5 | missed target | Windows reactor: 4 system calls per round trip (target 3): the zero-byte receive after each exchange | one idle buffer saved per connection; hypothesis: keep a real receive pending for a connection active in the last tick, cancelling on the idle timer, with its cost in pinned buffers | 0.6 |
+| R-18 | 0.5 | missed target | an idle reactor connection's state is 848 bytes on 64-bit Linux, against the 512-byte estimate (1,384 before limits and rate settings were shared and TLS state boxed) | B-5 on CI: 1,239 bytes of resident memory per idle connection at 10,000 (tokio 8,993, monoio 16,963, mio 88); B-6 on the build host: 511 bytes at 100,000. Boxing what is read only at the next event adds one allocation per connection and a pointer per event | retry at the 0.9 tuning pass with measured allocation cost |
+| R-19 | 0.5 | closed | the reactor's accept path keeps one accept thread per listener | D-131: `ListenOptions::per_worker` gives each worker its own `SO_REUSEPORT` socket. Measured against B-1 on CI: 1.08x tokio, against 1.07x with the shared accept thread, so the default stays. The accept gap to mio (1.24x) is R-30 | closed |
+| R-20 | 0.5 | open question | reactor throughput depends on the host. GitHub's runner at 0.6: 1.05x the pool at 64 connections and 1.25x at 256, with less CPU per round trip (13.6 us against 15.0); 0.5 on the same kind of runner was 1.16x and 1.20x. A WSL2 guest under load 45 to 65 was 0.25x | hypothesis: epoll wakes without the synchronous hint on kernels before 6.13, so on a busy host a worker waits for a CPU where a blocked thread would not. Not tested at 0.6: the test needs a dedicated Linux host, which this project does not have yet. Method: a dedicated host, then 6.13 or later, then a short poll before sleeping and `SO_INCOMING_CPU` placement (now built, D-131), each with its idle CPU cost | 0.9.x tuning pass |
+| R-21 | 0.5 | missed target | B-8 on CI at 0.6: insert 22.4 and 30.9 ns, lazy extend 3.9 and 2.6 ns, cancel 5.5 and 4.7 ns on two runs; targets under 20, 2, and 20 ns. 0.5 on CI met all three (17.0, 1.5, 2.3) | `src/wheel.rs` has not changed since 0.5, so the spread is the runner; insert and lazy extend miss on slower runners | 0.9.x tuning pass, on a quiet host with pinned cores |
+| R-22 | 0.5 | missed target | Windows reactor: 3.50 system calls per round trip at 0.6 (4 at 0.5; target 3): the zero-byte receive after an exchange | one idle buffer saved per connection; hypothesis: keep a real receive pending for a connection active in the last tick, cancelling on the idle timer, with its cost in pinned buffers | 0.9.x tuning pass |
 | R-23 | 0.5 | accepted gap | pipe and Windows AF_UNIX listeners cannot be handed off; `release_listeners` reports `Unsupported` for them | a pipe has no socket to duplicate; a new process can create the next instance under the same name, which needs its own overlap design | revisit with a consumer |
-| R-24 | 0.5 | platform note | kqueue's write filter fires now and then after an ACK: 3.05 system calls per round trip on macOS, against 3 | an empty wake, one in about twenty; arming the filter only after a blocked send would cost a `kevent` there | measure at 0.6 |
-| R-25 | 0.5 | accepted gap | a pipe on the reactor writes one chunk per system call (no gather) | IPC volume; short sends are handled | measure at 0.6 |
+| R-24 | 0.5 | closed | kqueue's write filter fired after ACKs: 3.05 to 3.13 system calls per round trip on macOS, against 3 | D-135: the filter exists only while a send or connect waits; macOS measures 3.00 on CI | closed |
+| R-25 | 0.5 | accepted gap | a pipe on the reactor writes one chunk per system call (no gather) | not measured at 0.6: no pipe benchmark exists, and no consumer sends volume over a pipe; short sends are handled | 0.9.x tuning pass: build the pipe benchmark, then decide |
 | R-26 | 0.5 | platform note | Windows AF_UNIX: a replaced socket file is removed by the old listener's `Drop` (no identity check; std has no stable file id) | documented | re-check with `GetFileInformationByHandle` at 0.9.x |
-| R-27 | 0.5 | deferred | std-only fallback for other targets (D-119) | moved from 0.5 | 0.6 |
+| R-27 | 0.5 | moved | std-only fallback for other targets (D-119) | D-132: moved after 1.0 as P3; without `poll`, `std` cannot wait on a socket and a wake together, which breaks the kill and deadline bounds | after 1.0 |
+| R-28 | 0.6 | accepted gap | `Placement::PinPerCore` pins worker `n` to CPU `n`, which can put two workers on SMT siblings before every physical core has one (D-130) | needs a topology read per OS | 0.9.x tuning pass |
+| R-29 | 0.6 | accepted gap | `compare/` is closed loop: its p99 understates latency under overload (D-133) | capacity is what the 1.2x gate compares | open-loop generator at the 0.9.x pass |
+| R-30 | 0.6 | missed target | the 1.2x gate against the best Rust competitor. On CI (4 vCPUs shared with the generator): net-io's reactor 1.07x tokio on B-1, 0.94x on B-2, 0.88x to 0.94x on B-3, 0.92x on B-4; the best competitor is mio at 1.00x to 1.24x tokio. On the 32-thread build host B-4 is about 2x tokio and 0.84x to 0.95x mio | mio is the same kind of event loop with no limits, deadlines, gate, or wiping, so 1.2x over it is not reachable on this harness. Decision: see the 0.6 exit table | 0.9.x tuning pass on a dedicated load machine |
+| R-31 | 0.6 | missed target | B-10 post to wake: p99 21 to 33 us on CI, target under 10 us | the post is a few nanoseconds; the rest is one OS wake of a sleeping thread on a VM, and the blocking driver pays it too (p99 26 to 29 us) | 0.9.x: measure on a dedicated host, then a short spin before sleeping, with its idle CPU cost |
+| R-32 | 0.6 | known issue | B-4 server CPU per round trip: net-io 22.3 us against tokio 18.8 and mio 18.2 on CI; wiping explains about 1 us (21.3 without) | not profiled at 0.6: the runner has no `perf`, and the build host is loaded | 0.9.x profile of the 16 KiB path |
+| R-33 | 0.6 | known issue | B-6 at 100,000 idle: no competitor row (the tokio echo stopped at 4,786 in that client, not investigated), and net-io used 20 ms of CPU per second while idle on the loaded build host (0.0 at 10,000 on CI) | CI's descriptor limit is 30,000, so B-6 runs only on the build host | 0.9.x on a dedicated host |
