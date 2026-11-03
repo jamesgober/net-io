@@ -5,7 +5,7 @@ mod common;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{DRIVERS, addr, client, eventually, round_trip};
@@ -239,7 +239,7 @@ fn test_accept_storm_leaves_established_connections_served() {
     // Each closed client port waits out TIME_WAIT (two minutes on Windows), and the
     // ephemeral range there is 16,384: a storm that used them all would make the
     // next connect in this run fail.
-    const PER_DRIVER: u64 = 3_000;
+    const PER_DRIVER: i64 = 3_000;
     for &driver in DRIVERS {
         let limits = Limits::builder()
             .max_connections(4_096)
@@ -259,19 +259,13 @@ fn test_accept_storm_leaves_established_connections_served() {
         let mut c = client(target);
         assert_eq!(round_trip(&mut c, b"ready"), b"ready");
         let until = Instant::now() + STORM;
-        let left = Arc::new(AtomicU64::new(PER_DRIVER));
+        let left = Arc::new(AtomicI64::new(PER_DRIVER));
         let storm: Vec<_> = (0..4)
             .map(|_| {
                 let left = left.clone();
                 std::thread::spawn(move || {
                     let mut opened = 0u64;
-                    while Instant::now() < until
-                        && left
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                                n.checked_sub(1)
-                            })
-                            .is_ok()
-                    {
+                    while Instant::now() < until && left.fetch_sub(1, Ordering::Relaxed) > 0 {
                         if TcpStream::connect(target).is_ok() {
                             opened += 1;
                         }
