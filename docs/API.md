@@ -1019,7 +1019,7 @@ impl SizeClass {
 
 The minimum rate applies per direction while that direction is active (receiving an exchange, or output pending). After `grace`, the bytes moved over the last `window` must reach `bytes_per_sec x window`, or the connection closes with `SlowPeer { direction }`. A one-byte-every-few-seconds client passes any per-read timeout; it does not pass this. Cost: one add per IO completion and one wheel timer per active connection per second [est. under 50 ns per check]. P0, Tier 2, `0.3.0`.
 
-`Pressure::default()` is high 0.8, low 0.6, factor 0.25. Adaptive deadlines (`Pressure`, P2, `0.6.0`): when open connections pass `high` of `max_connections`, the handshake and idle deadlines of new and idle connections are multiplied by `factor` (floor 1 s), and restored below `low`. No cost below the threshold.
+`Pressure::default()` is high 0.8, low 0.6, factor 0.25. Adaptive deadlines (`Pressure`, P2, `0.6.0`): when open connections pass `high` of `max_connections`, the handshake and idle deadlines of new and idle connections are multiplied by `factor` (floor 1 s), and restored below `low`. The reactor reschedules its idle timers once on each crossing and costs nothing below the threshold. On the blocking pool an idle wait lasts at most the shrunk idle deadline, then reads the state again, so with `Pressure` set an idle pool connection wakes once per that period (at least 1 s) whether or not the server is under pressure.
 
 ---
 

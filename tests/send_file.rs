@@ -76,7 +76,10 @@ fn test_file_that_ends_early_is_an_error_with_the_count() {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let at = l.local_addr().expect("addr");
     let reader = std::thread::spawn(move || {
-        let mut c = TcpStream::connect(at).expect("connect");
+        // The reset can arrive before `connect` returns, and Linux then reports it there.
+        let Ok(mut c) = TcpStream::connect(at) else {
+            return 0;
+        };
         let mut all = Vec::new();
         let _ = c.read_to_end(&mut all);
         all.len()

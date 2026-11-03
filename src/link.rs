@@ -116,6 +116,8 @@ pub(crate) struct Link {
     handshake_deadline: Option<Instant>,
     /// What deadlines are multiplied by under pressure (1 otherwise).
     deadline_scale: f32,
+    /// The owner reads the scale again when an idle wait ends (the pool's sessions).
+    rescales: bool,
     /// Bytes read past a handshake, served before the socket (the buffer returns
     /// to the worker's pool at close).
     pending: Option<Buffer>,
@@ -192,6 +194,14 @@ const TLS_RECORD: usize = 16 * 1024;
 /// Room kept per record for the TLS header, padding, and tag.
 const TLS_OVERHEAD: usize = 2 * 1024;
 
+/// `d` under a pressure scale: never below 1 s, never above `d`.
+fn scale(d: Duration, by: f32) -> Duration {
+    if by >= 1.0 {
+        return d;
+    }
+    d.mul_f32(by).max(Duration::from_secs(1)).min(d)
+}
+
 impl Link {
     pub(crate) fn new(
         stream: sys::Stream,
@@ -237,6 +247,7 @@ impl Link {
             idle_timeout,
             handshake_deadline: None,
             deadline_scale: 1.0,
+            rescales: false,
             pending: None,
             pending_at: 0,
             approved: 0,
@@ -688,13 +699,22 @@ impl Link {
         self.deadline_scale = scale;
     }
 
+    /// The owner reads the server's scale again when `read` returns `Woken`, so an
+    /// idle wait may end at the deadline pressure would give.
+    pub(crate) fn set_rescales(&mut self) {
+        self.rescales = true;
+    }
+
     pub(crate) fn scaled(&self, d: Duration) -> Duration {
-        if self.deadline_scale >= 1.0 {
-            return d;
-        }
-        d.mul_f32(self.deadline_scale)
-            .max(Duration::from_secs(1))
-            .min(d)
+        scale(d, self.deadline_scale)
+    }
+
+    /// The longest an idle wait may last before the scale is read again, so a
+    /// crossing reaches a connection already waiting.
+    fn idle_slice(&self) -> Option<Duration> {
+        let p = self.limits.pressure.filter(|_| self.rescales)?;
+        (self.phase == Phase::Idle && self.handshake_deadline.is_none())
+            .then(|| scale(self.idle_timeout, p.factor))
     }
 
     /// This connection's idle timeout from its next idle wait on (`None`: the
@@ -823,6 +843,10 @@ impl Link {
             if let Some(c) = self.rate_in.next_check(&self.limits.min_rate, now) {
                 until = until.min(c);
             }
+            let recheck = self.idle_slice().map(|s| now + s).filter(|&r| r < until);
+            if let Some(r) = recheck {
+                until = r;
+            }
             let timeout = until
                 .saturating_duration_since(now)
                 .max(Duration::from_millis(1));
@@ -838,6 +862,10 @@ impl Link {
             }
             if let Some(result) = got {
                 return result;
+            }
+            if recheck.is_some_and(|r| self.now() >= r) {
+                // The owner reads the server's scale again before the next wait.
+                return Ok(Got::Woken);
             }
         }
     }
@@ -1378,9 +1406,11 @@ impl Link {
         self.stream.set_nonblocking(true)
     }
 
-    /// Bytes arrived (the reactor made the call).
+    /// Bytes arrived (the reactor made the call). `Err` is a peer below the minimum
+    /// rate: the check runs here as well as on the timer, because a peer that sends
+    /// more often than the check interval re-arms the timer before it can fire.
     #[cfg(feature = "reactor")]
-    pub(crate) fn note_received(&mut self, n: usize) {
+    pub(crate) fn note_received(&mut self, n: usize) -> Result<(), NetError> {
         let now = self.now();
         self.bytes_in += n as u64;
         self.progress_at = now;
@@ -1389,22 +1419,43 @@ impl Link {
             self.rate_in.activate(now);
         }
         self.rate_in.record(now, n);
+        self.check_rate_in(now)
     }
 
     /// Ciphertext arrived: it counts for the rate and the deadline; the plaintext
-    /// starts the exchange when it is delivered.
+    /// starts the exchange when it is delivered. `Err` as for `note_received`.
     #[cfg(feature = "reactor")]
-    pub(crate) fn note_cipher(&mut self, n: usize) {
+    pub(crate) fn note_cipher(&mut self, n: usize) -> Result<(), NetError> {
         let now = self.now();
         self.bytes_in += n as u64;
         self.progress_at = now;
         self.rate_in.record(now, n);
+        self.check_rate_in(now)
     }
 
-    /// Bytes left (the reactor made the call).
+    /// `Err(SlowPeer)` when input is below the minimum rate.
     #[cfg(feature = "reactor")]
-    pub(crate) fn note_sent(&mut self, n: usize) {
+    fn check_rate_in(&mut self, now: Instant) -> Result<(), NetError> {
+        if self.rate_in.too_slow(&self.limits.min_rate, now) {
+            return Err(self.fail(
+                CloseReason::SlowPeer {
+                    direction: Direction::In,
+                },
+                NetError::SlowPeer {
+                    direction: Direction::In,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bytes left (the reactor made the call). `Err` is a reader below the minimum
+    /// rate, checked here for the reason given at `note_received`.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn note_sent(&mut self, n: usize) -> Result<(), NetError> {
         self.sent(n);
+        let now = self.now();
+        self.check_rate_out(now)
     }
 
     /// Before a send: the output deadline starts, a dead connection stops here,
@@ -1465,17 +1516,7 @@ impl Link {
         if self.exchange_deadline.is_some_and(|d| now >= d) {
             return Err(self.timed_out(TimeoutKind::Exchange));
         }
-        if self.rate_in.too_slow(&self.limits.min_rate, now) {
-            return Err(self.fail(
-                CloseReason::SlowPeer {
-                    direction: Direction::In,
-                },
-                NetError::SlowPeer {
-                    direction: Direction::In,
-                },
-            ));
-        }
-        Ok(())
+        self.check_rate_in(now)
     }
 
     /// When a wait for room to write must look at the clock again.
@@ -1501,6 +1542,12 @@ impl Link {
         if self.exchange_deadline.is_some_and(|d| now >= d) {
             return Err(self.timed_out(TimeoutKind::Exchange));
         }
+        self.check_rate_out(now)
+    }
+
+    /// `Err(SlowPeer)` when output is below the minimum rate.
+    #[cfg(feature = "reactor")]
+    fn check_rate_out(&mut self, now: Instant) -> Result<(), NetError> {
         if self.rate_out.too_slow(&self.limits.min_rate, now) {
             return Err(self.fail(
                 CloseReason::SlowPeer {

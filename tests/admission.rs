@@ -67,10 +67,15 @@ fn test_lane_reserve_keeps_slots_for_the_more_important() {
         server.open_door().expect("open");
         let mut first = client(addr(&server));
         assert_eq!(round_trip(&mut first, b"in"), b"in");
-        let mut second = client(addr(&server));
-        let _ = second.write_all(b"x");
-        let mut b = [0u8; 1];
-        assert!(!matches!(second.read(&mut b), Ok(n) if n > 0), "{driver:?}");
+        // Refused: the reset may come before `connect` returns, and Linux reports it there.
+        if let Ok(mut second) = TcpStream::connect(addr(&server)) {
+            second
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let _ = second.write_all(b"x");
+            let mut b = [0u8; 1];
+            assert!(!matches!(second.read(&mut b), Ok(n) if n > 0), "{driver:?}");
+        }
         assert!(
             eventually(WAIT, || server
                 .stats()
@@ -159,14 +164,23 @@ fn test_pressure_shrinks_idle_deadlines_and_lets_go() {
             .build()
             .expect("build");
         server.open_door().expect("open");
-        let mut conns: Vec<TcpStream> = (0..6).map(|_| client(addr(&server))).collect();
+        // Four below the threshold go idle first, with 30 s ahead of them; the
+        // crossing must reach them where they wait.
+        let mut conns: Vec<TcpStream> = (0..4).map(|_| client(addr(&server))).collect();
         for c in &mut conns {
             assert_eq!(round_trip(c, b"hi"), b"hi");
         }
+        std::thread::sleep(Duration::from_millis(200));
+        for _ in 0..2 {
+            let mut c = client(addr(&server));
+            assert_eq!(round_trip(&mut c, b"hi"), b"hi");
+            conns.push(c);
+        }
         let started = Instant::now();
         // 30 s scaled to the floor of 1 s, on a tick or two; well under the 30.
+        // Pressure lets go at 2 open (`low`), so 4 time out.
         assert!(
-            eventually(Duration::from_secs(10), || server.stats().timeouts >= 3),
+            eventually(Duration::from_secs(10), || server.stats().timeouts >= 4),
             "{driver:?}: {:?}",
             server.stats()
         );

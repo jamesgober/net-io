@@ -2956,6 +2956,7 @@ fn drive<G: Gate, S: Session>(
                 input.changed = false;
                 link.settle_phase(input.bytes().is_empty());
                 link.set_deadline_scale(w.shared.deadline_scale());
+                link.set_rescales();
                 let idle = link.phase() == Phase::Idle && input.bytes().is_empty();
                 if w.draining() && idle {
                     return CloseReason::Drained;

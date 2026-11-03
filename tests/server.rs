@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{addr, client, closed_by_server, eventually, refused, round_trip};
+use common::{DRIVERS, addr, client, closed_by_server, eventually, refused, round_trip};
 use net_io::{
     AllowAll, CloseReason, ConnectionInfo, DriverKind, Input, KillReason, Limits, ListenOptions,
     ListenerSpec, MinRate, NetError, Phase, PrefixPolicy, RefusalCause, ServerBuilder, Session,
@@ -330,6 +330,7 @@ fn test_read_timeout_inside_an_exchange() {
 
 #[test]
 fn test_slow_peer_is_closed() {
+    let (factory, first) = stall_factory();
     let server = ServerBuilder::new()
         .listener(ListenerSpec::tcp("127.0.0.1:0"))
         .limits(limits(|b| {
@@ -340,7 +341,7 @@ fn test_slow_peer_is_closed() {
                 check: Duration::from_millis(100),
             })
         }))
-        .sessions(stall_factory().0)
+        .sessions(factory)
         .gate(AllowAll)
         .build()
         .expect("build");
@@ -360,8 +361,120 @@ fn test_slow_peer_is_closed() {
         }
         std::thread::sleep(Duration::from_millis(40));
     }
-    assert!(closed, "slow peer was not closed");
+    assert!(
+        closed,
+        "slow peer was not closed: {:?} after {:?}, first byte seen: {:?}",
+        server.stats(),
+        start.elapsed(),
+        first.try_recv()
+    );
     assert!(eventually(WAIT, || server.stats().slow_peers == 1));
+}
+
+/// A peer that passes the first check with a burst, then sends a byte far more
+/// often than the check interval, is still measured: re-arming the timer on each
+/// arrival must not push the check away for good.
+#[test]
+fn test_trickle_faster_than_the_check_is_closed() {
+    for &driver in DRIVERS {
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .limits(limits(|b| {
+                b.min_rate(MinRate {
+                    bytes_per_sec: 1000,
+                    window: Duration::from_secs(2),
+                    grace: Duration::from_millis(200),
+                    check: Duration::from_secs(1),
+                })
+            }))
+            .sessions(stall_factory().0)
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = client(addr(&server));
+        c.write_all(&[b'x'; 2000]).expect("burst");
+        let start = Instant::now();
+        while start.elapsed() < WAIT && server.stats().slow_peers == 0 {
+            if c.write_all(b"x").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        // The burst leaves the window at 2 s; a check every second must follow.
+        assert!(
+            eventually(Duration::from_millis(200), || server.stats().slow_peers
+                == 1)
+                && start.elapsed() < Duration::from_secs(4),
+            "{driver:?}: {:?} after {:?}",
+            server.stats(),
+            start.elapsed()
+        );
+    }
+}
+
+/// The output side of the test above: a reader that takes a little often, but
+/// less than the minimum rate, is closed while it reads. Linux only: elsewhere the
+/// client's receive buffer grows to take the whole response, so the server never
+/// waits on the reader.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_reader_slower_than_the_rate_is_closed_while_it_reads() {
+    use std::io::Read;
+    static BIG: [u8; 16 << 20] = [b'r'; 16 << 20];
+    struct Flood(bool);
+    impl Session for Flood {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            if !self.0 {
+                self.0 = true;
+                cx.output().push_static(&BIG).expect("push");
+            }
+            Step::Write
+        }
+    }
+    for &driver in DRIVERS {
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp_with(
+                "127.0.0.1:0",
+                ListenOptions::new().send_buffer(16 * 1024),
+            ))
+            .driver(driver)
+            .limits(limits(|b| {
+                b.min_rate(MinRate {
+                    bytes_per_sec: 200_000,
+                    window: Duration::from_secs(2),
+                    grace: Duration::from_millis(200),
+                    check: Duration::from_secs(1),
+                })
+                .write_timeout(Duration::from_secs(30))
+            }))
+            .sessions(|_: &ConnectionInfo| Flood(false))
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = client(addr(&server));
+        c.write_all(b"go").expect("ask");
+        let mut b = [0u8; 4096];
+        let start = Instant::now();
+        while start.elapsed() < WAIT && server.stats().slow_peers == 0 {
+            match c.read(&mut b) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => std::thread::sleep(Duration::from_millis(40)),
+            }
+        }
+        assert!(
+            eventually(Duration::from_millis(200), || server.stats().slow_peers
+                == 1)
+                && start.elapsed() < Duration::from_secs(4),
+            "{driver:?}: {:?} after {:?}",
+            server.stats(),
+            start.elapsed()
+        );
+    }
 }
 
 #[test]

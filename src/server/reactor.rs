@@ -579,12 +579,19 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let Some(c) = self.slots[index as usize].conn.as_mut() else {
             return;
         };
-        let Some(wait) = c.proxy.as_mut() else { return };
+        if c.proxy.is_none() {
+            return;
+        }
         if n == 0 {
             self.pool.put(buffer);
             return self.close(index, CloseReason::ProxyMissing);
         }
-        c.link.note_cipher(n);
+        if c.link.note_cipher(n).is_err() {
+            self.pool.put(buffer);
+            let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+            return self.close(index, reason);
+        }
+        let Some(wait) = c.proxy.as_mut() else { return };
         let verdict = match wait.parser.feed(buffer.as_slice()) {
             Ok(ProxyProgress::Done { header, consumed }) => {
                 let real = match (header.command, header.source) {
@@ -1283,7 +1290,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     return;
                 }
                 input.changed = true;
-                c.link.note_received(n);
+                if c.link.note_received(n).is_err() {
+                    let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                    return self.close(index, reason);
+                }
                 if wait == Wait::Read {
                     self.input_arrived(index);
                 }
@@ -1296,8 +1306,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 }
                 if n == 0 {
                     c.link.tls_transport_closed();
-                } else {
-                    c.link.note_cipher(n);
+                } else if c.link.note_cipher(n).is_err() {
+                    let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                    return self.close(index, reason);
                 }
                 self.tls_turn(index);
             }
@@ -1372,11 +1383,15 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 }
                 match done.result {
                     Ok(n) => {
-                        c.link.note_sent(n);
+                        let rate = c.link.note_sent(n);
                         c.link.sent_of(total, n);
                         if let Some(output) = c.output.as_mut() {
                             output.advance(n);
                             output.bytes_since_begin += n as u64;
+                        }
+                        if rate.is_err() && !closing {
+                            let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                            return self.close(index, reason);
                         }
                     }
                     Err(class) => {
@@ -1397,11 +1412,15 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     return self.close(index, CloseReason::Io(OsErrorClass::FileTruncated));
                 }
                 Ok(n) => {
-                    c.link.note_sent(n);
+                    let rate = c.link.note_sent(n);
                     c.link.sent_of(total, n);
                     if let Some(output) = c.output.as_mut() {
                         output.advance(n);
                         output.bytes_since_begin += n as u64;
+                    }
+                    if rate.is_err() && !closing {
+                        let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                        return self.close(index, reason);
                     }
                 }
                 Err(class) => {
@@ -1417,7 +1436,13 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 let Some(mut chunks) = chunks else { return };
                 match done.result {
                     Ok(n) => {
-                        c.link.note_sent(n);
+                        if c.link.note_sent(n).is_err() && !closing {
+                            if let Some(cout) = chunks.into_buffer() {
+                                c.link.tls_put_cout(cout);
+                            }
+                            let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                            return self.close(index, reason);
+                        }
                         if chunks.advance(n) {
                             // A partial send of the records: the rest goes first.
                             c.sending = Sending::Sealed { taken };
@@ -1450,7 +1475,13 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 let Some(mut chunks) = chunks else { return };
                 match done.result {
                     Ok(n) => {
-                        c.link.note_sent(n);
+                        if c.link.note_sent(n).is_err() && !closing {
+                            if let Some(cout) = chunks.into_buffer() {
+                                c.link.tls_put_cout(cout);
+                            }
+                            let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                            return self.close(index, reason);
+                        }
                         if chunks.advance(n) {
                             c.sending = Sending::Machine;
                             let token = c.token;
