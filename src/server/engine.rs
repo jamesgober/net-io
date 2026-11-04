@@ -881,7 +881,8 @@ impl Shared {
     pub(crate) fn drain(&self, deadline: Instant) -> DrainReport {
         let start = Instant::now();
         self.close_door();
-        if !self.draining.swap(true, Ordering::AcqRel) {
+        let first = !self.draining.swap(true, Ordering::AcqRel);
+        if first {
             self.drained_graceful.store(0, Ordering::Relaxed);
             self.drained_killed.store(0, Ordering::Relaxed);
             self.event(Event::DrainStarted {
@@ -895,7 +896,15 @@ impl Shared {
             // pass for connections that finish an exchange during the drain.
             self.drain_idle_pass();
             let now = Instant::now();
-            if now >= deadline && !killed_at_deadline {
+            // A stop that arrives during the drain (the control line escalating to
+            // `Stopping`, or `request_stop`) ends it now, not at the drain's deadline.
+            let stop = self.stopping.load(Ordering::Acquire)
+                || self.control.state() == ControlState::Stopping;
+            if stop {
+                self.kill_all(CAUSE_STOP);
+                killed_at_deadline = true;
+            } else if now >= deadline {
+                // Every pass, not once: a connection admitted late is killed too.
                 killed_at_deadline = true;
                 self.kill_all(CAUSE_DRAIN);
             }
@@ -918,10 +927,13 @@ impl Shared {
             killed: self.drained_killed.load(Ordering::Relaxed),
             took: start.elapsed(),
         };
-        self.event(Event::DrainFinished {
-            graceful: report.graceful,
-            killed: report.killed,
-        });
+        // One drain, one event, however many threads waited on it.
+        if first {
+            self.event(Event::DrainFinished {
+                graceful: report.graceful,
+                killed: report.killed,
+            });
+        }
         report
     }
 
@@ -1839,6 +1851,17 @@ fn accept_loop<W: super::Workload, G: Gate>(
             pause_until = None;
         }
         for _ in 0..batch {
+            // Each admission sees the door, a drain, a stop, and the control line as
+            // they are now, not as they were when the batch began: three loads and the
+            // line's epoch, against an accept's system call.
+            if !shared.door.load(Ordering::Acquire)
+                || !conf.door.load(Ordering::Acquire)
+                || shared.draining.load(Ordering::Acquire)
+                || shared.stopping.load(Ordering::Acquire)
+                || view.moved(shared.control.as_ref())
+            {
+                break;
+            }
             let outcome = match rt {
                 ListenerRuntime::Tcp(l) => match acceptor.accept(l.std()) {
                     Accepted::Conn((stream, peer)) => {
@@ -2090,7 +2113,9 @@ impl<W, G: Gate> Engine<W, G> {
         let lim = &conf.limits;
         let count = &conf.count;
         // Caps before any byte is read.
-        if !take_slot(&shared.open, lim.max_connections) {
+        // The server's cap, whatever the listener's limits say (a listener has
+        // `max_per_listener`; its own `max_connections` is refused at build).
+        if !take_slot(&shared.open, shared.max_open) {
             {
                 self.refuse(stream, peer, RefusalCause::GlobalCap, None, co);
                 return Err(Some(RefusalCause::GlobalCap));
@@ -2157,7 +2182,7 @@ impl<W, G: Gate> Engine<W, G> {
         // What is left must cover what the more important lanes keep for themselves.
         let reserved = lim.reserved_above(info.lane);
         if reserved > 0
-            && shared.open.load(Ordering::Acquire).saturating_add(reserved) > lim.max_connections
+            && shared.open.load(Ordering::Acquire).saturating_add(reserved) > shared.max_open
         {
             let _ = guarded(|| {
                 self.gate.closed(
@@ -2590,9 +2615,11 @@ impl<G: Gate> Worker<G> {
         } else {
             self.gate_cell = Some(cell);
         }
-        // Queued before its listener was removed: close it unread.
+        // Queued before its listener was removed, or before a stop: close it unread.
         let failed = if listener.removed.load(Ordering::Acquire) {
             Some(CloseReason::Drained)
+        } else if self.shared.stopping.load(Ordering::Acquire) {
+            Some(CloseReason::Shutdown)
         } else {
             failed
         };

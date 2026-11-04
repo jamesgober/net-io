@@ -895,3 +895,30 @@ fn test_handler_refused_by_its_own_gate_releases_the_connection() {
     std::io::Read::read_exact(&mut c, &mut back).expect("served");
     assert_eq!(&back, b"ok");
 }
+
+/// A listener cannot lift the server's cap: its own `max_connections` is refused at
+/// build, and admission counts against the server's cap (review finding).
+#[test]
+fn test_listener_cannot_set_the_global_cap() {
+    let raised = Limits::builder()
+        .max_connections(100_000)
+        .build()
+        .expect("limits");
+    let result = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0").limits(raised))
+        .limits(limits(|b| b.max_connections(4)))
+        .handler(echo_handler)
+        .gate(AllowAll)
+        .build();
+    assert!(
+        matches!(
+            result,
+            Err(NetError::InvalidConfig {
+                field: "max_connections",
+                ..
+            })
+        ),
+        "{:?}",
+        result.err()
+    );
+}

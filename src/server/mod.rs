@@ -173,6 +173,19 @@ pub struct ListenerSpec {
 }
 
 impl ListenerSpec {
+    /// The global cap is the server's: a listener caps itself with
+    /// `max_per_listener`. Taking `max_connections` here would let a listener lift
+    /// the server's cap and the descriptor budget checked against it.
+    fn check_listener_limits(&self) -> Result<(), NetError> {
+        if self.limits.max_connections().is_some() {
+            return Err(NetError::InvalidConfig {
+                field: "max_connections",
+                reason: ConfigReason::Inconsistent,
+            });
+        }
+        Ok(())
+    }
+
     /// A TCP listener on `addr` (resolved now; a failure is reported by `build`).
     pub fn tcp<A: ToSocketAddrs>(addr: A) -> ListenerSpec {
         ListenerSpec {
@@ -769,6 +782,7 @@ where
         };
         limits.validate(workers, crate::sys::descriptor_limit())?;
         for spec in &listeners {
+            spec.check_listener_limits()?;
             limits.overlay(&spec.limits).validate(workers, None)?;
         }
         if self.placement != Placement::Off && !crate::sys::CAN_PIN {
@@ -1080,6 +1094,7 @@ impl Server {
             &names,
         )?;
         let workers = u16::try_from(self.shared.worker_count()).unwrap_or(u16::MAX);
+        spec.check_listener_limits()?;
         self.shared
             .base_limits
             .overlay(&spec.limits)
