@@ -1390,6 +1390,16 @@ pub(crate) fn inherited_kind(fd: RawFd) -> Result<super::SockKind, super::KindEr
     listener_kind(unsafe { BorrowedFd::borrow_raw(fd) })
 }
 
+/// Whether descriptor `fd` has close-on-exec set (`false` for a closed number). A
+/// descriptor that crossed an `execve` never has it, so one that has it was opened
+/// or claimed by this program image and is not an inheritance.
+pub(crate) fn close_on_exec(fd: RawFd) -> bool {
+    // SAFETY: F_GETFD only reads the descriptor's flags; on a closed number it
+    // fails with EBADF and touches nothing.
+    let flags = unsafe { fcntl(fd, c::F_GETFD) };
+    flags != -1 && flags & c::FD_CLOEXEC != 0
+}
+
 /// Takes ownership of an inherited descriptor and sets close-on-exec. The caller
 /// (`inherit`) does this once per descriptor per process, under its lock, after
 /// `inherited_kind` verified it; nothing else in net-io owns these numbers.
