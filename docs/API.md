@@ -894,7 +894,7 @@ impl Limits {
 
 Every bound net-io enforces, in one value. A `Limits` records only what was set; everything left unset takes the defaults of the driver that runs the connection (table below), so `Limits::builder().max_connections(100).build()` means "my cap, the driver's defaults for the rest" whichever driver the server picks. `Limits::default()` is the same as an empty builder. A server takes one `Limits` and each listener may override values of it (`ListenerSpec::limits`); a client `TcpConnection` takes one through `set_limits`. Limits are checked before the resource is committed: a connection over a cap is refused before any byte is read, a header over its size before buffering, a buffer before allocation. P0, Tier 2, `0.3.0`.
 
-`resolve` returns the effective values for a driver (every getter then returns `Some`); `validate` is what `ServerBuilder::build` runs on the resolved values (Tier 3 for code that checks limits ahead of time). `descriptor_limit` is the process's open-descriptor limit (`RLIMIT_NOFILE` soft limit on Unix, `None` on Windows, where socket handles do not come from a small table).
+`descriptor_limit()` (crate root, P1, Tier 2, `0.7.0`) returns the same descriptor limit `build` checks against, so a consumer can place a soft cap of its own under it (serve-net's request). `resolve` returns the effective values for a driver (every getter then returns `Some`); `validate` is what `ServerBuilder::build` runs on the resolved values (Tier 3 for code that checks limits ahead of time). `descriptor_limit` is the process's open-descriptor limit (`RLIMIT_NOFILE` soft limit on Unix, `None` on Windows, where socket handles do not come from a small table).
 
 ### `LimitsBuilder`
 

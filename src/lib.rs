@@ -176,7 +176,7 @@ pub use info::{
 #[cfg(unix)]
 pub use inherit::fastcgi_listener;
 pub use inherit::{InheritError, InheritedListener, systemd, systemd_named};
-pub use limits::{Limits, LimitsBuilder, MinRate, Pressure, SizeClass};
+pub use limits::{Limits, LimitsBuilder, MinRate, Pressure, SizeClass, descriptor_limit};
 #[cfg(all(unix, feature = "local"))]
 pub use local::{Descriptors, UnixConnection, UnixListener};
 #[cfg(feature = "local")]

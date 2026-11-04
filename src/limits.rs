@@ -847,6 +847,20 @@ impl LimitsBuilder {
     }
 }
 
+/// The process's open-descriptor limit (`RLIMIT_NOFILE`, soft) on Unix: what
+/// `ServerBuilder::build` checks a global cap against. `None` where it is unlimited,
+/// and on Windows, where socket handles do not come from a small table. Use it to
+/// place a soft cap of your own under the one net-io would pick.
+///
+/// ```
+/// let cap = net_io::descriptor_limit().map_or(10_000, |n| n.saturating_sub(64));
+/// assert!(cap > 0);
+/// ```
+#[must_use]
+pub fn descriptor_limit() -> Option<u64> {
+    crate::sys::descriptor_limit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
