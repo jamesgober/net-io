@@ -55,6 +55,12 @@ struct Timespec {
     tv_nsec: i64,
 }
 
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<Kevent>() == 32 && align_of::<Kevent>() == 8);
+#[cfg(target_os = "freebsd")]
+const _: () = assert!(size_of::<Kevent>() == 64 && align_of::<Kevent>() == 8);
+const _: () = assert!(size_of::<Timespec>() == 16 && align_of::<Timespec>() == 8);
+
 unsafe extern "C" {
     fn kqueue() -> c_int;
     fn kevent(

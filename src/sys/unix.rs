@@ -411,10 +411,25 @@ const _: () = assert!(size_of::<SockaddrIn6>() == 28);
 const _: () = assert!(size_of::<Linger>() == 8);
 const _: () = assert!(size_of::<PollFd>() == 8);
 const _: () = assert!(size_of::<Rlimit>() == 16);
+const _: () = assert!(size_of::<Timespec>() == 16 && align_of::<Timespec>() == 8);
 #[cfg(target_os = "linux")]
 const _: () = assert!(size_of::<MsgHdr>() == 56);
 #[cfg(not(target_os = "linux"))]
 const _: () = assert!(size_of::<MsgHdr>() == 48);
+#[cfg(all(feature = "udp", target_os = "linux"))]
+const _: () = assert!(size_of::<MmsgHdr>() == 64 && align_of::<MmsgHdr>() == 8);
+#[cfg(all(any(feature = "local", feature = "udp"), target_os = "linux"))]
+const _: () = assert!(size_of::<CmsgHdr>() == 16 && align_of::<CmsgHdr>() == 8);
+#[cfg(all(any(feature = "local", feature = "udp"), not(target_os = "linux")))]
+const _: () = assert!(size_of::<CmsgHdr>() == 12 && align_of::<CmsgHdr>() == 4);
+#[cfg(all(feature = "local", target_os = "linux"))]
+const _: () = assert!(size_of::<Ucred>() == 12 && align_of::<Ucred>() == 4);
+#[cfg(all(feature = "local", target_os = "freebsd"))]
+const _: () = assert!(size_of::<Xucred>() == 88 && align_of::<Xucred>() == 8);
+#[cfg(all(feature = "local", target_os = "linux"))]
+const _: () = assert!(size_of::<SockaddrUn>() == 110 && align_of::<SockaddrUn>() == 2);
+#[cfg(all(feature = "local", not(target_os = "linux")))]
+const _: () = assert!(size_of::<SockaddrUn>() == 106 && align_of::<SockaddrUn>() == 1);
 
 unsafe extern "C" {
     fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
