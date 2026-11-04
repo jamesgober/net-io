@@ -377,6 +377,7 @@ impl Port {
     /// Puts a connected or connecting socket on this port. A listener is refused
     /// (D-016).
     pub(crate) fn associate(&self, sock: Sock<'_>) -> io::Result<Associated> {
+        #[cfg(any(test, net_io_shim))]
         super::shim::check(super::shim::Op::Register)?;
         if super::is_listening_stream(sock)? {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));

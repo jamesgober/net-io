@@ -214,6 +214,7 @@ impl Poller {
     /// Registers a socket under `key` for reading, edge-triggered. Writing waits
     /// through [`WriteArm`].
     pub(crate) fn add(&self, sock: Sock<'_>, key: u64) -> io::Result<Registered> {
+        #[cfg(any(test, net_io_shim))]
         super::shim::check(super::shim::Op::Register)?;
         let raw = sock.as_raw_fd();
         let changes = [change(raw as usize, EVFILT_READ, EV_ADD | EV_CLEAR, 0, key)];

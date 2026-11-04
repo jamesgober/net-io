@@ -379,6 +379,7 @@ pub(super) fn startup() {
 }
 
 fn set_int(sock: Sock<'_>, level: i32, name: i32, value: i32) -> io::Result<()> {
+    #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::SetOption)?;
     // SAFETY: `sock` is open for the call; `value` is a live i32 and the length
     // passed is its size, as setsockopt requires for integer and DWORD options.
@@ -644,6 +645,7 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
         set_int(s.as_socket(), c::SOL_SOCKET, c::SO_RCVBUF, clamp_int(n))?;
     }
     bind_to(s.as_socket(), addr)?;
+    #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::Listen)?;
     // SAFETY: `s` is an open, bound stream socket.
     cvt(unsafe { listen(raw(s.as_socket()), clamp_int(p.backlog)) })?;
@@ -717,6 +719,7 @@ pub(crate) fn set_user_timeout(sock: Sock<'_>, timeout: Duration) -> io::Result<
 
 /// Binds `sock` to `addr`.
 pub(crate) fn bind_to(sock: Sock<'_>, addr: SocketAddr) -> io::Result<()> {
+    #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::Bind)?;
     let mut buf = [0u8; 28];
     let len = encode_addr(addr, &mut buf);
