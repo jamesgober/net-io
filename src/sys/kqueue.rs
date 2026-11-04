@@ -1,6 +1,11 @@
 //! Readiness on macOS and FreeBSD: kqueue with `EV_CLEAR` (edge-triggered) and
 //! `EVFILT_USER` for wake-ups.
 //!
+//! A socket's write filter exists only while a send or connect waits: registered
+//! for good, it fires now and then after an ACK and wakes the worker for nothing.
+//! Adding the filter looks at the socket, so a send that blocked just before the
+//! buffer drained still gets its event.
+//!
 //! References: `kqueue(2)` and `kevent(2)` in the macOS and FreeBSD man pages.
 //! Layout and constants are checked against `libc` by the tests below.
 
@@ -21,7 +26,9 @@ const EVFILT_USER: i16 = -10;
 const EVFILT_USER: i16 = -11;
 const EV_ADD: u16 = 0x0001;
 const EV_DELETE: u16 = 0x0002;
+const EV_ENABLE: u16 = 0x0004;
 const EV_CLEAR: u16 = 0x0020;
+const EV_DISPATCH: u16 = 0x0080;
 const EV_EOF: u16 = 0x8000;
 const EV_ERROR: u16 = 0x4000;
 const NOTE_TRIGGER: u32 = 0x0100_0000;
@@ -134,6 +141,36 @@ impl std::fmt::Debug for Poller {
     }
 }
 
+/// Asks a poller for one write event on a socket.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WriteArm {
+    kq: c_int,
+}
+
+impl WriteArm {
+    /// The next report that `reg` can take bytes, under `key`, once.
+    ///
+    /// A failure here is the kernel out of memory for a filter: the send waits, and
+    /// its write deadline ends the connection.
+    pub(crate) fn arm(self, reg: Registered, key: u64) {
+        // Adding again does not enable what the last event disabled.
+        let flags = EV_ADD | EV_ENABLE | EV_CLEAR | EV_DISPATCH;
+        let changes = [change(reg.raw() as usize, EVFILT_WRITE, flags, 0, key)];
+        // SAFETY: `kq` outlives the driver that holds this and `reg` is registered;
+        // one live change, no events asked for.
+        let _ = unsafe {
+            kevent(
+                self.kq,
+                changes.as_ptr(),
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+    }
+}
+
 impl Poller {
     pub(crate) fn new() -> io::Result<Poller> {
         // SAFETY: no arguments; a new descriptor or -1.
@@ -168,19 +205,17 @@ impl Poller {
         self.wake.clone()
     }
 
-    /// Registers a socket under `key` for both directions, edge-triggered.
+    /// Registers a socket under `key` for reading, edge-triggered. Writing waits
+    /// through [`WriteArm`].
     pub(crate) fn add(&self, sock: Sock<'_>, key: u64) -> io::Result<Registered> {
         let raw = sock.as_raw_fd();
-        let changes = [
-            change(raw as usize, EVFILT_READ, EV_ADD | EV_CLEAR, 0, key),
-            change(raw as usize, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, key),
-        ];
-        // SAFETY: `kq` and `raw` are open; two live changes, no events asked for.
+        let changes = [change(raw as usize, EVFILT_READ, EV_ADD | EV_CLEAR, 0, key)];
+        // SAFETY: `kq` and `raw` are open; one live change, no events asked for.
         cvt(unsafe {
             kevent(
                 self.kq.as_raw_fd(),
                 changes.as_ptr(),
-                2,
+                1,
                 std::ptr::null_mut(),
                 0,
                 std::ptr::null(),
@@ -189,6 +224,14 @@ impl Poller {
         Ok(Registered::new(raw))
     }
 
+    /// What asks for one write event; usable while a wait is delivering events.
+    pub(crate) fn write_arm(&self) -> WriteArm {
+        WriteArm {
+            kq: self.kq.as_raw_fd(),
+        }
+    }
+
+    /// Unregisters a socket. Its write filter may never have existed, so it goes last.
     pub(crate) fn remove(&self, reg: Registered) -> io::Result<()> {
         let raw = reg.raw();
         let changes = [
@@ -281,6 +324,8 @@ mod tests {
         assert_eq!(EV_ADD, libc::EV_ADD);
         assert_eq!(EV_DELETE, libc::EV_DELETE);
         assert_eq!(EV_CLEAR, libc::EV_CLEAR);
+        assert_eq!(EV_ENABLE, libc::EV_ENABLE);
+        assert_eq!(EV_DISPATCH, libc::EV_DISPATCH);
         assert_eq!(EV_EOF, libc::EV_EOF);
         assert_eq!(EV_ERROR, libc::EV_ERROR);
         assert_eq!(NOTE_TRIGGER, libc::NOTE_TRIGGER);
@@ -295,9 +340,21 @@ mod tests {
         s.set_nonblocking(true).unwrap();
         let reg = p.add(s.as_fd(), 7).unwrap();
         let mut seen = Vec::new();
-        p.wait(Some(Duration::from_secs(1)), |e| seen.push(e))
+        p.wait(Some(Duration::from_millis(50)), |e| seen.push(e))
             .unwrap();
-        assert!(seen.iter().any(|e| e.key == 7 && e.writable));
+        assert!(!seen.iter().any(|e| e.writable), "nobody asked");
+        // One event per ask, and the second ask works as the first did.
+        for _ in 0..2 {
+            seen.clear();
+            p.write_arm().arm(reg, 7);
+            p.wait(Some(Duration::from_secs(1)), |e| seen.push(e))
+                .unwrap();
+            assert!(seen.iter().any(|e| e.key == 7 && e.writable));
+            seen.clear();
+            p.wait(Some(Duration::from_millis(50)), |e| seen.push(e))
+                .unwrap();
+            assert!(!seen.iter().any(|e| e.writable), "once");
+        }
         seen.clear();
         (&c).write_all(b"hi").unwrap();
         p.wait(Some(Duration::from_secs(1)), |e| seen.push(e))

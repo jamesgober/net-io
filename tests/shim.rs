@@ -8,7 +8,8 @@
 
 mod common;
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -78,10 +79,17 @@ fn test_accept_out_of_descriptors_recovers() {
     let server = echo_server();
     program(Op::Accept, 0, 1, Fault::Os(EMFILE));
     // The first connection meets the fault; it may be shed or served after the pause.
-    let _first = client(addr(&server));
+    let _first = TcpStream::connect(addr(&server));
     assert!(eventually(WAIT, || server.stats().descriptor_pressure == 1));
-    let mut c = client(addr(&server));
-    assert_eq!(round_trip(&mut c, b"after"), b"after");
+    // A connection accepted during the pause is shed too, and on the BSDs that can
+    // reach the client inside `connect`.
+    assert!(eventually(WAIT, || {
+        TcpStream::connect(addr(&server)).is_ok_and(|mut c| {
+            let _ = c.set_read_timeout(Some(WAIT));
+            let mut b = [0u8; 5];
+            c.write_all(b"after").is_ok() && c.read_exact(&mut b).is_ok() && &b == b"after"
+        })
+    }));
 }
 
 #[test]
@@ -132,23 +140,29 @@ fn test_system_calls_per_echo_round_trip() {
     } else {
         2.0
     };
-    let blocking = net_io::serve("127.0.0.1:0", |conn: &mut net_io::TcpConnection| {
-        let mut buf = [0u8; 512];
-        loop {
-            let n = conn.recv(&mut buf)?;
-            if n == 0 {
-                return Ok(());
-            }
-            conn.send_all(&buf[..n])?;
-        }
-    })
-    .expect("serve");
-    let sessions = echo_server();
-    for (name, server) in [("blocking handler", &blocking), ("sessions", &sessions)] {
-        let mut c = client(addr(server));
+    for name in ["blocking handler", "sessions"] {
+        // One server at a time: the count is process-wide, and a worker still starting
+        // makes its first wait inside the other server's measurement.
+        let server = if name == "sessions" {
+            echo_server()
+        } else {
+            net_io::serve("127.0.0.1:0", |conn: &mut net_io::TcpConnection| {
+                let mut buf = [0u8; 512];
+                loop {
+                    let n = conn.recv(&mut buf)?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    conn.send_all(&buf[..n])?;
+                }
+            })
+            .expect("serve")
+        };
+        let mut c = client(addr(&server));
         for _ in 0..100 {
             assert_eq!(round_trip(&mut c, &[1u8; 64]), [1u8; 64]);
         }
+        std::thread::sleep(std::time::Duration::from_millis(200));
         start_counting();
         let rounds = 1000;
         for _ in 0..rounds {
@@ -164,13 +178,36 @@ fn test_system_calls_per_echo_round_trip() {
         let budget = match name {
             "sessions" if cfg!(net_io_force_blocking) => budget,
             "sessions" if cfg!(windows) => 4.0,
-            // The write filter fires now and then after an ACK: an empty wake.
-            "sessions" if cfg!(not(target_os = "linux")) => 3.1,
             "sessions" => 3.0,
             _ => budget,
         };
         assert!(per <= budget + 0.01, "{name}: {per:.2} > {budget}");
     }
+}
+
+/// A message that fills the read buffer can cost one more receive, the one that finds
+/// the socket empty: readiness cannot say there is no more without asking.
+#[test]
+fn test_system_calls_for_a_message_as_large_as_the_buffer() {
+    use net_io::__shim::{counted, start_counting, stop_counting};
+    let _shim = Shim::take();
+    let server = echo_server();
+    let mut c = client(addr(&server));
+    let body = vec![3u8; 16 * 1024];
+    for _ in 0..100 {
+        assert_eq!(round_trip(&mut c, &body), body);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    start_counting();
+    let rounds = 1000;
+    for _ in 0..rounds {
+        assert_eq!(round_trip(&mut c, &body), body);
+    }
+    stop_counting();
+    let calls = [Op::Recv, Op::Send, Op::Wait, Op::RecvTimeout].map(counted);
+    let per = calls.iter().sum::<u64>() as f64 / f64::from(rounds);
+    println!("16 KiB: {per:.2} system calls per round trip (recv, send, wait, timeout: {calls:?})");
+    assert!(per <= 4.01, "16 KiB: {per:.2} > 4");
 }
 
 /// Records every event.

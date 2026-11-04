@@ -26,8 +26,9 @@ use std::time::{Duration, Instant};
 
 use super::Sessions;
 use super::engine::{
-    CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP, CMD_SHED,
-    CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, record_close,
+    CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP, CMD_PRESSURE,
+    CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, count_drained,
+    record_close,
 };
 use crate::addr::PrefixKey;
 use crate::buf::{Buffer, BufferPool};
@@ -41,7 +42,7 @@ use crate::gate::{ErasedGate, Gate, GateCell, guarded};
 use crate::id::WorkerId;
 use crate::info::{ConnectionInfo, Lane};
 use crate::limits::SizeClass;
-use crate::link::{ClockRef, Link, TlsNext, WakeSource};
+use crate::link::{ClockRef, Link, TlsNext, WakeSource, begin_turn};
 use crate::proxy::ProxyFacts;
 use crate::session::{Input, Output, Phase, Session, SessionContext, SessionFactory, Step};
 use crate::sys::{self, AsSock, KillSink, KillSlot};
@@ -52,6 +53,9 @@ use crate::wheel::{Ticks, TimerId, Wheel};
 pub(crate) type Backend = crate::driver::ready::ReadyDriver;
 #[cfg(windows)]
 pub(crate) type Backend = crate::driver::iocp::IocpDriver;
+
+/// How much of a file one operation, and one gate check, covers.
+const FILE_CHUNK: u64 = 1 << 20;
 
 /// How many rounds of finished-at-once completions run between looks at the OS.
 const LOCAL_ROUNDS: usize = 16;
@@ -121,6 +125,10 @@ enum Sending {
     None,
     /// Output chunks: `total` bytes offered.
     Plain {
+        total: usize,
+    },
+    /// A piece of the file at the output's front.
+    File {
         total: usize,
     },
     /// Sealed records of `taken` plaintext bytes.
@@ -230,7 +238,10 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
             shared: ws.completer.clone(),
         },
         view: ControlView::new(),
-        clock: engine.clock.clone(),
+        clock: match engine.clock {
+            ClockRef::Monotonic => ClockRef::Turn,
+            ref other => other.clone(),
+        },
         notes,
         slot_pool: Vec::new(),
         cells: Vec::new(),
@@ -243,6 +254,7 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
 impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     fn main(&mut self) {
         loop {
+            begin_turn();
             self.take_inbox();
             self.run_commands();
             self.take_kills();
@@ -264,6 +276,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 self.close_all(CloseReason::Shutdown);
                 return;
             }
+            begin_turn();
             for c in done.drain() {
                 self.on_completion(c);
             }
@@ -292,8 +305,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         // Buffers free on any worker, and nothing wakes this one for them.
         let starved = !self.starved.is_empty();
         match self.clock {
-            ClockRef::Monotonic if !starved => timer,
-            ClockRef::Monotonic => {
+            ClockRef::Monotonic | ClockRef::Turn if !starved => timer,
+            ClockRef::Monotonic | ClockRef::Turn => {
                 let cap = STARVED_RETRY;
                 Some(timer.map_or(cap, |t| t.min(cap)))
             }
@@ -461,9 +474,11 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     fn handshake(&mut self, index: u32) {
         #[cfg(feature = "tls")]
         let acceptor = self.shared.tls.clone();
+        let scale = self.shared.deadline_scale();
         let Some(c) = self.conn(index) else { return };
         let accepted = c.link.info.accepted_at;
-        let timeout = c.link.limits.handshake_timeout;
+        c.link.set_deadline_scale(scale);
+        let timeout = c.link.scaled(c.link.limits.handshake_timeout);
         #[cfg(feature = "proxy")]
         if let Some(settings) = c.listener.proxy.clone() {
             if c.proxy.is_none() && !c.link.proxy_done() {
@@ -565,12 +580,19 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let Some(c) = self.slots[index as usize].conn.as_mut() else {
             return;
         };
-        let Some(wait) = c.proxy.as_mut() else { return };
+        if c.proxy.is_none() {
+            return;
+        }
         if n == 0 {
             self.pool.put(buffer);
             return self.close(index, CloseReason::ProxyMissing);
         }
-        c.link.note_cipher(n);
+        if c.link.note_cipher(n).is_err() {
+            self.pool.put(buffer);
+            let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+            return self.close(index, reason);
+        }
+        let Some(wait) = c.proxy.as_mut() else { return };
         let verdict = match wait.parser.feed(buffer.as_slice()) {
             Ok(ProxyProgress::Done { header, consumed }) => {
                 let real = match (header.command, header.source) {
@@ -1067,6 +1089,47 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             c.link.bytes_out > 0
         };
         c.link.response_tag = output.response_tag;
+        if output.front_file().is_some() && !c.link.sends_files_directly() {
+            // TLS and pipes take bytes: this piece becomes a chunk like any other.
+            if let Err(reason) = output.pull_file() {
+                self.close(index, reason);
+                return Flushed::Waiting;
+            }
+        }
+        if let Some((file, offset, left)) = output.front_file() {
+            let len = left.min(FILE_CHUNK) as usize;
+            let token = c.token;
+            return match c.link.check_send(len) {
+                Ok(()) => {
+                    c.sending = Sending::File { total: len };
+                    c.wait = after;
+                    let op = Operation::SendFile {
+                        token,
+                        file,
+                        offset,
+                        len: len as u32,
+                    };
+                    if self.driver.submit(op).is_err() {
+                        if let Some(c) = self.conn(index) {
+                            c.sending = Sending::None;
+                        }
+                        self.close(index, CloseReason::Io(OsErrorClass::Other(0)));
+                    } else {
+                        self.arm_timer(index);
+                    }
+                    Flushed::Waiting
+                }
+                Err(NetError::EgressDenied { code }) => {
+                    self.denied(index, code);
+                    Flushed::Waiting
+                }
+                Err(_) => {
+                    let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                    self.close(index, reason);
+                    Flushed::Waiting
+                }
+            };
+        }
         let total = output.pending_in_send();
         let tls = c.link.has_tls();
         let token = c.token;
@@ -1165,7 +1228,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
         match done.kind {
             OperationKind::Receive => self.on_receive(index, done),
-            OperationKind::Send => self.on_send(index, done),
+            OperationKind::Send | OperationKind::SendFile => self.on_send(index, done),
             _ => {}
         }
     }
@@ -1228,7 +1291,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     return;
                 }
                 input.changed = true;
-                c.link.note_received(n);
+                if c.link.note_received(n).is_err() {
+                    let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                    return self.close(index, reason);
+                }
                 if wait == Wait::Read {
                     self.input_arrived(index);
                 }
@@ -1241,8 +1307,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 }
                 if n == 0 {
                     c.link.tls_transport_closed();
-                } else {
-                    c.link.note_cipher(n);
+                } else if c.link.note_cipher(n).is_err() {
+                    let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                    return self.close(index, reason);
                 }
                 self.tls_turn(index);
             }
@@ -1317,11 +1384,15 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 }
                 match done.result {
                     Ok(n) => {
-                        c.link.note_sent(n);
+                        let rate = c.link.note_sent(n);
                         c.link.sent_of(total, n);
                         if let Some(output) = c.output.as_mut() {
                             output.advance(n);
                             output.bytes_since_begin += n as u64;
+                        }
+                        if rate.is_err() && !closing {
+                            let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                            return self.close(index, reason);
                         }
                     }
                     Err(class) => {
@@ -1334,11 +1405,45 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     }
                 }
             }
+            Sending::File { total } => match done.result {
+                Ok(0) => {
+                    if closing {
+                        return self.settle(index);
+                    }
+                    return self.close(index, CloseReason::Io(OsErrorClass::FileTruncated));
+                }
+                Ok(n) => {
+                    let rate = c.link.note_sent(n);
+                    c.link.sent_of(total, n);
+                    if let Some(output) = c.output.as_mut() {
+                        output.advance(n);
+                        output.bytes_since_begin += n as u64;
+                    }
+                    if rate.is_err() && !closing {
+                        let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                        return self.close(index, reason);
+                    }
+                }
+                Err(class) => {
+                    if closing {
+                        return self.settle(index);
+                    }
+                    c.link.note_failure(class);
+                    let reason = c.link.reason_or(CloseReason::Io(class));
+                    return self.close(index, reason);
+                }
+            },
             Sending::Sealed { taken } => {
                 let Some(mut chunks) = chunks else { return };
                 match done.result {
                     Ok(n) => {
-                        c.link.note_sent(n);
+                        if c.link.note_sent(n).is_err() && !closing {
+                            if let Some(cout) = chunks.into_buffer() {
+                                c.link.tls_put_cout(cout);
+                            }
+                            let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                            return self.close(index, reason);
+                        }
                         if chunks.advance(n) {
                             // A partial send of the records: the rest goes first.
                             c.sending = Sending::Sealed { taken };
@@ -1371,7 +1476,13 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 let Some(mut chunks) = chunks else { return };
                 match done.result {
                     Ok(n) => {
-                        c.link.note_sent(n);
+                        if c.link.note_sent(n).is_err() && !closing {
+                            if let Some(cout) = chunks.into_buffer() {
+                                c.link.tls_put_cout(cout);
+                            }
+                            let reason = c.link.reason_or(CloseReason::Io(OsErrorClass::Other(0)));
+                            return self.close(index, reason);
+                        }
                         if chunks.advance(n) {
                             c.sending = Sending::Machine;
                             let token = c.token;
@@ -1400,6 +1511,16 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 }
             }
             Sending::None => return,
+        }
+        // Before anything below can park the output with the connection idle.
+        let pool = &mut self.pool;
+        if let Some(output) = self
+            .slots
+            .get_mut(index as usize)
+            .and_then(|s| s.conn.as_mut())
+            .and_then(|c| c.output.as_mut())
+        {
+            output.return_spares(pool);
         }
         if closing {
             return self.settle(index);
@@ -1597,6 +1718,15 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         if cmd & CMD_SWEEP != 0 {
             self.sweep(|_| true, CloseReason::Drained);
         }
+        if cmd & CMD_PRESSURE != 0 {
+            let scale = shared.deadline_scale();
+            for i in 0..self.slots.len() as u32 {
+                if let Some(c) = self.conn(i) {
+                    c.link.set_deadline_scale(scale);
+                    self.arm_timer(i);
+                }
+            }
+        }
         if cmd & CMD_SHED != 0 {
             let lane = Lane(ws.lane.load(Ordering::Acquire));
             self.sweep(move |info| info.lane >= lane, CloseReason::Shed);
@@ -1789,6 +1919,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         self.free.push(index);
         self.open -= 1;
         ws.load.fetch_sub(1, Ordering::Relaxed);
+        count_drained(shared, reason);
         shared.release(&c.listener, c.source);
         record_close(shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
         if let Some(mut session) = c.session.take() {

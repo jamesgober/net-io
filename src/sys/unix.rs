@@ -137,6 +137,18 @@ mod c {
     pub const SOCK_DGRAM: c_int = 2;
     #[cfg(feature = "udp")]
     pub const MSG_TRUNC: c_int = 0x20;
+    #[cfg(feature = "udp")]
+    pub const MSG_WAITFORONE: c_int = 0x10000;
+    #[cfg(feature = "udp")]
+    pub const IP_RECVPKTINFO: c_int = 8;
+    #[cfg(feature = "udp")]
+    pub const IP_PKTINFO_TYPE: c_int = 8;
+    #[cfg(feature = "udp")]
+    pub const PKTINFO_ADDR_AT: usize = 8;
+    #[cfg(feature = "udp")]
+    pub const IPV6_RECVPKTINFO: c_int = 49;
+    #[cfg(feature = "udp")]
+    pub const IPV6_PKTINFO_TYPE: c_int = 50;
     pub const SOCK_CLOEXEC: c_int = 0o2_000_000;
     pub const SOL_SOCKET: c_int = 1;
     pub const SO_REUSEADDR: c_int = 2;
@@ -155,6 +167,10 @@ mod c {
     pub const IPV6_UNICAST_HOPS: c_int = 16;
     pub const IPV6_V6ONLY: c_int = 26;
     pub const TCP_NODELAY: c_int = 1;
+    pub const SO_INCOMING_CPU: c_int = 49;
+    pub const TCP_DEFER_ACCEPT: c_int = 9;
+    pub const TCP_USER_TIMEOUT: c_int = 18;
+    pub const TCP_FASTOPEN: c_int = 23;
     pub const TCP_KEEPIDLE: c_int = 4;
     pub const TCP_KEEPINTVL: c_int = 5;
     pub const TCP_KEEPCNT: c_int = 6;
@@ -199,6 +215,25 @@ mod c {
     pub const SOCK_DGRAM: c_int = 2;
     #[cfg(feature = "udp")]
     pub const MSG_TRUNC: c_int = 0x10;
+    #[cfg(all(feature = "udp", target_os = "macos"))]
+    pub const IP_RECVPKTINFO: c_int = 26;
+    #[cfg(all(feature = "udp", target_os = "macos"))]
+    pub const IP_PKTINFO_TYPE: c_int = 26;
+    #[cfg(all(feature = "udp", target_os = "macos"))]
+    pub const PKTINFO_ADDR_AT: usize = 8;
+    /// `IP_RECVDSTADDR`: FreeBSD's record is the address alone.
+    #[cfg(all(feature = "udp", target_os = "freebsd"))]
+    pub const IP_RECVPKTINFO: c_int = 7;
+    #[cfg(all(feature = "udp", target_os = "freebsd"))]
+    pub const IP_PKTINFO_TYPE: c_int = 7;
+    #[cfg(all(feature = "udp", target_os = "freebsd"))]
+    pub const PKTINFO_ADDR_AT: usize = 0;
+    #[cfg(all(feature = "udp", target_os = "macos"))]
+    pub const IPV6_RECVPKTINFO: c_int = 61;
+    #[cfg(all(feature = "udp", target_os = "freebsd"))]
+    pub const IPV6_RECVPKTINFO: c_int = 36;
+    #[cfg(feature = "udp")]
+    pub const IPV6_PKTINFO_TYPE: c_int = 46;
     pub const SOL_SOCKET: c_int = 0xffff;
     pub const SO_ACCEPTCONN: c_int = 0x2;
     pub const SO_REUSEADDR: c_int = 0x4;
@@ -224,6 +259,10 @@ mod c {
     pub const IPV6_UNICAST_HOPS: c_int = 4;
     pub const IPV6_V6ONLY: c_int = 27;
     pub const TCP_NODELAY: c_int = 0x1;
+    #[cfg(target_os = "macos")]
+    pub const TCP_FASTOPEN: c_int = 0x105;
+    #[cfg(target_os = "freebsd")]
+    pub const TCP_FASTOPEN: c_int = 1025;
     #[cfg(target_os = "macos")]
     pub const TCP_KEEPALIVE: c_int = 0x10;
     #[cfg(target_os = "macos")]
@@ -399,13 +438,54 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn getsockname(fd: c_int, addr: *mut c_void, len: *mut SockLen) -> c_int;
     fn getpeername(fd: c_int, addr: *mut c_void, len: *mut SockLen) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn sched_setaffinity(pid: c_int, size: usize, mask: *const u64) -> c_int;
+    #[cfg(target_os = "freebsd")]
+    fn cpuset_setaffinity(
+        level: c_int,
+        which: c_int,
+        id: i64,
+        size: usize,
+        mask: *const u64,
+    ) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn sendfile(out: c_int, file: c_int, offset: *mut i64, count: usize) -> isize;
+    #[cfg(target_os = "macos")]
+    fn sendfile(
+        file: c_int,
+        sock: c_int,
+        offset: i64,
+        len: *mut i64,
+        headers: *mut c_void,
+        flags: c_int,
+    ) -> c_int;
+    #[cfg(target_os = "freebsd")]
+    fn sendfile(
+        file: c_int,
+        sock: c_int,
+        offset: i64,
+        count: usize,
+        headers: *mut c_void,
+        sent: *mut i64,
+        flags: c_int,
+    ) -> c_int;
     #[cfg(feature = "local")]
     fn geteuid() -> u32;
     fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int;
     #[cfg(target_os = "linux")]
     fn syscall(num: std::ffi::c_long, ...) -> std::ffi::c_long;
-    #[cfg(any(feature = "local", all(feature = "udp", not(target_os = "linux"))))]
+    #[cfg(any(feature = "local", feature = "udp"))]
     fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
+    #[cfg(all(feature = "udp", target_os = "linux"))]
+    fn recvmmsg(
+        fd: c_int,
+        msgs: *mut MmsgHdr,
+        count: std::ffi::c_uint,
+        flags: c_int,
+        timeout: *mut c_void,
+    ) -> c_int;
+    #[cfg(all(feature = "udp", target_os = "linux"))]
+    fn sendmmsg(fd: c_int, msgs: *mut MmsgHdr, count: std::ffi::c_uint, flags: c_int) -> c_int;
     #[cfg(all(feature = "udp", target_os = "linux"))]
     fn recvfrom(
         fd: c_int,
@@ -576,6 +656,205 @@ fn udp_socket(v6: bool) -> io::Result<OwnedFd> {
     Ok(owned)
 }
 
+/// `struct mmsghdr`: one message of a batch.
+#[cfg(all(feature = "udp", target_os = "linux"))]
+#[repr(C)]
+struct MmsgHdr {
+    hdr: MsgHdr,
+    len: std::ffi::c_uint,
+}
+
+/// The most messages one batch system call carries.
+#[cfg(all(feature = "udp", target_os = "linux"))]
+pub(crate) const BATCH_MAX: usize = 64;
+
+/// One datagram of a received batch.
+#[cfg(all(feature = "udp", target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Incoming {
+    pub len: usize,
+    pub from: SocketAddr,
+    pub truncated: bool,
+}
+
+/// Fills `bufs` from one `recvmmsg`: it waits for the first datagram, then takes what
+/// is ready. Returns how many arrived; `out` holds them in order. A datagram the
+/// kernel gave no address for is skipped by the caller through `None`.
+#[cfg(all(feature = "udp", target_os = "linux"))]
+pub(crate) fn udp_recv_many(
+    sock: Sock<'_>,
+    bufs: &mut [&mut [u8]],
+    out: &mut [Option<Incoming>],
+) -> io::Result<usize> {
+    #[repr(C, align(8))]
+    struct Addrs([[u8; 128]; BATCH_MAX]);
+    let count = bufs.len().min(out.len()).min(BATCH_MAX);
+    let mut addrs = Addrs([[0; 128]; BATCH_MAX]);
+    let mut iovs = [(std::ptr::null_mut::<u8>(), 0usize); BATCH_MAX];
+    // SAFETY: an all-zero `mmsghdr` is valid: null pointers and zero lengths.
+    let mut msgs: [MmsgHdr; BATCH_MAX] = unsafe { std::mem::zeroed() };
+    for i in 0..count {
+        iovs[i] = (bufs[i].as_mut_ptr(), bufs[i].len());
+        msgs[i].hdr.msg_name = addrs.0[i].as_mut_ptr().cast();
+        msgs[i].hdr.msg_namelen = 128;
+        msgs[i].hdr.msg_iov = (&raw const iovs[i]).cast();
+        msgs[i].hdr.msg_iovlen = 1;
+    }
+    // SAFETY: the first `count` messages point at live `iovs`, `addrs`, and at buffers
+    // writable for their lengths; `(ptr, len)` has the layout of `struct iovec`.
+    let n = cvt(unsafe {
+        recvmmsg(
+            sock.as_raw_fd(),
+            msgs.as_mut_ptr(),
+            count as std::ffi::c_uint,
+            c::MSG_WAITFORONE | c::MSG_TRUNC,
+            std::ptr::null_mut(),
+        )
+    })?;
+    let n = n.unsigned_abs() as usize;
+    for i in 0..n {
+        let len = msgs[i].len as usize;
+        out[i] = decode_addr(&addrs.0[i], msgs[i].hdr.msg_namelen).map(|from| Incoming {
+            len,
+            from,
+            truncated: msgs[i].hdr.msg_flags & c::MSG_TRUNC != 0,
+        });
+    }
+    Ok(n)
+}
+
+/// Sends the first of `datagrams` (at most [`BATCH_MAX`]) in one `sendmmsg`; returns how
+/// many went.
+#[cfg(all(feature = "udp", target_os = "linux"))]
+pub(crate) fn udp_send_many(
+    sock: Sock<'_>,
+    datagrams: &[(&[u8], SocketAddr)],
+) -> io::Result<usize> {
+    let count = datagrams.len().min(BATCH_MAX);
+    let mut addrs = [[0u8; 28]; BATCH_MAX];
+    let mut iovs = [(std::ptr::null::<u8>(), 0usize); BATCH_MAX];
+    // SAFETY: an all-zero `mmsghdr` is valid: null pointers and zero lengths.
+    let mut msgs: [MmsgHdr; BATCH_MAX] = unsafe { std::mem::zeroed() };
+    for i in 0..count {
+        let (bytes, to) = datagrams[i];
+        let len = encode_addr(to, &mut addrs[i]);
+        iovs[i] = (bytes.as_ptr(), bytes.len());
+        msgs[i].hdr.msg_name = addrs[i].as_mut_ptr().cast();
+        msgs[i].hdr.msg_namelen = len;
+        msgs[i].hdr.msg_iov = (&raw const iovs[i]).cast();
+        msgs[i].hdr.msg_iovlen = 1;
+    }
+    // SAFETY: as in `udp_recv_many`; the kernel only reads what these messages point at.
+    let n = cvt(unsafe {
+        sendmmsg(
+            sock.as_raw_fd(),
+            msgs.as_mut_ptr(),
+            count as std::ffi::c_uint,
+            c::MSG_NOSIGNAL,
+        )
+    })?;
+    Ok(n.unsigned_abs() as usize)
+}
+
+/// Asks for each datagram's destination address.
+#[cfg(feature = "udp")]
+pub(crate) fn udp_packet_info(sock: Sock<'_>, v6: bool) -> io::Result<()> {
+    if v6 {
+        set_int(sock, c::IPPROTO_IPV6, c::IPV6_RECVPKTINFO, 1)
+    } else {
+        set_int(sock, c::IPPROTO_IP, c::IP_RECVPKTINFO, 1)
+    }
+}
+
+/// One datagram with the address it was sent to: as [`udp_recv_from`], through
+/// `recvmsg` and its ancillary data.
+#[cfg(feature = "udp")]
+pub(crate) fn udp_recv_with_destination(
+    sock: Sock<'_>,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, bool, Option<std::net::IpAddr>)> {
+    #[repr(C, align(8))]
+    struct Control([u8; 128]);
+    let mut addr = AddrBuf([0; 128]);
+    let mut control = Control([0; 128]);
+    let mut iov = [io::IoSliceMut::new(buf)];
+    let mut msg = MsgHdr {
+        msg_name: addr.0.as_mut_ptr().cast::<c_void>(),
+        msg_namelen: 128,
+        msg_iov: iov.as_mut_ptr().cast::<IoSlice<'static>>(),
+        msg_iovlen: 1,
+        msg_control: control.0.as_mut_ptr().cast::<c_void>(),
+        msg_controllen: 128,
+        msg_flags: 0,
+    };
+    #[cfg(target_os = "linux")]
+    let flags = c::MSG_TRUNC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    // SAFETY: `msg` points at `addr`, `control`, and one iovec over `buf`; all live for
+    // the call; `sock` is open.
+    let n = unsafe { recvmsg(sock.as_raw_fd(), &raw mut msg, flags) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let from = decode_addr(&addr.0, msg.msg_namelen)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    #[allow(clippy::unnecessary_cast)] // u32 off Linux
+    let used = (msg.msg_controllen as usize).min(control.0.len());
+    let destination = destination_in(&control.0[..used]);
+    Ok((
+        n.unsigned_abs(),
+        from,
+        msg.msg_flags & c::MSG_TRUNC != 0,
+        destination,
+    ))
+}
+
+/// Walks the control messages for a packet-info record. Lengths are the kernel's, and
+/// checked against the bytes it reported.
+#[cfg(feature = "udp")]
+fn destination_in(control: &[u8]) -> Option<std::net::IpAddr> {
+    let mut at = 0;
+    while at + size_of::<CmsgHdr>() <= control.len() {
+        let word =
+            |o: usize| -> Option<[u8; 4]> { control.get(at + o..at + o + 4)?.try_into().ok() };
+        // On Linux `cmsg_len` is a `size_t`, whose low half comes first on these targets.
+        let len = u32::from_ne_bytes(word(0)?) as usize;
+        let level = i32::from_ne_bytes(word(CMSG_LEVEL_AT)?);
+        let ty = i32::from_ne_bytes(word(CMSG_LEVEL_AT + 4)?);
+        if len < size_of::<CmsgHdr>() {
+            return None;
+        }
+        let data = control.get(at + cmsg_align_any(size_of::<CmsgHdr>())..at + len)?;
+        if level == c::IPPROTO_IP && ty == c::IP_PKTINFO_TYPE {
+            let octets: [u8; 4] = data
+                .get(c::PKTINFO_ADDR_AT..c::PKTINFO_ADDR_AT + 4)?
+                .try_into()
+                .ok()?;
+            return Some(std::net::IpAddr::from(octets));
+        }
+        if level == c::IPPROTO_IPV6 && ty == c::IPV6_PKTINFO_TYPE {
+            let octets: [u8; 16] = data.get(..16)?.try_into().ok()?;
+            return Some(std::net::IpAddr::from(octets));
+        }
+        at += cmsg_align_any(len);
+    }
+    None
+}
+
+#[cfg(feature = "udp")]
+const CMSG_LEVEL_AT: usize = size_of::<CmsgHdr>() - 8;
+
+#[cfg(feature = "udp")]
+const fn cmsg_align_any(n: usize) -> usize {
+    let to = if cfg!(target_os = "macos") {
+        4
+    } else {
+        size_of::<usize>()
+    };
+    (n + to - 1) & !(to - 1)
+}
+
 /// Creates and binds a UDP socket; `IPV6_V6ONLY` as asked for IPv6 addresses.
 /// No `SO_REUSEADDR`: another socket must not share the port.
 #[cfg(feature = "udp")]
@@ -689,6 +968,9 @@ pub(crate) struct ListenParams {
     pub send_buffer: Option<u32>,
     pub receive_buffer: Option<u32>,
     pub backlog: u32,
+    pub defer_accept: Option<Duration>,
+    pub fast_open: Option<u32>,
+    pub incoming_cpu: Option<u32>,
 }
 
 /// Creates, configures, binds, and listens, in the order `docs/API.md` gives.
@@ -714,13 +996,202 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
     if let Some(n) = p.receive_buffer {
         set_int(fd.as_fd(), c::SOL_SOCKET, c::SO_RCVBUF, clamp_int(n))?;
     }
+    set_incoming_cpu(fd.as_fd(), p.incoming_cpu)?;
     bind_to(fd.as_fd(), addr)?;
     // SAFETY: `fd` is an open, bound stream socket; listen(2) takes an int backlog.
     cvt(unsafe { listen(fd.as_raw_fd(), clamp_int(p.backlog)) })?;
+    set_defer_accept(fd.as_fd(), p.defer_accept)?;
+    if let Some(queue) = p.fast_open {
+        set_fast_open(fd.as_fd(), queue)?;
+    }
     let listener = TcpListener::from(fd);
     // Listeners are always non-blocking: accepts wait in poll with a wake channel.
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+/// One `sendfile` on a non-blocking socket: `WouldBlock` when the buffer is full, `0`
+/// when the file has nothing at `offset`.
+pub(crate) fn send_file(
+    sock: Sock<'_>,
+    file: &std::fs::File,
+    offset: u64,
+    len: usize,
+) -> io::Result<usize> {
+    let raw_file = file.as_raw_fd();
+    let start = i64::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    retry_interrupted(|| {
+        #[cfg(any(test, net_io_shim))]
+        let len = match super::shim::io(super::shim::Op::Send, len)? {
+            Some(n) => n,
+            None => len,
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let mut at = start;
+            // SAFETY: both descriptors are open for the call, and `at` is a live local.
+            let n = unsafe { sendfile(sock.as_raw_fd(), raw_file, &raw mut at, len) };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n.unsigned_abs())
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut moved = len as i64;
+            // SAFETY: both descriptors are open for the call; no headers; `moved` is a
+            // live local that the call reads as the count and writes as the result.
+            let ret = unsafe {
+                sendfile(
+                    raw_file,
+                    sock.as_raw_fd(),
+                    start,
+                    &raw mut moved,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            sendfile_result(ret, moved)
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            let mut moved = 0i64;
+            // SAFETY: both descriptors are open for the call; no headers; `moved` is a
+            // live local written during the call.
+            let ret = unsafe {
+                sendfile(
+                    raw_file,
+                    sock.as_raw_fd(),
+                    start,
+                    len,
+                    std::ptr::null_mut(),
+                    &raw mut moved,
+                    0,
+                )
+            };
+            sendfile_result(ret, moved)
+        }
+    })
+}
+
+/// On the BSDs a call that stopped at a full buffer fails and still reports its bytes.
+#[cfg(not(target_os = "linux"))]
+fn sendfile_result(ret: c_int, moved: i64) -> io::Result<usize> {
+    if ret == 0 || moved > 0 {
+        return Ok(moved.unsigned_abs() as usize);
+    }
+    Err(io::Error::last_os_error())
+}
+
+/// Whether `sendfile` turned this file or socket down, as opposed to failing: the
+/// bytes can still go by reading and writing.
+pub(crate) fn send_file_refused(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(errno::EINVAL | errno::EOPNOTSUPP | errno::ENOTSOCK)
+    ) || e.kind() == io::ErrorKind::Unsupported
+}
+
+/// Bytes of `file` at `offset`, leaving its position alone.
+pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+/// Whether this OS can pin a thread.
+pub(crate) const CAN_PIN: bool = cfg!(any(target_os = "linux", target_os = "freebsd"));
+
+/// `cpu` as a `cpu_set_t` or `cpuset_t` (1,024 CPUs on Linux, 256 on FreeBSD).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn cpu_mask(cpu: usize) -> io::Result<[u64; 16]> {
+    let mut mask = [0u64; 16];
+    let word = mask
+        .get_mut(cpu / 64)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    *word = 1 << (cpu % 64);
+    Ok(mask)
+}
+
+/// Pins the calling thread to `cpu`.
+#[cfg(target_os = "linux")]
+pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
+    let mask = cpu_mask(cpu)?;
+    // SAFETY: pid 0 means the calling thread; `mask` is live for its stated size.
+    cvt(unsafe { sched_setaffinity(0, size_of_val(&mask), mask.as_ptr()) }).map(drop)
+}
+
+/// Pins the calling thread to `cpu`.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
+    const CPU_LEVEL_WHICH: c_int = 3;
+    const CPU_WHICH_TID: c_int = 1;
+    let mask = cpu_mask(cpu)?;
+    // SAFETY: id -1 means the calling thread; `mask` is live, and 32 bytes is `cpuset_t`.
+    cvt(unsafe { cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 32, mask.as_ptr()) })
+        .map(drop)
+}
+
+/// macOS has no affinity call; `build` refuses a placement there.
+#[cfg(target_os = "macos")]
+pub(crate) fn pin_current_thread(_cpu: usize) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+/// `SO_INCOMING_CPU`: connections to a reuse-port group go to the listener on the
+/// CPU that received them.
+#[cfg(target_os = "linux")]
+fn set_incoming_cpu(sock: Sock<'_>, cpu: Option<u32>) -> io::Result<()> {
+    match cpu {
+        Some(cpu) => set_int(sock, c::SOL_SOCKET, c::SO_INCOMING_CPU, clamp_int(cpu)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_incoming_cpu(_sock: Sock<'_>, cpu: Option<u32>) -> io::Result<()> {
+    match cpu {
+        Some(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
+        None => Ok(()),
+    }
+}
+
+/// `TCP_DEFER_ACCEPT`: `accept` returns once bytes arrive, or after `wait`.
+#[cfg(target_os = "linux")]
+fn set_defer_accept(sock: Sock<'_>, wait: Option<Duration>) -> io::Result<()> {
+    match wait {
+        Some(d) => set_int(sock, c::IPPROTO_TCP, c::TCP_DEFER_ACCEPT, secs(d)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_defer_accept(_sock: Sock<'_>, wait: Option<Duration>) -> io::Result<()> {
+    match wait {
+        Some(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
+        None => Ok(()),
+    }
+}
+
+/// Server fast open: a queue length on Linux, on or off on the BSDs.
+fn set_fast_open(sock: Sock<'_>, queue: u32) -> io::Result<()> {
+    let value = if cfg!(target_os = "linux") {
+        clamp_int(queue)
+    } else {
+        c_int::from(queue != 0)
+    };
+    set_int(sock, c::IPPROTO_TCP, c::TCP_FASTOPEN, value)
+}
+
+/// `TCP_USER_TIMEOUT`: how long sent bytes may stay unacknowledged.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_user_timeout(sock: Sock<'_>, timeout: Duration) -> io::Result<()> {
+    let ms = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
+    set_int(sock, c::IPPROTO_TCP, c::TCP_USER_TIMEOUT, ms)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn set_user_timeout(_sock: Sock<'_>, _timeout: Duration) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// Binds `sock` to `addr`.
@@ -1413,7 +1884,7 @@ struct Ucred {
 }
 
 /// `struct cmsghdr` (`cmsg(3)`): Linux uses `size_t` for the length.
-#[cfg(all(feature = "local", target_os = "linux"))]
+#[cfg(all(any(feature = "local", feature = "udp"), target_os = "linux"))]
 #[repr(C)]
 struct CmsgHdr {
     cmsg_len: usize,
@@ -1422,7 +1893,7 @@ struct CmsgHdr {
 }
 
 /// `struct cmsghdr` on macOS: `socklen_t` for the length.
-#[cfg(all(feature = "local", not(target_os = "linux")))]
+#[cfg(all(any(feature = "local", feature = "udp"), not(target_os = "linux")))]
 #[repr(C)]
 struct CmsgHdr {
     cmsg_len: u32,
@@ -1884,6 +2355,13 @@ mod layout {
         assert_eq!(c::TCP_NODELAY, libc::TCP_NODELAY);
         assert_eq!(c::TCP_KEEPINTVL, libc::TCP_KEEPINTVL);
         assert_eq!(c::TCP_KEEPCNT, libc::TCP_KEEPCNT);
+        assert_eq!(c::TCP_FASTOPEN, libc::TCP_FASTOPEN);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(c::SO_INCOMING_CPU, libc::SO_INCOMING_CPU);
+            assert_eq!(c::TCP_DEFER_ACCEPT, libc::TCP_DEFER_ACCEPT);
+            assert_eq!(c::TCP_USER_TIMEOUT, libc::TCP_USER_TIMEOUT);
+        }
         assert_eq!(c::MSG_DONTWAIT, libc::MSG_DONTWAIT);
         assert_eq!(c::POLLIN, libc::POLLIN);
         assert_eq!(c::POLLOUT, libc::POLLOUT);
@@ -2358,6 +2836,9 @@ mod layout {
             send_buffer: Some(64 * 1024),
             receive_buffer: None,
             backlog: 16,
+            defer_accept: None,
+            fast_open: None,
+            incoming_cpu: None,
         };
         let l = tcp_listener("127.0.0.1:0".parse().unwrap(), &p).unwrap();
         assert!(is_listening_stream(l.as_fd()).unwrap());

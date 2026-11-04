@@ -8,7 +8,9 @@
 //! a socket is writable nearly always, and the wait is the expensive part.
 
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io::{self, IoSlice};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
@@ -17,7 +19,7 @@ use super::{
 };
 use crate::buf::Buffer;
 use crate::error::{NetError, OsErrorClass};
-use crate::sys::{self, PollEvent, Poller, Registered};
+use crate::sys::{self, PollEvent, Poller, Registered, WriteArm};
 
 #[derive(Debug, Default)]
 enum Recv {
@@ -34,6 +36,7 @@ enum Out {
     None,
     Connect,
     Chunks(SendChunks),
+    File(Arc<File>, u64, u32),
 }
 
 #[derive(Debug)]
@@ -124,7 +127,7 @@ impl ReadyDriver {
         }
     }
 
-    fn try_send(reg: &mut Reg, local: &mut VecDeque<Completion>) {
+    fn try_send(reg: &mut Reg, local: &mut VecDeque<Completion>, arm: WriteArm) {
         let token = Token(reg.token);
         match std::mem::take(&mut reg.out) {
             Out::None => {}
@@ -138,12 +141,26 @@ impl ReadyDriver {
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         reg.writable = false;
                         reg.out = Out::Chunks(chunks);
+                        arm.arm(reg.socket, reg.token);
                     }
                     other => {
                         let result = other.map_err(|e| OsErrorClass::from_io(&e));
                         let mut c = Completion::new(token, OperationKind::Send, result);
                         c.chunks = Some(chunks);
                         local.push_back(c);
+                    }
+                }
+            }
+            Out::File(file, offset, len) if reg.writable => {
+                match reg.socket.send_file(&file, offset, len as usize) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        reg.writable = false;
+                        reg.out = Out::File(file, offset, len);
+                        arm.arm(reg.socket, reg.token);
+                    }
+                    other => {
+                        let result = other.map_err(|e| OsErrorClass::from_io(&e));
+                        local.push_back(Completion::new(token, OperationKind::SendFile, result));
                     }
                 }
             }
@@ -182,7 +199,12 @@ impl ReadyDriver {
         n
     }
 
-    fn on_event(regs: &mut [Option<Reg>], local: &mut VecDeque<Completion>, e: PollEvent) {
+    fn on_event(
+        regs: &mut [Option<Reg>],
+        local: &mut VecDeque<Completion>,
+        arm: WriteArm,
+        e: PollEvent,
+    ) {
         let token = Token(e.key);
         let Some(reg) = regs
             .get_mut(token.index())
@@ -195,7 +217,7 @@ impl ReadyDriver {
         reg.writable |= e.writable;
         reg.hangup |= e.hangup;
         ReadyDriver::try_recv(reg, local);
-        ReadyDriver::try_send(reg, local);
+        ReadyDriver::try_send(reg, local, arm);
     }
 }
 
@@ -233,6 +255,7 @@ impl Driver for ReadyDriver {
                 .push_back(Completion::new(token, OperationKind::Nop, Ok(0)));
             return Ok(());
         }
+        let arm = self.poller.write_arm();
         let local = &mut self.local;
         let Some(reg) = self
             .regs
@@ -257,7 +280,13 @@ impl Driver for ReadyDriver {
             }
             Operation::Send { chunks, .. } if matches!(reg.out, Out::None) => {
                 reg.out = Out::Chunks(chunks);
-                ReadyDriver::try_send(reg, local);
+                ReadyDriver::try_send(reg, local, arm);
+            }
+            Operation::SendFile {
+                file, offset, len, ..
+            } if matches!(reg.out, Out::None) => {
+                reg.out = Out::File(file, offset, len);
+                ReadyDriver::try_send(reg, local, arm);
             }
             Operation::Connect { addr, .. } if matches!(reg.out, Out::None) => {
                 match reg.socket.connect_start(addr) {
@@ -267,6 +296,7 @@ impl Driver for ReadyDriver {
                     Ok(true) => {
                         reg.writable = false;
                         reg.out = Out::Connect;
+                        arm.arm(reg.socket, reg.token);
                     }
                     Err(e) => {
                         local.push_back(Completion::new(
@@ -303,8 +333,9 @@ impl Driver for ReadyDriver {
                 timeout
             };
             let (regs, local) = (&mut self.regs, &mut self.local);
+            let arm = self.poller.write_arm();
             self.poller
-                .wait(timeout, |e| ReadyDriver::on_event(regs, local, e))
+                .wait(timeout, |e| ReadyDriver::on_event(regs, local, arm, e))
                 .map_err(|e| NetError::from_os("wait", e))?;
         } else {
             self.skipped += 1;
@@ -342,17 +373,22 @@ impl Driver for ReadyDriver {
                     }
                 }
             }
-            OperationKind::Send | OperationKind::Connect => match std::mem::take(&mut reg.out) {
-                Out::None => {}
-                Out::Chunks(chunks) => {
-                    let mut c = Completion::new(token, OperationKind::Send, aborted);
-                    c.chunks = Some(chunks);
-                    local.push_back(c);
+            OperationKind::Send | OperationKind::SendFile | OperationKind::Connect => {
+                match std::mem::take(&mut reg.out) {
+                    Out::None => {}
+                    Out::Chunks(chunks) => {
+                        let mut c = Completion::new(token, OperationKind::Send, aborted);
+                        c.chunks = Some(chunks);
+                        local.push_back(c);
+                    }
+                    Out::File(..) => {
+                        local.push_back(Completion::new(token, OperationKind::SendFile, aborted));
+                    }
+                    Out::Connect => {
+                        local.push_back(Completion::new(token, OperationKind::Connect, aborted));
+                    }
                 }
-                Out::Connect => {
-                    local.push_back(Completion::new(token, OperationKind::Connect, aborted));
-                }
-            },
+            }
             _ => {}
         }
         ReadyDriver::try_close(reg, local);

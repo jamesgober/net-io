@@ -146,8 +146,10 @@ fn test_untrusted_peer_is_closed_before_reading() {
         Limits::default(),
         &rec,
     );
-    let mut c = client(addr(&server));
-    let _ = c.write_all(b"PROXY TCP4 203.0.113.7 127.0.0.1 40000 443\r\n");
+    // The close can reach a BSD client inside `connect`.
+    if let Ok(mut c) = std::net::TcpStream::connect(addr(&server)) {
+        let _ = c.write_all(b"PROXY TCP4 203.0.113.7 127.0.0.1 40000 443\r\n");
+    }
     assert_eq!(rec.wait_close(), CloseReason::ProxyUntrusted);
 }
 

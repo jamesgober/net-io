@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). No dependencies: OS calls the standard library does not expose go through the crate's own fenced FFI layer.
     </p>
     <blockquote>
-        <strong>Status: <code>0.5.0</code>, feature complete.</strong> Its own reactor on epoll, kqueue, and IOCP beside the blocking pool, on Linux, macOS, FreeBSD, and Windows; TCP, Unix domain sockets, Windows named pipes, and UDP; the PROXY protocol, the TLS seam, inheritance, and listener hand-off. Pre-1.0: the API in <a href="./docs/API.md"><code>docs/API.md</code></a> is locked, and each item says the version that ships it. Performance work comes in <code>0.6.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
+        <strong>Status: <code>0.6.0</code>, optimisation.</strong> Its own reactor on epoll, kqueue, and IOCP beside the blocking pool, on Linux, macOS, FreeBSD, and Windows; TCP, Unix domain sockets, Windows named pipes, and UDP; zero-copy file sends; the PROXY protocol, the TLS seam, inheritance, and listener hand-off. Pre-1.0: the API in <a href="./docs/API.md"><code>docs/API.md</code></a> is locked, and each item says the version that ships it. Hardening comes in <code>0.7.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
@@ -38,13 +38,13 @@
 
 ## What it does
 
-| Area | In `0.5.0` | Later |
+| Area | In `0.6.0` | Later |
 |---|---|---|
-| Transports | TCP; Unix domain sockets with peer credentials and descriptor passing, and AF_UNIX on Windows; Windows named pipes with ACLs and the client's pid; UDP with budgets and an amplification guard | batched UDP and multicast (`0.6.0`) |
-| Drivers | its own reactor on epoll, kqueue, and IOCP, the default: 10,000 idle connections in about 17 MB of heap with no read buffers; a bounded blocking worker pool for handlers; no allocation after warm-up on either; a public completion-shaped `Driver` interface | zero-copy file sends (`0.6.0`), an executor adapter (`0.8.0`) |
-| Limits | global, per-listener, and per-source caps; idle, read, write, exchange, and park deadlines; a minimum transfer rate against slowloris and slow readers; bounded buffers | adaptive deadlines and lane reservations (`0.6.0`) |
+| Transports | TCP; Unix domain sockets with peer credentials and descriptor passing, and AF_UNIX on Windows; Windows named pipes with ACLs and the client's pid; UDP with budgets, an amplification guard, batches, multicast, and sessions | GSO and GRO (after `1.0.0`) |
+| Drivers | its own reactor on epoll, kqueue, and IOCP, the default: 10,000 idle connections in about 17 MB of heap with no read buffers; a bounded blocking worker pool for handlers; no allocation after warm-up on either; zero-copy file sends; worker placement and per-worker listeners; a public completion-shaped `Driver` interface | an executor adapter (`0.8.0`) |
+| Limits | global, per-listener, and per-source caps; idle, read, write, exchange, and park deadlines; a minimum transfer rate against slowloris and slow readers; bounded buffers; adaptive deadlines and lane reservations | |
 | Lifecycle | the door, graceful drain with a deadline, kill from any thread, one `CloseReason` and one closed event per connection, a control line (shed, lockdown, drain, stop); listeners added and removed while running; systemd and FastCGI inheritance; listener hand-off between processes on Unix and Windows | |
-| Seams | the gate (admission before any byte is read, a check before every write, also for adopted and dialed connections), sans-IO sessions, an event sink, a completion queue for offloaded work; the PROXY protocol from trusted proxies; the TLS seam on listeners | adaptive deadlines and lane reservations (`0.6.0`) |
+| Seams | the gate (admission before any byte is read, a check before every write, also for adopted and dialed connections), sans-IO sessions, an event sink, a completion queue for offloaded work; the PROXY protocol from trusted proxies; the TLS seam on listeners | |
 
 The full plan:
 
@@ -64,7 +64,7 @@ The full plan:
 
 ```toml
 [dependencies]
-net-io = "0.3"
+net-io = "0.6"
 ```
 
 The simplest server (the full API is in [`docs/API.md`](./docs/API.md); `examples/` has a sans-IO session, kill and drain, and a gate):

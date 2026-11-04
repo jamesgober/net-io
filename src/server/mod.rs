@@ -166,7 +166,10 @@ pub struct ListenerSpec {
     pub(crate) unix: Option<(PathBuf, LocalOptions)>,
     #[cfg(all(windows, feature = "local"))]
     pub(crate) pipe: Option<(String, crate::pipe::PipeOptions)>,
+    #[cfg(feature = "udp")]
+    pub(crate) udp: Option<crate::udp::UdpOptions>,
     pub(crate) adopt: Option<ListenerHandle>,
+    pub(crate) lockdown_allowed: bool,
 }
 
 impl ListenerSpec {
@@ -186,14 +189,42 @@ impl ListenerSpec {
             unix: None,
             #[cfg(all(windows, feature = "local"))]
             pipe: None,
+            #[cfg(feature = "udp")]
+            udp: None,
             adopt: None,
+            lockdown_allowed: false,
         }
+    }
+
+    /// Keeps admitting under `ControlState::Lockdown`, for the listener an operator
+    /// comes in through while everything else is refused.
+    pub fn lockdown_allowed(mut self, on: bool) -> ListenerSpec {
+        self.lockdown_allowed = on;
+        self
     }
 
     /// A TCP listener with explicit options (their backlog wins over the limits').
     pub fn tcp_with<A: ToSocketAddrs>(addr: A, options: ListenOptions) -> ListenerSpec {
         ListenerSpec {
             options: Some(options),
+            ..ListenerSpec::tcp(addr)
+        }
+    }
+
+    /// A UDP socket served by the [`UdpSession`](crate::UdpSession) that
+    /// `ServerBuilder::udp_sessions` makes (feature `udp`). A thread of its own reads
+    /// it, with the door and a stop like any listener, and the socket's budgets and
+    /// amplification guard apply.
+    ///
+    /// ```
+    /// use net_io::{ListenerSpec, UdpOptions};
+    /// let spec = ListenerSpec::udp("0.0.0.0:5353", UdpOptions::new());
+    /// # let _ = spec;
+    /// ```
+    #[cfg(feature = "udp")]
+    pub fn udp<A: ToSocketAddrs>(addr: A, options: crate::udp::UdpOptions) -> ListenerSpec {
+        ListenerSpec {
+            udp: Some(options),
             ..ListenerSpec::tcp(addr)
         }
     }
@@ -240,8 +271,11 @@ impl ListenerSpec {
             trusted: None,
             tls: false,
             unix: Some((path.into(), options)),
+            lockdown_allowed: false,
             #[cfg(all(windows, feature = "local"))]
             pipe: None,
+            #[cfg(feature = "udp")]
+            udp: None,
             adopt: None,
         }
     }
@@ -273,7 +307,10 @@ impl ListenerSpec {
             unix: None,
             #[cfg(all(windows, feature = "local"))]
             pipe: None,
+            #[cfg(feature = "udp")]
+            udp: None,
             adopt: Some(handle),
+            lockdown_allowed: false,
         }
     }
 
@@ -320,9 +357,33 @@ impl ListenerSpec {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoWork;
 
+/// What `ServerBuilder::udp_sessions` produces when a server has no TCP work; programs
+/// never name it.
+#[cfg(feature = "udp")]
+#[derive(Debug)]
+pub struct UdpOnly;
+
 /// The unset gate (no `build` exists for it): name `AllowAll` to run without a gate.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoGate;
+
+/// Where workers run.
+///
+/// ```
+/// let pinned = net_io::Placement::Explicit(vec![0, 2, 4, 6]);
+/// # let _ = pinned;
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Placement {
+    /// The OS decides.
+    #[default]
+    Off,
+    /// Worker `n` on CPU `n`, wrapping around.
+    PinPerCore,
+    /// Worker `n` on `cpus[n % cpus.len()]`.
+    Explicit(Vec<usize>),
+}
 
 /// What `ServerBuilder::sessions` produces; programs never name it.
 #[derive(Debug)]
@@ -354,6 +415,11 @@ pub(crate) mod sealed {
 
 /// What runs per connection: [`Sessions`] or a [`BlockingHandler`]. Sealed.
 pub trait Workload: sealed::Sealed + engine::Serve + Send + Sync + 'static {}
+
+#[cfg(feature = "udp")]
+impl sealed::Sealed for UdpOnly {}
+#[cfg(feature = "udp")]
+impl Workload for UdpOnly {}
 
 impl<F: SessionFactory> sealed::Sealed for Sessions<F> {}
 impl<F: SessionFactory> Workload for Sessions<F> {}
@@ -405,6 +471,9 @@ pub struct ServerBuilder<W = NoWork, G = NoGate, S = NoopSink, T = NoTls> {
     wipe: bool,
     clock: Option<Arc<dyn Clock>>,
     trusted: Option<Arc<TrustedProxies>>,
+    placement: Placement,
+    #[cfg(feature = "udp")]
+    udp: Option<Arc<dyn crate::udp::UdpSessionFactory>>,
 }
 
 impl ServerBuilder {
@@ -423,6 +492,9 @@ impl ServerBuilder {
             wipe: true,
             clock: None,
             trusted: None,
+            placement: Placement::Off,
+            #[cfg(feature = "udp")]
+            udp: None,
         }
     }
 }
@@ -451,6 +523,9 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
             wipe,
             clock,
             trusted,
+            placement,
+            #[cfg(feature = "udp")]
+            udp,
         } = self;
         let (work, gate, sink, tls) = f(work, gate, sink, tls);
         ServerBuilder {
@@ -466,6 +541,9 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
             wipe,
             clock,
             trusted,
+            placement,
+            #[cfg(feature = "udp")]
+            udp,
         }
     }
 
@@ -485,6 +563,13 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
     /// The driver (default `Auto`).
     pub fn driver(mut self, kind: DriverKind) -> Self {
         self.driver = kind;
+        self
+    }
+
+    /// Pins workers to CPUs (`Unsupported` on macOS). A worker that stays on one CPU
+    /// keeps its cache; the cost is that the OS can no longer move it off a busy CPU.
+    pub fn placement(mut self, placement: Placement) -> Self {
+        self.placement = placement;
         self
     }
 
@@ -543,6 +628,51 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
     /// The clock deadlines read (tests inject a `ManualClock`).
     pub fn clock<K: Clock>(mut self, clock: Arc<K>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+}
+
+#[cfg(feature = "udp")]
+impl<G, S, T> ServerBuilder<NoWork, G, S, T> {
+    /// Serves UDP listeners only; a TCP listener then fails `build`. One thread per
+    /// listener, and no worker pool.
+    ///
+    /// ```no_run
+    /// use std::net::SocketAddr;
+    /// use net_io::{AllowAll, ListenerInfo, ListenerSpec, ServerBuilder, UdpContext, UdpOptions, UdpSession};
+    /// struct Echo;
+    /// impl UdpSession for Echo {
+    ///     fn on_datagram(&mut self, cx: &mut UdpContext<'_>, from: SocketAddr, bytes: &[u8]) {
+    ///         let _ = cx.send_to(bytes, from);
+    ///     }
+    /// }
+    /// let server = ServerBuilder::new()
+    ///     .listener(ListenerSpec::udp("0.0.0.0:7000", UdpOptions::new()))
+    ///     .udp_sessions(|_: &ListenerInfo| Echo)
+    ///     .gate(AllowAll)
+    ///     .build()?;
+    /// server.open_door()?;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn udp_sessions<F>(self, factory: F) -> ServerBuilder<UdpOnly, G, S, T>
+    where
+        F: crate::udp::UdpSessionFactory,
+    {
+        let mut b = self.map(|_, g, s, t| (UdpOnly, g, s, t));
+        b.udp = Some(Arc::new(factory));
+        b.workers.get_or_insert(1);
+        b
+    }
+}
+
+#[cfg(feature = "udp")]
+impl<W: Workload, G, S, T> ServerBuilder<W, G, S, T> {
+    /// Serves the UDP listeners beside this server's TCP work.
+    pub fn udp_sessions<F>(mut self, factory: F) -> Self
+    where
+        F: crate::udp::UdpSessionFactory,
+    {
+        self.udp = Some(Arc::new(factory));
         self
     }
 }
@@ -608,6 +738,17 @@ where
         let mut listeners = self.listeners;
         let has_tls = TypeId::of::<T>() != TypeId::of::<NoTls>();
         let mut names = Vec::new();
+        #[cfg(feature = "udp")]
+        for spec in &listeners {
+            if (spec.udp.is_some() && self.udp.is_none())
+                || (spec.udp.is_none() && <W as engine::Serve>::UDP_ONLY)
+            {
+                return Err(invalid("udp_sessions", ConfigReason::Inconsistent));
+            }
+            if spec.udp.is_some() && (spec.tls || spec.proxy != ProxyMode::Off) {
+                return Err(invalid("udp", ConfigReason::Inconsistent));
+            }
+        }
         for spec in &mut listeners {
             check_spec(spec, self.trusted.as_ref(), has_tls, &names)?;
             if let Some(n) = &spec.name {
@@ -630,6 +771,15 @@ where
         for spec in &listeners {
             limits.overlay(&spec.limits).validate(workers, None)?;
         }
+        if self.placement != Placement::Off && !crate::sys::CAN_PIN {
+            return Err(NetError::Unsupported {
+                feature: "worker placement",
+                platform: std::env::consts::OS,
+            });
+        }
+        if self.placement == Placement::Explicit(Vec::new()) {
+            return Err(invalid("placement", ConfigReason::Zero));
+        }
         let tls: Option<Arc<dyn ErasedAcceptor>> = if has_tls {
             Some(Arc::new(self.tls))
         } else {
@@ -648,6 +798,9 @@ where
             control: self.control,
             wipe: self.wipe,
             clock: self.clock,
+            placement: self.placement,
+            #[cfg(feature = "udp")]
+            udp: self.udp,
         })
     }
 }

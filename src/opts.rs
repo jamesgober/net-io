@@ -76,6 +76,9 @@ pub struct TcpOptions {
     pub send_buffer: Option<u32>,
     /// `SO_RCVBUF`.
     pub receive_buffer: Option<u32>,
+    /// How long sent bytes may stay unacknowledged before the OS drops the connection
+    /// (`TCP_USER_TIMEOUT`; `TCP_MAXRT` on Windows, in whole seconds).
+    pub user_timeout: Option<Duration>,
     /// Hop limit (`IP_TTL` / `IPV6_UNICAST_HOPS`).
     pub ttl: Option<u8>,
 }
@@ -116,6 +119,14 @@ impl TcpOptions {
         self
     }
 
+    /// How long sent bytes may stay unacknowledged before the OS drops the connection.
+    /// `Unsupported` on macOS and FreeBSD. The write timeout covers the same case
+    /// inside net-io; this also covers the bytes already in the kernel at a close.
+    pub fn user_timeout(mut self, timeout: Duration) -> TcpOptions {
+        self.user_timeout = Some(timeout);
+        self
+    }
+
     /// Hop limit.
     pub fn ttl(mut self, hops: u8) -> TcpOptions {
         self.ttl = Some(hops);
@@ -142,6 +153,18 @@ impl TcpOptions {
         }
         if let Some(n) = self.receive_buffer {
             sys::set_receive_buffer(sock, n).map_err(os("SO_RCVBUF"))?;
+        }
+        if let Some(t) = self.user_timeout {
+            sys::set_user_timeout(sock, t).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::Unsupported {
+                    NetError::Unsupported {
+                        feature: "user_timeout",
+                        platform: std::env::consts::OS,
+                    }
+                } else {
+                    NetError::from_os("TCP_USER_TIMEOUT", e)
+                }
+            })?;
         }
         if let Some(h) = self.ttl {
             sys::set_ttl(sock, v6, h).map_err(os("IP_TTL"))?;
@@ -189,6 +212,10 @@ pub struct ListenOptions {
     pub(crate) ipv6_only: bool,
     pub(crate) send_buffer: Option<u32>,
     pub(crate) receive_buffer: Option<u32>,
+    pub(crate) defer_accept: Option<Duration>,
+    pub(crate) fast_open: Option<u32>,
+    pub(crate) incoming_cpu: Option<u32>,
+    pub(crate) per_worker: bool,
     pub(crate) tcp: TcpOptions,
 }
 
@@ -201,6 +228,10 @@ impl Default for ListenOptions {
             ipv6_only: true,
             send_buffer: None,
             receive_buffer: None,
+            defer_accept: None,
+            fast_open: None,
+            incoming_cpu: None,
+            per_worker: false,
             tcp: TcpOptions::new().nodelay(true),
         }
     }
@@ -249,6 +280,45 @@ impl ListenOptions {
         self
     }
 
+    /// `accept` returns once the client has sent bytes, or after `wait`
+    /// (`TCP_DEFER_ACCEPT`, whole seconds; `Unsupported` off Linux). A client that
+    /// connects and stays silent costs no accept for that long. Cost: the gate sees
+    /// the connection later, and a server that speaks first must not use this.
+    pub fn defer_accept(mut self, wait: Option<Duration>) -> ListenOptions {
+        self.defer_accept = wait;
+        self
+    }
+
+    /// Server TCP Fast Open with this many pending requests. Saves a round trip for a
+    /// client that returns. Security: the first flight of data can be replayed by the
+    /// network, so turn this on only for requests that are safe to run twice; the gate
+    /// and the PROXY check run as usual. Linux also needs `net.ipv4.tcp_fastopen`.
+    pub fn fast_open(mut self, queue: Option<u32>) -> ListenOptions {
+        self.fast_open = queue;
+        self
+    }
+
+    /// Accepts on this listener the connections the given CPU received
+    /// (`SO_INCOMING_CPU`, Linux; `Unsupported` elsewhere). For one reuse-port
+    /// listener per CPU.
+    pub fn incoming_cpu(mut self, cpu: Option<u32>) -> ListenOptions {
+        self.incoming_cpu = cpu;
+        self
+    }
+
+    /// One socket and one accept thread per reactor worker, in a `SO_REUSEPORT` group
+    /// (Linux; `Unsupported` elsewhere, `InvalidConfig` on the blocking driver). Each
+    /// feeds its own worker, so no connection crosses to another worker, and no accept
+    /// thread is a bottleneck; with `ServerBuilder::placement` each socket also takes
+    /// the connections its worker's CPU received. Costs: a socket and a thread per
+    /// worker, the kernel's hash decides the balance, and such a listener cannot be
+    /// handed off: closing one socket of a group resets what is queued on it.
+    pub fn per_worker(mut self, on: bool) -> ListenOptions {
+        self.per_worker = on;
+        self.reuse_port = self.reuse_port || on;
+        self
+    }
+
     /// Options applied to every accepted socket.
     pub fn tcp_options(mut self, options: TcpOptions) -> ListenOptions {
         self.tcp = options;
@@ -263,6 +333,9 @@ impl ListenOptions {
             send_buffer: self.send_buffer,
             receive_buffer: self.receive_buffer,
             backlog: self.backlog,
+            defer_accept: self.defer_accept,
+            fast_open: self.fast_open,
+            incoming_cpu: self.incoming_cpu,
         }
     }
 }

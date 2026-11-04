@@ -1305,10 +1305,12 @@ mod tests {
             let mut c = UnixConnection::connect(&p2).unwrap();
             let (mut mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
             c.send_descriptors(b"take this", &[theirs.as_fd()]).unwrap();
-            drop(theirs);
             mine.write_all(b"hello").unwrap();
             let mut b = [0u8; 1];
             let _ = c.recv(&mut b);
+            // Held until the receiver is done: macOS can drop bytes on a socket whose
+            // only descriptor is in flight.
+            drop(theirs);
         });
         let (mut c, _) = l.accept().unwrap();
         let mut fds = Descriptors::new();

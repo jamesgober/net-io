@@ -45,12 +45,11 @@
 //!
 //! ## Status
 //!
-//! `0.5.0`: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
+//! `0.6.0`: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
 //! Linux, macOS, FreeBSD, and Windows. TCP, Unix domain sockets (AF_UNIX on
-//! Windows), Windows named pipes, and UDP; the PROXY protocol, the TLS seam,
-//! systemd and FastCGI inheritance, listener hand-off on Unix and Windows, and
-//! the public [`Driver`] interface. Performance work and the remaining P2 items
-//! come in `0.6.0`.
+//! Windows), Windows named pipes, and UDP with batches and sessions; zero-copy file
+//! sends; the PROXY protocol, the TLS seam, systemd and FastCGI inheritance, listener
+//! hand-off on Unix and Windows, and the public [`Driver`] interface.
 
 #![doc(html_root_url = "https://docs.rs/net-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -180,11 +179,13 @@ pub use proxy::{ProxyError, ProxyFacts, ProxyMode, ProxyVersions};
 #[cfg(feature = "proxy")]
 pub use proxy_parse::{
     ProxyAddress, ProxyCommand, ProxyHeader, ProxyParser, ProxyProgress, ProxySsl, ProxyTransport,
-    Tlv, Tlvs,
+    Tlv, Tlvs, encode_v1, encode_v2,
 };
+#[cfg(feature = "udp")]
+pub use server::UdpOnly;
 pub use server::{
-    AdoptSpec, BlockingHandler, DoorState, DrainReport, ListenerSpec, NoGate, NoWork, Server,
-    ServerBuilder, ServerHandle, Sessions, Stats, Workload,
+    AdoptSpec, BlockingHandler, DoorState, DrainReport, ListenerSpec, NoGate, NoWork, Placement,
+    Server, ServerBuilder, ServerHandle, Sessions, Stats, Workload,
 };
 pub use session::{
     Input, Output, OutputFull, Phase, Session, SessionContext, SessionFactory, Step, SwapError,
@@ -197,7 +198,10 @@ pub use tls::{
 };
 pub use trusted::TrustedProxies;
 #[cfg(feature = "udp")]
-pub use udp::{Datagram, UdpBudget, UdpOptions, UdpSocket, UdpStats};
+pub use udp::{
+    Datagram, DatagramBuffer, MulticastInterface, OutgoingDatagram, UdpBudget, UdpContext,
+    UdpOptions, UdpSession, UdpSessionFactory, UdpSocket, UdpStats,
+};
 
 /// Crate version string, populated by Cargo at build time.
 ///

@@ -76,6 +76,9 @@ pub(crate) const CMD_KILL_ALL: u32 = 4;
 pub(crate) const CMD_LISTENER_SWEEP: u32 = 8;
 #[cfg(feature = "reactor")]
 pub(crate) const CMD_LISTENER_KILL: u32 = 16;
+/// Deadlines shrank or returned: every waiting connection looks again.
+#[cfg(feature = "reactor")]
+pub(crate) const CMD_PRESSURE: u32 = 32;
 
 /// How many admitted connections wait for one reactor worker before new ones are
 /// refused with `Busy`.
@@ -122,6 +125,9 @@ pub(crate) struct Config<W, G, S> {
     pub control: Option<Arc<dyn ControlLine>>,
     pub wipe: bool,
     pub clock: Option<Arc<dyn Clock>>,
+    pub placement: super::Placement,
+    #[cfg(feature = "udp")]
+    pub udp: Option<Arc<dyn crate::udp::UdpSessionFactory>>,
 }
 
 /// One worker's counters. The worker is the only writer; `seq` makes a reader's
@@ -280,7 +286,33 @@ impl CompleterTarget for WorkerTarget {
 }
 
 /// The non-generic state `Server` and `ServerHandle` share with the threads.
+/// How many workers there are and where they run: what a listener group is built from.
+#[derive(Clone, Debug)]
+struct Layout {
+    workers: u16,
+    placement: super::Placement,
+}
+
+impl Layout {
+    /// The CPU worker `i` runs on, when it is pinned.
+    fn cpu_of(&self, i: usize) -> Option<usize> {
+        match &self.placement {
+            super::Placement::Off => None,
+            super::Placement::PinPerCore => Some(i),
+            super::Placement::Explicit(cpus) => Some(cpus[i % cpus.len()]),
+        }
+    }
+}
+
 pub(crate) struct Shared {
+    layout: Layout,
+    /// Adaptive deadlines, when set.
+    pressure: Option<crate::limits::Pressure>,
+    /// Open connections passed `pressure.high` and have not yet fallen below `low`.
+    pressured: AtomicBool,
+    /// Makes the session of each UDP listener.
+    #[cfg(feature = "udp")]
+    udp: Option<Arc<dyn crate::udp::UdpSessionFactory>>,
     /// The reactor runs this server (the blocking pool otherwise).
     #[cfg(feature = "reactor")]
     pub(crate) reactor: bool,
@@ -347,7 +379,7 @@ type AdoptFn = Box<
 
 /// Starts the accept thread of one listener.
 type SpawnAccept = Box<
-    dyn Fn(Arc<ListenerConf>, Arc<ListenerRuntime>) -> std::io::Result<JoinHandle<()>>
+    dyn Fn(Arc<ListenerConf>, Arc<ListenerRuntime>, usize) -> std::io::Result<JoinHandle<()>>
         + Send
         + Sync,
 >;
@@ -375,7 +407,6 @@ impl Shared {
     }
 
     /// Connections in use against the global cap, 0.0 to 1.0.
-    #[cfg(feature = "reactor")]
     pub(crate) fn occupancy(&self) -> f32 {
         let open = self.open.load(Ordering::Relaxed) as f32;
         (open / self.max_open.max(1) as f32).min(1.0)
@@ -481,7 +512,10 @@ impl Shared {
         };
         for e in self.lock_listeners().iter_mut() {
             if e.thread.is_none() {
-                e.thread = Some(spawn(e.conf.clone(), e.runtime.clone())?);
+                e.thread = Some(spawn(e.conf.clone(), e.runtime.clone(), 0)?);
+                for (i, s) in e.siblings.iter_mut().enumerate() {
+                    s.thread = Some(spawn(e.conf.clone(), s.runtime.clone(), i + 1)?);
+                }
             }
         }
         Ok(())
@@ -497,6 +531,11 @@ impl Shared {
         for mut e in entries {
             if let Some(t) = e.thread.take() {
                 let _ = t.join();
+            }
+            for s in &mut e.siblings {
+                if let Some(t) = s.thread.take() {
+                    let _ = t.join();
+                }
             }
         }
     }
@@ -532,6 +571,12 @@ impl Shared {
         let list = self.lock_listeners();
         let mut out = Vec::with_capacity(list.len());
         for e in list.iter() {
+            if !e.siblings.is_empty() {
+                return Err(NetError::Unsupported {
+                    feature: "handing off a per-worker listener",
+                    platform: std::env::consts::OS,
+                });
+            }
             let info = e.runtime.info();
             let sock = e
                 .runtime
@@ -563,18 +608,19 @@ impl Shared {
                 max: u64::from(u16::MAX),
             },
         })?);
-        let (mut entry, info) = bind_listener(spec, id, &self.base_limits, self.driver)?;
+        let (mut entry, info) =
+            bind_listener(spec, id, &self.base_limits, self.driver, &self.layout)?;
         let Some(spawn) = self.spawn_accept.get() else {
             return Err(NetError::ShuttingDown);
         };
-        entry.thread = Some(
-            spawn(entry.conf.clone(), entry.runtime.clone()).map_err(|e| {
-                NetError::DriverSetup {
-                    driver: DriverKind::Blocking,
-                    source: e,
-                }
-            })?,
-        );
+        let setup = |e| NetError::DriverSetup {
+            driver: DriverKind::Blocking,
+            source: e,
+        };
+        entry.thread = Some(spawn(entry.conf.clone(), entry.runtime.clone(), 0).map_err(setup)?);
+        for (i, s) in entry.siblings.iter_mut().enumerate() {
+            s.thread = Some(spawn(entry.conf.clone(), s.runtime.clone(), i + 1).map_err(setup)?);
+        }
         self.lock_listeners().push(entry);
         self.event(Event::ListenerOpened {
             listener: id,
@@ -608,12 +654,18 @@ impl Shared {
             conf,
             runtime,
             thread,
+            siblings,
         } = entry;
         conf.door.store(false, Ordering::Release);
         conf.removed.store(true, Ordering::Release);
         conf.wake.wake();
         if let Some(t) = thread {
             let _ = t.join();
+        }
+        for s in siblings {
+            if let Some(t) = s.thread {
+                let _ = t.join();
+            }
         }
         drop(runtime);
         self.event(Event::ListenerClosed { listener: id });
@@ -942,8 +994,31 @@ impl Shared {
         self.wake_all();
     }
 
+    /// Moves the pressure state when the open count crossed a threshold.
+    fn update_pressure(&self) {
+        let Some(p) = self.pressure else { return };
+        let fill = self.occupancy();
+        let on = self.pressured.load(Ordering::Acquire);
+        if on != (fill >= p.high) && (!on || fill <= p.low) {
+            self.pressured.store(!on, Ordering::Release);
+            #[cfg(feature = "reactor")]
+            if self.reactor {
+                self.command(CMD_PRESSURE);
+            }
+        }
+    }
+
+    /// What deadlines are multiplied by right now.
+    pub(crate) fn deadline_scale(&self) -> f32 {
+        match self.pressure {
+            Some(p) if self.pressured.load(Ordering::Acquire) => p.factor,
+            _ => 1.0,
+        }
+    }
+
     pub(crate) fn release(&self, listener: &ListenerConf, source: Option<PrefixKey>) {
         self.open.fetch_sub(1, Ordering::AcqRel);
+        self.update_pressure();
         listener.count.fetch_sub(1, Ordering::AcqRel);
         if let Some(k) = source {
             listener.sources.release(k);
@@ -983,6 +1058,8 @@ pub(crate) struct ListenerConf {
     /// `Some` when the listener requires a PROXY header.
     #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
     pub(crate) proxy: Option<ListenerProxy>,
+    /// Connections are still admitted under `ControlState::Lockdown`.
+    lockdown_allowed: bool,
     /// Whether the listener serves TLS.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub(crate) tls: bool,
@@ -998,7 +1075,7 @@ pub(crate) struct ListenerConf {
     /// Set by `remove_listener` and at shutdown: the accept thread ends and
     /// queued connections close with `Drained`.
     pub(crate) removed: AtomicBool,
-    wake: Arc<Wake>,
+    wake: Wakes,
 }
 
 #[cfg(feature = "reactor")]
@@ -1013,6 +1090,30 @@ struct ListenerEntry {
     conf: Arc<ListenerConf>,
     runtime: Arc<ListenerRuntime>,
     thread: Option<JoinHandle<()>>,
+    /// The other sockets of a per-worker group, one for each worker after the first.
+    siblings: Vec<Sibling>,
+}
+
+struct Sibling {
+    runtime: Arc<ListenerRuntime>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// The wake channels of a listener's accept threads, one each: a wake is read by
+/// whoever reads it, so threads cannot share a channel.
+struct Wakes(Vec<Arc<Wake>>);
+
+impl Wakes {
+    fn wake(&self) {
+        for w in &self.0 {
+            w.wake();
+        }
+    }
+}
+
+thread_local! {
+    /// On an accept thread of a per-worker group: the worker it feeds.
+    static FEEDS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Binds (or adopts) the socket of `spec` and builds its settings.
@@ -1021,7 +1122,21 @@ fn bind_listener(
     id: ListenerId,
     base: &Limits,
     driver: DriverKind,
+    layout: &Layout,
 ) -> Result<(ListenerEntry, ListenerInfo), NetError> {
+    let per_worker = spec.options.is_some_and(|o| o.per_worker);
+    if per_worker && !cfg!(target_os = "linux") {
+        return Err(NetError::Unsupported {
+            feature: "per-worker listeners",
+            platform: std::env::consts::OS,
+        });
+    }
+    if per_worker && driver.resolve() != DriverKind::Reactor {
+        return Err(NetError::InvalidConfig {
+            field: "per_worker",
+            reason: crate::error::ConfigReason::Inconsistent,
+        });
+    }
     let lim = base.overlay(&spec.limits).effective(driver);
     let proxy = match spec.proxy {
         ProxyMode::Required { versions } => Some(ListenerProxy {
@@ -1030,6 +1145,7 @@ fn bind_listener(
         }),
         _ => None,
     };
+    let group_options = spec.options;
     let (runtime, info, tcp) = 'bound: {
         if let Some(handle) = spec.adopt {
             let name = spec.name.clone();
@@ -1060,6 +1176,30 @@ fn bind_listener(
                     });
                 }
             }
+        }
+        #[cfg(feature = "udp")]
+        if let Some(options) = spec.udp {
+            let addrs = spec.addrs.clone().map_err(|text| NetError::Os {
+                op: "resolve",
+                source: std::io::Error::other(text),
+            })?;
+            let socket = crate::udp::UdpSocket::bind_with(&addrs[..], options)?;
+            socket.set_nonblocking()?;
+            let local = socket.local_addr()?;
+            let info = ListenerInfo {
+                id,
+                name: spec.name.clone(),
+                local: crate::info::Endpoint::Ip(local),
+                backlog: None,
+                transport: Transport::Udp,
+                proxy: ProxyMode::Off,
+                tls: false,
+            };
+            break 'bound (
+                ListenerRuntime::Udp(Mutex::new(socket), info.clone()),
+                info,
+                TcpOptions::default(),
+            );
         }
         #[cfg(all(windows, feature = "local"))]
         if let Some((path, options)) = spec.unix {
@@ -1123,17 +1263,43 @@ fn bind_listener(
         let tcp = *listener.tcp_options();
         (ListenerRuntime::Tcp(listener), info, tcp)
     };
-    let wake = Wake::new()
-        .map(Arc::new)
+    let threads = if per_worker {
+        usize::from(layout.workers)
+    } else {
+        1
+    };
+    let mut siblings = Vec::with_capacity(threads.saturating_sub(1));
+    if let (true, Some(options), Some(local)) =
+        (per_worker, group_options, info.local.socket_addr())
+    {
+        for i in 1..threads {
+            let cpu = layout.cpu_of(i).and_then(|c| u32::try_from(c).ok());
+            let params = options.incoming_cpu(cpu).params();
+            let socket =
+                sys::tcp_listener(local, &params).map_err(|e| crate::tcp::bind_error(local, e))?;
+            let mut l = TcpListener::finish(socket, options, id, spec.name.clone())?;
+            l.set_proxy_mode(spec.proxy);
+            l.set_tls(spec.tls);
+            siblings.push(Sibling {
+                runtime: Arc::new(ListenerRuntime::Tcp(l)),
+                thread: None,
+            });
+        }
+    }
+    let wakes = (0..threads)
+        .map(|_| Wake::new().map(Arc::new))
+        .collect::<std::io::Result<Vec<_>>>()
         .map_err(|e| NetError::DriverSetup {
             driver: DriverKind::Blocking,
             source: e,
         })?;
+    let wake = Wakes(wakes);
     let conf = Arc::new(ListenerConf {
         id,
         limits: Arc::new(lim),
         tcp,
         proxy,
+        lockdown_allowed: spec.lockdown_allowed,
         tls: spec.tls,
         #[cfg(feature = "reactor")]
         killed: AtomicU32::new(0),
@@ -1148,6 +1314,7 @@ fn bind_listener(
             conf,
             runtime: Arc::new(runtime),
             thread: None,
+            siblings,
         },
         info,
     ))
@@ -1185,8 +1352,12 @@ impl<T> Job<T> {
     }
 }
 
+// Listeners are few, and each lives as long as its thread.
+#[allow(clippy::large_enum_variant)]
 enum ListenerRuntime {
     Tcp(TcpListener),
+    #[cfg(feature = "udp")]
+    Udp(Mutex<crate::udp::UdpSocket>, ListenerInfo),
     #[cfg(all(unix, feature = "local"))]
     Unix(UnixListener),
     #[cfg(all(windows, feature = "local"))]
@@ -1206,6 +1377,8 @@ impl ListenerRuntime {
             ListenerRuntime::AfUnix(l) => l.std().sock(),
             #[cfg(all(windows, feature = "local"))]
             ListenerRuntime::Pipe(_) => return,
+            #[cfg(feature = "udp")]
+            ListenerRuntime::Udp(..) => return,
         };
         let _ = sys::wait(sock, Interest::Read, Some(wake), None);
     }
@@ -1219,6 +1392,8 @@ impl ListenerRuntime {
             ListenerRuntime::AfUnix(l) => l.info(),
             #[cfg(all(windows, feature = "local"))]
             ListenerRuntime::Pipe(l) => l.info(),
+            #[cfg(feature = "udp")]
+            ListenerRuntime::Udp(_, info) => info,
         }
     }
 
@@ -1237,6 +1412,8 @@ impl ListenerRuntime {
             ListenerRuntime::AfUnix(_) | ListenerRuntime::Pipe(_) => {
                 Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
             }
+            #[cfg(feature = "udp")]
+            ListenerRuntime::Udp(..) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }
 }
@@ -1292,12 +1469,14 @@ impl<W, G: Gate> Engine<W, G> {
     #[allow(clippy::result_large_err)]
     fn hand_to_worker(&self, job: Job<G::Ticket>) -> Result<(), Job<G::Ticket>> {
         let shared = &self.shared;
-        let idx = shared
-            .workers
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, w)| w.load.load(Ordering::Relaxed))
-            .map_or(0, |(i, _)| i);
+        let idx = FEEDS.with(std::cell::Cell::get).unwrap_or_else(|| {
+            shared
+                .workers
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, w)| w.load.load(Ordering::Relaxed))
+                .map_or(0, |(i, _)| i)
+        });
         {
             let mut inbox = self.inboxes[idx]
                 .0
@@ -1324,11 +1503,15 @@ where
     let driver = cfg.driver;
     let reactor = driver == DriverKind::Reactor;
     let limits = cfg.limits.effective(driver);
+    let layout = Layout {
+        workers: cfg.workers,
+        placement: cfg.placement.clone(),
+    };
     let mut entries = Vec::with_capacity(cfg.listeners.len());
     let mut infos = Vec::with_capacity(cfg.listeners.len());
     for (i, spec) in cfg.listeners.into_iter().enumerate() {
         let id = ListenerId(u16::try_from(i).unwrap_or(u16::MAX));
-        let (entry, info) = bind_listener(spec, id, &cfg.limits, driver)?;
+        let (entry, info) = bind_listener(spec, id, &cfg.limits, driver, &layout)?;
         entries.push(entry);
         infos.push(info);
     }
@@ -1362,6 +1545,11 @@ where
     let queue_capacity = limits.completion_queue as usize;
     let next_listener = u32::try_from(infos.len()).unwrap_or(u32::MAX);
     let shared = Arc::new_cyclic(|weak: &Weak<Shared>| Shared {
+        layout: layout.clone(),
+        pressure: limits.pressure,
+        pressured: AtomicBool::new(false),
+        #[cfg(feature = "udp")]
+        udp: cfg.udp,
         pid: std::process::id(),
         door: AtomicBool::new(false),
         draining: AtomicBool::new(false),
@@ -1474,13 +1662,13 @@ where
         },
     ));
     let weak = Arc::downgrade(&engine);
-    let _ = shared.spawn_accept.set(Box::new(move |conf, rt| {
+    let _ = shared.spawn_accept.set(Box::new(move |conf, rt, slot| {
         let Some(e) = weak.upgrade() else {
             return Err(std::io::Error::other("the server stopped"));
         };
         std::thread::Builder::new()
             .name(format!("net-io-accept-{}", conf.id.0))
-            .spawn(move || accept_loop(&e, &conf, &rt))
+            .spawn(move || accept_loop(&e, &conf, &rt, slot))
     }));
 
     let mut threads = Vec::with_capacity(usize::from(cfg.workers));
@@ -1491,11 +1679,18 @@ where
     let mut failure = None;
     for i in 0..usize::from(cfg.workers) {
         let e = engine.clone();
+        let cpu = layout.cpu_of(i);
         match std::thread::Builder::new()
             .name(format!("net-io-worker-{i}"))
             .stack_size(WORKER_STACK)
-            .spawn(move || W::run_worker(&e, i))
-        {
+            .spawn(move || {
+                if let Some(cpu) = cpu {
+                    // Placement is a tuning hint: a CPU this process may not use leaves
+                    // the worker where it is, working.
+                    let _ = sys::pin_current_thread(cpu);
+                }
+                W::run_worker(&e, i);
+            }) {
             Ok(t) => threads.push(t),
             Err(err) => {
                 failure = Some(spawn_error(err));
@@ -1525,15 +1720,74 @@ where
     })
 }
 
+// ---- UDP ------------------------------------------------------------------
+
+/// Datagrams read per wait, so a flood cannot keep this loop from a stop.
+#[cfg(feature = "udp")]
+const UDP_TURN: usize = 64;
+
+/// One UDP listener: its thread owns the socket, so the guard needs no lock on the data
+/// path. The door gates reading, and a closed door leaves datagrams in the kernel.
+#[cfg(feature = "udp")]
+fn udp_loop(
+    shared: &Arc<Shared>,
+    conf: &Arc<ListenerConf>,
+    socket: &Mutex<crate::udp::UdpSocket>,
+    info: &ListenerInfo,
+) {
+    let Some(factory) = shared.udp.as_ref() else {
+        return;
+    };
+    let mut session = factory.open(info);
+    let mut socket = socket.lock().unwrap_or_else(PoisonError::into_inner);
+    let wake = conf.wake.0[0].clone();
+    let mut buf = vec![0u8; 65_536];
+    loop {
+        if shared.stopping.load(Ordering::Acquire)
+            || shared.draining.load(Ordering::Acquire)
+            || conf.removed.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if !shared.door.load(Ordering::Acquire) || !conf.door.load(Ordering::Acquire) {
+            let _ = sys::wait_wake(&wake, None);
+            continue;
+        }
+        let _ = sys::wait(socket.raw_sock(), Interest::Read, Some(&wake), None);
+        for _ in 0..UDP_TURN {
+            let Ok(d) = socket.recv_from(&mut buf) else {
+                break;
+            };
+            let mut cx = crate::udp::UdpContext {
+                socket: &mut socket,
+            };
+            let bytes = &buf[..d.len.min(65_536)];
+            let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.on_datagram(&mut cx, d.from, bytes);
+            }));
+            // A session that panics loses this datagram, and the socket goes on.
+            let _ = called;
+        }
+    }
+}
+
 // ---- accept ---------------------------------------------------------------
 
 fn accept_loop<W: super::Workload, G: Gate>(
     engine: &Arc<Engine<W, G>>,
     conf: &Arc<ListenerConf>,
     rt: &ListenerRuntime,
+    slot: usize,
 ) {
     let shared = &engine.shared;
-    let wake = conf.wake.clone();
+    #[cfg(feature = "udp")]
+    if let ListenerRuntime::Udp(socket, info) = rt {
+        return udp_loop(shared, conf, socket, info);
+    }
+    let wake = conf.wake.0[slot].clone();
+    if conf.wake.0.len() > 1 {
+        FEEDS.with(|f| f.set(Some(slot)));
+    }
     let batch = conf.limits.accept_batch;
     let mut acceptor = Acceptor::new();
     let mut ids = IdBlock::new();
@@ -1600,6 +1854,8 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     }
                     other => other.without_conn(),
                 },
+                #[cfg(feature = "udp")]
+                ListenerRuntime::Udp(..) => return,
                 #[cfg(all(windows, feature = "local"))]
                 ListenerRuntime::AfUnix(l) => match acceptor.accept_af_unix(l.std()) {
                     Accepted::Conn(stream) => {
@@ -1856,8 +2112,9 @@ impl<W, G: Gate> Engine<W, G> {
                 }
             }
         }
+        shared.update_pressure();
         let release = |s: &Self| s.shared.release(conf, source);
-        if matches!(view.state(), ControlState::Lockdown) {
+        if matches!(view.state(), ControlState::Lockdown) && !conf.lockdown_allowed {
             release(self);
             {
                 self.refuse(stream, peer, RefusalCause::Lockdown, None, co);
@@ -1896,6 +2153,22 @@ impl<W, G: Gate> Engine<W, G> {
         info.lane = admitted.lane;
         info.gate = admitted.tag;
         let ticket = admitted.ticket;
+        // What is left must cover what the more important lanes keep for themselves.
+        let reserved = lim.reserved_above(info.lane);
+        if reserved > 0
+            && shared.open.load(Ordering::Acquire).saturating_add(reserved) > lim.max_connections
+        {
+            let _ = guarded(|| {
+                self.gate.closed(
+                    ticket,
+                    &info,
+                    CloseReason::Refused(RefusalCause::LaneReserve),
+                )
+            });
+            release(self);
+            self.refuse(stream, peer, RefusalCause::LaneReserve, None, co);
+            return Err(Some(RefusalCause::LaneReserve));
+        }
         if let ControlState::Shed { from_lane } = view.state() {
             if info.lane >= from_lane {
                 let _ = guarded(|| {
@@ -2048,6 +2321,9 @@ pub trait Serve: Send + Sync + Sized + 'static {
     /// Whether this workload needs a thread per connection (a blocking handler).
     const BLOCKING_ONLY: bool;
 
+    /// Whether this server has no TCP work at all.
+    const UDP_ONLY: bool = false;
+
     /// Serves one admitted connection on a worker.
     fn serve<G: Gate>(&self, w: &mut Worker<G>, job: Job<G::Ticket>);
 
@@ -2143,7 +2419,8 @@ impl<G: Gate> Worker<G> {
             return Err(CloseReason::Limit(crate::error::LimitKind::BufferBudget));
         };
         link.attach_tls(session, cin, cout);
-        link.begin_handshake(link.info.accepted_at + lim.handshake_timeout);
+        link.set_deadline_scale(self.shared.deadline_scale());
+        link.begin_handshake(link.info.accepted_at + link.scaled(lim.handshake_timeout));
         let r = link.tls_handshake();
         link.end_handshake(None);
         match r {
@@ -2185,7 +2462,8 @@ impl<G: Gate> Worker<G> {
             .unwrap_or(u16::MAX)
             .min(lim.proxy_header_max);
         let mut parser = ProxyParser::new(proxy.versions, body_max);
-        link.begin_handshake(link.info.accepted_at + lim.handshake_timeout);
+        link.set_deadline_scale(self.shared.deadline_scale());
+        link.begin_handshake(link.info.accepted_at + link.scaled(lim.handshake_timeout));
         let outcome = loop {
             match parser.feed(buf.as_slice()) {
                 Ok(ProxyProgress::Done { header, consumed }) => {
@@ -2377,6 +2655,7 @@ impl<G: Gate> Worker<G> {
         self.output.reset();
         ws.current.store(0, Ordering::Release);
         ws.listener.store(NO_LISTENER, Ordering::Release);
+        count_drained(&shared, reason);
         shared.release(&listener, source);
         record_close(&shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
         shared.busy.fetch_sub(1, Ordering::AcqRel);
@@ -2444,6 +2723,15 @@ where
     }
 }
 
+#[cfg(feature = "udp")]
+impl Serve for super::UdpOnly {
+    // The pool never gets a job: there is nothing for a reactor to run.
+    const BLOCKING_ONLY: bool = true;
+    const UDP_ONLY: bool = true;
+
+    fn serve<G: Gate>(&self, _w: &mut Worker<G>, _job: Job<G::Ticket>) {}
+}
+
 impl<F: SessionFactory> Serve for Sessions<F> {
     const BLOCKING_ONLY: bool = false;
 
@@ -2502,6 +2790,18 @@ impl<F: SessionFactory> Serve for Sessions<F> {
 }
 
 /// Counts one close and tells the event sink. Both drivers end here.
+/// Counts a close for a running drain's report. Before the connection is released:
+/// a drain ends when the last one is, and reads its report then.
+pub(crate) fn count_drained(shared: &Shared, reason: CloseReason) {
+    if shared.draining.load(Ordering::Acquire) {
+        if reason == CloseReason::DrainDeadline {
+            shared.drained_killed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            shared.drained_graceful.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 pub(crate) fn record_close(
     shared: &Shared,
     ws: &WorkerShared,
@@ -2541,13 +2841,6 @@ pub(crate) fn record_close(
         }),
         CloseReason::SessionPanicked => shared.event(Event::SessionPanicked { id: info.id }),
         _ => {}
-    }
-    if shared.draining.load(Ordering::Acquire) {
-        if reason == CloseReason::DrainDeadline {
-            shared.drained_killed.fetch_add(1, Ordering::Relaxed);
-        } else {
-            shared.drained_graceful.fetch_add(1, Ordering::Relaxed);
-        }
     }
     shared.event(Event::Closed {
         id: info.id,
@@ -2668,6 +2961,8 @@ fn drive<G: Gate, S: Session>(
                 }
                 input.changed = false;
                 link.settle_phase(input.bytes().is_empty());
+                link.set_deadline_scale(w.shared.deadline_scale());
+                link.set_rescales();
                 let idle = link.phase() == Phase::Idle && input.bytes().is_empty();
                 if w.draining() && idle {
                     return CloseReason::Drained;
@@ -2789,10 +3084,18 @@ fn flush<G: Gate, S: Session>(
             link.bytes_out > 0
         };
         link.response_tag = w.output.response_tag;
-        let result = {
+        let result = if let Some((file, offset, left)) = w.output.front_file() {
+            link.send_file(&file, offset, left).map(|n| n as usize)
+        } else {
             let mut slices = [IoSlice::new(&[]); 64];
             let mut k = 0;
-            for chunk in w.output.chunks.iter().take(slices.len()) {
+            for chunk in w
+                .output
+                .chunks
+                .iter()
+                .take(slices.len())
+                .take_while(|c| !c.is_file())
+            {
                 slices[k] = IoSlice::new(chunk.remaining());
                 k += 1;
             }
@@ -2801,6 +3104,7 @@ fn flush<G: Gate, S: Session>(
         match result {
             Ok(n) => {
                 w.output.advance(n);
+                w.output.return_spares(&mut w.pool);
                 w.output.bytes_since_begin += n as u64;
             }
             Err(NetError::EgressDenied { code }) => {

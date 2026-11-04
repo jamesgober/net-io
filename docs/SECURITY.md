@@ -16,15 +16,15 @@ Owned elsewhere: bans and rates (the gate, for example bouncer-io), content insp
 
 ## Threats, defences, tests
 
-Costs are estimates (`[est.]`) until measured in `0.6.0`. Test names are `tests/<file>.rs::<name>` or `src/<file>.rs::<name>`.
+A cost marked `[est.]` is an estimate; the rest are measured, on the hosts `docs/PERFORMANCE.md` describes. Test names are `tests/<file>.rs::<name>` or `src/<file>.rs::<name>`.
 
 | # | Threat | Defence | Cost | Test (status at 0.4) |
 |---|---|---|---|---|
-| T-1 | connection flood exhausting descriptors | global, per-listener, and per-source caps before any read; the gate before any read | under 50 ns per accept [est.] | `server::test_global_cap_refuses_before_reading`, `server::test_per_source_cap`, `server::test_per_source_cap_per_listener` |
+| T-1 | connection flood exhausting descriptors | global, per-listener, and per-source caps before any read; the gate before any read | 343 ns to take and release a source, on a loaded host; the 50 ns estimate was too low, and it is a small part of an accept | `server::test_global_cap_refuses_before_reading`, `server::test_per_source_cap`, `server::test_per_source_cap_per_listener` |
 | T-2 | descriptor exhaustion making accept spin or stall | reserve descriptor, accept backoff | one spare descriptor per acceptor | `src/accept.rs::test_emfile_sheds_and_retries_the_reserve` |
-| T-3 | slowloris | handshake and read deadlines, inbound minimum rate, exchange deadline | one timer per active connection | `server::test_slow_peer_is_closed`, `src/rate.rs::test_rate_trickle_is_too_slow` |
-| T-4 | slow read | write deadline, outbound minimum rate, output budget | as T-3 | `server::test_peer_that_never_reads_hits_the_write_timeout` |
-| T-5 | idle keep-alive hoarding | idle deadline (5 s on the blocking driver) | none below pressure | `server::test_idle_timeout_closes`; adaptive deadlines in 0.6 |
+| T-3 | slowloris | handshake and read deadlines, inbound minimum rate checked on every arrival and on a timer (D-138), exchange deadline | one timer per active connection; one rate check per receive [est. 10 to 20 ns] | `server::test_slow_peer_is_closed`, `server::test_trickle_faster_than_the_check_is_closed`, `src/rate.rs::test_rate_trickle_is_too_slow` |
+| T-4 | slow read | write deadline, outbound minimum rate checked on every send completion and on a timer, output budget | as T-3 | `server::test_peer_that_never_reads_hits_the_write_timeout`, `server::test_reader_slower_than_the_rate_is_closed_while_it_reads` (Linux) |
+| T-5 | idle keep-alive hoarding | idle deadline (5 s on the blocking driver) | none below pressure | `server::test_idle_timeout_closes`, `admission::test_pressure_shrinks_idle_deadlines_and_lets_go` |
 | T-6 | a handshake that never finishes | one handshake deadline for PROXY and TLS | one timer | `proxy::test_missing_invalid_and_slow_headers`, `tls::test_refused_hello_and_handshake_timeout` |
 | T-7 | memory exhaustion through many connections | buffer budget, per-connection output budget, pooled buffers | none | `src/buf.rs::test_pool_budget_bounds_allocation`; the 50,000-connection RSS test with the reactor (0.5) |
 | T-8 | oversized PROXY header | 107-byte v1 cap; v2 length checked against the limit before the body is read | none | `src/proxy_parse.rs::test_v1_too_long`, `src/proxy_parse.rs::test_v2_errors` |
@@ -35,13 +35,13 @@ Costs are estimates (`[est.]`) until measured in `0.6.0`. Test names are `tests/
 | T-13 | framing someone else through a forged address | as T-9; `client_addr` and `client_key` use the PROXY address only from a trusted header | none | `src/info.rs::test_client_addr_prefers_real_peer`, `proxy::test_source_cap_moves_to_the_real_client` |
 | T-14 | data leaving a revoked connection | the gate is asked before every write system call; abortive close on denial | one hook call per write | `close_reasons::reason_egress_denied`, `adopt::set_gate_checks_writes_and_closes_once`; wire capture in 0.7 |
 | T-15 | a partial response leaking before a denial | denial bytes only before the response started | none | `close_reasons::reason_egress_denied` |
-| T-16 | residual request data in reused buffers | wipe on release (default on) | 50 to 100 ns per 2 KiB [est.] | `src/buf.rs::test_pool_reuses_and_wipes` |
+| T-16 | residual request data in reused buffers | wipe on release (default on) | 21.5 ns per 2 KiB, 127 ns per 16 KiB | `src/buf.rs::test_pool_reuses_and_wipes` |
 | T-17 | kill races (double close, reused descriptor) | a closing flag set by compare-and-swap; only the owner closes; generations | one CAS per close | `src/sys/kill.rs` loom models, `edge::edge_129_kill_from_many_threads_closes_once` |
 | T-18 | use after free on cancelled completions (IOCP, io_uring) | an operation and its buffers are owned by the kernel until the packet is dequeued | none | `src/driver/iocp.rs::test_cancel_completes_once_with_the_buffer`, `test_stale_packet_is_dropped`, `test_blocked_send_cancels_with_its_chunks`; io_uring after 1.0 |
-| T-19 | an accept storm starving established connections | accept batch per wake-up | none | load test in 0.6 |
+| T-19 | an accept storm starving established connections | accept batch per wake-up | none | `admission::test_accept_storm_leaves_established_connections_served` |
 | T-20 | an offload flood filling completion queues | bounded ring, `Full`, park deadline | none | `src/completer.rs::test_ring_many_producers_never_exceeds_capacity` |
 | T-21 | the event sink as a bottleneck | coalescing above 1,000 events per second per kind | one counter | `src/events.rs::test_coalescer_folds_above_threshold` |
-| T-22 | hash flooding the per-source tables | SipHash with a random per-process key (`std`) | about 20 ns per lookup [est.] | 0.7 (chain-length test) |
+| T-22 | hash flooding the per-source tables | SipHash with a random per-process key (`std`) | included in T-1's 343 ns | 0.7 (chain-length test) |
 | T-23 | Unix socket hijack or eavesdropping | mode `0600` by default, set before `listen`; `bind_atomic`; `require_uid`; private directory guidance | one `getsockopt` per accept | `src/local.rs::test_bind_accept_echo_and_credentials`, `src/local.rs::test_require_uid_closes_other_users`, `unix::unix_listener_refuses_other_users_with_credentials_cause` |
 | T-24 | stale-path deletion of a non-socket (symlink attack) | `lstat`; only a socket that refuses a probe connect is removed; identity checked around `chmod` | one `lstat` | `src/local.rs::test_stale_socket_removed_live_one_refused`, `src/local.rs::test_longest_path_binds_and_non_sockets_stay`, `src/local.rs::test_drop_leaves_a_replacement_alone` |
 | T-25 | Linux abstract socket squatting | abstract names only with `require_uid` | one `getsockopt` | after 1.0 (`bind_abstract`, P3) |
@@ -94,3 +94,18 @@ Costs are estimates (`[est.]`) until measured in `0.6.0`. Test names are `tests/
 | Named pipes reject remote clients, are owner-only by default, and detect a squatter through the first instance | one token query per listener | `src/pipe.rs::test_name_in_use_and_next_instance`, `test_security_keeps_this_user_out_when_told_to` |
 | A pipe server can identify a client and cannot impersonate it | none | by the client's `SECURITY_IDENTIFICATION` flag |
 | Windows AF_UNIX refuses mode and owner options rather than ignoring them | none | `windows_unix::test_options_that_do_not_apply_are_refused` |
+
+## Optimisation additions (0.6)
+
+| Measure | Cost | Test |
+|---|---|---|
+| A file that ends early resets the connection with `Io(FileTruncated)`: the peer was promised a length, and a clean close would read as a complete response | none until it happens | `send_file::test_push_file_that_ends_early_resets_on_both_drivers` |
+| The gate checks a file 1 MiB at a time, so a revoked connection stops within that much | one check per MiB | `send_file::test_gate_counts_file_bytes_once_on_both_drivers` |
+| `fast_open` is off by default: data in a SYN can be replayed, and it arrives before the peer's address is proven. A deployment that turns it on must treat first-flight requests as replayable | one socket option | `src/tcp.rs::test_fast_open_listener_still_accepts` |
+| Deadlines shrink under `Pressure`, floor 1 s, with hysteresis, so an idle hoarder gives way first | one walk of the connections per crossing | `admission::test_pressure_shrinks_idle_deadlines_and_lets_go` |
+| `lane_reserve` keeps slots for the more important lanes | one comparison after the gate | `admission::test_lane_reserve_keeps_slots_for_the_more_important` |
+| `lockdown_allowed` keeps a named listener open through lockdown, for an admin path | one comparison per accept | `admission::test_lockdown_leaves_the_allowed_listener_open` |
+| A UDP session runs behind the same amplification guard as a socket | as T-35 | `udp_session::test_door_and_guard` |
+
+The moved-buffer path allocates nothing after warm-up (D-134), so a client cannot drive allocation by sending full buffers; `tests/alloc.rs` checks it on every driver.
+

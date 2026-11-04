@@ -45,12 +45,12 @@ pub(crate) use poll::{PollEvent, Registered, WAKE_KEY};
 #[cfg(all(feature = "reactor", target_os = "linux"))]
 mod epoll;
 #[cfg(all(feature = "reactor", target_os = "linux"))]
-pub(crate) use epoll::{PollWaker, Poller};
+pub(crate) use epoll::{PollWaker, Poller, WriteArm};
 
 #[cfg(all(feature = "reactor", any(target_os = "macos", target_os = "freebsd")))]
 mod kqueue;
 #[cfg(all(feature = "reactor", any(target_os = "macos", target_os = "freebsd")))]
-pub(crate) use kqueue::{PollWaker, Poller};
+pub(crate) use kqueue::{PollWaker, Poller, WriteArm};
 
 #[cfg(all(feature = "reactor", windows))]
 mod iocp;
@@ -138,7 +138,6 @@ impl Stream {
         }
     }
 
-    #[cfg(feature = "reactor")]
     pub(crate) fn set_nonblocking(&self, on: bool) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.set_nonblocking(on),

@@ -41,7 +41,7 @@ Test locations: `tests/<file>.rs::<name>`, unit tests as `src/<file>.rs::<name>`
 | 26. Denial between two chunks of a response: RST, no denial | `edge::edge_26_denial_inside_a_response_resets_without_a_denial` |
 | 27, 28. Denial before the first byte: written once, not checked again | `edge::edge_27_28_denial_before_the_first_byte_is_written_once`, `close_reasons::reason_egress_denied` |
 | 29. Output budget full: `OutputFull`, `Step::Write` | `server::test_sessions_echo_large_message`, `src/session.rs::test_output_push_all_or_nothing_and_partial` |
-| 30. `sendfile` short or file shrinks | 0.6 (`send_file` and `Output::push_file` ship then) |
+| 30. `sendfile` short or file shrinks | `send_file::test_file_that_ends_early_is_an_error_with_the_count`, `send_file::test_push_file_that_ends_early_resets_on_both_drivers` |
 | 31. TLS ciphertext over the budget | 0.4 (the TLS seam is wired then) |
 
 ## Close

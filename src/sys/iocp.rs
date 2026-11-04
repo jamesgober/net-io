@@ -49,6 +49,14 @@ const WSAID_CONNECTEX: Guid = Guid {
     data4: [0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e],
 };
 
+/// `WSAID_TRANSMITFILE`, by its fields.
+const WSAID_TRANSMITFILE: Guid = Guid {
+    data1: 0xb536_7df0,
+    data2: 0xcbac,
+    data3: 0x11cf,
+    data4: [0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92],
+};
+
 /// How many packets one wait removes.
 const ENTRIES: usize = 256;
 /// The key of a wake packet; sockets use 0.
@@ -81,6 +89,16 @@ struct Guid {
     data3: u16,
     data4: [u8; 8],
 }
+
+type TransmitFile = unsafe extern "system" fn(
+    s: Socket,
+    file: Handle,
+    bytes: u32,
+    per_send: u32,
+    overlapped: *mut Overlapped,
+    buffers: *mut c_void,
+    flags: u32,
+) -> i32;
 
 type ConnectEx = unsafe extern "system" fn(
     s: Socket,
@@ -183,6 +201,7 @@ unsafe extern "system" {
 pub(crate) enum OpKind {
     Receive,
     Send,
+    SendFile,
     Connect,
 }
 
@@ -197,6 +216,7 @@ struct Op {
     pipe: bool,
     buffer: Option<Buffer>,
     chunks: Option<SendChunks>,
+    file: Option<Arc<std::fs::File>>,
     addr: [u8; 28],
 }
 
@@ -284,6 +304,7 @@ pub(crate) struct Port {
     /// Whether every provider gives real handles, so the skip mode is sound.
     skip: bool,
     connect_ex: Option<ConnectEx>,
+    transmit_file: Option<TransmitFile>,
 }
 
 impl std::fmt::Debug for Port {
@@ -345,6 +366,7 @@ impl Port {
             outstanding: 0,
             skip,
             connect_ex: None,
+            transmit_file: None,
         })
     }
 
@@ -416,6 +438,7 @@ impl Port {
                 pipe: false,
                 buffer: None,
                 chunks: None,
+                file: None,
                 addr: [0; 28],
             })
         });
@@ -455,6 +478,7 @@ impl Port {
             buffer: op.buffer.take(),
             chunks: op.chunks.take(),
         };
+        op.file = None;
         self.free.push(op);
         done
     }
@@ -618,6 +642,72 @@ impl Port {
         };
         // SAFETY: `ret` is the result of the call above.
         unsafe { self.started(on, raw, ret, moved) }
+    }
+
+    /// The `TransmitFile` of this provider, looked up once per port.
+    fn transmit_file(&mut self, sock: Sock<'_>) -> io::Result<TransmitFile> {
+        if let Some(f) = self.transmit_file {
+            return Ok(f);
+        }
+        let guid = WSAID_TRANSMITFILE;
+        let mut f: Option<TransmitFile> = None;
+        let mut returned = 0u32;
+        // SAFETY: as in `connect_ex`.
+        let ret = unsafe {
+            WSAIoctl(
+                win::raw(sock),
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                (&raw const guid).cast(),
+                size_of::<Guid>() as u32,
+                (&raw mut f).cast(),
+                size_of::<Option<TransmitFile>>() as u32,
+                &raw mut returned,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ret != 0 {
+            // SAFETY: reads this thread's last Winsock error.
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        }
+        self.transmit_file = f;
+        f.ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    /// Sends `len` bytes of `file` from `offset`, zero copy. The operation holds the
+    /// file until it ends.
+    pub(crate) fn send_file(
+        &mut self,
+        on: Associated,
+        token: u64,
+        file: Arc<std::fs::File>,
+        offset: u64,
+        len: u32,
+    ) -> io::Result<Started> {
+        // SAFETY: open between `register` and `deregister` by the `Driver` contract.
+        let sock = unsafe { win::borrow(on.socket) };
+        let transmit = self.transmit_file(sock)?;
+        let mut op = self.op(on, token, OpKind::SendFile);
+        op.overlapped.offset = offset as u32;
+        op.overlapped.offset_high = (offset >> 32) as u32;
+        let handle = file.as_raw_handle();
+        op.file = Some(file);
+        let raw = Box::into_raw(op);
+        // SAFETY: `raw` is live and holds the file until it is reclaimed, so `handle`
+        // stays open during the operation. No head or tail buffers.
+        let ok = unsafe {
+            transmit(
+                on.socket,
+                handle,
+                len,
+                0,
+                &raw mut (*raw).overlapped,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        // SAFETY: the return value is mapped as in `connect`, right after the call.
+        Ok(unsafe { self.started(on, raw, win_ret(ok), len) })
     }
 
     /// The `ConnectEx` of this provider, looked up once per port.

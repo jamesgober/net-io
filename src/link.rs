@@ -12,7 +12,7 @@ use crate::error::{
     CloseReason, Direction, KillReason, LimitKind, NetError, OsErrorClass, TimeoutKind,
 };
 use crate::gate::{Denial, ErasedGate, WriteCheck};
-use crate::info::{ConnectionInfo, GateTag};
+use crate::info::{ConnectionInfo, GateTag, Transport};
 use crate::limits::Effective;
 use crate::rate::Rate;
 use crate::session::Phase;
@@ -25,6 +25,22 @@ use crate::tls::{TlsError, TlsEvent, TlsFailure, TlsSession};
 pub(crate) enum ClockRef {
     Monotonic,
     Custom(Arc<dyn Clock>),
+    /// The time of this reactor turn: one clock read per trip through the OS, however
+    /// many connections and deadlines the turn touches. Off a worker's thread, the
+    /// clock itself.
+    #[cfg(feature = "reactor")]
+    Turn,
+}
+
+#[cfg(feature = "reactor")]
+thread_local! {
+    static TURN: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// A new reactor turn: reads the clock for it.
+#[cfg(feature = "reactor")]
+pub(crate) fn begin_turn() {
+    TURN.with(|t| t.set(Some(Instant::now())));
 }
 
 impl ClockRef {
@@ -33,6 +49,8 @@ impl ClockRef {
         match self {
             ClockRef::Monotonic => Instant::now(),
             ClockRef::Custom(c) => c.now(),
+            #[cfg(feature = "reactor")]
+            ClockRef::Turn => TURN.with(std::cell::Cell::get).unwrap_or_else(Instant::now),
         }
     }
 }
@@ -96,6 +114,10 @@ pub(crate) struct Link {
     idle_timeout: Duration,
     /// While a PROXY (or TLS) handshake runs: its deadline replaces the phase's.
     handshake_deadline: Option<Instant>,
+    /// What deadlines are multiplied by under pressure (1 otherwise).
+    deadline_scale: f32,
+    /// The owner reads the scale again when an idle wait ends (the pool's sessions).
+    rescales: bool,
     /// Bytes read past a handshake, served before the socket (the buffer returns
     /// to the worker's pool at close).
     pending: Option<Buffer>,
@@ -162,10 +184,23 @@ enum Ev {
     Closed,
 }
 
+/// How much of a file one gate check covers.
+const FILE_CHUNK: u64 = 1 << 20;
+/// The buffer of a file sent by reading and writing.
+const FILE_COPY: usize = 64 * 1024;
+
 /// The largest plaintext encrypted into one record.
 const TLS_RECORD: usize = 16 * 1024;
 /// Room kept per record for the TLS header, padding, and tag.
 const TLS_OVERHEAD: usize = 2 * 1024;
+
+/// `d` under a pressure scale: never below 1 s, never above `d`.
+fn scale(d: Duration, by: f32) -> Duration {
+    if by >= 1.0 {
+        return d;
+    }
+    d.mul_f32(by).max(Duration::from_secs(1)).min(d)
+}
 
 impl Link {
     pub(crate) fn new(
@@ -211,6 +246,8 @@ impl Link {
             replied: false,
             idle_timeout,
             handshake_deadline: None,
+            deadline_scale: 1.0,
+            rescales: false,
             pending: None,
             pending_at: 0,
             approved: 0,
@@ -657,6 +694,29 @@ impl Link {
         n
     }
 
+    /// Under pressure deadlines shrink by `scale`, never below 1 s.
+    pub(crate) fn set_deadline_scale(&mut self, scale: f32) {
+        self.deadline_scale = scale;
+    }
+
+    /// The owner reads the server's scale again when `read` returns `Woken`, so an
+    /// idle wait may end at the deadline pressure would give.
+    pub(crate) fn set_rescales(&mut self) {
+        self.rescales = true;
+    }
+
+    pub(crate) fn scaled(&self, d: Duration) -> Duration {
+        scale(d, self.deadline_scale)
+    }
+
+    /// The longest an idle wait may last before the scale is read again, so a
+    /// crossing reaches a connection already waiting.
+    fn idle_slice(&self) -> Option<Duration> {
+        let p = self.limits.pressure.filter(|_| self.rescales)?;
+        (self.phase == Phase::Idle && self.handshake_deadline.is_none())
+            .then(|| scale(self.idle_timeout, p.factor))
+    }
+
     /// This connection's idle timeout from its next idle wait on (`None`: the
     /// limits' value again). At least one tick.
     pub(crate) fn set_idle_timeout(&mut self, timeout: Option<Duration>) {
@@ -783,6 +843,10 @@ impl Link {
             if let Some(c) = self.rate_in.next_check(&self.limits.min_rate, now) {
                 until = until.min(c);
             }
+            let recheck = self.idle_slice().map(|s| now + s).filter(|&r| r < until);
+            if let Some(r) = recheck {
+                until = r;
+            }
             let timeout = until
                 .saturating_duration_since(now)
                 .max(Duration::from_millis(1));
@@ -798,6 +862,10 @@ impl Link {
             }
             if let Some(result) = got {
                 return result;
+            }
+            if recheck.is_some_and(|r| self.now() >= r) {
+                // The owner reads the server's scale again before the next wait.
+                return Ok(Got::Woken);
             }
         }
     }
@@ -1154,6 +1222,146 @@ impl Link {
         }
     }
 
+    /// Whether `sendfile` can take this connection: a plain socket, and on Windows only
+    /// through the reactor's `TransmitFile`.
+    pub(crate) fn sends_files_directly(&self) -> bool {
+        self.tls.is_none()
+            && (self.info.transport == Transport::Tcp
+                || (self.info.transport == Transport::Unix && cfg!(target_os = "linux")))
+    }
+
+    /// Sends `len` bytes of `file` from `offset`, a gate check before each chunk; returns
+    /// the count, which is `len`: a file that ends early fails the connection.
+    pub(crate) fn send_file(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let start = self.now();
+        self.rate_out.activate(start);
+        let direct = cfg!(unix) && self.sends_files_directly();
+        let sent = if direct {
+            self.send_file_direct(file, offset, len)?
+        } else {
+            0
+        };
+        let copied = self.send_file_copy(file, offset + sent, len - sent)?;
+        self.rate_out.deactivate();
+        Ok(sent + copied)
+    }
+
+    /// Zero copy until the file is done. Stops early, with the count so far, if the OS
+    /// turns the file down, and the rest goes by reading and writing.
+    fn send_file_direct(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        // `sendfile` has no non-blocking flag, and Linux keeps sockets blocking here.
+        let was_blocking = !sys::WAIT_BEFORE_RECV;
+        if was_blocking {
+            self.stream
+                .set_nonblocking(true)
+                .map_err(|e| self.fail_os("ioctl", e))?;
+        }
+        let result = self.send_file_chunks(file, offset, len);
+        if was_blocking {
+            let _ = self.stream.set_nonblocking(false);
+        }
+        result
+    }
+
+    fn send_file_chunks(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        let mut sent = 0u64;
+        while sent < len {
+            let take = (len - sent).min(FILE_CHUNK) as usize;
+            self.check_terminal()?;
+            self.gate_check(take.saturating_sub(self.approved))?;
+            self.approved = take;
+            loop {
+                self.check_terminal()?;
+                match self.send_file_once(file, offset + sent, take) {
+                    Ok(0) => return Err(self.file_truncated(sent)),
+                    Ok(n) => {
+                        self.sent(n);
+                        self.approved = take - n;
+                        sent += n as u64;
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.wait_writable()?,
+                    Err(e) if sent == 0 && sys::send_file_refused(&e) => return Ok(0),
+                    Err(e) => return Err(self.os_error("sendfile", e)),
+                }
+            }
+        }
+        Ok(sent)
+    }
+
+    #[cfg(unix)]
+    fn send_file_once(&self, file: &std::fs::File, offset: u64, len: usize) -> io::Result<usize> {
+        sys::send_file(self.stream.sock(), file, offset, len)
+    }
+
+    #[cfg(not(unix))]
+    fn send_file_once(
+        &self,
+        _file: &std::fs::File,
+        _offset: u64,
+        _len: usize,
+    ) -> io::Result<usize> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    /// Reads and writes, for what cannot use `sendfile`: TLS, pipes, and the blocking
+    /// path on Windows.
+    fn send_file_copy(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut buf = vec![0u8; FILE_COPY.min(len as usize)];
+        let mut sent = 0u64;
+        while sent < len {
+            let take = ((len - sent) as usize).min(buf.len());
+            let n = sys::read_file_at(file, &mut buf[..take], offset + sent)
+                .map_err(|e| self.os_error("read", e))?;
+            if n == 0 {
+                return Err(self.file_truncated(sent));
+            }
+            let mut at = 0;
+            while at < n {
+                at += self.write(&buf[at..n])?;
+            }
+            sent += n as u64;
+        }
+        Ok(sent)
+    }
+
+    fn file_truncated(&mut self, sent: u64) -> NetError {
+        self.fail(
+            CloseReason::Io(OsErrorClass::FileTruncated),
+            NetError::FileTruncated { sent },
+        )
+    }
+
+    fn fail_os(&mut self, op: &'static str, e: io::Error) -> NetError {
+        self.os_error(op, e)
+    }
+
     /// Sends every slice, advancing them in place (no copy).
     pub(crate) fn write_all_vectored(
         &mut self,
@@ -1198,9 +1406,11 @@ impl Link {
         self.stream.set_nonblocking(true)
     }
 
-    /// Bytes arrived (the reactor made the call).
+    /// Bytes arrived (the reactor made the call). `Err` is a peer below the minimum
+    /// rate: the check runs here as well as on the timer, because a peer that sends
+    /// more often than the check interval re-arms the timer before it can fire.
     #[cfg(feature = "reactor")]
-    pub(crate) fn note_received(&mut self, n: usize) {
+    pub(crate) fn note_received(&mut self, n: usize) -> Result<(), NetError> {
         let now = self.now();
         self.bytes_in += n as u64;
         self.progress_at = now;
@@ -1209,22 +1419,43 @@ impl Link {
             self.rate_in.activate(now);
         }
         self.rate_in.record(now, n);
+        self.check_rate_in(now)
     }
 
     /// Ciphertext arrived: it counts for the rate and the deadline; the plaintext
-    /// starts the exchange when it is delivered.
+    /// starts the exchange when it is delivered. `Err` as for `note_received`.
     #[cfg(feature = "reactor")]
-    pub(crate) fn note_cipher(&mut self, n: usize) {
+    pub(crate) fn note_cipher(&mut self, n: usize) -> Result<(), NetError> {
         let now = self.now();
         self.bytes_in += n as u64;
         self.progress_at = now;
         self.rate_in.record(now, n);
+        self.check_rate_in(now)
     }
 
-    /// Bytes left (the reactor made the call).
+    /// `Err(SlowPeer)` when input is below the minimum rate.
     #[cfg(feature = "reactor")]
-    pub(crate) fn note_sent(&mut self, n: usize) {
+    fn check_rate_in(&mut self, now: Instant) -> Result<(), NetError> {
+        if self.rate_in.too_slow(&self.limits.min_rate, now) {
+            return Err(self.fail(
+                CloseReason::SlowPeer {
+                    direction: Direction::In,
+                },
+                NetError::SlowPeer {
+                    direction: Direction::In,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bytes left (the reactor made the call). `Err` is a reader below the minimum
+    /// rate, checked here for the reason given at `note_received`.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn note_sent(&mut self, n: usize) -> Result<(), NetError> {
         self.sent(n);
+        let now = self.now();
+        self.check_rate_out(now)
     }
 
     /// Before a send: the output deadline starts, a dead connection stops here,
@@ -1250,7 +1481,10 @@ impl Link {
     fn read_deadline(&self) -> (Instant, TimeoutKind) {
         match (self.handshake_deadline, self.phase) {
             (Some(d), _) => (d, TimeoutKind::Handshake),
-            (None, Phase::Idle) => (self.progress_at + self.idle_timeout, TimeoutKind::Idle),
+            (None, Phase::Idle) => (
+                self.progress_at + self.scaled(self.idle_timeout),
+                TimeoutKind::Idle,
+            ),
             (None, _) => (
                 self.progress_at + self.limits.read_timeout,
                 TimeoutKind::Read,
@@ -1282,17 +1516,7 @@ impl Link {
         if self.exchange_deadline.is_some_and(|d| now >= d) {
             return Err(self.timed_out(TimeoutKind::Exchange));
         }
-        if self.rate_in.too_slow(&self.limits.min_rate, now) {
-            return Err(self.fail(
-                CloseReason::SlowPeer {
-                    direction: Direction::In,
-                },
-                NetError::SlowPeer {
-                    direction: Direction::In,
-                },
-            ));
-        }
-        Ok(())
+        self.check_rate_in(now)
     }
 
     /// When a wait for room to write must look at the clock again.
@@ -1318,6 +1542,12 @@ impl Link {
         if self.exchange_deadline.is_some_and(|d| now >= d) {
             return Err(self.timed_out(TimeoutKind::Exchange));
         }
+        self.check_rate_out(now)
+    }
+
+    /// `Err(SlowPeer)` when output is below the minimum rate.
+    #[cfg(feature = "reactor")]
+    fn check_rate_out(&mut self, now: Instant) -> Result<(), NetError> {
         if self.rate_out.too_slow(&self.limits.min_rate, now) {
             return Err(self.fail(
                 CloseReason::SlowPeer {

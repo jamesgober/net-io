@@ -1,6 +1,6 @@
 # net-io - Platform notes
 
-What differs between operating systems, what net-io does about it, and what an operator should know. Covers 0.5.0.
+What differs between operating systems, what net-io does about it, and what an operator should know. Covers 0.6.0.
 
 ## Every platform
 
@@ -11,6 +11,7 @@ What differs between operating systems, what net-io does about it, and what an o
 - **The door.** `close_door` stops accepting but keeps the listening sockets open: new connections wait in the kernel's backlog for the next process (hand-off, 0.4) or until `shutdown` closes the listener, which resets them.
 - **PROXY behind a proxy.** A listener with `ProxyMode::Required` closes a peer outside its trusted proxies before reading a byte. On a Unix listener every peer that can open the socket file is trusted, so the file's mode is the boundary. HAProxy (v1 and v2) and nginx (v1) are tested in CI over TCP and Unix sockets; Apache's `mod_proxy` does not send the PROXY protocol (`mod_remoteip` only receives it).
 - **UDP.** Every datagram is charged to its source address's budget before `recv_from` returns it, and replies to a source that has not been marked verified never exceed what it sent (factor 1 by default). Sources are keyed by IP address, not port. A full source table (65,536 by default, about 130 bytes each) evicts unverified entries; strangers that still find no room share one overflow budget and get no send allowance.
+- **Files.** `send_file` and `push_file` use `sendfile` on Unix and `TransmitFile` on the Windows reactor. TLS, named pipes, and Unix sockets off Linux read a piece at a time on the worker, as does a held `TcpConnection` on Windows, so a slow disk holds that worker. A file must not shrink while in flight: the connection is reset with `Io(FileTruncated)`.
 - **Closing.** A graceful close sends FIN and, if the peer may still have unread request bytes in flight, reads and discards up to 64 KiB for up to 2 s so the reply is not destroyed by a reset. An idle connection with nothing unread closes at once. Kills, timeouts in the middle of an exchange, and refusals close with RST (linger 0).
 
 ## Linux
@@ -27,12 +28,18 @@ What differs between operating systems, what net-io does about it, and what an o
 - **Inheritance.** systemd socket activation is tested with systemd's own `systemd-socket-activate`; `LISTEN_PIDFDID` (systemd 259 and Linux 6.9 or later) is checked against this process's pidfd.
 - **Descriptor passing** receives with `MSG_CMSG_CLOEXEC`, so a passed descriptor is close-on-exec from the moment it arrives.
 
+- **Fast open** needs `net.ipv4.tcp_fastopen` to include the server bit (2). A client's first data can be replayed by the network: turn it on only for requests that are safe to run twice.
+- **`per_worker`** builds a `SO_REUSEPORT` group, so the kernel's hash decides the balance, and with `ServerBuilder::placement` each socket takes what its worker's CPU received. Closing one socket of a group resets the connections queued on it, so such a listener cannot be handed off.
+- **Batches.** `recv_batch` and `send_batch` are `recvmmsg` and `sendmmsg`; elsewhere they are a loop that flips the socket non-blocking and back.
+
 ## macOS
 
 - **No SIGPIPE.** Each socket gets `SO_NOSIGPIPE` at creation.
 - **Waits.** Sockets stay non-blocking and every receive waits in `poll` first, as on Windows (decision D-083): a send with `MSG_DONTWAIT` on a blocking socket was seen to block on a full buffer, and `setsockopt` fails with `EINVAL` once a connection has ended, so the Linux model (blocking `recv` under `SO_RCVTIMEO`) does not hold. A keep-alive round trip is three system calls.
 - **Backlog.** Capped by `kern.ipc.somaxconn`; the effective value is not readable per listener, so `ListenerInfo::backlog` is `None`.
 - **Linger** uses `SO_LINGER_SEC` (seconds), not `SO_LINGER`.
+- **Placement** does not exist: `ServerBuilder::placement` is `Unsupported`.
+- **Write wake-ups.** kqueue's write filter fires now and then after an ACK, an empty wake about once in twenty exchanges.
 - **`TcpListener::from_std`** cannot ask macOS whether a socket listens (`SO_ACCEPTCONN` is not answered), so it accepts a stream socket that is bound and has no peer; a socket that was bound but never listened then fails at its first `accept`.
 - **`shutdown(SHUT_RD)`** discards data already received and any that arrives later; a drain or kill therefore never delivers more input to the session (Linux delivers what was already queued).
 
@@ -44,11 +51,14 @@ What differs between operating systems, what net-io does about it, and what an o
 
 - **Same model as macOS.** Sockets stay non-blocking, every receive on the blocking pool waits in `poll` first, and the reactor uses kqueue with `EV_CLEAR`. Each socket gets `SO_NOSIGPIPE`.
 - **Peer credentials.** `getpeereid` gives the uid and gid, and `LOCAL_PEERCRED` the pid.
+- **Fast open** needs `net.inet.tcp.fastopen.server_enable`.
 - **Close-on-exec.** As on macOS, descriptors get `FD_CLOEXEC` right after the call.
 
 ## Windows
 
 - **The reactor** runs on an I/O completion port per worker. A receive that finds no bytes pends, and an idle connection waits with a zero-byte receive, so it pins no memory. That adds one system call per exchange: wait, receive, send, zero-byte receive. A call that finishes at once completes without a trip through the port (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, unless a layered provider without real handles is installed).
+- **UDP packet info** is `Unsupported`; it needs `WSARecvMsg`, and no consumer has asked.
+- **`user_timeout`** is `TCP_MAXRT`, in whole seconds.
 - **Pending sends** pin the output's pages in the kernel until the peer takes them. The output budget bounds this per connection, and the write deadline cancels it.
 - **Waits.** Microsoft documents a socket whose blocking receive or send timed out as being in an indeterminate state, so net-io never relies on `SO_RCVTIMEO`: every socket in the blocking driver is non-blocking and every wait is `WSAPoll` on the socket and the worker's wake channel (decision D-052). A keep-alive round trip is therefore three system calls (`WSAPoll`, `recv`, `send`).
 - **Wake channels.** Each worker's wake channel is a loopback UDP socket connected to itself, which holds one ephemeral port. With 128 workers that is 128 ports per server; many servers in one process (a test suite starting dozens of default servers at once) can run out of buffer space (`WSAENOBUFS`). Size `workers` to the load.
@@ -65,4 +75,4 @@ What differs between operating systems, what net-io does about it, and what an o
 
 ## Targets
 
-0.5 builds on Linux, macOS, FreeBSD, and Windows for x86_64 and aarch64, with net-io's own declarations of the OS calls it needs (`dev/SYS-SURFACE.md` lists them). A std-only fallback for other targets arrives in 0.6; until then other targets stop at a compile error that says so.
+0.5 builds on Linux, macOS, FreeBSD, and Windows for x86_64 and aarch64, with net-io's own declarations of the OS calls it needs (`dev/SYS-SURFACE.md` lists them). Other targets stop at a compile error that says so.

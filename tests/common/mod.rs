@@ -6,7 +6,14 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use net_io::Server;
+use net_io::{DriverKind, Server};
+
+/// Every driver this build has.
+pub const DRIVERS: &[DriverKind] = if cfg!(feature = "reactor") {
+    &[DriverKind::Blocking, DriverKind::Reactor]
+} else {
+    &[DriverKind::Blocking]
+};
 
 /// The address of a server's first listener.
 pub fn addr(server: &Server) -> SocketAddr {
@@ -21,7 +28,8 @@ pub fn client(addr: SocketAddr) -> TcpStream {
     let s = TcpStream::connect(addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
-    s.set_nodelay(true).expect("nodelay");
+    // A server that already closed makes this fail on the BSDs: the test will see that.
+    let _ = s.set_nodelay(true);
     s
 }
 

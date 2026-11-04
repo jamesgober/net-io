@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "net-io"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -33,7 +33,7 @@ documentation = "https://docs.rs/net-io"
 authors = ["James Gober <me@jamesgober.com>"]
 
 # Kept out of the published crate
-exclude = ["fuzz/"]
+exclude = ["fuzz/", "compare/"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -113,6 +113,11 @@ required-features = ["udp"]
 [[bench]]
 name    = "echo"
 harness = false
+
+[[bench]]
+name              = "lifecycle"
+harness           = false
+required-features = ["proxy", "reactor"]
 
 
 # LINTS

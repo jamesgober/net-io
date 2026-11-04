@@ -86,6 +86,17 @@ impl PollWaker {
     }
 }
 
+/// Nothing to do here: `EPOLLOUT` is registered for good, and only a change of state
+/// reports it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WriteArm;
+
+impl WriteArm {
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub(crate) fn arm(self, _reg: Registered, _key: u64) {}
+}
+
 impl Poller {
     pub(crate) fn new() -> io::Result<Poller> {
         // SAFETY: plain integer arguments; a new descriptor or -1.
@@ -114,6 +125,12 @@ impl Poller {
 
     pub(crate) fn waker(&self) -> Arc<PollWaker> {
         self.wake.clone()
+    }
+
+    /// See [`WriteArm`].
+    #[allow(clippy::unused_self)]
+    pub(crate) fn write_arm(&self) -> WriteArm {
+        WriteArm
     }
 
     /// Registers a socket under `key` for both directions, edge-triggered.

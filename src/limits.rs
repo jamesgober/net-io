@@ -62,7 +62,10 @@ impl MinRate {
     }
 }
 
-/// Adaptive deadlines under pressure (applied from `0.6.0`).
+/// Adaptive deadlines: past `high` of `max_connections`, the handshake and idle
+/// deadlines of new and waiting connections are multiplied by `factor`, down to 1 s,
+/// until the count falls below `low`. No cost below the threshold beyond one check
+/// per connection opened or closed.
 ///
 /// ```
 /// let p = net_io::Pressure::default();
@@ -213,9 +216,20 @@ pub(crate) struct Effective {
     pub graceful_linger_bytes: u32,
     pub refusal_bytes_max: u16,
     pub tick: Duration,
+    pub pressure: Option<Pressure>,
+    /// Slots each of the most important lanes keeps free from the less important.
+    pub lane_reserve: [u32; RESERVED_LANES],
 }
 
 impl Effective {
+    /// The slots the lanes more important than `lane` keep free.
+    pub(crate) fn reserved_above(&self, lane: Lane) -> u32 {
+        self.lane_reserve
+            .iter()
+            .take(usize::from(lane.0))
+            .fold(0u32, |sum, r| sum.saturating_add(*r))
+    }
+
     /// The defaults of `driver` (blocking, or the reactor).
     pub(crate) fn defaults(driver: DriverKind) -> Effective {
         let blocking = driver.resolve() == DriverKind::Blocking;
@@ -244,6 +258,8 @@ impl Effective {
             graceful_linger_bytes: 64 * 1024,
             refusal_bytes_max: 512,
             tick: Duration::from_millis(if blocking { 10 } else { 1 }),
+            pressure: None,
+            lane_reserve: [0; RESERVED_LANES],
         }
     }
 }
@@ -389,6 +405,8 @@ impl Limits {
             graceful_linger_bytes,
             refusal_bytes_max: self.refusal_bytes_max.unwrap_or(d.refusal_bytes_max),
             tick: self.tick.unwrap_or(d.tick),
+            pressure: self.pressure,
+            lane_reserve: self.lane_reserve.map(|v| v.unwrap_or(0)),
         }
     }
 
@@ -636,7 +654,7 @@ impl LimitsBuilder {
         refusal_bytes_max, u16);
     setter!(/// The timer resolution (1 ms to 100 ms).
         tick, Duration);
-    setter!(/// Adaptive deadlines under pressure (applied from `0.6.0`).
+    setter!(/// Adaptive deadlines under pressure.
         pressure, Pressure);
 
     /// The per-source concurrency cap and how sources are grouped.

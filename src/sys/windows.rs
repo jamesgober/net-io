@@ -98,6 +98,8 @@ pub(super) mod c {
     pub const SO_TYPE: i32 = 0x1008;
     pub const TCP_NODELAY: i32 = 0x1;
     pub const TCP_KEEPIDLE: i32 = 3;
+    pub const TCP_MAXRT: i32 = 5;
+    pub const TCP_FASTOPEN: i32 = 15;
     pub const TCP_KEEPCNT: i32 = 16;
     pub const TCP_KEEPINTVL: i32 = 17;
     pub const IP_TTL: i32 = 4;
@@ -267,6 +269,14 @@ const FROM_PROTOCOL_INFO: i32 = -1;
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    fn GetActiveProcessorGroupCount() -> u16;
+    fn GetActiveProcessorCount(group: u16) -> u32;
+    fn GetCurrentThread() -> *mut c_void;
+    fn SetThreadGroupAffinity(
+        thread: *mut c_void,
+        affinity: *const GroupAffinity,
+        previous: *mut GroupAffinity,
+    ) -> i32;
     fn CreateEventW(
         attributes: *const c_void,
         manual: i32,
@@ -595,6 +605,9 @@ pub(crate) struct ListenParams {
     pub send_buffer: Option<u32>,
     pub receive_buffer: Option<u32>,
     pub backlog: u32,
+    pub defer_accept: Option<Duration>,
+    pub fast_open: Option<u32>,
+    pub incoming_cpu: Option<u32>,
 }
 
 /// Creates, configures, binds, and listens. Without `reuse_address`, the socket
@@ -605,6 +618,9 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
             io::ErrorKind::Unsupported,
             "SO_REUSEPORT does not exist on Windows",
         ));
+    }
+    if p.defer_accept.is_some() || p.incoming_cpu.is_some() {
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
     }
     let s = tcp_socket(addr.is_ipv6())?;
     if p.reuse_address {
@@ -629,9 +645,72 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
     bind_to(s.as_socket(), addr)?;
     // SAFETY: `s` is an open, bound stream socket.
     cvt(unsafe { listen(raw(s.as_socket()), clamp_int(p.backlog)) })?;
+    if p.fast_open.is_some() {
+        set_int(s.as_socket(), c::IPPROTO_TCP, c::TCP_FASTOPEN, 1)?;
+    }
     let listener = TcpListener::from(s);
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+/// Whether a file send was turned down, so the bytes must go by reading and writing.
+pub(crate) fn send_file_refused(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Unsupported
+}
+
+/// Bytes of `file` at `offset`. Windows moves the file's position, which no net-io
+/// path relies on.
+pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
+/// Whether this OS can pin a thread.
+pub(crate) const CAN_PIN: bool = true;
+
+/// `GROUP_AFFINITY`.
+#[repr(C)]
+struct GroupAffinity {
+    mask: usize,
+    group: u16,
+    reserved: [u16; 3],
+}
+
+/// Pins the calling thread to the `cpu`th processor, counting across processor groups.
+pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
+    let mut left = cpu;
+    // SAFETY: takes no pointers.
+    let groups = unsafe { GetActiveProcessorGroupCount() };
+    for group in 0..groups {
+        // SAFETY: takes no pointers.
+        let in_group = unsafe { GetActiveProcessorCount(group) } as usize;
+        if left < in_group {
+            let affinity = GroupAffinity {
+                mask: 1usize << left,
+                group,
+                reserved: [0; 3],
+            };
+            // SAFETY: the pseudo handle needs no closing; `affinity` lives for the call,
+            // and the previous-affinity pointer may be null.
+            let ok = unsafe {
+                SetThreadGroupAffinity(
+                    GetCurrentThread(),
+                    &raw const affinity,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+        left -= in_group;
+    }
+    Err(io::Error::from(io::ErrorKind::InvalidInput))
+}
+
+/// `TCP_MAXRT`: how long sent bytes may stay unacknowledged, in whole seconds.
+pub(crate) fn set_user_timeout(sock: Sock<'_>, timeout: Duration) -> io::Result<()> {
+    set_int(sock, c::IPPROTO_TCP, c::TCP_MAXRT, secs(timeout).max(1))
 }
 
 /// Binds `sock` to `addr`.
@@ -1410,6 +1489,9 @@ mod layout {
             send_buffer: None,
             receive_buffer: None,
             backlog: 16,
+            defer_accept: None,
+            fast_open: None,
+            incoming_cpu: None,
         };
         let l = tcp_listener("127.0.0.1:0".parse().unwrap(), &p).unwrap();
         assert!(is_listening_stream(l.as_socket()).unwrap());
