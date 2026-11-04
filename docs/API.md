@@ -2456,6 +2456,8 @@ conn.send_all(b"ready\n")?;
     // recv, recv_exact, send, send_all, close, abort, info, id, kill_handle, set_limits, set_phase,
     // set_exchange_deadline: the same signatures as UnixConnection; Read, Write, Drop as TcpConnection
     pub fn client_pid(&self) -> Result<u32, NetError>;
+    pub fn server_pid(&self) -> Result<u32, NetError>;
+    pub fn server_owner_sid(&self) -> Result<String, NetError>;                     // "S-1-5-18"
 }
 #[cfg(windows)] #[must_use] #[derive(Clone, Debug)] pub struct PipeOptions { /* ... */ }
 #[cfg(windows)] impl PipeOptions {
@@ -2472,8 +2474,11 @@ pub enum PipeSecurity { OwnerOnly, OwnerAndSystem, Sddl(String) }
 |---|---|---|---|---|---|
 | `create`, `create_with` | the first instance uses `FILE_FLAG_FIRST_PIPE_INSTANCE`, so if another process already owns the name the call fails instead of sharing it; `PIPE_REJECT_REMOTE_CLIENTS` always (not configurable); an owner-only security descriptor by default; a backslash in the name part is refused before any system call | `PipeNameInUse`, `PermissionDenied`, `InvalidConfig`, `Os` | P1 | 1 / 2 | `0.5.0` |
 | `accept` | waits for a client (overlapped on the reactor), creates the next instance before returning so a client never finds none; a client that connected before the wait (`ERROR_PIPE_CONNECTED`) is a success | `Os` | P1 | 1 | `0.5.0` |
+| `accept`: the name between instances | a pipe exists while one of its instances is open. When every instance is connected (always with `max_instances(1)`) there is no spare, so after those connections close the name is free and a client gets `NotFound` until the next accept. The listener counts its open instances, spare and connections together; when it holds none, the next instance claims the name again with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so it never joins a pipe another process created in the gap (which would carry that process's security descriptor). A failed `ConnectNamedPipe` keeps an instance open. Cost: one mutex per accept and per server-end close [est. under 1 µs] | `PipeNameInUse` (another process took the name in the gap), `Os` | P1 | 1 | `0.7.0` |
 | `PipeConnection::connect` | `CreateFileW` with `SECURITY_SQOS_PRESENT \| SECURITY_IDENTIFICATION`, so the server can identify the client but not impersonate it beyond that; on `ERROR_PIPE_BUSY` waits with `WaitNamedPipeW` within `timeout` | `ConnectTimeout`, `NotFound`, `PermissionDenied` | P1 | 1 | `0.5.0` |
 | `client_pid` | `GetNamedPipeClientProcessId` | `Os` | P1 | 2 | `0.5.0` |
+| `server_pid` | `GetNamedPipeServerProcessId`: the process that created the server end. Any local user may create a pipe name nobody holds, so a client that knows its server's process (one it started, say) checks this before it sends anything that matters. Process ids are reused after exit; `server_owner_sid` checks an account instead. Cost: one system call | `Closed`, `Os` | P1 | 2 | `0.7.0` |
+| `server_owner_sid` | `GetSecurityInfo(OWNER_SECURITY_INFORMATION)` on the connection's own handle, as a canonical string SID: the account that created the pipe, or `S-1-5-32-544` when an elevated administrator did. A user who squats a name cannot make a pipe owned by another account, so comparing this with the account the server runs as (`S-1-5-18` for a service as local system) tells the real server from a squatter, with no race: the handle is the pipe that was reached. Cost: one system call and one string [est. under 10 µs] | `Closed`, `Os` | P1 | 2 | `0.7.0` |
 
 ### `LocalListener`, `LocalConnection`
 
