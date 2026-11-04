@@ -1317,7 +1317,7 @@ impl Keepalive { pub const DEFAULT: Keepalive; }      // 60 s, 10 s, 6
 pub enum Linger { Off, Abortive, Timeout(Duration) }
 ```
 
-`None` leaves the OS default. P0, Tier 2, `0.3.0`.
+`None` leaves the OS default. `SO_LINGER` counts whole seconds, so `Linger::Timeout` rounds up: under a second it lingers one second (from `0.7.0`; before, it truncated to 0, which resets). P0, Tier 2, `0.3.0`.
 
 ### `SocketOptions`
 
@@ -2816,7 +2816,7 @@ pub enum HandoffError {
 |---|---|---|---|---|
 | `ListenerHandle` | owned, move-only; dropping it closes the socket | P0 | 3 | `0.4.0` |
 | `send_listeners`, `recv_listeners` | one message carrying up to 64 descriptors (`SCM_RIGHTS`, attached to its first byte) and a manifest: magic `NIOH`, version 1, count, total length, per listener its kind, name (at most 64 bytes, cut at a character boundary), and local address, then a CRC32C of everything before it. The receiver checks the sender's credentials against `expect` (default: same uid) before reading, reads under `deadline`, receives close-on-exec, fails on a truncated control message or a sender that closes mid-message, refuses descriptors on any later read, checks magic, version, checksum, and count, and verifies every descriptor (`SO_TYPE`, `SO_ACCEPTCONN`, `getsockname` equals the manifest address). Any failure closes every received descriptor and returns the error: all or nothing (decision D-099) | P0 | 3 | `0.4.0` |
-| `share_listeners`, `receive_shared` | Windows: `WSADuplicateSocketW` per socket for one target pid (each blob works once, in that process only), sent with a random nonce over a named pipe with an owner-only security descriptor; the receiver checks the process at the far end of the pipe against `expect.pid`, refuses a nonce it already accepted, creates each socket with `WSASocketW(FROM_PROTOCOL_INFO, WSA_FLAG_OVERLAPPED)`, and verifies it | P0 | 3 | `0.5.0` |
+| `share_listeners`, `receive_shared` | Windows: `WSADuplicateSocketW` per socket for one target pid (each blob works once, in that process only), sent with a random nonce over a named pipe with an owner-only security descriptor; the receiver checks the process at the far end of the pipe against `expect.pid`, refuses a nonce it already accepted, creates each socket with `WSASocketW(FROM_PROTOCOL_INFO, WSA_FLAG_OVERLAPPED)` and makes it non-inheritable, claims every socket of the message before verifying any (a failure closes them all), refuses a socket this process already owns, and verifies each against the manifest. A damaged message cannot be claimed safely, so its sockets stay open until the process exits; the pipe's access list bounds who can send one | P0 | 3 | `0.5.0` (claim-all, refuse-owned, non-inheritable `0.7.0`) |
 | `HandoffPeer`, `HandoffError` | | P0 | 3 | `0.4.0` |
 
 Keep the channel's socket in a private directory (`0700`). Cost: under 1 ms per hand-off [est.].
