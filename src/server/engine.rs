@@ -1913,6 +1913,9 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     }
                     // The wake: the top of the loop decides what it meant.
                     Ok(None) => break,
+                    // Someone else holds the name now (D-154): this listener is gone,
+                    // and pausing would hide that.
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Accepted::Failed(e),
                     // Out of instances or handles: the same pause as out of descriptors.
                     Err(_) => acceptor.pause(),
                 },
