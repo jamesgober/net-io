@@ -1281,7 +1281,12 @@ fn clamp_int(n: u32) -> i32 {
 pub(crate) fn set_linger(sock: Sock<'_>, linger: Option<Duration>) -> io::Result<()> {
     let value = Linger {
         l_onoff: u16::from(linger.is_some()),
-        l_linger: linger.map_or(0, |d| u16::try_from(d.as_secs()).unwrap_or(u16::MAX)),
+        // Whole seconds, rounded up: a sub-second linger truncated to 0 would reset
+        // the connection, the opposite of what was asked. Zero stays the reset.
+        l_linger: linger.map_or(0, |d| {
+            let secs = d.as_secs() + u64::from(d.subsec_nanos() > 0);
+            u16::try_from(secs).unwrap_or(u16::MAX)
+        }),
     };
     // SAFETY: `value` is a live repr(C) LINGER and the length is its size.
     let ret = unsafe {

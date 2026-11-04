@@ -1,6 +1,8 @@
 //! A file streamed to a fast reader beside small exchanges on the same worker: the
 //! small ones keep their latency.
 
+#![cfg(feature = "reactor")]
+
 mod common;
 
 use std::fs::File;
@@ -107,7 +109,6 @@ fn at(sorted: &[Duration], q: f64) -> Duration {
 
 /// One reactor worker serves a fast reader of 512 MiB and a ping client at once.
 #[test]
-#[cfg(feature = "reactor")]
 fn test_bulk_stream_leaves_small_exchanges_their_latency() {
     let temp = Temp::new(FILE_LEN);
     let file = Arc::new(File::open(&temp.0).expect("open"));
