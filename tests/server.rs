@@ -725,3 +725,79 @@ fn test_per_source_cap_per_listener() {
     }
     assert_eq!(server.stats().refused_for(RefusalCause::SourceCap), 1);
 }
+
+/// Lines: each complete line is answered; a session that survives its read timeout
+/// keeps waiting for the rest of a partial one.
+struct Lines {
+    timeouts: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Session for Lines {
+    fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+        while let Some(end) = input.bytes().iter().position(|&b| b == b'\n') {
+            let line = input.bytes()[..=end].to_vec();
+            input.consume(end + 1);
+            cx.output().push(&line).expect("push");
+        }
+        Step::Write
+    }
+
+    fn on_writable(&mut self, _: &mut SessionContext<'_>) -> Step {
+        Step::Read
+    }
+
+    fn on_timeout(&mut self, _: &mut SessionContext<'_>, _: net_io::TimeoutKind) -> Step {
+        self.timeouts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Step::Read
+    }
+}
+
+/// A complete line plus the start of the next, then silence past the read timeout:
+/// the session survives the timeout while its partial line is with the receive in
+/// flight, and the line completes later (review finding: the reactor indexed the
+/// stand-in buffer and the worker panicked).
+#[test]
+fn test_session_survives_a_timeout_with_a_partial_message_held() {
+    for &driver in DRIVERS {
+        let timeouts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let t2 = timeouts.clone();
+        let limits = Limits::builder()
+            .read_timeout(Duration::from_millis(300))
+            .idle_timeout(Duration::from_millis(300))
+            .build()
+            .expect("limits");
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0").limits(limits))
+            .driver(driver)
+            // One reactor worker serves both clients; the pool needs one each.
+            .workers(if driver == DriverKind::Blocking { 2 } else { 1 })
+            .sessions(move |_: &ConnectionInfo| Lines {
+                timeouts: t2.clone(),
+            })
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = client(addr(&server));
+        c.write_all(b"one\npar").expect("write");
+        let mut back = [0u8; 4];
+        std::io::Read::read_exact(&mut c, &mut back).expect("first line");
+        assert_eq!(&back, b"one\n", "{driver:?}");
+        assert!(
+            eventually(Duration::from_secs(5), || timeouts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2),
+            "{driver:?}: no timeout"
+        );
+        c.write_all(b"tial\n").expect("write");
+        let mut back = [0u8; 8];
+        std::io::Read::read_exact(&mut c, &mut back).expect("second line");
+        assert_eq!(&back, b"partial\n", "{driver:?}");
+        // The worker is still alive for others.
+        let mut d = client(addr(&server));
+        d.write_all(b"two\n").expect("write");
+        std::io::Read::read_exact(&mut d, &mut back[..4]).expect("other client");
+        assert_eq!(&back[..4], b"two\n", "{driver:?}");
+    }
+}

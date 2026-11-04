@@ -209,6 +209,10 @@ impl BufferPool {
     ///
     /// A buffer from another worker's pool is accepted (it is just memory).
     pub fn put(&mut self, mut buf: Buffer) {
+        if buf.data.is_empty() {
+            // A stand-in owns no memory and was never charged to the budget.
+            return;
+        }
         if self.wipe {
             buf.wipe();
         } else {

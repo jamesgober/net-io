@@ -320,15 +320,32 @@ impl Link {
 
     /// Puts TLS on this connection: from now on reads return plaintext and
     /// writes encrypt. `cin` must hold the largest record the engine needs.
+    ///
+    /// Bytes read past a PROXY header are ciphertext: they move into `cin` here, so
+    /// the engine reads them first and nothing reaches the session unencrypted. The
+    /// emptied read-ahead buffer is returned for its pool.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    #[must_use]
     pub(crate) fn attach_tls(
         &mut self,
         session: Box<dyn TlsSession>,
         mut cin: Buffer,
         mut cout: Buffer,
-    ) {
+    ) -> Option<Buffer> {
         cin.set_len(0);
         cout.set_len(0);
+        let ahead = self.pending.take();
+        if let Some(p) = ahead.as_ref() {
+            let rest = p.as_slice().get(self.pending_at..).unwrap_or(&[]);
+            if rest.len() > cin.capacity() {
+                // Cannot happen with the pool's classes; fail closed if it does.
+                self.terminal.get_or_insert(CloseReason::TlsFailed);
+            } else {
+                cin.spare()[..rest.len()].copy_from_slice(rest);
+                cin.set_len(rest.len());
+            }
+        }
+        self.pending_at = 0;
         self.tls = Some(Box::new(TlsLayer {
             session,
             cin,
@@ -342,6 +359,7 @@ impl Link {
             data_from: 0,
             data_to: 0,
         }));
+        ahead
     }
 
     /// Whether TLS is on this connection.
