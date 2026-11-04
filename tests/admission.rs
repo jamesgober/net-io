@@ -69,9 +69,9 @@ fn test_lane_reserve_keeps_slots_for_the_more_important() {
         assert_eq!(round_trip(&mut first, b"in"), b"in");
         // Refused: the reset may come before `connect` returns, and Linux reports it there.
         if let Ok(mut second) = TcpStream::connect(addr(&server)) {
-            second
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("timeout");
+            // macOS refuses the option with EINVAL once the reset has arrived, which
+            // already shows the refusal.
+            let _ = second.set_read_timeout(Some(Duration::from_secs(5)));
             let _ = second.write_all(b"x");
             let mut b = [0u8; 1];
             assert!(!matches!(second.read(&mut b), Ok(n) if n > 0), "{driver:?}");
