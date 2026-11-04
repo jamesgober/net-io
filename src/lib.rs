@@ -144,8 +144,8 @@ pub use control::{ControlLine, ControlState, NoControl, SimpleControl};
 #[cfg(feature = "reactor")]
 pub use driver::new_reactor_driver;
 pub use driver::{
-    BorrowedSocket, Completion, Completions, Driver, DriverKind, DriverWaker, Operation,
-    OperationKind, Rejected, SendChunks, Token,
+    Completion, Completions, Driver, DriverKind, DriverWaker, Operation, OperationKind, Rejected,
+    SendChunks, SharedSocket, Token,
 };
 pub use error::{
     CloseReason, ConfigReason, Direction, ErrorClass, KillReason, LimitKind, NetError,

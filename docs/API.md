@@ -2169,7 +2169,7 @@ The driver interface itself becomes public (Tier 3) at `0.5.0` so an executor ad
 ```rust
 pub trait Driver: Send {
     fn kind(&self) -> DriverKind;
-    fn register(&mut self, socket: BorrowedSocket<'_>, token: Token) -> Result<(), NetError>;
+    fn register(&mut self, socket: SharedSocket, token: Token) -> Result<(), NetError>;   // the driver holds the socket until deregister
     fn submit(&mut self, operation: Operation) -> Result<(), Rejected>;   // Rejected gives the operation and its buffers back
     fn wait(&mut self, out: &mut Completions, timeout: Option<Duration>) -> Result<usize, NetError>;
     fn cancel(&mut self, token: Token, which: OperationKind) -> Result<(), NetError>;  // always followed by exactly one completion
@@ -2194,15 +2194,15 @@ pub struct SendChunks { /* up to 64 chunks: pool buffers, &'static slices; taken
 pub struct Rejected { pub operation: Operation }
 #[derive(Clone)] pub struct DriverWaker { /* eventfd, EVFILT_USER, IOCP port, or parker */ }
 impl DriverWaker { pub fn wake(&self); }
-#[cfg(unix)] pub type BorrowedSocket<'a> = BorrowedFd<'a>;
-#[cfg(windows)] pub type BorrowedSocket<'a> = std::os::windows::io::BorrowedSocket<'a>;
+#[cfg(unix)] pub type SharedSocket = Arc<dyn AsFd + Send + Sync>;
+#[cfg(windows)] pub type SharedSocket = Arc<dyn std::os::windows::io::AsSocket + Send + Sync>;
 ```
 
 ```rust
 #[cfg(feature = "reactor")] pub fn new_reactor_driver(capacity: usize) -> Result<Box<dyn Driver>, NetError>;
 ```
 
-Completion-shaped (decision D-005): operations own their buffers until the completion returns them, which is what IOCP and io_uring need; epoll and kqueue adapt by doing the non-blocking call when readiness arrives. Cancellation always ends in exactly one completion. A token's low 32 bits index a table the driver keeps, so keep them small and dense, and put a generation in the high 32 bits to catch a completion for a slot that moved on. On Windows a listener cannot be registered (D-016) and `Accept` is refused. P2, Tier 3, `0.5.0`.
+Completion-shaped (decision D-005): operations own their buffers until the completion returns them, which is what IOCP and io_uring need; epoll and kqueue adapt by doing the non-blocking call when readiness arrives. Cancellation always ends in exactly one completion. The driver does I/O on a registered socket's descriptor by number, so it holds the socket (a `SharedSocket`, any `Arc` of a socket type) from `register` until `deregister`: a socket the caller dropped early stays open, and its number cannot go to another connection whose bytes a stale operation would then read or write. `deregister` drops the driver's clone, which closes the socket when it was the last one. Keep a clone to accept from a registered listener. The descriptor `as_fd` (`as_socket`) returns at registration is the one used throughout, as every `std` socket type keeps it. Cost: one `Arc` per registered socket, made by the caller (one allocation if the socket was not shared already) and 16 bytes in the driver's table; nothing per operation. Before `0.7.0`, `register` took a `BorrowedSocket<'_>` and only the documentation asked the caller to keep the socket open, which safe code could break. A token's low 32 bits index a table the driver keeps, so keep them small and dense, and put a generation in the high 32 bits to catch a completion for a slot that moved on. On Windows a listener cannot be registered (D-016) and `Accept` is refused. P2, Tier 3, `0.5.0`.
 
 ---
 

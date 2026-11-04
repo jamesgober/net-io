@@ -14,18 +14,33 @@ use std::time::Duration;
 
 use super::{
     BorrowedSocket, Completion, Completions, Driver, DriverKind, DriverWaker, Operation,
-    OperationKind, Rejected, Token, operation_token,
+    OperationKind, Rejected, SharedSocket, Token, operation_token,
 };
 use crate::error::{NetError, OsErrorClass};
 use crate::sys::{self, Associated, Finished, InFlight, OpKind, Port, Started};
 
-#[derive(Debug)]
 struct Reg {
     token: u64,
     socket: Associated,
+    /// What keeps `socket` open: the caller's shared socket, or nothing when the
+    /// server's reactor registered it and keeps it open itself.
+    keep: Option<SharedSocket>,
     recv: Option<InFlight>,
     out: Option<InFlight>,
     close: bool,
+}
+
+impl std::fmt::Debug for Reg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reg")
+            .field("token", &self.token)
+            .field("socket", &self.socket)
+            .field("shared", &self.keep.is_some())
+            .field("recv", &self.recv)
+            .field("out", &self.out)
+            .field("close", &self.close)
+            .finish()
+    }
 }
 
 /// How many waits may skip the port while local completions are queued, so a busy
@@ -113,22 +128,43 @@ impl IocpDriver {
         handle: std::os::windows::io::RawHandle,
         token: Token,
     ) -> Result<(), NetError> {
-        let i = token.index();
-        if i >= self.regs.len() {
-            self.regs.resize_with(i + 1, || None);
-        }
         let socket = self
             .port
             .associate_pipe(handle)
             .map_err(|e| NetError::from_os("CreateIoCompletionPort", e))?;
+        self.insert(token, socket, None);
+        Ok(())
+    }
+
+    /// As [`Driver::register`], for the server's own reactor, which owns each
+    /// connection's socket and keeps it open until its operations are dequeued.
+    /// Inherent, so the reactor's calls resolve here.
+    pub(crate) fn register(
+        &mut self,
+        socket: BorrowedSocket<'_>,
+        token: Token,
+    ) -> Result<(), NetError> {
+        let socket = self
+            .port
+            .associate(socket)
+            .map_err(|e| NetError::from_os("CreateIoCompletionPort", e))?;
+        self.insert(token, socket, None);
+        Ok(())
+    }
+
+    fn insert(&mut self, token: Token, socket: Associated, keep: Option<SharedSocket>) {
+        let i = token.index();
+        if i >= self.regs.len() {
+            self.regs.resize_with(i + 1, || None);
+        }
         self.regs[i] = Some(Reg {
             token: token.0,
             socket,
+            keep,
             recv: None,
             out: None,
             close: false,
         });
-        Ok(())
     }
 
     fn on(port: Port, capacity: usize) -> IocpDriver {
@@ -166,22 +202,12 @@ impl Driver for IocpDriver {
         DriverKind::Reactor
     }
 
-    fn register(&mut self, socket: BorrowedSocket<'_>, token: Token) -> Result<(), NetError> {
-        let i = token.index();
-        if i >= self.regs.len() {
-            self.regs.resize_with(i + 1, || None);
-        }
-        let socket = self
+    fn register(&mut self, socket: SharedSocket, token: Token) -> Result<(), NetError> {
+        let associated = self
             .port
-            .associate(socket)
+            .associate(socket.as_socket())
             .map_err(|e| NetError::from_os("CreateIoCompletionPort", e))?;
-        self.regs[i] = Some(Reg {
-            token: token.0,
-            socket,
-            recv: None,
-            out: None,
-            close: false,
-        });
+        self.insert(token, associated, Some(socket));
         Ok(())
     }
 

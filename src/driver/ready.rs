@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use super::{
     BorrowedSocket, Completion, Completions, Driver, DriverKind, DriverWaker, Operation,
-    OperationKind, Rejected, SendChunks, Token, operation_token,
+    OperationKind, Rejected, SendChunks, SharedSocket, Token, operation_token,
 };
 use crate::buf::Buffer;
 use crate::error::{NetError, OsErrorClass};
@@ -39,10 +39,12 @@ enum Out {
     File(Arc<File>, u64, u32),
 }
 
-#[derive(Debug)]
 struct Reg {
     token: u64,
     socket: Registered,
+    /// What keeps `socket` open: the caller's shared socket, or nothing when the
+    /// server's reactor registered it and keeps it open itself.
+    keep: Option<SharedSocket>,
     readable: bool,
     writable: bool,
     /// The peer hung up: reads must go on until the end of stream, because no
@@ -51,6 +53,22 @@ struct Reg {
     recv: Recv,
     out: Out,
     close: bool,
+}
+
+impl std::fmt::Debug for Reg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reg")
+            .field("token", &self.token)
+            .field("socket", &self.socket)
+            .field("shared", &self.keep.is_some())
+            .field("readable", &self.readable)
+            .field("writable", &self.writable)
+            .field("hangup", &self.hangup)
+            .field("recv", &self.recv)
+            .field("out", &self.out)
+            .field("close", &self.close)
+            .finish()
+    }
 }
 
 /// How many waits may skip the OS while local completions are queued, so a busy
@@ -78,6 +96,40 @@ impl ReadyDriver {
             local: VecDeque::with_capacity(capacity.min(1024)),
             skipped: 0,
         })
+    }
+
+    /// As [`Driver::register`], for the server's own reactor, which owns each
+    /// connection's socket and deregisters it before the socket drops
+    /// (`reactor::finish`). Inherent, so the reactor's calls resolve here.
+    pub(crate) fn register(
+        &mut self,
+        socket: BorrowedSocket<'_>,
+        token: Token,
+    ) -> Result<(), NetError> {
+        let registered = self
+            .poller
+            .add(socket, token.0)
+            .map_err(|e| NetError::from_os("epoll_ctl", e))?;
+        self.insert(token, registered, None);
+        Ok(())
+    }
+
+    fn insert(&mut self, token: Token, socket: Registered, keep: Option<SharedSocket>) {
+        let i = token.index();
+        if i >= self.regs.len() {
+            self.regs.resize_with(i + 1, || None);
+        }
+        self.regs[i] = Some(Reg {
+            token: token.0,
+            socket,
+            keep,
+            readable: false,
+            writable: true,
+            hangup: false,
+            recv: Recv::None,
+            out: Out::None,
+            close: false,
+        });
     }
 
     fn try_recv(reg: &mut Reg, local: &mut VecDeque<Completion>) {
@@ -226,25 +278,12 @@ impl Driver for ReadyDriver {
         DriverKind::Reactor
     }
 
-    fn register(&mut self, socket: BorrowedSocket<'_>, token: Token) -> Result<(), NetError> {
-        let i = token.index();
-        if i >= self.regs.len() {
-            self.regs.resize_with(i + 1, || None);
-        }
+    fn register(&mut self, socket: SharedSocket, token: Token) -> Result<(), NetError> {
         let registered = self
             .poller
-            .add(socket, token.0)
+            .add(socket.as_fd(), token.0)
             .map_err(|e| NetError::from_os("epoll_ctl", e))?;
-        self.regs[i] = Some(Reg {
-            token: token.0,
-            socket: registered,
-            readable: false,
-            writable: true,
-            hangup: false,
-            recv: Recv::None,
-            out: Out::None,
-            close: false,
-        });
+        self.insert(token, registered, Some(socket));
         Ok(())
     }
 

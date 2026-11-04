@@ -29,8 +29,10 @@ pub(crate) struct PollEvent {
     pub(crate) hangup: bool,
 }
 
-/// A registered socket: opaque, used only between `register` and `deregister`,
-/// while the caller keeps the socket open (the `Driver` contract).
+/// A registered socket: opaque, used only between `register` and `deregister`.
+/// The descriptor is open all that time: the driver holds the caller's
+/// `SharedSocket` (the public `Driver::register`), or the server's reactor owns
+/// the socket and deregisters it before closing it (the crate's own register).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Registered(RawFd);
 
@@ -44,7 +46,8 @@ impl Registered {
     }
 
     fn sock(self) -> Sock<'static> {
-        // SAFETY: open between `register` and `deregister` by the `Driver` contract.
+        // SAFETY: open between `register` and `deregister`, as the type's doc says;
+        // the borrow is used only for one call within that span.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
     }
 
@@ -64,8 +67,7 @@ impl Registered {
             #[cfg(not(any(test, net_io_shim)))]
             let room = buf.len();
             // SAFETY: `buf` is writable for `room` bytes and lives for the call. The
-            // descriptor is open by the `Driver` contract; a stale number can only
-            // make recv(2) fail or read another socket's bytes into `buf`.
+            // descriptor is open (see `Registered`), so it is still this socket's.
             let n = unsafe {
                 recv(
                     self.0,
