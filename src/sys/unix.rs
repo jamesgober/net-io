@@ -1943,6 +1943,18 @@ pub(crate) const MAX_FDS: usize = 64;
 #[repr(C, align(8))]
 struct CmsgBuf([u8; cmsg_space(4 * MAX_FDS)]);
 
+/// Control-message space a receive offers: room for 512 descriptors, more than
+/// one message can carry (Linux caps it at 253, `SCM_MAX_FD`; macOS and FreeBSD
+/// cap the control data at `MCLBYTES`, 2,048 bytes [to confirm on each]). A
+/// message never comes back cut short, so macOS and FreeBSD, which install every
+/// descriptor before copying, never install one whose number is lost.
+#[cfg(feature = "local")]
+const RECV_CONTROL: usize = cmsg_space(4 * 512);
+
+#[cfg(feature = "local")]
+#[repr(C, align(8))]
+struct RecvBuf([u8; RECV_CONTROL]);
+
 /// Sends `body` (not empty) with `fds` attached (`SCM_RIGHTS`, at most
 /// [`MAX_FDS`]); never blocks. Returns the bytes of `body` sent; the descriptors
 /// travel with the first byte.
@@ -2020,22 +2032,23 @@ pub(crate) struct Received {
     pub(crate) bytes: usize,
     /// Descriptors stored into the caller's array.
     pub(crate) fds: usize,
-    /// The control data did not fit: every descriptor received was closed.
+    /// The control data did not fit, or carried more than [`MAX_FDS`]
+    /// descriptors: every descriptor received was closed.
     pub(crate) truncated: bool,
 }
 
 /// Receives into `body` and stores attached descriptors (close-on-exec) into
 /// `into` from index 0. Like [`recv`]: on Linux it blocks under the receive
 /// timeout, on macOS the socket is non-blocking and the caller waited first.
-/// On a truncated control message every descriptor received is closed and
-/// `truncated` is set.
+/// On a truncated control message, or one with more than [`MAX_FDS`]
+/// descriptors, every descriptor received is closed and `truncated` is set.
 #[cfg(feature = "local")]
 pub(crate) fn recv_with_fds(
     stream: &super::Stream,
     body: &mut [u8],
     into: &mut [Option<OwnedFd>; MAX_FDS],
 ) -> io::Result<Received> {
-    let mut control = CmsgBuf([0; cmsg_space(4 * MAX_FDS)]);
+    let mut control = RecvBuf([0; RECV_CONTROL]);
     let mut iov = [io::IoSliceMut::new(body)];
     let mut msg = MsgHdr {
         msg_name: std::ptr::null_mut(),
@@ -2071,66 +2084,102 @@ pub(crate) fn recv_with_fds(
     #[cfg(not(target_os = "linux"))]
     let used = (msg.msg_controllen as usize).min(control.0.len());
     let truncated = msg.msg_flags & c::MSG_CTRUNC != 0;
+    // SAFETY: `control[..used]` is what recvmsg(2) just wrote: every SCM_RIGHTS
+    // record in it names descriptors the kernel installed in this process for this
+    // call, which nothing else owns.
+    let (fds, refused) = unsafe { take_fds(&control.0[..used], truncated, into) };
+    Ok(Received {
+        bytes: n,
+        fds,
+        truncated: truncated || refused,
+    })
+}
+
+/// Moves the descriptors of the `SCM_RIGHTS` records in `control` into `into`
+/// from index 0 and returns how many, and whether they were refused: a record
+/// cut short, or more than [`MAX_FDS`] descriptors. When `truncated` or refused,
+/// every descriptor found is closed instead and the count is 0.
+///
+/// macOS and FreeBSD install every descriptor of a message before they copy the
+/// control data out, and copy a record that does not fit only in part, keeping
+/// its original `cmsg_len`. The descriptors whose numbers reached the buffer are
+/// closed here; any whose numbers did not would be beyond reach, which is why
+/// the receive buffer holds more than a message can carry (Linux installs only
+/// what fits, and rewrites `cmsg_len` to match).
+///
+/// # Safety
+///
+/// Every descriptor number in an `SCM_RIGHTS` record of `control` must be open
+/// and owned by no one else: the kernel's report of a `recvmsg` call.
+#[cfg(feature = "local")]
+unsafe fn take_fds(
+    control: &[u8],
+    truncated: bool,
+    into: &mut [Option<OwnedFd>; MAX_FDS],
+) -> (usize, bool) {
+    let used = control.len();
     let hdr = cmsg_align(size_of::<CmsgHdr>());
     let level_at = size_of::<CmsgHdr>() - 2 * size_of::<c_int>();
+    let word = |at: usize| -> [u8; 4] {
+        control
+            .get(at..at + 4)
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0xFF; 4])
+    };
     let mut count = 0;
+    let mut cut = false;
+    let mut over = false;
     let mut off = 0;
     while off + size_of::<CmsgHdr>() <= used {
-        let bytes = &control.0[off..used];
         #[cfg(target_os = "linux")]
-        let len = usize::from_ne_bytes(
-            bytes[..size_of::<usize>()]
-                .try_into()
-                .unwrap_or([0; size_of::<usize>()]),
-        );
+        let len = control
+            .get(off..off + size_of::<usize>())
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, usize::from_ne_bytes);
         #[cfg(not(target_os = "linux"))]
-        let len = u32::from_ne_bytes(bytes[..4].try_into().unwrap_or([0; 4])) as usize;
-        let level =
-            c_int::from_ne_bytes(bytes[level_at..level_at + 4].try_into().unwrap_or([0; 4]));
-        let kind = c_int::from_ne_bytes(
-            bytes[level_at + 4..level_at + 8]
-                .try_into()
-                .unwrap_or([0; 4]),
-        );
-        if len < hdr || off + len > used {
+        let len = u32::from_ne_bytes(word(off)) as usize;
+        let level = c_int::from_ne_bytes(word(off + level_at));
+        let kind = c_int::from_ne_bytes(word(off + level_at + 4));
+        if len < hdr {
             break;
         }
+        let end = off.saturating_add(len).min(used);
+        cut |= end < off.saturating_add(len);
         if level == c::SOL_SOCKET && kind == c::SCM_RIGHTS {
-            for i in 0..(len - hdr) / 4 {
-                let at = off + hdr + 4 * i;
-                let raw =
-                    RawFd::from_ne_bytes(control.0[at..at + 4].try_into().unwrap_or([0xFF; 4]));
+            for at in (off + hdr..end).step_by(4).take_while(|at| at + 4 <= end) {
+                let raw = RawFd::from_ne_bytes(word(at));
                 if raw < 0 {
                     continue;
                 }
-                // SAFETY: the kernel just installed `raw` in this process for us
-                // (SCM_RIGHTS); nothing else owns it.
+                // SAFETY: the caller's contract: the kernel installed `raw` in this
+                // process for this call, and nothing else owns it.
                 let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "macos")]
                 {
                     // SAFETY: `owned` is open; F_SETFD with FD_CLOEXEC takes an int.
+                    // macOS has no MSG_CMSG_CLOEXEC, so this is a second step.
                     unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) };
                 }
-                if count < MAX_FDS && !truncated {
+                over |= count == MAX_FDS;
+                if !over && !truncated && !cut {
                     into[count] = Some(owned);
                     count += 1;
                 }
                 // Otherwise `owned` drops here and the descriptor is closed.
             }
         }
+        if cut {
+            break;
+        }
         off += cmsg_align(len);
     }
-    if truncated {
+    if truncated || cut || over {
         for slot in into.iter_mut().take(count) {
             *slot = None;
         }
         count = 0;
     }
-    Ok(Received {
-        bytes: n,
-        fds: count,
-        truncated,
-    })
+    (count, cut || over)
 }
 
 /// The peer's process id (where the OS says), user id, and group id.
@@ -2558,8 +2607,11 @@ mod layout {
         assert!(send_with_fds(&a, b"x", &many).is_err());
     }
 
-    /// Edge case 81: more descriptors than the receive buffer holds sets
-    /// `MSG_CTRUNC`; every descriptor that arrived is closed, none leak.
+    /// Edge case 81: more descriptors than net-io takes from one message
+    /// ([`MAX_FDS`]) is refused like `MSG_CTRUNC`: every descriptor that arrived
+    /// is closed, none leak. (The receive buffer holds more than Linux sends in
+    /// one message, so the kernel never cuts it; a cut record is covered by
+    /// `test_cut_record_closes_the_descriptors_it_holds`.)
     #[cfg(all(feature = "local", target_os = "linux"))]
     #[test]
     fn test_truncated_control_message_closes_every_descriptor() {
@@ -2613,6 +2665,46 @@ mod layout {
         // `y` reads end of stream only once every copy of `x` is closed.
         y.set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
+        let mut one = [0u8; 1];
+        assert_eq!(
+            std::io::Read::read(&mut y, &mut one).unwrap(),
+            0,
+            "a copy leaked"
+        );
+    }
+
+    /// What macOS and FreeBSD hand back when a message carries more descriptors
+    /// than the buffer holds: one record, cut short, with its original `cmsg_len`.
+    /// The descriptors whose numbers arrived are closed, none kept.
+    #[cfg(feature = "local")]
+    #[test]
+    fn test_cut_record_closes_the_descriptors_it_holds() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        let (x, mut y) = UnixStream::pair().unwrap();
+        let hdr = cmsg_align(size_of::<CmsgHdr>());
+        let level_at = size_of::<CmsgHdr>() - 2 * size_of::<c_int>();
+        let mut control = CmsgBuf([0; cmsg_space(4 * MAX_FDS)]);
+        let claimed = cmsg_len(4 * 10);
+        #[cfg(target_os = "linux")]
+        control.0[..size_of::<usize>()].copy_from_slice(&claimed.to_ne_bytes());
+        #[cfg(not(target_os = "linux"))]
+        control.0[..4].copy_from_slice(&(claimed as u32).to_ne_bytes());
+        control.0[level_at..level_at + 4].copy_from_slice(&c::SOL_SOCKET.to_ne_bytes());
+        control.0[level_at + 4..level_at + 8].copy_from_slice(&c::SCM_RIGHTS.to_ne_bytes());
+        for i in 0..3 {
+            let raw = x.try_clone().unwrap().into_raw_fd();
+            control.0[hdr + 4 * i..hdr + 4 * i + 4].copy_from_slice(&raw.to_ne_bytes());
+        }
+        // Three whole numbers and half of a fourth reached the buffer.
+        let used = hdr + 4 * 3 + 2;
+        let mut slots: [Option<OwnedFd>; MAX_FDS] = [const { None }; MAX_FDS];
+        // SAFETY: the three numbers are open copies of `x` that nothing owns.
+        let (count, cut) = unsafe { take_fds(&control.0[..used], true, &mut slots) };
+        assert_eq!((count, cut), (0, true));
+        assert!(slots.iter().all(Option::is_none));
+        drop(x);
+        y.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut one = [0u8; 1];
         assert_eq!(
             std::io::Read::read(&mut y, &mut one).unwrap(),
