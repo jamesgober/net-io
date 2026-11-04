@@ -894,10 +894,20 @@ fn test_manual_clock_close_then_shutdown_returns() {
         server.open_door().expect("open");
         let mut c = client(addr(&server));
         c.write_all(b"go").expect("write");
-        std::thread::sleep(Duration::from_millis(100));
-        clock.advance(Duration::from_secs(2));
+        // Advance until the deadline fires: on a loaded host the session may set it
+        // after a first advance.
+        c.set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
         let mut reply = [0u8; 4];
-        c.read_exact(&mut reply).expect("408");
+        let mut got = false;
+        for _ in 0..50 {
+            clock.advance(Duration::from_secs(2));
+            if c.read_exact(&mut reply).is_ok() {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "{driver:?}: no 408");
         assert_eq!(&reply, b"408\n", "{driver:?}");
         let started = Instant::now();
         let _ = server.shutdown(Instant::now() + Duration::from_secs(1));
