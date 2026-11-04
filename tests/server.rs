@@ -801,3 +801,110 @@ fn test_session_survives_a_timeout_with_a_partial_message_held() {
         assert_eq!(&back[..4], b"two\n", "{driver:?}");
     }
 }
+
+/// A post from another thread reaches a connection that waits for input, not only a
+/// parked one, on both drivers: a server push with nothing from the client (serve-net
+/// request 7).
+#[test]
+fn test_post_wakes_a_connection_waiting_for_input() {
+    use std::io::Read;
+    struct Push(mpsc::Sender<(net_io::Completer, net_io::ConnectionId)>);
+    impl Session for Push {
+        fn on_open(&mut self, cx: &mut SessionContext<'_>) -> Step {
+            let _ = self.0.send((cx.completer(), cx.info().id));
+            Step::Read
+        }
+        fn on_data(&mut self, _: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            Step::Read
+        }
+        fn on_wake(&mut self, cx: &mut SessionContext<'_>, token: u32, value: u64) -> Step {
+            let _ = cx
+                .output()
+                .push(format!("woke {token} {value}\n").as_bytes());
+            Step::Write
+        }
+        fn on_writable(&mut self, _: &mut SessionContext<'_>) -> Step {
+            Step::Read
+        }
+    }
+    for &driver in DRIVERS {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(2)
+            .sessions(move |_: &ConnectionInfo| Push(tx.lock().expect("lock").clone()))
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = client(addr(&server));
+        let (completer, id) = rx.recv_timeout(Duration::from_secs(5)).expect("opened");
+        // Let the connection settle into its read wait.
+        std::thread::sleep(Duration::from_millis(100));
+        std::thread::spawn(move || completer.post(id, 3, 42).expect("post"))
+            .join()
+            .expect("poster");
+        let mut line = [0u8; 10];
+        c.read_exact(&mut line).expect("pushed line");
+        assert_eq!(&line, b"woke 3 42\n", "{driver:?}");
+        // Still a normal connection afterwards.
+        c.write_all(b"x").expect("write");
+        assert_eq!(server.stats().closed, 0, "{driver:?}");
+    }
+}
+
+/// serve-net 0.5 item 2: with an injected clock on the reactor, a connection that
+/// answered its deadline and closed gracefully, then `shutdown`: it returns.
+#[test]
+fn test_manual_clock_close_then_shutdown_returns() {
+    use std::io::Read;
+    struct Late;
+    impl Session for Late {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            let at = cx.now() + Duration::from_secs(1);
+            cx.set_exchange_deadline(Some(at));
+            cx.set_phase(Phase::Receiving);
+            Step::Read
+        }
+        fn on_timeout(&mut self, cx: &mut SessionContext<'_>, _: net_io::TimeoutKind) -> Step {
+            let _ = cx.output().push(b"408\n");
+            Step::Write
+        }
+        fn on_writable(&mut self, _: &mut SessionContext<'_>) -> Step {
+            Step::Close
+        }
+    }
+    for &driver in DRIVERS {
+        let clock = Arc::new(net_io::ManualClock::new());
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(1)
+            .clock(clock.clone())
+            .sessions(|_: &ConnectionInfo| Late)
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = client(addr(&server));
+        c.write_all(b"go").expect("write");
+        std::thread::sleep(Duration::from_millis(100));
+        clock.advance(Duration::from_secs(2));
+        let mut reply = [0u8; 4];
+        c.read_exact(&mut reply).expect("408");
+        assert_eq!(&reply, b"408\n", "{driver:?}");
+        let started = Instant::now();
+        let _ = server.shutdown(Instant::now() + Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{driver:?}: shutdown took {:?}",
+            started.elapsed()
+        );
+    }
+}

@@ -13,6 +13,41 @@
 
 ---
 
+## [0.6.1] - 2026-11-04
+
+A patch for serve-net's requests 4 and 7 and three defects found by the 0.7
+review. No API change.
+
+### Security
+
+- On the reactor, bytes that arrived with a PROXY header on a TLS listener reached
+  the session as if they had been decrypted, once the handshake finished: a client
+  (or anyone between it and a proxy in TCP mode) could put bytes in front of the
+  real ClientHello and have them read as the TLS peer's. They now go to the TLS
+  engine, which refuses them. A ClientHello sent in the same segment as the header
+  no longer stalls the handshake. Affects 0.5.0 and 0.6.0 with sessions on the
+  reactor behind PROXY with TLS; the blocking pool was not affected.
+- A session that survived a read timeout while part of a message waited in its
+  buffer could make a reactor worker panic, closing every connection on that worker
+  without its closed event. The input now knows when a receive holds its buffer.
+
+### Fixed
+
+- A `Completer::post` now reaches a connection that waits for input, not only a
+  parked one, on both drivers, so a WebSocket can be written to from another thread
+  (serve-net request 7). A post that arrives while the session is busy is delivered
+  at its next wait.
+- A session step that ends in `Step::Read` while a receive is already out (a
+  survived idle timeout, a wake) gives back its idle buffers, as a fresh wait does:
+  a trimmed idle connection holds about 1.8 KB, not 4.9 KB (serve-net request 4).
+- With an injected clock on the reactor, `Server::shutdown` waited for ever on a
+  connection that had closed gracefully and was lingering: a stop or a deadline
+  kill now ends a linger, as a single kill already did.
+- An accept batch checks the door, a drain, a stop, and the control line before each
+  accept, so no connection is admitted after the door closed (serve-net's drain race).
+
+---
+
 ## [0.6.0] - 2026-11-04
 
 Optimisation: the P2 options, files and UDP batches on both drivers, the

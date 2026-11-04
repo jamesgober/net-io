@@ -117,3 +117,68 @@ fn test_idle_connections_hold_no_buffers() {
         assert_eq!(&back, b"ping");
     }
 }
+
+/// An idle connection whose session survives its idle timeout (a trim from a timer)
+/// gives its buffers back while its next receive is out: the timeout's step must not
+/// leave it holding an output (serve-net request 4).
+#[test]
+fn test_trimmed_connections_hold_no_buffers() {
+    struct Trim;
+    impl Session for Trim {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            Step::Write
+        }
+        fn on_timeout(&mut self, cx: &mut SessionContext<'_>, _: net_io::TimeoutKind) -> Step {
+            cx.set_idle_timeout(Some(Duration::from_secs(600)));
+            Step::Read
+        }
+    }
+    let count: u32 = 100;
+    let limits = Limits::builder()
+        .max_connections(count + 16)
+        .max_per_source(count + 16, PrefixPolicy::DEFAULT)
+        .backlog(4096)
+        .idle_timeout(Duration::from_millis(300))
+        .build()
+        .expect("limits");
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(DriverKind::Reactor)
+        .workers(2)
+        .limits(limits)
+        .sessions(|_: &ConnectionInfo| Trim)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let target = addr(&server);
+    let mut back = [0u8; 4];
+    let mut first = TcpStream::connect(target).expect("connect");
+    first.write_all(b"warm").expect("write");
+    first.read_exact(&mut back).expect("read");
+
+    let mut clients: Vec<TcpStream> = Vec::with_capacity(count as usize);
+    let before = LIVE.load(Ordering::Relaxed);
+    for _ in 0..count {
+        let mut c = TcpStream::connect(target).expect("connect");
+        c.write_all(b"ping").expect("write");
+        c.read_exact(&mut back).expect("read");
+        clients.push(c);
+    }
+    // Every connection's idle timeout fires and is survived.
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(server.stats().closed, 0, "{:?}", server.stats());
+    let per = (LIVE.load(Ordering::Relaxed) - before) / i64::from(count);
+    eprintln!("{count} trimmed idle connections: {per} bytes of heap each");
+    assert!(
+        per < i64::from(SizeClass::SMALL.bytes()),
+        "{per} bytes per trimmed connection"
+    );
+    for c in clients.iter_mut().step_by(23) {
+        c.write_all(b"pong").expect("write");
+        c.read_exact(&mut back).expect("read");
+        assert_eq!(&back, b"pong");
+    }
+}
