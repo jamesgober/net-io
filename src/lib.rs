@@ -126,6 +126,16 @@ pub mod __fuzz {
     pub fn systemd_env(data: &[u8]) {
         crate::inherit::fuzz_systemd_env(data);
     }
+
+    /// The timing wheel against a model.
+    pub fn wheel(data: &[u8]) {
+        crate::wheel::fuzz_wheel(data);
+    }
+
+    /// The minimum-rate counter's invariants.
+    pub fn rate(data: &[u8]) {
+        crate::rate::fuzz_rate(data);
+    }
 }
 
 /// Fault injection for net-io's own tests, compiled only with `--cfg net_io_shim`.

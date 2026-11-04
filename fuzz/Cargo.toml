@@ -52,3 +52,17 @@ path = "fuzz_targets/trusted.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "wheel"
+path = "fuzz_targets/wheel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rate"
+path = "fuzz_targets/rate.rs"
+test = false
+doc = false
+bench = false

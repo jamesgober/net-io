@@ -1,0 +1,44 @@
+name: Fuzz (nightly)
+
+# Continuous fuzzing: every target for 10 minutes each night, with the corpus kept
+# between runs. A crash fails the run and uploads its input.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }} (10 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [proxy, manifest, systemd_env, cidr, trusted, wheel, rate]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Restore the corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        working-directory: fuzz
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu "${{ matrix.target }}" -- -max_total_time=600 -rss_limit_mb=1024
+        env:
+          RUSTFLAGS: ""
+      - name: Keep the crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
