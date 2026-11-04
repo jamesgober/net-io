@@ -518,3 +518,97 @@ fn test_tls_listener_needs_an_engine() {
         })
     ));
 }
+
+/// An engine that panics on `BOOM` in place of a hello.
+struct Panicky;
+
+impl TlsAcceptor for Panicky {
+    type Session = PanickySession;
+    fn session(&self, _info: &ConnectionInfo) -> Result<PanickySession, TlsError> {
+        Ok(PanickySession(ToySession::default()))
+    }
+}
+
+struct PanickySession(ToySession);
+
+impl TlsSession for PanickySession {
+    fn step<'i>(
+        &mut self,
+        input: &'i mut [u8],
+        output: &mut [u8],
+    ) -> Result<TlsProgress<'i>, TlsError> {
+        assert!(!input.starts_with(b"BOOM"), "engine bug");
+        self.0.step(input, output)
+    }
+    fn encrypt(&mut self, plaintext: &[u8], output: &mut [u8]) -> Result<usize, TlsError> {
+        self.0.encrypt(plaintext, output)
+    }
+    fn close(&mut self, output: &mut [u8]) -> Result<usize, TlsError> {
+        self.0.close(output)
+    }
+    fn on_transport_closed(&mut self) -> TlsCloseKind {
+        self.0.on_transport_closed()
+    }
+    fn info(&self) -> Option<TlsInfo> {
+        self.0.info()
+    }
+    fn input_capacity_required(&self) -> usize {
+        self.0.input_capacity_required()
+    }
+}
+
+/// A panic inside the TLS engine closes only that connection, `TlsFailed`, on both
+/// drivers: the worker, its caps, and drain survive (review finding).
+#[test]
+fn test_engine_panic_closes_only_that_connection() {
+    struct Echo;
+    impl Session for Echo {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            Step::Write
+        }
+    }
+    for &driver in common::DRIVERS {
+        let rec = Recorder::default();
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+            .driver(driver)
+            .workers(1)
+            .tls(Panicky)
+            .sessions(|_: &ConnectionInfo| Echo)
+            .gate(AllowAll)
+            .events(rec.clone())
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        for _ in 0..3 {
+            let mut s = client(addr(&server));
+            s.write_all(b"BOOM!").expect("write");
+            let mut rest = Vec::new();
+            let _ = s.read_to_end(&mut rest);
+        }
+        assert!(
+            eventually(WAIT, || server.stats().closed == 3
+                && server.stats().open == 0),
+            "{driver:?}: {:?}",
+            server.stats()
+        );
+        assert!(
+            rec.0
+                .lock()
+                .expect("lock")
+                .iter()
+                .all(|r| *r == CloseReason::TlsFailed),
+            "{driver:?}: {:?}",
+            rec.0.lock().expect("lock")
+        );
+        // The one worker still serves.
+        let mut c = ToyClient::connect(&server);
+        c.send(b"still here");
+        assert_eq!(c.recv_exact(10), b"still here", "{driver:?}");
+        drop(c);
+        let report = server.shutdown(std::time::Instant::now() + Duration::from_secs(2));
+        assert_eq!(report.killed, 0, "{driver:?}: {report:?}");
+    }
+}

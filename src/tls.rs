@@ -278,8 +278,93 @@ pub(crate) trait ErasedAcceptor: Send + Sync {
 
 impl<A: TlsAcceptor> ErasedAcceptor for A {
     fn session_boxed(&self, info: &ConnectionInfo) -> Result<Box<dyn TlsSession>, TlsError> {
-        self.session(info)
-            .map(|s| Box::new(s) as Box<dyn TlsSession>)
+        match crate::gate::guarded(|| self.session(info)) {
+            Some(Ok(s)) => Ok(Box::new(Guarded {
+                inner: Box::new(s),
+                poisoned: false,
+            })),
+            Some(Err(e)) => Err(e),
+            None => Err(PANICKED),
+        }
+    }
+}
+
+/// The error a panicking engine call becomes.
+const PANICKED: TlsError = TlsError::new(TlsFailure::State, u16::MAX, None);
+
+/// An engine behind a panic boundary: a panic in any call becomes [`PANICKED`] and
+/// every later call fails the same way, so the connection closes `TlsFailed` through
+/// the normal close path and its worker, slots, and ticket survive. The engine parses
+/// the most hostile bytes a connection carries; this keeps one engine bug from
+/// taking a worker with it. No cost unless a panic unwinds.
+struct Guarded {
+    inner: Box<dyn TlsSession>,
+    poisoned: bool,
+}
+
+impl Guarded {
+    fn call<R>(
+        &mut self,
+        f: impl FnOnce(&mut dyn TlsSession) -> Result<R, TlsError>,
+    ) -> Result<R, TlsError> {
+        if self.poisoned {
+            return Err(PANICKED);
+        }
+        let inner = &mut *self.inner;
+        match crate::gate::guarded(|| f(inner)) {
+            Some(r) => r,
+            None => {
+                self.poisoned = true;
+                Err(PANICKED)
+            }
+        }
+    }
+}
+
+impl TlsSession for Guarded {
+    fn step<'i>(
+        &mut self,
+        input: &'i mut [u8],
+        output: &mut [u8],
+    ) -> Result<TlsProgress<'i>, TlsError> {
+        if self.poisoned {
+            return Err(PANICKED);
+        }
+        let inner = &mut *self.inner;
+        match crate::gate::guarded(move || inner.step(input, output)) {
+            Some(r) => r,
+            None => {
+                self.poisoned = true;
+                Err(PANICKED)
+            }
+        }
+    }
+
+    fn encrypt(&mut self, plaintext: &[u8], output: &mut [u8]) -> Result<usize, TlsError> {
+        self.call(|s| s.encrypt(plaintext, output))
+    }
+
+    fn close(&mut self, output: &mut [u8]) -> Result<usize, TlsError> {
+        self.call(|s| s.close(output))
+    }
+
+    fn on_transport_closed(&mut self) -> TlsCloseKind {
+        self.call(|s| Ok(s.on_transport_closed()))
+            .unwrap_or(TlsCloseKind::Unclean)
+    }
+
+    fn info(&self) -> Option<TlsInfo> {
+        if self.poisoned {
+            return None;
+        }
+        crate::gate::guarded(|| self.inner.info()).flatten()
+    }
+
+    fn input_capacity_required(&self) -> usize {
+        if self.poisoned {
+            return 0;
+        }
+        crate::gate::guarded(|| self.inner.input_capacity_required()).unwrap_or(0)
     }
 }
 

@@ -385,9 +385,10 @@ type SpawnAccept = Box<
 >;
 
 impl Shared {
+    /// A sink that panics loses that event and nothing else.
     pub(crate) fn event(&self, e: Event) {
         if let Some(s) = &self.sink {
-            s.event(&e);
+            let _ = guarded(|| s.event(&e));
         }
     }
 
@@ -2349,6 +2350,8 @@ pub struct Worker<G: Gate> {
     clock: ClockRef,
     /// Recycled PROXY facts (D-061): reused when no one else holds them.
     facts_pool: Vec<Arc<ProxyFacts>>,
+    /// A job's slots are taken and `end` has not given them back yet.
+    holding: bool,
 }
 
 fn worker_loop<W: Serve, G: Gate>(engine: &Arc<Engine<W, G>>, idx: usize) {
@@ -2378,9 +2381,26 @@ fn worker_loop<W: Serve, G: Gate>(engine: &Arc<Engine<W, G>>, idx: usize) {
         view: ControlView::new(),
         clock: engine.clock.clone(),
         facts_pool: Vec::new(),
+        holding: false,
     };
     while let Some(job) = engine.next_job() {
-        engine.work.serve(&mut w, job);
+        let (listener, source, info) = (job.listener.clone(), job.source, job.info.clone());
+        w.holding = true;
+        let served = guarded(|| engine.work.serve(&mut w, job)).is_some();
+        if w.holding {
+            // The job ended without `end`: a panic got past every inner boundary
+            // (the gate, the session, the TLS engine, and the event sink each have
+            // their own), or the link left the connection. The socket is already
+            // closed; what it held goes back, so the caps, `busy`, and any drain stay
+            // right and the worker serves the next job.
+            let reason = if served {
+                CloseReason::SessionError
+            } else {
+                CloseReason::SessionPanicked
+            };
+            w.abandon(&info, &listener, source, reason);
+        }
+        w.holding = false;
     }
 }
 
@@ -2658,6 +2678,7 @@ impl<G: Gate> Worker<G> {
         ws.current.store(0, Ordering::Release);
         ws.listener.store(NO_LISTENER, Ordering::Release);
         count_drained(&shared, reason);
+        self.holding = false;
         shared.release(&listener, source);
         record_close(&shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
         shared.busy.fetch_sub(1, Ordering::AcqRel);
@@ -2667,6 +2688,34 @@ impl<G: Gate> Worker<G> {
 
     fn draining(&self) -> bool {
         self.shared.draining.load(Ordering::Acquire)
+    }
+
+    /// `end` for a job whose link was lost to a panic or left the connection.
+    fn abandon(
+        &mut self,
+        info: &ConnectionInfo,
+        listener: &ListenerConf,
+        source: Option<PrefixKey>,
+        reason: CloseReason,
+    ) {
+        let shared = self.shared.clone();
+        let ws = &shared.workers[self.idx];
+        self.output.reset();
+        self.input_buf = None;
+        if self.gate_cell.is_none() {
+            self.gate_cell = Some(Box::new(GateCell {
+                gate: self.gate.clone(),
+                ticket: None,
+            }));
+        }
+        ws.current.store(0, Ordering::Release);
+        ws.listener.store(NO_LISTENER, Ordering::Release);
+        count_drained(&shared, reason);
+        shared.release(listener, source);
+        let lifetime = self.clock.now().saturating_duration_since(info.accepted_at);
+        record_close(&shared, ws, info, reason, 0, 0, lifetime);
+        shared.busy.fetch_sub(1, Ordering::AcqRel);
+        shared.notify_progress();
     }
 
     /// The control line's reaction for a running connection.

@@ -260,7 +260,11 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         facts_pool: Vec::new(),
         done: Some(Completions::new()),
     };
-    r.main();
+    if guarded(|| r.main()).is_none() {
+        // A panic got past every inner boundary: nothing on this worker can be
+        // trusted to finish, so each connection closes now and gives back what it held.
+        r.abandon_all();
+    }
 }
 
 impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
@@ -1996,6 +2000,37 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 self.facts_pool.push(facts);
             }
         }
+        shared.notify_progress();
+    }
+}
+
+impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
+    /// After a panic in the loop: every connection is reset, its gate ticket and caps
+    /// returned, and its close counted, so `stats`, drains, and admission stay right.
+    fn abandon_all(&mut self) {
+        let shared = self.shared;
+        let ws = &shared.workers[self.idx];
+        for i in 0..self.slots.len() {
+            let Some(c) = self.slots[i].conn.take() else {
+                continue;
+            };
+            let _ = self.driver.deregister(c.token);
+            let mut link = c.link;
+            let info = link.info.clone();
+            let (bytes_in, bytes_out) = (link.bytes_in, link.bytes_out);
+            let lifetime = self.clock.now().saturating_duration_since(info.accepted_at);
+            let erased = link.gate.take();
+            let reason = link.finish_reactor(CloseReason::SessionPanicked);
+            if let Some(mut g) = erased {
+                g.close(&info, reason);
+            }
+            shared.unregister_conn(info.id);
+            ws.load.fetch_sub(1, Ordering::Relaxed);
+            count_drained(shared, reason);
+            shared.release(&c.listener, c.source);
+            record_close(shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
+        }
+        self.open = 0;
         shared.notify_progress();
     }
 }

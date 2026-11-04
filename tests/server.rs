@@ -801,3 +801,97 @@ fn test_session_survives_a_timeout_with_a_partial_message_held() {
         assert_eq!(&back[..4], b"two\n", "{driver:?}");
     }
 }
+
+/// An event sink that panics on every close loses those events and nothing else:
+/// caps come back and drain finishes, on both drivers (review finding).
+#[test]
+fn test_panicking_event_sink_loses_only_its_events() {
+    struct Bad;
+    impl net_io::EventSink for Bad {
+        fn event(&self, e: &net_io::Event) {
+            assert!(!matches!(e, net_io::Event::Closed { .. }), "sink bug");
+        }
+    }
+    for &driver in DRIVERS {
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(1)
+            .sessions(|_: &ConnectionInfo| Echo)
+            .gate(AllowAll)
+            .events(Bad)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        for _ in 0..3 {
+            let mut c = client(addr(&server));
+            assert_eq!(round_trip(&mut c, b"hi"), b"hi", "{driver:?}");
+        }
+        assert!(
+            eventually(Duration::from_secs(5), || server.stats().open == 0),
+            "{driver:?}: {:?}",
+            server.stats()
+        );
+        let mut c = client(addr(&server));
+        assert_eq!(round_trip(&mut c, b"again"), b"again", "{driver:?}");
+        drop(c);
+        let started = Instant::now();
+        let _ = server.shutdown(Instant::now() + Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(4), "{driver:?}");
+    }
+}
+
+/// A handler that gates its own accepted connection and is refused: the connection
+/// closes, its slots come back, and the worker serves the next one (review finding).
+#[test]
+fn test_handler_refused_by_its_own_gate_releases_the_connection() {
+    struct No;
+    impl net_io::Gate for No {
+        type Ticket = ();
+        fn admit(
+            &self,
+            _: &ConnectionInfo,
+            _: net_io::AdmitStage,
+        ) -> Result<net_io::Admitted<()>, net_io::Refusal> {
+            Err(net_io::Refusal::Reset { code: 7 })
+        }
+        fn readmit(&self, _: &mut (), _: &ConnectionInfo) -> Result<(), net_io::Refusal> {
+            Ok(())
+        }
+        fn check(&self, _: &mut (), _: &net_io::WriteCheck) -> Result<(), net_io::Denial> {
+            Ok(())
+        }
+    }
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(DriverKind::Blocking)
+        .workers(1)
+        .handler(|conn: &mut TcpConnection| {
+            let mut b = [0u8; 1];
+            conn.recv(&mut b)?;
+            if b[0] == b'g' {
+                conn.set_gate(Arc::new(No))?;
+            }
+            conn.send_all(b"ok")
+        })
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    for _ in 0..3 {
+        let mut c = client(addr(&server));
+        c.write_all(b"g").expect("write");
+        assert!(closed_by_server(&mut c));
+    }
+    assert!(
+        eventually(Duration::from_secs(5), || server.stats().open == 0
+            && server.stats().closed == 3),
+        "{:?}",
+        server.stats()
+    );
+    let mut c = client(addr(&server));
+    c.write_all(b"x").expect("write");
+    let mut back = [0u8; 2];
+    std::io::Read::read_exact(&mut c, &mut back).expect("served");
+    assert_eq!(&back, b"ok");
+}
