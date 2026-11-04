@@ -982,10 +982,53 @@ pub(crate) fn share_socket(sock: Sock<'_>, pid: u32) -> io::Result<[u8; SHARED_S
     Ok(out)
 }
 
-/// The socket a description from [`share_socket`] names. Windows hands back the same
-/// socket if a description is used twice, so the caller keeps each to one use.
+/// Sockets made from descriptions and still owned in this process, by handle value.
+/// Windows hands back the socket it made before when a description is used again,
+/// and the provider-reserved field could name any socket here, so a value on this
+/// list is refused rather than given a second owner (two closes of one handle).
 #[cfg(feature = "local")]
-pub(crate) fn socket_from_shared(blob: &[u8; SHARED_SOCKET]) -> io::Result<OwnedSocket> {
+static ADOPTED: std::sync::Mutex<Vec<RawSocket>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "local")]
+fn adopted() -> std::sync::MutexGuard<'static, Vec<RawSocket>> {
+    ADOPTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A socket's place on the adopted list. Kept after the socket, so dropping both
+/// closes the socket first and then frees its value.
+#[cfg(feature = "local")]
+#[derive(Debug)]
+pub(crate) struct Adoption(RawSocket);
+
+#[cfg(feature = "local")]
+impl Adoption {
+    /// The socket moves to an owner that does not carry this: its value stays
+    /// taken for the life of the process, so a later description that names it
+    /// is refused even after that owner closes it (a reused value fails closed).
+    pub(crate) fn keep_for_good(self) {
+        std::mem::forget(self);
+    }
+}
+
+#[cfg(feature = "local")]
+impl Drop for Adoption {
+    fn drop(&mut self) {
+        let mut list = adopted();
+        if let Some(at) = list.iter().position(|&s| s == self.0) {
+            list.swap_remove(at);
+        }
+    }
+}
+
+/// The socket a description from [`share_socket`] names, not inheritable.
+/// `AlreadyExists` when it names a socket this process already owns through an
+/// earlier description: that one keeps its single owner, and nothing is closed.
+#[cfg(feature = "local")]
+pub(crate) fn socket_from_shared(
+    blob: &[u8; SHARED_SOCKET],
+) -> io::Result<(OwnedSocket, Adoption)> {
     startup();
     let mut info = std::mem::MaybeUninit::<WsaProtocolInfo>::uninit();
     // SAFETY: `info` has room for the bytes, and any bytes are a valid WsaProtocolInfo.
@@ -1006,8 +1049,42 @@ pub(crate) fn socket_from_shared(blob: &[u8; SHARED_SOCKET]) -> io::Result<Owned
     if s == c::INVALID_SOCKET {
         return Err(last_error());
     }
-    // SAFETY: `s` was just created, is open, and is owned by no one else.
-    Ok(unsafe { OwnedSocket::from_raw_socket(s as RawSocket) })
+    let mut list = adopted();
+    if list.contains(&(s as RawSocket)) {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
+    list.push(s as RawSocket);
+    drop(list);
+    let adoption = Adoption(s as RawSocket);
+    // SAFETY: `s` is open and was not on the list, so this call made it: nothing
+    // else in the process owns it.
+    let sock = unsafe { OwnedSocket::from_raw_socket(s as RawSocket) };
+    // The flag passed above does not reach a socket made from a description (the
+    // sender's duplicate is inheritable), so it is cleared here.
+    // SAFETY: the handle is open; clearing the flag is the call's documented use.
+    if unsafe { SetHandleInformation(s as *mut c_void, c::HANDLE_FLAG_INHERIT, 0) } == 0 {
+        let e = io::Error::last_os_error();
+        drop((sock, adoption));
+        return Err(e);
+    }
+    Ok((sock, adoption))
+}
+
+#[cfg(test)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetHandleInformation(handle: *mut c_void, flags: *mut u32) -> i32;
+}
+
+/// Whether a process this one starts with handle inheritance would get `sock`.
+#[cfg(test)]
+pub(crate) fn is_inheritable(sock: Sock<'_>) -> io::Result<bool> {
+    let mut flags = 0u32;
+    // SAFETY: the socket is open for the call; `flags` is written during it.
+    if unsafe { GetHandleInformation(raw(sock) as *mut c_void, &raw mut flags) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & c::HANDLE_FLAG_INHERIT != 0)
 }
 
 /// Bytes from the OS's preferred random source.
