@@ -696,18 +696,21 @@ pub(crate) fn udp_recv_many(
     struct Addrs([[u8; 128]; BATCH_MAX]);
     let count = bufs.len().min(out.len()).min(BATCH_MAX);
     let mut addrs = Addrs([[0; 128]; BATCH_MAX]);
-    let mut iovs = [(std::ptr::null_mut::<u8>(), 0usize); BATCH_MAX];
+    let mut iovs: [io::IoSliceMut<'_>; BATCH_MAX] =
+        std::array::from_fn(|_| io::IoSliceMut::new(&mut []));
+    for (iov, buf) in iovs.iter_mut().zip(bufs.iter_mut()).take(count) {
+        *iov = io::IoSliceMut::new(buf);
+    }
     // SAFETY: an all-zero `mmsghdr` is valid: null pointers and zero lengths.
     let mut msgs: [MmsgHdr; BATCH_MAX] = unsafe { std::mem::zeroed() };
     for i in 0..count {
-        iovs[i] = (bufs[i].as_mut_ptr(), bufs[i].len());
         msgs[i].hdr.msg_name = addrs.0[i].as_mut_ptr().cast();
         msgs[i].hdr.msg_namelen = 128;
         msgs[i].hdr.msg_iov = (&raw const iovs[i]).cast();
         msgs[i].hdr.msg_iovlen = 1;
     }
     // SAFETY: the first `count` messages point at live `iovs`, `addrs`, and at buffers
-    // writable for their lengths; `(ptr, len)` has the layout of `struct iovec`.
+    // writable for their lengths; `IoSliceMut` is ABI-compatible with `struct iovec`.
     let n = cvt(unsafe {
         recvmmsg(
             sock.as_raw_fd(),
@@ -738,13 +741,13 @@ pub(crate) fn udp_send_many(
 ) -> io::Result<usize> {
     let count = datagrams.len().min(BATCH_MAX);
     let mut addrs = [[0u8; 28]; BATCH_MAX];
-    let mut iovs = [(std::ptr::null::<u8>(), 0usize); BATCH_MAX];
+    let mut iovs = [IoSlice::new(&[]); BATCH_MAX];
     // SAFETY: an all-zero `mmsghdr` is valid: null pointers and zero lengths.
     let mut msgs: [MmsgHdr; BATCH_MAX] = unsafe { std::mem::zeroed() };
     for i in 0..count {
         let (bytes, to) = datagrams[i];
         let len = encode_addr(to, &mut addrs[i]);
-        iovs[i] = (bytes.as_ptr(), bytes.len());
+        iovs[i] = IoSlice::new(bytes);
         msgs[i].hdr.msg_name = addrs[i].as_mut_ptr().cast();
         msgs[i].hdr.msg_namelen = len;
         msgs[i].hdr.msg_iov = (&raw const iovs[i]).cast();
