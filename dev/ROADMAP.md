@@ -186,7 +186,7 @@ Exit criteria, as met:
 
 | Criterion | Status |
 |---|---|
-| Every benchmark meets the 1.2x gate, or the miss is recorded with James's written decision | Missed, R-30: see `docs/PERFORMANCE.md`. James's decision: PENDING |
+| Every benchmark meets the 1.2x gate, or the miss is recorded with James's written decision | Missed, R-30: see `docs/PERFORMANCE.md`. James's decision (2026-11-04, D-139): accept the miss for 0.6.0; re-run the gate on a dedicated, quiet load machine at 0.9.x; before 1.0 the gate is met or the target is derived again with the reason written down |
 | No regression over 5% between 0.5 and 0.6 | Met: `cargo bench --bench echo` from the v0.5.0 tag and from this branch, alternated three times on the build host. Medians: B-1 reactor +4% at 64 connections and +2% at 256, CPU per round trip -6% and +3%; B-2 p50 within 0.2 us on every stack (worst +1.4%). `docs/PERFORMANCE.md` |
 | Every P2 item shipped or moved here with a reason | Shipped, except packet info on Windows (D-126) and FastCGI on Windows (OD-26, below) |
 
@@ -196,7 +196,7 @@ Moved to a later version (anti-deferral record):
 |---|---|---|
 | Std-only fallback for other targets | after 1.0 | D-132 |
 | Packet info on Windows | after 1.0, on request | D-126: needs `WSARecvMsg` through an extension pointer; no consumer asks |
-| FastCGI on Windows | OD-26-DECISION | OD-26 |
+| FastCGI on Windows | after 1.0 | OD-26, D-139: no Windows FastCGI deployment is planned |
 | Physical-core pinning, open-loop generator, B-6 competitor row | 0.9.x | R-28, R-29, R-33 |
 
 ## v0.7.0 - Hardening
@@ -222,6 +222,7 @@ Standing rule from James: "make sure to go back and fix any issues / perf tune /
 Items:
 - **Revisit the register.** Every accepted gap, deferred item, known issue, platform note, and missed target, one by one: fix it, or measure it and record why it stays (with the cost of fixing it), or move it after 1.0 with a reason. Nothing stays open by default.
 - **Performance tuning pass.** Re-run every benchmark in `docs/PERFORMANCE.md` (B-1 to B-14) against the competitor harness on Linux, macOS, and Windows; profile the hot paths (accept, read, write, close, the gate check, the timing wheel); try to remove the extra system call per round trip on macOS and Windows; publish before and after numbers. A missed target is either met or written into the readiness note with its gap.
+- **The 1.2x gate on a quiet machine (required, R-30, D-139).** Re-run `compare/` on a dedicated load machine with the generator on its own cores and nothing else running. Before 1.0 the gate is met, or the target is derived again from those numbers with the reason written down; the 0.6.0 acceptance does not carry to 1.0.
 - **Security and edge-case review.** Re-run the threat table in `docs/SECURITY.md` (every attack test), every case in `dev/EDGE-CASES.md`, extended fuzzing of every target, and an adversarial read of every change since 0.7's review; findings fixed test-first.
 - **Platform notes.** Every caveat in `docs/PLATFORM-NOTES.md` is checked again on current OS versions: still true, still needed, still the best available behaviour.
 - **1.0 readiness note** (`docs/STABILITY-1.0.md`, section "Open at 1.0"): in plain English, every item still open, what it costs a user, and a recommendation, for James's go/no-go.
@@ -285,7 +286,7 @@ Every entry is revisited in the 0.9.x polish milestone. Add an entry in the same
 | R-27 | 0.5 | moved | std-only fallback for other targets (D-119) | D-132: moved after 1.0 as P3; without `poll`, `std` cannot wait on a socket and a wake together, which breaks the kill and deadline bounds | after 1.0 |
 | R-28 | 0.6 | accepted gap | `Placement::PinPerCore` pins worker `n` to CPU `n`, which can put two workers on SMT siblings before every physical core has one (D-130) | needs a topology read per OS | 0.9.x tuning pass |
 | R-29 | 0.6 | accepted gap | `compare/` is closed loop: its p99 understates latency under overload (D-133) | capacity is what the 1.2x gate compares | open-loop generator at the 0.9.x pass |
-| R-30 | 0.6 | missed target | the 1.2x gate against the best Rust competitor. On CI (4 vCPUs shared with the generator): net-io's reactor 1.07x tokio on B-1, 0.94x on B-2, 0.88x to 0.94x on B-3, 0.92x on B-4; the best competitor is mio at 1.00x to 1.24x tokio. On the 32-thread build host B-4 is about 2x tokio and 0.84x to 0.95x mio | mio is the same kind of event loop with no limits, deadlines, gate, or wiping, so 1.2x over it is not reachable on this harness. Decision: see the 0.6 exit table | 0.9.x tuning pass on a dedicated load machine |
+| R-30 | 0.6 | missed target | the 1.2x gate against the best Rust competitor. On CI (4 vCPUs shared with the generator): net-io's reactor 1.07x tokio on B-1, 0.94x on B-2, 0.88x to 0.94x on B-3, 0.92x on B-4; the best competitor is mio at 1.00x to 1.24x tokio. On the 32-thread build host B-4 is about 2x tokio and 0.84x to 0.95x mio | mio is the same kind of event loop with no limits, deadlines, gate, or wiping, so 1.2x over it is not reachable on this harness. Accepted for 0.6.0 only (D-139); not final | 0.9.x, required: re-run the gate on a dedicated, quiet load machine; before 1.0 it is met, or the target is derived again with the reason written down |
 | R-31 | 0.6 | missed target | B-10 post to wake: p99 21 to 33 us on CI, target under 10 us | the post is a few nanoseconds; the rest is one OS wake of a sleeping thread on a VM, and the blocking driver pays it too (p99 26 to 29 us) | 0.9.x: measure on a dedicated host, then a short spin before sleeping, with its idle CPU cost |
 | R-32 | 0.6 | known issue | B-4 server CPU per round trip: net-io 22.3 us against tokio 18.8 and mio 18.2 on CI; wiping explains about 1 us (21.3 without) | not profiled at 0.6: the runner has no `perf`, and the build host is loaded | 0.9.x profile of the 16 KiB path |
 | R-33 | 0.6 | known issue | B-6 at 100,000 idle: no competitor row (the tokio echo stopped at 4,786 in that client, not investigated), and net-io used 20 ms of CPU per second while idle on the loaded build host (0.0 at 10,000 on CI) | CI's descriptor limit is 30,000, so B-6 runs only on the build host | 0.9.x on a dedicated host |

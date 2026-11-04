@@ -13,7 +13,7 @@
 
 ---
 
-## [0.6.0] - 2026-11-03
+## [0.6.0] - 2026-11-04
 
 Optimisation: the P2 options, files and UDP batches on both drivers, the
 competitor harness, and the benchmarks B-1 to B-14 with their numbers.
@@ -56,9 +56,11 @@ competitor harness, and the benchmarks B-1 to B-14 with their numbers.
 - The reactor did not apply the minimum transfer rate to a peer that sent more
   often than the check interval (1 s by default): each arrival moved the check
   later, so a client sending one byte every 40 ms after an opening burst kept its
-  connection for as long as it kept sending. The rate is now checked on every
-  arrival and every send completion. The blocking pool was not affected. Affects
-  0.5.0 with the reactor, the default driver for sessions.
+  connection for as long as it kept sending (slowloris). The rate is now checked
+  on every arrival and every send completion. The blocking pool was not affected.
+  Affects 0.5.0 with the reactor, the default driver for sessions, and 0.5.0 is
+  yanked from crates.io for this reason; lockfiles that already name it still
+  build.
 
 ### Fixed
 
