@@ -416,3 +416,61 @@ fn test_keepalive_timeout_is_an_io_error_not_a_deadline() {
     );
     assert_eq!(s.timeouts, 0, "not counted as a deadline");
 }
+
+/// A file streamed to a fast reader gives way to the rest of the worker: at least
+/// one look at the OS for every 256 KiB of file (D-141). Linux, where each piece is a
+/// `sendfile` in the worker's own thread.
+#[cfg(all(target_os = "linux", feature = "reactor", not(net_io_force_blocking)))]
+#[test]
+fn test_file_stream_looks_at_the_os_every_256_kib() {
+    use net_io::__shim::{counted, start_counting, stop_counting};
+    use std::sync::Arc;
+
+    struct Stream(Arc<std::fs::File>, u64);
+    impl Session for Stream {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            cx.output()
+                .push_file(self.0.clone(), 0, self.1)
+                .expect("push");
+            Step::Close
+        }
+    }
+
+    let _shim = Shim::take();
+    let len: u64 = 64 << 20;
+    let path = std::env::temp_dir().join(format!("nio-shim-bulk-{}", std::process::id()));
+    std::fs::write(&path, vec![7u8; len as usize]).expect("write");
+    let file = Arc::new(std::fs::File::open(&path).expect("open"));
+    let server = net_io::ServerBuilder::new()
+        .listener(net_io::ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(net_io::DriverKind::Reactor)
+        .workers(1)
+        .sessions(move |_: &ConnectionInfo| Stream(file.clone(), len))
+        .gate(net_io::AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    std::thread::sleep(Duration::from_millis(100));
+    let mut c = client(addr(&server));
+    start_counting();
+    c.write_all(b"go").expect("write");
+    let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    loop {
+        match c.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => total += n as u64,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    stop_counting();
+    let _ = std::fs::remove_file(&path);
+    let (waits, sends) = (counted(Op::Wait), counted(Op::Send));
+    println!("{total} bytes: {waits} waits, {sends} sends");
+    assert_eq!(total, len);
+    let pieces = len / (256 << 10);
+    assert!(sends >= pieces, "{sends} sends for {pieces} pieces");
+    assert!(waits >= pieces, "{waits} waits for {pieces} pieces");
+}

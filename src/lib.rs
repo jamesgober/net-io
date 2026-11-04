@@ -97,6 +97,7 @@ mod proxy;
 #[cfg(feature = "proxy")]
 mod proxy_parse;
 mod rate;
+mod retry;
 mod server;
 mod session;
 mod sys;
@@ -181,6 +182,7 @@ pub use proxy_parse::{
     ProxyAddress, ProxyCommand, ProxyHeader, ProxyParser, ProxyProgress, ProxySsl, ProxyTransport,
     Tlv, Tlvs, encode_v1, encode_v2,
 };
+pub use retry::Backoff;
 #[cfg(feature = "udp")]
 pub use server::UdpOnly;
 pub use server::{
@@ -190,7 +192,7 @@ pub use server::{
 pub use session::{
     Input, Output, OutputFull, Phase, Session, SessionContext, SessionFactory, Step, SwapError,
 };
-pub use tcp::{ConnectOptions, ListenerInfo, TcpConnection, TcpListener};
+pub use tcp::{ConnectOptions, Drained, Health, ListenerInfo, TcpConnection, TcpListener};
 pub use time::{Clock, ManualClock, MonotonicClock, monotonic_micros};
 pub use tls::{
     NoTls, NoTlsSession, TlsAcceptor, TlsCloseKind, TlsError, TlsEvent, TlsFailure, TlsInfo,

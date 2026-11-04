@@ -15,6 +15,7 @@ use crate::limits::{Effective, Limits};
 use crate::link::{ClockRef, Got, Link, WakeSource};
 use crate::opts::{ListenOptions, SocketOptions, TcpOptions};
 use crate::proxy::ProxyMode;
+use crate::retry::Backoff;
 use crate::session::Phase;
 use crate::sys::{self, AddrFailure, AsSock, Interest, KillSlot, Ready};
 
@@ -87,6 +88,20 @@ fn connect_error(addr: SocketAddr, after: Duration, e: io::Error) -> NetError {
             source: e,
         },
     }
+}
+
+/// Whether a connect error is one a restarting or failing-over server produces.
+fn reconnectable(e: &NetError) -> bool {
+    e.is_retryable()
+        || matches!(
+            e,
+            NetError::ConnectionRefused { .. }
+                | NetError::HostUnreachable { .. }
+                | NetError::NetworkUnreachable { .. }
+                | NetError::ConnectionReset
+                | NetError::NoAddresses
+                | NetError::Os { op: "resolve", .. }
+        )
 }
 
 fn resolve<A: ToSocketAddrs>(addr: A) -> Result<Vec<SocketAddr>, NetError> {
@@ -494,6 +509,39 @@ impl ConnectOptions {
     }
 }
 
+/// What [`TcpConnection::probe`] found, without waiting or consuming anything.
+///
+/// ```
+/// assert_ne!(net_io::Health::Open, net_io::Health::PeerClosed);
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    /// Connected, nothing waiting: safe to send a request on.
+    Open,
+    /// Bytes are waiting (on a TLS connection, possibly only records), or, on a
+    /// stream other than TCP, bytes or the end of the stream.
+    Readable,
+    /// The peer sent FIN: the next read returns 0. A pooled connection in this state
+    /// should be closed, not reused.
+    PeerClosed,
+}
+
+/// What [`TcpConnection::drain`] saw before closing.
+///
+/// ```
+/// let d = net_io::Drained::default();
+/// assert!(!d.peer_closed && d.discarded == 0);
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Drained {
+    /// The peer's FIN arrived in time: both sides finished, nothing was reset.
+    pub peer_closed: bool,
+    /// Bytes read and dropped while waiting for it.
+    pub discarded: u64,
+}
+
 /// A connected TCP socket that carries its own limits.
 ///
 /// Every read honours the current phase's deadline (a connection from `accept`
@@ -542,6 +590,45 @@ impl TcpConnection {
     ) -> Result<TcpConnection, NetError> {
         let addrs = resolve(addr)?;
         TcpConnection::connect_addrs(&addrs, &options)
+    }
+
+    /// Connects, and after a failure a restarting or failing-over server produces
+    /// (refused, timed out, unreachable, reset, no addresses, resolution failed),
+    /// sleeps for [`Backoff::next_delay`] and tries again, resolving `addr` again
+    /// each time. Any other error returns at once.
+    ///
+    /// ```no_run
+    /// use net_io::{Backoff, ConnectOptions, TcpConnection};
+    /// use std::time::Duration;
+    ///
+    /// let mut backoff = Backoff::new().give_up_after(Duration::from_secs(60));
+    /// let conn = TcpConnection::connect_retry("db.internal:5433", ConnectOptions::new(), &mut backoff)?;
+    /// backoff.reset();
+    /// # let _ = conn;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The last connect error once `backoff` is spent; a non-transient error at once.
+    pub fn connect_retry<A: ToSocketAddrs>(
+        addr: A,
+        options: ConnectOptions,
+        backoff: &mut Backoff,
+    ) -> Result<TcpConnection, NetError> {
+        loop {
+            let err = match TcpConnection::connect_with(&addr, options.clone()) {
+                Ok(conn) => return Ok(conn),
+                Err(e) => e,
+            };
+            if !reconnectable(&err) {
+                return Err(err);
+            }
+            match backoff.next_delay() {
+                Some(d) => std::thread::sleep(d),
+                None => return Err(err),
+            }
+        }
     }
 
     /// Resolves `host` with the standard library and connects to the addresses in
@@ -793,6 +880,53 @@ impl TcpConnection {
     /// As [`TcpConnection::send`].
     pub fn send_all_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> Result<(), NetError> {
         self.link()?.write_all_vectored(bufs)
+    }
+
+    /// What the next read would find, without waiting and without consuming: one
+    /// zero-timeout wait, and a one-byte peek when the socket is readable. Use it
+    /// before reusing an idle pooled connection; a request sent on a connection
+    /// whose peer already closed is lost.
+    ///
+    /// ```no_run
+    /// use net_io::Health;
+    /// let mut conn = net_io::connect("127.0.0.1:7000")?;
+    /// if conn.probe()? != Health::Open {
+    ///     conn = net_io::connect("127.0.0.1:7000")?;
+    /// }
+    /// # let _ = conn;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// `ConnectionReset` when the peer reset it, `Killed`, `Closed` after a fatal
+    /// error, `Os`.
+    pub fn probe(&mut self) -> Result<Health, NetError> {
+        self.link()?.probe()
+    }
+
+    /// Client-side drain: FIN, then reads and discards until the peer's FIN arrives
+    /// or `within` passes, then closes. Closing after the peer's FIN leaves nothing
+    /// unread, so neither side sees a reset.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// let conn = net_io::connect("127.0.0.1:7000")?;
+    /// let drained = conn.drain(Duration::from_secs(2));
+    /// println!("clean: {}, discarded {} bytes", drained.peer_closed, drained.discarded);
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn drain(mut self, within: Duration) -> Drained {
+        let Some(mut link) = self.link.take() else {
+            return Drained::default();
+        };
+        let (peer_closed, discarded) = link.drain_for(within);
+        let reason = link.reason_or(CloseReason::SessionClosed);
+        link.finish_quick(reason);
+        Drained {
+            peer_closed,
+            discarded,
+        }
     }
 
     /// Half-close: `Write` sends FIN and keeps reading; `Read` stops reading.

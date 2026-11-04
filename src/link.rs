@@ -17,6 +17,7 @@ use crate::limits::Effective;
 use crate::rate::Rate;
 use crate::session::Phase;
 use crate::sys::{self, AsSock, Interest, KillSlot, Ready, Wake};
+use crate::tcp::Health;
 use crate::time::Clock;
 use crate::tls::{TlsError, TlsEvent, TlsFailure, TlsSession};
 
@@ -1387,6 +1388,83 @@ impl Link {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
             Err(e) => Err(NetError::from_os("shutdown", e)),
+        }
+    }
+
+    /// What the next read would find, looked at without waiting and without
+    /// consuming anything: one zero-timeout wait and, when the socket is readable,
+    /// a one-byte peek (TCP; other streams report `Readable`).
+    pub(crate) fn probe(&mut self) -> Result<Health, NetError> {
+        self.check_terminal()?;
+        let held = self
+            .tls
+            .as_ref()
+            .is_some_and(|t| t.plain_at < t.plain_end || t.start < t.cin.len());
+        if self.pending.is_some() || held {
+            return Ok(Health::Readable);
+        }
+        if self.peer_closed {
+            return Ok(Health::PeerClosed);
+        }
+        match self.stream.wait(Interest::Read, None, Some(Duration::ZERO)) {
+            Ok(Ready::Socket) => {}
+            Ok(_) => {
+                return match sys::take_error(self.stream.sock()) {
+                    Ok(None) => Ok(Health::Open),
+                    Ok(Some(e)) | Err(e) => Err(self.os_error("probe", e)),
+                };
+            }
+            Err(e) => return Err(NetError::from_os("poll", e)),
+        }
+        if self.stream.tcp().is_none() {
+            return Ok(Health::Readable);
+        }
+        let mut one = [0u8; 1];
+        match self.stream.peek(&mut one) {
+            Ok(0) => Ok(Health::PeerClosed),
+            Ok(_) => Ok(Health::Readable),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Health::Open),
+            Err(e) => Err(self.os_error("recv", e)),
+        }
+    }
+
+    /// FIN, then reads and discards until the peer's FIN, `within`, or a kill.
+    /// Returns whether the peer closed, and how many bytes were discarded.
+    pub(crate) fn drain_for(&mut self, within: Duration) -> (bool, u64) {
+        self.tls_close_notify();
+        let _ = self.stream.shutdown(Shutdown::Write);
+        if self.peer_closed {
+            return (true, 0);
+        }
+        let deadline = self.now().checked_add(within);
+        let mut discarded = 0u64;
+        let mut scratch = [0u8; 4096];
+        loop {
+            if self.killed().is_some() {
+                return (false, discarded);
+            }
+            let now = self.now();
+            let timeout = match deadline {
+                Some(d) if now >= d => return (false, discarded),
+                Some(d) => d
+                    .saturating_duration_since(now)
+                    .max(Duration::from_millis(1)),
+                None => Duration::from_secs(1),
+            };
+            match self.wait(Interest::Read, timeout) {
+                Ok(Ready::Socket) => {}
+                Ok(_) => continue,
+                Err(_) => return (false, discarded),
+            }
+            match self.stream.read(&mut scratch) {
+                Ok(0) => {
+                    self.peer_closed = true;
+                    return (true, discarded);
+                }
+                Ok(n) => discarded += n as u64,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => return (false, discarded),
+            }
         }
     }
 

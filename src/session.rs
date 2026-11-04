@@ -560,6 +560,12 @@ impl Output {
     /// connection is reset with `Io(FileTruncated)` if it does. A read on TLS or a pipe
     /// happens on the worker's thread, so a slow disk holds that worker.
     ///
+    /// On the reactor a file goes out in pieces of at most 256 KiB, each after a gate
+    /// check, and a worker sends at most 256 KiB of file between two looks at the OS,
+    /// so a stream to a fast reader cannot hold off the worker's other connections.
+    /// To interleave small replies with a stream on one connection, push the stream a
+    /// few pieces at a time from `on_writable`.
+    ///
     /// # Errors
     ///
     /// [`OutputFull`] when the chunk limit is reached.

@@ -54,8 +54,14 @@ pub(crate) type Backend = crate::driver::ready::ReadyDriver;
 #[cfg(windows)]
 pub(crate) type Backend = crate::driver::iocp::IocpDriver;
 
-/// How much of a file one operation, and one gate check, covers.
-const FILE_CHUNK: u64 = 1 << 20;
+/// How much of a file one operation, and one gate check, covers: one
+/// [`BULK_TURN`], so a worker never copies more than that between looks at the OS.
+const FILE_CHUNK: u64 = BULK_TURN as u64;
+
+/// How many file bytes a worker sends between two looks at the OS. A `sendfile`
+/// copies in the calling thread, so a fast reader would otherwise hold the worker
+/// for as long as its stream lasts (D-141).
+const BULK_TURN: usize = 256 << 10;
 
 /// How many rounds of finished-at-once completions run between looks at the OS.
 const LOCAL_ROUNDS: usize = 16;
@@ -200,6 +206,10 @@ struct Reactor<'a, F: SessionFactory, G: Gate> {
     completer: Completer,
     /// Connections waiting for a buffer, oldest first.
     starved: VecDeque<(u32, Token)>,
+    /// File bytes sent since the last look at the OS.
+    bulk_sent: usize,
+    /// Connections whose next file piece waits for the next look at the OS.
+    yielded: VecDeque<(u32, Token)>,
     view: ControlView,
     clock: ClockRef,
     notes: Arc<KillNotes>,
@@ -234,6 +244,8 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         pool: BufferPool::new(engine.budget.clone(), engine.wipe),
         outputs: Vec::new(),
         starved: VecDeque::new(),
+        bulk_sent: 0,
+        yielded: VecDeque::new(),
         completer: Completer {
             shared: ws.completer.clone(),
         },
@@ -277,6 +289,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 return;
             }
             begin_turn();
+            self.bulk_sent = 0;
+            self.resume_yielded();
             for c in done.drain() {
                 self.on_completion(c);
             }
@@ -291,6 +305,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 }
             }
             self.done = Some(done);
+            if !self.yielded.is_empty() {
+                self.driver.poll_next();
+            }
         }
     }
 
@@ -302,6 +319,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             .wheel
             .next_expiry()
             .map(|t| self.ticks.until(t, now).max(Duration::from_micros(100)));
+        if !self.yielded.is_empty() {
+            return Some(Duration::ZERO);
+        }
         // Buffers free on any worker, and nothing wakes this one for them.
         let starved = !self.starved.is_empty();
         match self.clock {
@@ -314,6 +334,24 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 let cap = Duration::from_millis(5);
                 Some(timer.map_or(cap, |t| t.min(cap)))
             }
+        }
+    }
+
+    /// File sends that gave way at the last look at the OS go on, oldest first.
+    fn resume_yielded(&mut self) {
+        for _ in 0..self.yielded.len() {
+            let Some((index, token)) = self.yielded.pop_front() else {
+                return;
+            };
+            let wait = match self.conn(index) {
+                Some(c)
+                    if c.token == token && c.sending == Sending::None && c.closing.is_none() =>
+                {
+                    c.wait
+                }
+                _ => continue,
+            };
+            self.flush_and_continue(index, wait);
         }
     }
 
@@ -1069,6 +1107,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
 
     /// Starts sending what is queued: the gate first, one operation at a time.
     fn flush(&mut self, index: u32, after: Wait) -> Flushed {
+        let bulk_room = self.bulk_sent < BULK_TURN;
         let Some(c) = self.conn(index) else {
             return Flushed::Waiting;
         };
@@ -1099,6 +1138,11 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         if let Some((file, offset, left)) = output.front_file() {
             let len = left.min(FILE_CHUNK) as usize;
             let token = c.token;
+            if !bulk_room {
+                c.wait = after;
+                self.yielded.push_back((index, token));
+                return Flushed::Waiting;
+            }
             return match c.link.check_send(len) {
                 Ok(()) => {
                     c.sending = Sending::File { total: len };
@@ -1109,6 +1153,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                         offset,
                         len: len as u32,
                     };
+                    self.bulk_sent += len;
                     if self.driver.submit(op).is_err() {
                         if let Some(c) = self.conn(index) {
                             c.sending = Sending::None;
@@ -1525,6 +1570,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         if closing {
             return self.settle(index);
         }
+        self.flush_and_continue(index, wait);
+    }
+
+    /// Sends the next piece and, when the output is empty, does what the wait was
+    /// for.
+    fn flush_and_continue(&mut self, index: u32, wait: Wait) {
         match wait {
             Wait::Flush => match self.flush(index, Wait::Flush) {
                 Flushed::Done => match self.call(index, |s, cx| s.on_writable(cx)) {

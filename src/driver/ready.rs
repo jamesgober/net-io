@@ -187,6 +187,11 @@ impl ReadyDriver {
     }
 
     /// Moves what finished without the OS into `out`.
+    /// The next wait looks at the OS even with local completions queued.
+    pub(crate) fn poll_next(&mut self) {
+        self.skipped = FAIRNESS;
+    }
+
     pub(crate) fn take_local(&mut self, out: &mut Completions) -> usize {
         let mut n = 0;
         while out.has_room() {

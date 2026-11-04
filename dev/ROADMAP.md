@@ -204,10 +204,25 @@ Exit: zero open findings of severity medium or above; the soak shows no memory, 
 
 Items: continuous fuzzing of every target with no open crash; every threat in PLAN 8.2 has its attack test passing; full shim coverage (every `sys` call site with each error class); 24-hour soak with mixed normal and hostile peers on Linux, Windows, macOS; adversarial review of the whole crate with findings fixed test-first; `docs/SECURITY.md` final.
 
+A database consumer's transport needs, added 2026-11-04 (D-140). The two that are transport hardening land here; the third needs the executor adapter and lands with it in 0.8:
+- **Bulk transfer that cannot starve small requests.** Files already go out by `sendfile` and `TransmitFile` (0.6). Measure a small request's p99 and p99.9 on a worker that also streams a file to a fast reader, bound what one connection sends per reactor turn, and add receiving into a file (`splice` on Linux, a copy elsewhere) for snapshot and log shipping.
+- **An outbound client that survives its server.** Connect exists; add reconnect with backoff and jitter, a health probe that does not consume data, and a graceful client-side drain. Pooling stays in the pooling crates (PLAN section 3); the soak runs these through a small test pool while the server restarts and kills connections.
+- **Tail latency through the `executor` adapter** (0.8): p99 and p99.9 measured through the adapter, beside the reactor's own numbers.
+
+The plan for each item:
+
+| Item | Plan |
+|---|---|
+| Fuzzing | every parser has a target (PROXY, CIDR, trusted lists, manifest, systemd environment) plus new stateful targets for the timing wheel, the rate counter, and the UDP source table against models; a scheduled CI workflow runs each target for longer than the per-push 30 s and keeps the corpus between runs |
+| Threat tests | every row of `docs/SECURITY.md` names a passing test, or a later version with a reason |
+| Shim coverage | a list of every `sys` call site, each with an injected error test, checked by a test that fails when a new site has none |
+| Soak | `tests/soak.rs`, driven by `NET_IO_SOAK_SECS`: normal clients, slowloris and slow readers, floods at the cap, kills, and client reconnects through a test pool, sampling memory, descriptors or handles, and open connections; 24 hours on the build host's Windows and Linux. macOS runs on GitHub's hosted runner, whose jobs stop at 6 hours, so it runs 5.5 hours there (recorded with the result) |
+| Review | six independent reviews of the crate (link and sessions, reactor and drivers, engine and admission, Unix `sys`, Windows `sys`, parsers and UDP); every finding fixed test-first or recorded with a reason |
+
 ## v0.8.0 - Alpha
 Exit: two consumers in daily use for two weeks without a net-io defect of severity medium or above.
 
-Items: serve-net and a request pipeline run on net-io; one non-HTTP consumer (HiveDB network layer, raft-io, or rpc-io) runs on it; the executor adapter (feature `executor`, D-030) built and tested against the executor's published version; `docs/ARCHITECTURE.md` and `docs/PLATFORM-NOTES.md` drafts complete; API changes from integration recorded in PLAN.
+Items: serve-net and a request pipeline run on net-io; one non-HTTP consumer (a database's network layer, raft-io, or rpc-io) runs on it; the executor adapter (feature `executor`, D-030) built and tested against the executor's published version, with p99 and p99.9 measured through it beside the reactor's own (a database consumer's need, D-140); `docs/ARCHITECTURE.md` and `docs/PLATFORM-NOTES.md` drafts complete; API changes from integration recorded in PLAN.
 
 ## v0.9.0 - Beta and release candidates
 Exit: no API change requested by consumers for the final release candidate; the audit checklist for `docs/STABILITY-1.0.md` complete except the sign-off.

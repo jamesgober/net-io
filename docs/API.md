@@ -47,6 +47,8 @@
 - [TCP](#tcp)
   - [`TcpListener`](#tcplistener)
   - [`TcpConnection`](#tcpconnection)
+  - [`Health`, `Drained`](#health-drained)
+  - [`Backoff`](#backoff)
   - [`ConnectOptions`](#connectoptions)
 - [Socket options](#socket-options)
   - [`ListenOptions`](#listenoptions)
@@ -1088,6 +1090,7 @@ impl TcpConnection {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<TcpConnection, NetError>;
     pub fn connect_with<A: ToSocketAddrs>(addr: A, options: ConnectOptions) -> Result<TcpConnection, NetError>;
     pub fn connect_host(host: &str, port: u16, options: ConnectOptions) -> Result<TcpConnection, NetError>;
+    pub fn connect_retry<A: ToSocketAddrs>(addr: A, options: ConnectOptions, backoff: &mut Backoff) -> Result<TcpConnection, NetError>;
 
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, NetError>;           // 0 = the peer closed its side
     pub fn recv_exact(&mut self, buf: &mut [u8]) -> Result<(), NetError>;
@@ -1101,6 +1104,8 @@ impl TcpConnection {
 
     pub fn shutdown(&mut self, how: Shutdown) -> Result<(), NetError>;
     pub fn close(self) -> Result<(), NetError>;                                  // graceful
+    pub fn drain(self, within: Duration) -> Drained;                             // FIN, wait for the peer's FIN
+    pub fn probe(&mut self) -> Result<Health, NetError>;                         // no wait, nothing consumed
     pub fn abort(self);                                                          // RST
 
     pub fn info(&self) -> &ConnectionInfo;
@@ -1128,15 +1133,18 @@ A connected TCP socket that carries its own limits: every read honours the curre
 | `connect` | as [`connect`](#connect) | as `connect` | | P0 | 1 | `0.3.0` |
 | `connect_with` | uses [`ConnectOptions`](#connectoptions) | as `connect` | | P0 | 2 | `0.3.0` |
 | `connect_host` | resolves through `std::net::ToSocketAddrs`, tries addresses in order, per-attempt deadline = remaining total / remaining addresses (at least 1 s); Happy Eyeballs when `ConnectOptions::happy_eyeballs(true)` | `NoAddresses`, connect errors (the last one) | resolution plus one round trip | P1 (Happy Eyeballs P2) | 2 | `0.3.0` (Happy Eyeballs `0.5.0`) |
+| `connect_retry` | connects; after an error a restarting or failing-over server produces (refused, timed out, unreachable, reset, no addresses, resolution failed) sleeps [`Backoff::next_delay`](#backoff) and tries again, resolving `addr` again each time; any other error returns at once | the last connect error once the backoff is spent | one connect per attempt, plus the delays | P1 | 2 | `0.7.0` |
 | `recv`, `recv_vectored` | retries `EINTR` with the remaining deadline; a zero-length `buf` returns `Ok(0)` without a system call (this is not end of stream; check `buf.len()`) | `TimedOut { kind }`, `SlowPeer { In }`, `ConnectionReset`, `Killed`, `Closed` | 1 system call; 2 when the deadline target moved by more than a tick | P0 (vectored P1) | 1 | `0.3.0` |
 | `recv_exact` | loops until `buf` is full | as `recv`, plus `Closed` when the peer closes early | | P1 | 1 | `0.3.0` |
 | `peek` | `MSG_PEEK` | as `recv` | 1 system call | P2 | 2 | `0.3.0` |
 | `send` | gate check, then one system call; may write less than `buf` | `TimedOut`, `SlowPeer { Out }`, `BrokenPipe`, `ConnectionReset`, `EgressDenied`, `Killed` | gate check + 1 system call | P0 | 1 | `0.3.0` |
 | `send_all` | loops from the exact offset until done, the deadline passes, or the gate denies; the gate check runs before each write (a retry after the socket was full is not checked again, D-074) | as `send` | 1 system call per chunk | P0 | 1 | `0.3.0` |
 | `send_vectored`, `send_all_vectored` | up to 64 slices per system call; `send_all_vectored` advances the slices in place (no copy) | as `send` | 1 system call per 64 slices | P1 | 2 | `0.3.0` |
-| `send_file` | `sendfile` (Linux, macOS, FreeBSD) in 1 MiB chunks, a gate check before each; `TransmitFile` for `push_file` on the Windows reactor; falls back to read-and-write internally where zero copy is unavailable (TLS, pipes, Unix sockets off Linux, a held connection on Windows) | as `send`; `FileTruncated { sent }` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
+| `send_file` | `sendfile` (Linux, macOS, FreeBSD) in 1 MiB chunks (256 KiB on the reactor, at most 256 KiB of file per worker between two looks at the OS), a gate check before each; `TransmitFile` for `push_file` on the Windows reactor; falls back to read-and-write internally where zero copy is unavailable (TLS, pipes, Unix sockets off Linux, a held connection on Windows) | as `send`; `FileTruncated { sent }` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
 | `shutdown` | half-close: `Write` sends FIN and keeps reading; `Read` stops reading; repeated calls are no-ops | `Closed`, `Os` | 1 system call | P0 | 1 | `0.3.0` |
 | `close` | graceful: FIN, then reads and discards up to 64 KiB for up to 2 s so unread input does not cause an RST that destroys the last response, then close | `TimedOut`, `Os` | flush plus linger | P0 | 1 | `0.3.0` |
+| `drain` | client-side drain: FIN, then reads and discards until the peer's FIN or `within`, then closes; closing after the peer's FIN leaves nothing unread, so neither side sees a reset. [`Drained`](#health-drained) says whether the peer finished and how much was discarded | none surfaced | 1 `shutdown`, one wait and read per arrival | P1 | 2 | `0.7.0` |
+| `probe` | what the next read would find, without waiting or consuming: one zero-timeout wait and, when readable, a one-byte `MSG_PEEK` (TCP); [`Health`](#health-drained) `Open`, `Readable`, or `PeerClosed`. For checking an idle pooled connection before reuse | `ConnectionReset`, `Killed`, `Closed`, `Os` | 1 or 2 system calls | P1 | 2 | `0.7.0` |
 | `abort` | `SO_LINGER {on, 0}` and close: RST, kernel resources freed at once | none surfaced | 2 system calls | P0 | 1 | `0.3.0` |
 | `info`, `id`, `peer_addr`, `local_addr` | | | none | P0 | 1 | `0.3.0` |
 | `kill_handle` | a handle other threads can use to abort this connection | | one `Arc` clone | P0 | 2 | `0.3.0` |
@@ -1173,6 +1181,44 @@ let mut buf = [0u8; 16];
 assert!(matches!(conn.recv(&mut buf), Err(net_io::NetError::Killed { .. })));
 # Ok::<(), net_io::NetError>(())
 ```
+
+### `Health`, `Drained`
+
+```rust
+#[non_exhaustive]
+pub enum Health { Open, Readable, PeerClosed }
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Drained {
+    pub peer_closed: bool,   // the peer's FIN arrived in time
+    pub discarded: u64,      // bytes read and dropped while waiting
+}
+```
+
+P1, Tier 2, `0.7.0`. `Readable` on a TLS connection can mean records with no plaintext; on a stream other than TCP it can mean the end of the stream (only TCP can peek). A pool in front of these is the pooling crates' job (`pool-mod`, `fetch-net`); net-io supplies the connection, its health, and its drain (D-140).
+
+### `Backoff`
+
+```rust
+#[must_use]
+#[derive(Clone, Debug)]
+pub struct Backoff { /* ... */ }
+impl Backoff {
+    pub fn new() -> Self;                                  // 100 ms doubling to 30 s, jitter on, no limits
+    pub fn first(self, d: Duration) -> Self;               // at least 1 ms
+    pub fn max(self, d: Duration) -> Self;                 // at least `first`
+    pub fn jitter(self, on: bool) -> Self;
+    pub fn attempts(self, n: u32) -> Self;
+    pub fn give_up_after(self, total: Duration) -> Self;
+    pub fn next_delay(&mut self) -> Option<Duration>;
+    pub fn attempt(&self) -> u32;
+    pub fn reset(&mut self);
+}
+impl Default for Backoff;
+```
+
+P1, Tier 2, `0.7.0`. Delay `n` is `first * 2^n`, capped at `max`; with jitter each is drawn from the upper half of its step, so a fleet of clients that lost the same server spreads out but none retries faster than half the step (D-142). `next_delay` returns `None` once `attempts` delays were handed out, or when waiting the next one would end later than `give_up_after` from the first call. `reset` after a success. No allocation; the jitter source is a xorshift seeded from the standard library's per-process random hash key.
 
 ### `ConnectOptions`
 
