@@ -47,8 +47,8 @@ pub(crate) struct Acceptor {
 }
 
 impl Acceptor {
-    /// Backs off for a resource shortage seen outside `accept`.
-    #[cfg(all(windows, feature = "local"))]
+    /// Backs off for a resource shortage seen outside `accept`, or a run of errors
+    /// that took no connection.
     pub(crate) fn pause(&mut self) -> Accepted<()> {
         let d = self.backoff;
         self.backoff = (self.backoff * 2).min(BACKOFF_MAX);

@@ -432,7 +432,16 @@ impl Link {
                 TlsNext::Plain => return Ok(Pump::Plain),
                 TlsNext::Handshaken => return Ok(Pump::Handshaken),
                 TlsNext::Eof => return Ok(Pump::Eof),
-                TlsNext::Transmit => self.send_raw_all(t.cout.as_slice())?,
+                TlsNext::Transmit => {
+                    // Records the engine wrote on its own are not the session's reply:
+                    // they must not end an exchange, and they go out under the
+                    // outbound rate like any send.
+                    let replied = self.replied;
+                    self.rate_out.activate(self.now());
+                    let r = self.send_raw_all(t.cout.as_slice());
+                    self.replied = replied;
+                    r?;
+                }
                 TlsNext::NeedInput => {
                     if let Some(p) = self.tls_fill(t)? {
                         return Ok(p);
@@ -739,7 +748,9 @@ impl Link {
     /// This connection's idle timeout from its next idle wait on (`None`: the
     /// limits' value again). At least one tick.
     pub(crate) fn set_idle_timeout(&mut self, timeout: Option<Duration>) {
-        self.idle_timeout = timeout.map_or(self.limits.idle_timeout, |t| t.max(self.limits.tick));
+        self.idle_timeout = timeout.map_or(self.limits.idle_timeout, |t| {
+            crate::time::bounded(t).max(self.limits.tick)
+        });
     }
 
     pub(crate) fn killed(&self) -> Option<KillReason> {
@@ -1001,6 +1012,11 @@ impl Link {
             if self.exchange_deadline.is_some_and(|d| now >= d) {
                 return Err(self.timed_out(TimeoutKind::Exchange));
             }
+            // A handshake flight that the peer drains a byte at a time still ends at
+            // the handshake deadline, not at a write timeout each byte restarts.
+            if self.handshake_deadline.is_some_and(|d| now >= d) {
+                return Err(self.timed_out(TimeoutKind::Handshake));
+            }
             if self.rate_out.too_slow(&self.limits.min_rate, now) {
                 return Err(self.fail(
                     CloseReason::SlowPeer {
@@ -1013,6 +1029,9 @@ impl Link {
             }
             let mut until = deadline;
             if let Some(d) = self.exchange_deadline {
+                until = until.min(d);
+            }
+            if let Some(d) = self.handshake_deadline {
                 until = until.min(d);
             }
             if let Some(c) = self.rate_out.next_check(&self.limits.min_rate, now) {
@@ -1525,6 +1544,13 @@ impl Link {
         let now = self.now();
         self.bytes_in += n as u64;
         self.progress_at = now;
+        // As on the pool: any ciphertext starts an exchange, so records that carry no
+        // plaintext fall under the read deadline and the inbound rate instead of
+        // moving the idle deadline for ever.
+        if self.phase == Phase::Idle {
+            self.phase = Phase::Receiving;
+            self.rate_in.activate(now);
+        }
         self.rate_in.record(now, n);
         self.check_rate_in(now)
     }
@@ -1552,6 +1578,16 @@ impl Link {
         self.sent(n);
         let now = self.now();
         self.check_rate_out(now)
+    }
+
+    /// As `note_sent`, for records the TLS engine wrote on its own: not the
+    /// session's reply, so the exchange does not end on them.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn note_engine_sent(&mut self, n: usize) -> Result<(), NetError> {
+        let replied = self.replied;
+        let r = self.note_sent(n);
+        self.replied = replied;
+        r
     }
 
     /// Before a send: the output deadline starts, a dead connection stops here,
@@ -1909,8 +1945,26 @@ impl Link {
     }
 
     /// One send attempt without the gate check, for the denial bytes after a denial.
+    /// Under TLS the denial is a record like any other: encrypted into the output
+    /// buffer and sent once, or not sent at all if the engine cannot encrypt it
+    /// (the output buffer is out with a send, or the denial does not fit).
     pub(crate) fn send_denial_once(&mut self, buf: &[u8]) {
-        if let Ok(n) = sys::send(&self.stream, buf) {
+        let sent = match self.tls.as_mut() {
+            Some(t) => {
+                t.cout.set_len(0);
+                match t.session.encrypt(buf, t.cout.spare()) {
+                    Ok(n) if n > 0 => {
+                        t.cout.set_len(n);
+                        let r = sys::send(&self.stream, t.cout.as_slice());
+                        t.cout.set_len(0);
+                        r.ok()
+                    }
+                    _ => None,
+                }
+            }
+            None => sys::send(&self.stream, buf).ok(),
+        };
+        if let Some(n) = sent {
             self.bytes_out += n as u64;
             self.replied = true;
         }

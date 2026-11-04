@@ -23,7 +23,10 @@ pub(crate) struct SourceTable {
 
 impl SourceTable {
     pub(crate) fn new(max_connections: u32, cap_per_source: u32) -> SourceTable {
-        let per_shard = (max_connections as usize).div_ceil(SHARDS).max(4) * 2;
+        // Room for twice the cap, so lookups stay short, but never more than 8,192
+        // entries a shard up front (about 4 MiB a listener): a large cap grows the
+        // table as sources arrive instead of reserving it at build.
+        let per_shard = ((max_connections as usize).div_ceil(SHARDS).max(4) * 2).min(8_192);
         let hasher = RandomState::new();
         let shards = (0..SHARDS)
             .map(|_| Mutex::new(HashMap::with_capacity_and_hasher(per_shard, hasher.clone())))

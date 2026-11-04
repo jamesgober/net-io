@@ -22,6 +22,9 @@ use crate::limits::SizeClass;
 pub struct Buffer {
     data: Box<[u8]>,
     len: usize,
+    /// The longest `len` since the last wipe: `clear`, `compact`, and a consumed
+    /// input shrink `len` but leave the bytes, so the wipe covers this much.
+    dirty: usize,
     class: SizeClass,
 }
 
@@ -38,6 +41,7 @@ impl Buffer {
         Buffer {
             data: Box::default(),
             len: 0,
+            dirty: 0,
             class: SizeClass::SMALL,
         }
     }
@@ -46,6 +50,7 @@ impl Buffer {
         Buffer {
             data: vec![0u8; class.bytes() as usize].into_boxed_slice(),
             len: 0,
+            dirty: 0,
             class,
         }
     }
@@ -81,6 +86,7 @@ impl Buffer {
     /// Sets the filled length; saturates at the capacity.
     pub fn set_len(&mut self, n: usize) {
         self.len = n.min(self.data.len());
+        self.dirty = self.dirty.max(self.len);
     }
 
     /// The capacity in bytes.
@@ -100,14 +106,16 @@ impl Buffer {
         self.len = 0;
     }
 
-    /// Overwrites the filled part with zeroes and empties the buffer.
+    /// Overwrites everything filled since the last wipe with zeroes and empties the
+    /// buffer.
     pub(crate) fn wipe(&mut self) {
-        let used = &mut self.data[..self.len];
+        let used = &mut self.data[..self.dirty.max(self.len)];
         used.fill(0);
         // The buffer stays reachable and is read again by the next owner, so the
         // stores cannot be removed as dead; black_box makes that explicit.
         std::hint::black_box(&*used);
         self.len = 0;
+        self.dirty = 0;
     }
 
     /// Moves the bytes `from..` to the front.
@@ -269,6 +277,50 @@ mod tests {
         assert!(b.is_empty());
         b.set_len(6);
         assert_eq!(b.as_slice(), &[0u8; 6]);
+    }
+
+    /// Bytes left behind a shorter `len` are wiped too: a cleared buffer, a
+    /// compacted one, and a consumed input (review finding: only `[..len]` was).
+    #[test]
+    fn test_pool_wipes_what_a_shorter_len_left_behind() {
+        let mut pool = BufferPool::standalone(1 << 20);
+        let mut b = pool.take(SizeClass::SMALL).unwrap();
+        b.spare()[..12].copy_from_slice(b"token=secret");
+        b.set_len(12);
+        b.clear();
+        pool.put(b);
+        let mut b = pool.take(SizeClass::SMALL).unwrap();
+        b.set_len(b.capacity());
+        assert!(
+            b.as_slice().iter().all(|&x| x == 0),
+            "cleared bytes survived"
+        );
+        b.set_len(0);
+        b.spare()[..12].copy_from_slice(b"token=secret");
+        b.set_len(12);
+        b.compact(6);
+        assert_eq!(b.as_slice(), b"secret");
+        pool.put(b);
+        let mut b = pool.take(SizeClass::SMALL).unwrap();
+        b.set_len(b.capacity());
+        assert!(
+            b.as_slice().iter().all(|&x| x == 0),
+            "compacted tail survived"
+        );
+        let mut input = crate::session::Input::new({
+            b.set_len(0);
+            b
+        });
+        input.buf.spare()[..6].copy_from_slice(b"secret");
+        input.filled(6);
+        input.consume(6);
+        pool.put(input.buf);
+        let mut b = pool.take(SizeClass::SMALL).unwrap();
+        b.set_len(b.capacity());
+        assert!(
+            b.as_slice().iter().all(|&x| x == 0),
+            "consumed input survived"
+        );
     }
 
     #[test]

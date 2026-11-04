@@ -99,6 +99,9 @@ const NO_LISTENER: u32 = u32::MAX;
 /// How often a drain looks again for connections that became idle.
 const DRAIN_PASS: Duration = Duration::from_millis(10);
 
+/// Accept errors in a row, none of them a connection, before the accept loop pauses.
+const SKIPS_BEFORE_PAUSE: u32 = 64;
+
 /// Increments `counter` unless it already reached `cap`; `true` when a slot was taken.
 #[inline]
 fn take_slot(counter: &AtomicU32, cap: u32) -> bool {
@@ -1807,6 +1810,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
     let mut view = ControlView::new();
     let mut coalescer = Coalescer::new();
     let mut pause_until: Option<Instant> = None;
+    let mut skipped = 0u32;
     loop {
         if shared.stopping.load(Ordering::Acquire) || conf.removed.load(Ordering::Acquire) {
             return;
@@ -1865,6 +1869,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
             let outcome = match rt {
                 ListenerRuntime::Tcp(l) => match acceptor.accept(l.std()) {
                     Accepted::Conn((stream, peer)) => {
+                        skipped = 0;
                         engine.admit_tcp(stream, peer, conf, &mut ids, &view, &mut coalescer);
                         continue;
                     }
@@ -1873,6 +1878,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
                 #[cfg(all(unix, feature = "local"))]
                 ListenerRuntime::Unix(l) => match acceptor.accept_unix(l.std()) {
                     Accepted::Conn(stream) => {
+                        skipped = 0;
                         engine.admit_unix(l, stream, conf, &mut ids, &view, &mut coalescer);
                         continue;
                     }
@@ -1883,6 +1889,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
                 #[cfg(all(windows, feature = "local"))]
                 ListenerRuntime::AfUnix(l) => match acceptor.accept_af_unix(l.std()) {
                     Accepted::Conn(stream) => {
+                        skipped = 0;
                         engine.admit_af_unix(l, stream, conf, &mut ids, &view, &mut coalescer);
                         continue;
                     }
@@ -1891,6 +1898,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
                 #[cfg(all(windows, feature = "local"))]
                 ListenerRuntime::Pipe(l) => match l.accept_or_wake(&wake) {
                     Ok(Some(stream)) => {
+                        skipped = 0;
                         engine.admit_pipe(l, stream, conf, &mut ids, &view, &mut coalescer);
                         continue;
                     }
@@ -1902,11 +1910,25 @@ fn accept_loop<W: super::Workload, G: Gate>(
             };
             match outcome {
                 Accepted::Conn(()) => {}
-                Accepted::Skipped(class) => shared.event(Event::AcceptError {
-                    listener: conf.id,
-                    class,
-                }),
+                Accepted::Skipped(class) => {
+                    shared.event(Event::AcceptError {
+                        listener: conf.id,
+                        class,
+                    });
+                    // An error that never consumes a backlog entry (the network
+                    // subsystem failing) would otherwise spin: after a batch of them
+                    // in a row, pause as for descriptor pressure.
+                    skipped += 1;
+                    if skipped >= SKIPS_BEFORE_PAUSE {
+                        skipped = 0;
+                        if let Accepted::Pause(backoff) = acceptor.pause() {
+                            pause_until = Some(engine.clock.now() + backoff);
+                            break;
+                        }
+                    }
+                }
                 Accepted::Again => {
+                    skipped = 0;
                     rt.wait(&wake);
                     break;
                 }

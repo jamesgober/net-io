@@ -228,7 +228,7 @@ impl TcpListener {
         &self,
         timeout: Duration,
     ) -> Result<Option<(TcpConnection, ConnectionInfo)>, NetError> {
-        self.accept_until(Some(Instant::now() + timeout))
+        self.accept_until(Some(Instant::now() + crate::time::bounded(timeout)))
     }
 
     fn accept_until(
@@ -468,9 +468,9 @@ impl ConnectOptions {
         ConnectOptions::default()
     }
 
-    /// The total time for all attempts.
+    /// The total time for all attempts (held to at most 365 days).
     pub fn timeout(mut self, total: Duration) -> ConnectOptions {
-        self.timeout = total;
+        self.timeout = crate::time::bounded(total);
         self
     }
 

@@ -213,6 +213,15 @@ impl EventSink for Recorder {
 }
 
 impl Recorder {
+    fn wait_close_within(&self, limit: Duration) -> Option<CloseReason> {
+        if !eventually(limit, || {
+            self.0.lock().map(|v| !v.is_empty()).unwrap_or(false)
+        }) {
+            return None;
+        }
+        self.0.lock().ok().map(|v| v[0])
+    }
+
     fn wait_close(&self) -> CloseReason {
         assert!(
             eventually(WAIT, || self
@@ -610,5 +619,169 @@ fn test_engine_panic_closes_only_that_connection() {
         drop(c);
         let report = server.shutdown(std::time::Instant::now() + Duration::from_secs(2));
         assert_eq!(report.killed, 0, "{driver:?}: {report:?}");
+    }
+}
+
+/// A gate denial on a TLS connection goes out as a record, never as plaintext on the
+/// socket, on both drivers (review finding).
+#[test]
+fn test_denial_under_tls_is_encrypted() {
+    struct DenyAfterHandshake;
+    impl Gate for DenyAfterHandshake {
+        type Ticket = ();
+        fn admit(&self, _: &ConnectionInfo, _: AdmitStage) -> Result<Admitted<()>, Refusal> {
+            Ok(Admitted {
+                lane: Lane(0),
+                ticket: (),
+                tag: GateTag(0),
+            })
+        }
+        fn readmit(&self, _: &mut (), _: &ConnectionInfo) -> Result<(), Refusal> {
+            Ok(())
+        }
+        fn check(&self, _: &mut (), _: &WriteCheck) -> Result<(), Denial> {
+            Err(Denial { code: 3 })
+        }
+    }
+    struct Reply;
+    impl Session for Reply {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            cx.output().begin_response();
+            cx.output().push(b"the real reply").expect("push");
+            Step::Write
+        }
+        fn on_denied(&mut self, _code: u16, output: &mut net_io::Output) {
+            let _ = output.push(b"DENIED-IN-THE-CLEAR");
+        }
+    }
+    for &driver in common::DRIVERS {
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+            .driver(driver)
+            .workers(2)
+            .tls(Toy)
+            .sessions(|_: &ConnectionInfo| Reply)
+            .gate(DenyAfterHandshake)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = ToyClient::connect(&server);
+        c.send(b"go");
+        let mut wire = Vec::new();
+        let _ = c.0.read_to_end(&mut wire);
+        let clear = b"DENIED-IN-THE-CLEAR";
+        assert!(
+            !wire.windows(clear.len()).any(|w| w == clear),
+            "{driver:?}: the denial crossed the wire unencrypted"
+        );
+        assert!(
+            !wire.windows(14).any(|w| w == b"the real reply"),
+            "{driver:?}"
+        );
+    }
+}
+
+/// An engine whose handshake flight is 60 KiB: more than the socket buffers hold.
+struct BigFlight;
+
+impl TlsAcceptor for BigFlight {
+    type Session = BigSession;
+    fn session(&self, _info: &ConnectionInfo) -> Result<BigSession, TlsError> {
+        Ok(BigSession(false))
+    }
+}
+
+struct BigSession(bool);
+
+impl TlsSession for BigSession {
+    fn step<'i>(
+        &mut self,
+        input: &'i mut [u8],
+        output: &mut [u8],
+    ) -> Result<TlsProgress<'i>, TlsError> {
+        if self.0 || input.len() < 5 {
+            return Ok(TlsProgress {
+                consumed: 0,
+                written: 0,
+                event: TlsEvent::NeedInput,
+            });
+        }
+        self.0 = true;
+        let n = output.len().min(60 << 10);
+        output[..n].fill(0xEE);
+        Ok(TlsProgress {
+            consumed: 5,
+            written: n,
+            event: TlsEvent::Transmit,
+        })
+    }
+    fn encrypt(&mut self, _: &[u8], _: &mut [u8]) -> Result<usize, TlsError> {
+        Err(TlsError::new(TlsFailure::State, 0, None))
+    }
+    fn close(&mut self, _: &mut [u8]) -> Result<usize, TlsError> {
+        Ok(0)
+    }
+    fn on_transport_closed(&mut self) -> TlsCloseKind {
+        TlsCloseKind::Unclean
+    }
+    fn info(&self) -> Option<TlsInfo> {
+        None
+    }
+    fn input_capacity_required(&self) -> usize {
+        0
+    }
+}
+
+/// A peer that takes the handshake flight a byte at a time (here: not at all) is
+/// closed at the handshake deadline, not after a write timeout each byte restarts,
+/// on both drivers (review finding: the pool waited on the write timeout).
+#[test]
+fn test_handshake_flight_is_bounded_by_the_handshake_deadline() {
+    struct Nothing;
+    impl Session for Nothing {
+        fn on_data(&mut self, _: &mut SessionContext<'_>, _: &mut Input) -> Step {
+            Step::Close
+        }
+    }
+    for &driver in common::DRIVERS {
+        let rec = Recorder::default();
+        let limits = Limits::builder()
+            .handshake_timeout(Duration::from_millis(800))
+            .write_timeout(Duration::from_secs(60))
+            .build()
+            .expect("limits");
+        let server = ServerBuilder::new()
+            .listener(
+                ListenerSpec::tcp_with(
+                    "127.0.0.1:0",
+                    net_io::ListenOptions::new().send_buffer(4096),
+                )
+                .tls(true)
+                .limits(limits),
+            )
+            .driver(driver)
+            .workers(2)
+            .tls(BigFlight)
+            .sessions(|_: &ConnectionInfo| Nothing)
+            .gate(AllowAll)
+            .events(rec.clone())
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let options = net_io::ConnectOptions::new()
+            .tcp_options(net_io::TcpOptions::new().receive_buffer(4096));
+        let mut c = TcpConnection::connect_with(addr(&server), options).expect("connect");
+        c.send_all(b"HELLO").expect("hello");
+        let started = std::time::Instant::now();
+        let reason = rec.wait_close_within(Duration::from_secs(10));
+        assert_eq!(reason, Some(CloseReason::HandshakeTimeout), "{driver:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{driver:?}: {:?}",
+            started.elapsed()
+        );
+        drop(c);
     }
 }

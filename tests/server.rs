@@ -922,3 +922,42 @@ fn test_listener_cannot_set_the_global_cap() {
         result.err()
     );
 }
+
+/// A session that sets "no idle limit" as `Duration::MAX`, and a client connect with
+/// a `Duration::MAX` timeout, work instead of panicking (review finding).
+#[test]
+fn test_duration_max_is_held_to_a_year_not_a_panic() {
+    struct Forever;
+    impl Session for Forever {
+        fn on_open(&mut self, cx: &mut SessionContext<'_>) -> Step {
+            cx.set_idle_timeout(Some(Duration::MAX));
+            Step::Read
+        }
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            Step::Write
+        }
+    }
+    for &driver in DRIVERS {
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(1)
+            .sessions(|_: &ConnectionInfo| Forever)
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let options = net_io::ConnectOptions::new().timeout(Duration::MAX);
+        let mut c = TcpConnection::connect_with(addr(&server), options).expect("connect");
+        for _ in 0..3 {
+            c.send_all(b"ping").expect("send");
+            let mut back = [0u8; 4];
+            c.recv_exact(&mut back).expect("recv");
+            assert_eq!(&back, b"ping", "{driver:?}");
+        }
+        assert_eq!(server.stats().session_panics, 0, "{driver:?}");
+        assert_eq!(server.stats().closed, 0, "{driver:?}");
+    }
+}

@@ -1538,7 +1538,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 let Some(mut chunks) = chunks else { return };
                 match done.result {
                     Ok(n) => {
-                        if c.link.note_sent(n).is_err() && !closing {
+                        if c.link.note_engine_sent(n).is_err() && !closing {
                             if let Some(cout) = chunks.into_buffer() {
                                 c.link.tls_put_cout(cout);
                             }

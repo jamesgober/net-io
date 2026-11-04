@@ -623,6 +623,9 @@ macro_rules! setter {
     };
 }
 
+/// The most connections one server holds: the source tables are sized from it.
+pub(crate) const MAX_CONNECTIONS: u32 = 1 << 20;
+
 impl LimitsBuilder {
     setter!(/// The global connection cap.
         max_connections, u32);
@@ -713,6 +716,11 @@ impl LimitsBuilder {
     }
 
     fn check(&self) -> Result<(), NetError> {
+        /// A timeout over a year is refused (in seconds): `Instant + Duration` panics
+        /// on overflow, and "no limit" is not a limit a peer should be able to hold.
+        const TOO_LONG: ConfigReason = ConfigReason::TooLarge {
+            max: crate::time::LONGEST.as_secs(),
+        };
         let l = &self.limits;
         // Zero where zero is meaningless.
         let zeros: [(&'static str, bool); 6] = [
@@ -757,6 +765,26 @@ impl LimitsBuilder {
             if value.is_some_and(|d| d < tick) {
                 return Err(invalid(field, ConfigReason::BelowTick));
             }
+            if value.is_some_and(|d| d > crate::time::LONGEST) {
+                return Err(invalid(field, TOO_LONG));
+            }
+        }
+        let long = |d: Duration| d > crate::time::LONGEST;
+        if l.min_rate
+            .is_some_and(|r| long(r.grace) || long(r.window) || long(r.check))
+        {
+            return Err(invalid("min_rate", TOO_LONG));
+        }
+        if l.graceful_linger.is_some_and(|(d, _)| long(d)) {
+            return Err(invalid("graceful_linger", TOO_LONG));
+        }
+        if l.max_connections.is_some_and(|n| n > MAX_CONNECTIONS) {
+            return Err(invalid(
+                "max_connections",
+                ConfigReason::TooLarge {
+                    max: u64::from(MAX_CONNECTIONS),
+                },
+            ));
         }
         if let Some(rate) = l.min_rate {
             if !rate.is_off() {
@@ -872,6 +900,42 @@ mod tests {
             NetError::InvalidConfig {
                 field: "read_timeout",
                 reason: ConfigReason::BelowTick
+            }
+        ));
+    }
+
+    /// "No limit" spelled `Duration::MAX` is refused at build instead of panicking
+    /// on the first deadline (review finding).
+    #[test]
+    fn test_timeouts_over_a_year_and_huge_caps_rejected() {
+        for field in ["idle_timeout", "read_timeout", "drain_timeout"] {
+            let b = Limits::builder();
+            let b = match field {
+                "idle_timeout" => b.idle_timeout(Duration::MAX),
+                "read_timeout" => b.read_timeout(Duration::from_secs(400 * 86_400)),
+                _ => b.drain_timeout(Duration::MAX),
+            };
+            let err = b.build().unwrap_err();
+            assert!(
+                matches!(err, NetError::InvalidConfig { field: f, reason: ConfigReason::TooLarge { .. } } if f == field),
+                "{err:?}"
+            );
+        }
+        assert!(
+            Limits::builder()
+                .idle_timeout(Duration::from_secs(365 * 86_400))
+                .build()
+                .is_ok()
+        );
+        let err = Limits::builder()
+            .max_connections(u32::MAX)
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NetError::InvalidConfig {
+                field: "max_connections",
+                reason: ConfigReason::TooLarge { .. }
             }
         ));
     }
