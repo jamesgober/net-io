@@ -1082,6 +1082,9 @@ impl Link {
             self.gate_check(chunk)?;
             return self.write_tls(&buf[..chunk]);
         }
+        // One offer is at most what `WriteCheck::bytes` can say, so the gate's
+        // count stays exact for a single enormous write.
+        let buf = &buf[..buf.len().min(u32::MAX as usize)];
         self.gate_check(buf.len().saturating_sub(self.approved))?;
         let n = self.send_raw(buf)?;
         self.approved = buf.len() - n;
@@ -1341,7 +1344,11 @@ impl Link {
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.wait_writable()?,
-                    Err(e) if sent == 0 && sys::send_file_refused(&e) => return Ok(0),
+                    Err(e) if sent == 0 && sys::send_file_refused(&e) => {
+                        // The copy that follows asks the gate for these bytes itself.
+                        self.approved = 0;
+                        return Ok(0);
+                    }
                     Err(e) => return Err(self.os_error("sendfile", e)),
                 }
             }

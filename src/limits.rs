@@ -310,6 +310,7 @@ impl Limits {
     pub fn to_builder(&self) -> LimitsBuilder {
         LimitsBuilder {
             limits: self.clone(),
+            bad_lane: false,
         }
     }
 
@@ -345,6 +346,7 @@ impl Limits {
         // Rules that need only the values themselves.
         LimitsBuilder {
             limits: self.clone(),
+            bad_lane: false,
         }
         .check()?;
         let e = self.effective(DriverKind::Blocking);
@@ -611,6 +613,8 @@ fn invalid(field: &'static str, reason: ConfigReason) -> NetError {
 #[derive(Clone, Debug, Default)]
 pub struct LimitsBuilder {
     limits: Limits,
+    /// A `lane_reserve` for a lane that does not exist, refused by `build`.
+    bad_lane: bool,
 }
 
 macro_rules! setter {
@@ -695,7 +699,7 @@ impl LimitsBuilder {
         match self.limits.lane_reserve.get_mut(usize::from(lane.0)) {
             Some(slot) => *slot = Some(slots),
             // Rejected by `build` (field "lane_reserve").
-            None => self.limits.lane_reserve[RESERVED_LANES - 1] = Some(u32::MAX),
+            None => self.bad_lane = true,
         }
         self
     }
@@ -830,7 +834,7 @@ impl LimitsBuilder {
                 return Err(invalid("pressure", ConfigReason::Inconsistent));
             }
         }
-        if l.lane_reserve[RESERVED_LANES - 1] == Some(u32::MAX) {
+        if self.bad_lane {
             return Err(invalid("lane_reserve", ConfigReason::TooLarge { max: 7 }));
         }
         let reserved: u64 = l.lane_reserve.iter().flatten().map(|n| u64::from(*n)).sum();
@@ -986,6 +990,14 @@ mod tests {
         };
         assert!(Limits::builder().pressure(bad).build().is_err());
         assert!(Limits::builder().lane_reserve(Lane(8), 1).build().is_err());
+        // A later valid lane 7 does not hide the invalid one (review finding).
+        assert!(
+            Limits::builder()
+                .lane_reserve(Lane(8), 1)
+                .lane_reserve(Lane(7), 1)
+                .build()
+                .is_err()
+        );
         assert!(
             Limits::builder()
                 .max_connections(10)

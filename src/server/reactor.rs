@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use super::Sessions;
 use super::engine::{
     CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP, CMD_PRESSURE,
-    CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, count_drained,
-    record_close,
+    CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, announce,
+    count_drained, record_close,
 };
 use crate::addr::PrefixKey;
 use crate::buf::{Buffer, BufferPool};
@@ -426,6 +426,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let (stream, mut info, ticket, listener, source) = job.into_parts();
         let shared = self.shared;
         info.worker = WorkerId(self.idx as u16);
+        announce(shared, &info, &listener);
         let index = match self.free.pop() {
             Some(i) => i,
             None => {
