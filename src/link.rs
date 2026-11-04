@@ -686,22 +686,26 @@ impl Link {
     }
 
     /// Ends a handshake. `rest` holds bytes read past it (`buffer[at..]`), served
-    /// before the socket. The connection waits for its first exchange again.
+    /// before the socket. The connection waits for its first exchange again. A
+    /// buffer with nothing past the header comes back for its pool at once, so an
+    /// idle connection holds no read buffer.
     #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
-    pub(crate) fn end_handshake(&mut self, rest: Option<(Buffer, usize)>) {
+    #[must_use]
+    pub(crate) fn end_handshake(&mut self, rest: Option<(Buffer, usize)>) -> Option<Buffer> {
         self.handshake_deadline = None;
+        let mut unused = None;
         if let Some((buffer, at)) = rest {
             if at < buffer.len() {
                 self.pending_at = at;
                 self.pending = Some(buffer);
             } else {
-                self.pending = Some(buffer);
-                self.pending_at = usize::MAX;
+                unused = Some(buffer);
             }
         }
         self.phase = Phase::Idle;
         self.progress_at = self.now();
         self.rate_in.deactivate();
+        unused
     }
 
     /// The handshake buffer, for its pool.

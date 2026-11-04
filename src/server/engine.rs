@@ -2491,7 +2491,7 @@ impl<G: Gate> Worker<G> {
         link.set_deadline_scale(self.shared.deadline_scale());
         link.begin_handshake(link.info.accepted_at + link.scaled(lim.handshake_timeout));
         let r = link.tls_handshake();
-        link.end_handshake(None);
+        let _ = link.end_handshake(None);
         match r {
             Ok(()) => Ok(()),
             Err(_) => Err(link.reason_or(CloseReason::TlsFailed)),
@@ -2561,11 +2561,15 @@ impl<G: Gate> Worker<G> {
         let (facts, real, consumed) = match outcome {
             Ok(v) => v,
             Err(reason) => {
-                link.end_handshake(Some((buf, usize::MAX)));
+                if let Some(b) = link.end_handshake(Some((buf, usize::MAX))) {
+                    self.pool.put(b);
+                }
                 return Err(reason);
             }
         };
-        link.end_handshake(Some((buf, consumed)));
+        if let Some(b) = link.end_handshake(Some((buf, consumed))) {
+            self.pool.put(b);
+        }
         proxy_resolved(
             &self.shared,
             link,

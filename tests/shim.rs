@@ -474,3 +474,30 @@ fn test_file_stream_looks_at_the_os_every_256_kib() {
     assert!(sends >= pieces, "{sends} sends for {pieces} pieces");
     assert!(waits >= pieces, "{waits} waits for {pieces} pieces");
 }
+
+/// The reactor's wait failing: every connection on the worker closes at once with its
+/// close counted and its caps returned, instead of waiting for completions that will
+/// never be read (review finding).
+#[cfg(all(feature = "reactor", not(net_io_force_blocking)))]
+#[test]
+fn test_reactor_wait_failure_closes_every_connection() {
+    let _shim = Shim::take();
+    let server = driver_echo_server(net_io::DriverKind::Reactor);
+    let mut clients: Vec<TcpStream> = (0..4).map(|_| client(addr(&server))).collect();
+    for c in &mut clients {
+        assert_eq!(round_trip(c, b"hi"), b"hi");
+    }
+    assert!(eventually(WAIT, || server.stats().open == 4));
+    // EBADF on Unix, WSAEINVAL-like on Windows: anything but an interrupt.
+    program(Op::Wait, 0, 1_000, Fault::Os(9));
+    for c in &mut clients {
+        let _ = c.write_all(b"x");
+    }
+    assert!(
+        eventually(WAIT, || server.stats().open == 0
+            && server.stats().closed >= 4),
+        "{:?}",
+        server.stats()
+    );
+    clear();
+}

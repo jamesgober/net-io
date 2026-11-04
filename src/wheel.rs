@@ -182,6 +182,10 @@ impl Wheel {
     /// The next expired timer at time `now`, in deadline order, or `None` when
     /// nothing has expired. Call it in a loop with a bound per iteration.
     pub(crate) fn pop_expired(&mut self, now: u64) -> Option<Fired> {
+        // A clock that went back (a user `Clock` that broke its contract) is held at
+        // the wheel's own time: placing an entry due between the two would otherwise
+        // put it straight back on the due list, for ever.
+        let now = now.max(self.elapsed);
         loop {
             if self.due_head != NONE {
                 let index = self.due_head;
@@ -466,6 +470,19 @@ mod tests {
         assert!(drain(&mut w, 50).is_empty());
         w.insert(50, 7);
         assert_eq!(drain(&mut w, 50), vec![7]);
+    }
+
+    /// A clock that goes back cannot hang the wheel: an entry due between the two
+    /// times fires instead of circling the due list (review finding).
+    #[test]
+    fn test_clock_going_back_does_not_spin() {
+        let mut w = Wheel::with_capacity(8);
+        assert!(drain(&mut w, 1_000).is_empty());
+        w.insert(990, 7);
+        assert_eq!(drain(&mut w, 980), vec![7]);
+        w.insert(1_500, 8);
+        assert!(drain(&mut w, 900).is_empty());
+        assert_eq!(drain(&mut w, 1_500), vec![8]);
     }
 
     /// Edge case 54: a deadline in the past fires at the next look.
