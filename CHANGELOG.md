@@ -11,6 +11,86 @@
 
 ## [Unreleased]
 
+Hardening: an adversarial review of the whole crate with every finding of medium
+severity or above fixed, attack tests for every threat, continuous fuzzing, a
+soak, and a database consumer's transport needs.
+
+### Security
+
+- On the reactor, bytes read with a PROXY header on a TLS listener reached the
+  session as plaintext after the handshake. They go to the TLS engine now
+  (also in 0.6.1).
+- A gate denial on a TLS connection was written in the clear between records. It
+  is an encrypted record now, sent once.
+- A panic in a TLS engine or an event sink cost a worker its connections, their
+  cap slots, and every later drain. Both run behind panic boundaries, and each
+  worker has a last boundary that closes and accounts for what a panic left.
+- Released buffers were wiped only up to their current length, so a consumed
+  request or decrypted TLS plaintext could reach the next owner. The wipe covers
+  everything the buffer held since its last wipe.
+- TLS records with no plaintext, or records the engine sends on its own, could
+  keep a connection past its idle deadline or its minimum rate, and a handshake
+  flight drained a byte at a time held a pool worker past the handshake deadline.
+- A listener's own `max_connections` replaced the server's cap; it is refused at
+  build now (use `max_per_listener`).
+- Windows: a pipe listener with no open instance claims its name again instead of
+  joining a pipe another user created under it; clients can check who serves a
+  pipe (`PipeConnection::server_pid`, `server_owner_sid`); hand-off refuses a
+  socket the process already owns, closes every socket of a failed message, and
+  makes received sockets non-inheritable; binding an AF_UNIX path no longer
+  deletes a reparse point that is not a socket file.
+- Unix: a cut `SCM_RIGHTS` message closes every descriptor it carried; FreeBSD
+  sets close-on-exec atomically; systemd and FastCGI descriptors with
+  close-on-exec set are not taken (an in-place re-exec).
+- UDP: verification is per address and port and expires (`verification_lifetime`,
+  60 s), in its own bounded table; a dropped datagram no longer keeps its source
+  in the table.
+- The public `Driver` holds each registered socket until `deregister`, so a
+  dropped socket's number cannot be reused by a connection that then gets another
+  connection's bytes.
+
+### Added
+
+- `Backoff`, `TcpConnection::connect_retry`, `probe` (`Health`), and `drain`
+  (`Drained`): reconnecting with backoff and jitter, a health check that consumes
+  nothing, and a client-side drain.
+- `PipeConnection::server_pid` and `server_owner_sid`.
+- `UdpOptions::verification_lifetime`, `UdpOptions::verified_table`,
+  `UdpSocket::forget_verified`, `UdpContext::forget_verified`.
+- `SharedSocket`, the socket type `Driver::register` takes.
+- Fuzz targets `wheel` and `rate`, a nightly fuzz workflow, and `tests/soak.rs`.
+
+### Changed
+
+- The reactor sends at most 256 KiB of file between two looks at the OS, in
+  256 KiB pieces, so a stream to a fast reader cannot hold off the worker's other
+  connections.
+- `Driver::register` takes a `SharedSocket`; `BorrowedSocket` is no longer public.
+- Timeouts over a year and `max_connections` over 2^20 are refused at build;
+  durations at call sites are held to a year.
+- `Accepted` and `Admitted` come from the worker that takes the connection, so
+  they always precede its `Closed`; one drain emits one `DrainFinished`.
+- UDP verification expires and is per port: protocols call `mark_verified` on each
+  proof. `amplification_window` is at most an hour.
+- A sub-second `Linger::Timeout` rounds up to one second on every OS.
+
+### Fixed
+
+- A session that survived a timeout with part of a message held could panic a
+  reactor worker (also in 0.6.1).
+- The accept batch admitted connections after the door closed; a stop during a
+  drain waited for the drain's deadline.
+- On the reactor: a paused reader whose wait moved on never resumed; a failed OS
+  wait abandoned every connection; a post could lose its wake; a flush behind the
+  TLS engine's records lost its timer; a linger that began with a receive out
+  never read; idle PROXY connections kept their handshake buffer.
+- The minimum rate required nothing at low rates or with a window under twice its
+  check interval (found by the new `rate` fuzz target).
+- Smaller fixes: drains and sheds could hit a worker's next connection; a flood's
+  coalesced tail waited for the next refusal; a persistent accept error spun the
+  accept thread; an invalid lane reservation could be hidden by a later one; a
+  pipe listener whose name was taken paused instead of failing.
+
 ---
 
 ## [0.6.0] - 2026-11-04
