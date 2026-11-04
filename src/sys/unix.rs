@@ -613,7 +613,8 @@ fn encode_addr(addr: SocketAddr, out: &mut [u8; 28]) -> SockLen {
                 #[cfg(target_os = "linux")]
                 sin6_family: c::AF_INET6 as u16,
                 sin6_port: a.port().to_be(),
-                sin6_flowinfo: a.flowinfo().to_be(),
+                // As `std` stores it: the value is copied, not byte-swapped.
+                sin6_flowinfo: a.flowinfo(),
                 sin6_addr: a.ip().octets(),
                 sin6_scope_id: a.scope_id(),
             };
@@ -642,7 +643,8 @@ fn decode_addr(b: &[u8; 128], len: SockLen) -> Option<SocketAddr> {
     } else if family == c::AF_INET6 && len as usize >= 28 {
         let mut octets = [0u8; 16];
         octets.copy_from_slice(&b[8..24]);
-        let flow = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+        // Copied as `std` copies it (see `encode_addr`).
+        let flow = u32::from_ne_bytes([b[4], b[5], b[6], b[7]]);
         let scope = u32::from_ne_bytes([b[24], b[25], b[26], b[27]]);
         Some(SocketAddr::V6(std::net::SocketAddrV6::new(
             std::net::Ipv6Addr::from(octets),
@@ -1317,8 +1319,15 @@ pub(crate) fn listener_kind(sock: Sock<'_>) -> Result<super::SockKind, super::Ki
     let kind = if family == c::AF_UNIX_FAMILY {
         let end = (len as usize).min(addr.0.len());
         let path = addr.0.get(2..end).unwrap_or(&[]);
-        // Up to the terminator; an abstract name (leading NUL) counts as unnamed.
-        let path = path.split(|&b| b == 0).next().unwrap_or(&[]);
+        let path = match path.first() {
+            // A Linux abstract name: the leading NUL and every byte the kernel
+            // reported (its length is exact), so two abstract listeners never look
+            // alike. An unnamed socket reports no path at all.
+            #[cfg(target_os = "linux")]
+            Some(0) => path,
+            // A path: up to its terminator.
+            _ => path.split(|&b| b == 0).next().unwrap_or(&[]),
+        };
         SockKind::Unix(path.to_vec())
     } else {
         match decode_addr(&addr.0, len) {
@@ -1695,11 +1704,16 @@ fn clamp_int(n: u32) -> c_int {
     c_int::try_from(n).unwrap_or(c_int::MAX)
 }
 
-/// Linger: `None` = off, `Some(0)` = abortive (RST on close), `Some(d)` = wait up to `d`.
+/// Linger: `None` = off, `Some(0)` = abortive (RST on close), `Some(d)` = wait up to `d`,
+/// rounded up to whole seconds: the option counts seconds, and a value of 0 would
+/// turn a sub-second wait into a reset.
 pub(crate) fn set_linger(sock: Sock<'_>, linger: Option<Duration>) -> io::Result<()> {
     let value = Linger {
         l_onoff: c_int::from(linger.is_some()),
-        l_linger: linger.map_or(0, |d| c_int::try_from(d.as_secs()).unwrap_or(c_int::MAX)),
+        l_linger: linger.map_or(0, |d| {
+            let up = d.as_secs().saturating_add(u64::from(d.subsec_nanos() > 0));
+            c_int::try_from(up).unwrap_or(c_int::MAX)
+        }),
     };
     #[cfg(target_os = "linux")]
     let name = c::SO_LINGER;
@@ -2987,5 +3001,56 @@ mod layout {
         assert!(nodelay(s.as_fd()).unwrap());
         set_ttl(s.as_fd(), false, 33).unwrap();
         assert_eq!(ttl(s.as_fd(), false).unwrap(), 33);
+    }
+
+    /// A linger under one second waits one second; only zero resets.
+    #[test]
+    fn test_sub_second_linger_rounds_up() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let s = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        set_linger(s.as_fd(), Some(Duration::from_millis(500))).unwrap();
+        assert_eq!(linger(s.as_fd()).unwrap(), Some(Duration::from_secs(1)));
+        set_linger(s.as_fd(), Some(Duration::from_millis(1_500))).unwrap();
+        assert_eq!(linger(s.as_fd()).unwrap(), Some(Duration::from_secs(2)));
+        set_linger(s.as_fd(), Some(Duration::ZERO)).unwrap();
+        assert_eq!(linger(s.as_fd()).unwrap(), Some(Duration::ZERO));
+    }
+
+    /// `sin6_flowinfo` is copied as `std` copies it, with no byte swap.
+    #[test]
+    fn test_flowinfo_matches_std() {
+        let a = std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 443, 0x000a_bcde, 7);
+        let mut buf = [0u8; 28];
+        assert_eq!(encode_addr(SocketAddr::V6(a), &mut buf), 28);
+        // SAFETY (test): `buf` holds a sockaddr_in6 written by encode_addr.
+        let sa: libc::sockaddr_in6 = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast()) };
+        assert_eq!(sa.sin6_flowinfo, a.flowinfo());
+        assert_eq!(sa.sin6_scope_id, a.scope_id());
+        assert_eq!(u16::from_be(sa.sin6_port), 443);
+        let mut back = [0u8; 128];
+        back[..28].copy_from_slice(&buf);
+        assert_eq!(decode_addr(&back, 28), Some(SocketAddr::V6(a)));
+    }
+
+    /// An abstract listener is identified by its name, so a hand-off can tell two
+    /// apart.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_listener_kind_keeps_abstract_names() {
+        use super::super::SockKind;
+        use std::os::linux::net::SocketAddrExt;
+        let name = format!("net-io-kind-{}", std::process::id());
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let a = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        let other = format!("net-io-kind-{}-b", std::process::id());
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(other.as_bytes()).unwrap();
+        let b = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        let mut want = vec![0u8];
+        want.extend_from_slice(name.as_bytes());
+        assert_eq!(listener_kind(a.as_fd()).unwrap(), SockKind::Unix(want));
+        assert_ne!(
+            listener_kind(a.as_fd()).unwrap(),
+            listener_kind(b.as_fd()).unwrap()
+        );
     }
 }
