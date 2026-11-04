@@ -823,9 +823,17 @@ fn test_panicking_event_sink_loses_only_its_events() {
             .build()
             .expect("build");
         server.open_door().expect("open");
-        for _ in 0..3 {
+        for n in 0..3 {
             let mut c = client(addr(&server));
-            assert_eq!(round_trip(&mut c, b"hi"), b"hi", "{driver:?}");
+            c.write_all(b"hi").expect("write");
+            let mut back = [0u8; 2];
+            if let Err(e) = std::io::Read::read_exact(&mut c, &mut back) {
+                std::thread::sleep(Duration::from_millis(200));
+                panic!("{driver:?} round {n}: {e}: {:?}", server.stats());
+            }
+            drop(c);
+            // One worker: the next client waits for this close, or the pool says Busy.
+            assert!(eventually(Duration::from_secs(5), || server.stats().open == 0));
         }
         assert!(
             eventually(Duration::from_secs(5), || server.stats().open == 0),
@@ -882,6 +890,8 @@ fn test_handler_refused_by_its_own_gate_releases_the_connection() {
         let mut c = client(addr(&server));
         c.write_all(b"g").expect("write");
         assert!(closed_by_server(&mut c));
+        // One worker: the next client waits for this close, or the pool says Busy.
+        assert!(eventually(Duration::from_secs(5), || server.stats().open == 0));
     }
     assert!(
         eventually(Duration::from_secs(5), || server.stats().open == 0

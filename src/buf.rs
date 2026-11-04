@@ -23,8 +23,9 @@ pub struct Buffer {
     data: Box<[u8]>,
     len: usize,
     /// The longest `len` since the last wipe: `clear`, `compact`, and a consumed
-    /// input shrink `len` but leave the bytes, so the wipe covers this much.
-    dirty: usize,
+    /// input shrink `len` but leave the bytes, so the wipe covers this much. A `u32`
+    /// (buffers are at most 1 MiB), so it packs beside the class.
+    dirty: u32,
     class: SizeClass,
 }
 
@@ -86,7 +87,7 @@ impl Buffer {
     /// Sets the filled length; saturates at the capacity.
     pub fn set_len(&mut self, n: usize) {
         self.len = n.min(self.data.len());
-        self.dirty = self.dirty.max(self.len);
+        self.dirty = self.dirty.max(u32::try_from(self.len).unwrap_or(u32::MAX));
     }
 
     /// The capacity in bytes.
@@ -109,7 +110,8 @@ impl Buffer {
     /// Overwrites everything filled since the last wipe with zeroes and empties the
     /// buffer.
     pub(crate) fn wipe(&mut self) {
-        let used = &mut self.data[..self.dirty.max(self.len)];
+        let held = (self.dirty as usize).max(self.len).min(self.data.len());
+        let used = &mut self.data[..held];
         used.fill(0);
         // The buffer stays reachable and is read again by the next owner, so the
         // stores cannot be removed as dead; black_box makes that explicit.
