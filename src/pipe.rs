@@ -74,6 +74,14 @@ impl PipeOptions {
     }
 
     /// The most connections at once (at least 1; 255 is the OS's "unlimited").
+    ///
+    /// A pipe exists while one of its instances is open. When every instance is
+    /// connected there is no spare, so once those connections close the name is
+    /// free until the next accept: a client then gets `NotFound`, and another
+    /// process could create the name. With `max_instances(1)` that happens after
+    /// every connection. The next accept never shares a name another process took:
+    /// it fails with `PipeNameInUse`. Clients that must not talk to such a process
+    /// check [`PipeConnection::server_owner_sid`] or [`PipeConnection::server_pid`].
     pub fn max_instances(mut self, n: u8) -> PipeOptions {
         self.max_instances = n;
         self
@@ -197,17 +205,24 @@ impl PipeListener {
     }
 
     /// Blocks until a client connects. The next instance exists before this
-    /// returns, so a client never finds none.
+    /// returns, so a client never finds none, unless every instance is in use (see
+    /// [`PipeOptions::max_instances`]).
     ///
     /// # Errors
     ///
-    /// `Os`.
+    /// `PipeNameInUse` (this listener held no instance, and another process created
+    /// the name in the meantime), `Os`.
     pub fn accept(&self) -> Result<(PipeConnection, ConnectionInfo), NetError> {
         loop {
-            let stream = self
-                .server
-                .accept(None)
-                .map_err(|e| NetError::from_os("ConnectNamedPipe", e))?;
+            let stream = self.server.accept(None).map_err(|e| {
+                if sys::is_name_taken(&e) {
+                    NetError::PipeNameInUse {
+                        name: self.name.to_string_lossy(),
+                    }
+                } else {
+                    NetError::from_os("ConnectNamedPipe", e)
+                }
+            })?;
             if let Some(stream) = stream {
                 let info = self.info_of(&stream, crate::id::issue_single(), Instant::now());
                 let conn = PipeConnection::from_stream(stream, info.clone(), Phase::Idle);
@@ -454,6 +469,70 @@ impl PipeConnection {
         self.inner.pipe_pid(false)
     }
 
+    /// The process that created the server end (`GetNamedPipeServerProcessId`).
+    /// A client checks it before it sends anything that matters when it knows the
+    /// server's process, for example one it started itself: any local user may
+    /// create a pipe name nobody holds, so the name alone does not say who serves
+    /// it. A process id can be reused once that process exits; prefer
+    /// [`server_owner_sid`](PipeConnection::server_owner_sid) to check an account.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use net_io::PipeConnection;
+    /// # let expected = 1234;
+    /// let conn = PipeConnection::connect("myapp-control", Duration::from_secs(5))?;
+    /// if conn.server_pid()? != expected {
+    ///     conn.abort();
+    ///     return Ok(());
+    /// }
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// `Closed`, `Os`.
+    pub fn server_pid(&self) -> Result<u32, NetError> {
+        self.stream()?
+            .server_pid()
+            .map_err(|e| NetError::from_os("GetNamedPipeServerProcessId", e))
+    }
+
+    /// The owner of the pipe, as a string SID in its canonical form (`S-1-5-18`
+    /// for the local system account): the account that created it, or the
+    /// Administrators group (`S-1-5-32-544`) when an elevated administrator did.
+    /// Read from this connection's handle, so it describes the pipe actually
+    /// reached. A client compares it with the account its server runs as before it
+    /// sends anything that matters: a user who created the name while the server
+    /// was down cannot make a pipe owned by another account.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use net_io::PipeConnection;
+    /// let mut conn = PipeConnection::connect("myapp-control", Duration::from_secs(5))?;
+    /// if conn.server_owner_sid()? != "S-1-5-18" {
+    ///     conn.abort();
+    ///     return Ok(());
+    /// }
+    /// conn.send_all(b"status\n")?;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// `Closed`, `Os`.
+    pub fn server_owner_sid(&self) -> Result<String, NetError> {
+        self.stream()?
+            .owner_sid()
+            .map_err(|e| NetError::from_os("GetSecurityInfo", e))
+    }
+
+    fn stream(&self) -> Result<&PipeStream, NetError> {
+        match &self.inner.link_ref().stream {
+            sys::Stream::Pipe(p) => Ok(p),
+            _ => Err(NetError::Closed),
+        }
+    }
+
     /// The process at the far end, whichever end this is.
     pub(crate) fn peer_pid(&self) -> Result<u32, NetError> {
         self.inner.pipe_pid(self.info().origin == Origin::Dialed)
@@ -642,6 +721,77 @@ mod tests {
             })
         ));
         drop((one, server));
+    }
+
+    /// With one instance the name is free between connections. A pipe another
+    /// process made under the name in that gap is never joined: the next accept
+    /// claims the name again and reports it taken.
+    #[test]
+    fn test_accept_never_joins_a_pipe_made_in_the_gap() {
+        let n = name();
+        let listener = PipeListener::create_with(&n, PipeOptions::new().max_instances(1)).unwrap();
+        let client = PipeConnection::connect(&n, Duration::from_secs(1)).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        drop((client, server));
+        // Anyone may add instances to this one.
+        let squatter = PipeListener::create_with(
+            &n,
+            PipeOptions::new().security(PipeSecurity::Sddl("D:(A;;GA;;;WD)".into())),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(listener.accept().map(drop));
+        });
+        // Two clients fill the squatter's instance and, without the fix, ours.
+        let clients: Vec<_> = (0..2)
+            .map(|_| PipeConnection::connect(&n, Duration::from_millis(300)))
+            .collect();
+        let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(got, Err(NetError::PipeNameInUse { .. })),
+            "accept joined the other pipe: {got:?}"
+        );
+        drop((clients, squatter));
+    }
+
+    /// A client sees who created the pipe before it sends anything.
+    #[test]
+    fn test_client_checks_the_server() {
+        let n = name();
+        let listener = PipeListener::create(&n).unwrap();
+        let client = PipeConnection::connect(&n, Duration::from_secs(1)).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert_eq!(client.server_pid().unwrap(), std::process::id());
+        let owner = client.server_owner_sid().unwrap();
+        assert!(owner.starts_with("S-1-"), "{owner}");
+        assert_eq!(server.server_owner_sid().unwrap(), owner);
+    }
+
+    /// The name can be claimed again once the only connection is gone.
+    #[test]
+    fn test_one_instance_accepts_again_after_a_close() {
+        let n = name();
+        let listener = PipeListener::create_with(&n, PipeOptions::new().max_instances(1)).unwrap();
+        let listener = Arc::new(listener);
+        for _ in 0..3 {
+            let accepted = std::thread::spawn({
+                let listener = listener.clone();
+                move || listener.accept().unwrap().0
+            });
+            // Until the accept makes the instance, nobody serves the name.
+            let mut client = loop {
+                match PipeConnection::connect(&n, Duration::from_secs(1)) {
+                    Err(NetError::NotFound) => std::thread::sleep(Duration::from_millis(5)),
+                    other => break other.unwrap(),
+                }
+            };
+            let mut server = accepted.join().unwrap();
+            client.send_all(b"k").unwrap();
+            let mut one = [0u8; 1];
+            server.recv_exact(&mut one).unwrap();
+            drop((client, server));
+        }
     }
 
     /// Edge case 88: a client that came and went before the accept costs nothing.

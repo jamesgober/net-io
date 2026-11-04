@@ -177,9 +177,10 @@ impl KillSlot {
     }
 
     /// A drain closes an idle connection: when the connection of `generation` is
-    /// waiting for its next exchange, shut its read side (under the same guard as a
-    /// kill) and wake its owner, who then closes it with `Drained`. A reply already
-    /// in progress still goes out: writes are untouched. Returns `false` when the
+    /// waiting for its next exchange, shut its read side (Unix; Windows uses the
+    /// wake channel alone) under the same guard as a kill, and wake its owner, who
+    /// then closes it with `Drained`. A reply already in progress still goes out:
+    /// writes are untouched. Returns `false` when the
     /// connection is not idle, already drained, killed, or closing.
     pub(crate) fn drain_idle(&self, generation: u32) -> bool {
         let mut s = self.state.load(Ordering::Acquire);
@@ -201,15 +202,22 @@ impl KillSlot {
             }
         }
         let raw = self.raw.load(Ordering::Relaxed) as RawSock;
-        // SAFETY: the KILLING bit is set; the owner's `begin_close` waits for it to
-        // clear before it closes the socket, so `raw` is open for this call.
-        unsafe { super::shutdown_read_raw(raw) };
-        if let Some(w) = self
+        let wake = self
             .wake
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-        {
+            .clone();
+        // Windows has no read-side shutdown that wakes a wait: its cancel ends every
+        // operation on the handle, a pipe write already reported as sent included
+        // (`CancelIoEx` with no `OVERLAPPED`), and the reply would be cut short. Every
+        // Windows wait also watches the wake channel, so the channel alone reaches
+        // the owner; the cancel is left for an owner without one.
+        if !cfg!(windows) || wake.is_none() {
+            // SAFETY: the KILLING bit is set; the owner's `begin_close` waits for it to
+            // clear before it closes the socket, so `raw` is open for this call.
+            unsafe { super::shutdown_read_raw(raw) };
+        }
+        if let Some(w) = wake {
             w.wake();
         }
         self.state.fetch_and(!KILLING, Ordering::Release);
