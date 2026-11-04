@@ -219,6 +219,14 @@ The plan for each item:
 | Soak | `tests/soak.rs`, driven by `NET_IO_SOAK_SECS`: normal clients, slowloris and slow readers, floods at the cap, kills, and client reconnects through a test pool, sampling memory, descriptors or handles, and open connections; 24 hours on the build host's Windows and Linux. macOS runs on GitHub's hosted runner, whose jobs stop at 6 hours, so it runs 5.5 hours there (recorded with the result) |
 | Review | six independent reviews of the crate (link and sessions, reactor and drivers, engine and admission, Unix `sys`, Windows `sys`, parsers and UDP); every finding fixed test-first or recorded with a reason |
 
+Done:
+- [x] Six independent reviews of the crate: 1 critical, 2 high, 24 medium, 33 low. Every critical, high, and medium finding fixed with a test that failed before it, or shown not to be a defect (D-143 to D-161); the lows fixed or entered in the register (R-34 to R-41).
+- [x] Attack tests for every threat in `docs/SECURITY.md`, now final (T-1 to T-52).
+- [x] Fuzzing: stateful targets `wheel` and `rate` (the second found D-153 at once); every target runs 30 s per push and 10 minutes nightly with the corpus kept.
+- [x] Shim: the reactor's wait failing, a file stream giving way, the descriptor routine's reset.
+- [x] A database consumer's needs: bulk files give way every 256 KiB (D-141); `Backoff`, `connect_retry`, `probe`, `drain` (D-142); tail latency through the executor adapter scheduled with it in 0.8 (D-140).
+- [x] `tests/soak.rs`: normal, pooled, and hostile peers with memory, handle, and connection sampling.
+
 ## v0.8.0 - Alpha
 Exit: two consumers in daily use for two weeks without a net-io defect of severity medium or above.
 

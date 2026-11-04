@@ -103,7 +103,7 @@ io_uring (cases of its own, 71 to 75) after 1.0 (D-015). IOCP, named pipes, and 
 | 78. Stale socket file: removed, bind succeeds | `src/local.rs::test_stale_socket_removed_live_one_refused` |
 | 79. Live listener on the path: `StaleSocketInUse`, file untouched | `src/local.rs::test_stale_socket_removed_live_one_refused`, `unix::unix_listener_on_a_live_path_fails_build` |
 | 80. Regular file, directory, symlink: not removed, error | `src/local.rs::test_stale_socket_removed_live_one_refused` (file), `src/local.rs::test_longest_path_binds_and_non_sockets_stay` (directory, symlink) |
-| 81. `MSG_CTRUNC`: every descriptor closed, `Truncated` | `src/sys/unix.rs::test_truncated_control_message_closes_every_descriptor` (Linux; macOS runs the same receive code, without this test) |
+| 81. `MSG_CTRUNC`: every descriptor closed, `Truncated`; more than 64 in one message is refused the same way; a record macOS or FreeBSD cut short closes every descriptor it holds (D-161) | `src/sys/unix.rs::test_truncated_control_message_closes_every_descriptor` (Linux), `src/sys/unix.rs::test_cut_record_closes_the_descriptors_it_holds` |
 | 82. Truncated or bad-checksum body: all closed | `src/handoff.rs::test_manifest_rejects_damage`, `src/handoff.rs::test_count_mismatch_truncation_timeout_and_peer`; fuzz target `manifest` |
 | 83. More (or fewer) descriptors than declared: `CountMismatch` | `src/handoff.rs::test_count_mismatch_truncation_timeout_and_peer` |
 | 84. Credentials unavailable: `None`, and `require_uid` refuses | `src/local.rs::test_unknown_credentials_fail_require_uid` |
