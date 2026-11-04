@@ -223,12 +223,16 @@ pub struct Input {
     pub(crate) buf: Buffer,
     pub(crate) start: usize,
     pub(crate) changed: bool,
+    /// The buffer travels with a receive on the reactor: `buf` is a stand-in, and
+    /// the unconsumed bytes are in the lent buffer until it comes back.
+    lent: bool,
 }
 
 impl Input {
     pub(crate) fn new(buf: Buffer) -> Input {
         Input {
             buf,
+            lent: false,
             start: 0,
             changed: false,
         }
@@ -256,7 +260,7 @@ impl Input {
     /// The unconsumed bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        &self.buf.as_slice()[self.start..]
+        self.buf.as_slice().get(self.start..).unwrap_or(&[])
     }
 
     /// Consumes `n` bytes (saturating at the length).
@@ -275,7 +279,7 @@ impl Input {
     /// Whether the buffer is full: the session must consume or grow it.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.buf.len() == self.buf.capacity() && self.start == 0
+        !self.lent && self.buf.len() == self.buf.capacity() && self.start == 0
     }
 
     /// The buffer's size class.
@@ -325,6 +329,28 @@ impl Input {
             self.start = 0;
         }
         self.buf.spare()
+    }
+
+    /// Hands the buffer to a receive (compacted first when the free tail is small),
+    /// leaving an empty stand-in until [`Input::give_back`].
+    #[cfg(feature = "reactor")]
+    pub(crate) fn lend(&mut self) -> Buffer {
+        let _ = self.spare_for_read();
+        self.lent = true;
+        std::mem::replace(&mut self.buf, Buffer::placeholder())
+    }
+
+    /// The lent buffer is back, with what the receive added.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn give_back(&mut self, buf: Buffer) {
+        self.buf = buf;
+        self.lent = false;
+    }
+
+    /// Whether a receive holds the buffer.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn lent(&self) -> bool {
+        self.lent
     }
 
     pub(crate) fn filled(&mut self, n: usize) {

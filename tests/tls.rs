@@ -419,6 +419,90 @@ fn test_proxy_then_tls_in_one_segment() {
     assert_eq!(c.recv().as_deref(), Some(&b"Some(203.0.113.9:7)"[..]));
 }
 
+/// Sessions behind a PROXY header on a TLS listener: bytes read with the header go
+/// to the engine, never to the session as plaintext, on both drivers.
+#[test]
+fn test_proxy_then_tls_on_sessions_feeds_read_ahead_to_the_engine() {
+    struct Seen(Arc<Mutex<Vec<u8>>>);
+    impl Session for Seen {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            if let Ok(mut v) = self.0.lock() {
+                v.extend_from_slice(input.bytes());
+            }
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            Step::Write
+        }
+    }
+    for &driver in common::DRIVERS {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let rec = Recorder::default();
+        let s2 = seen.clone();
+        let server = ServerBuilder::new()
+            .listener(
+                ListenerSpec::tcp("127.0.0.1:0")
+                    .proxy(net_io::ProxyMode::Required {
+                        versions: net_io::ProxyVersions::V1,
+                    })
+                    .trusted_proxies(net_io::TrustedProxies::loopback())
+                    .tls(true),
+            )
+            .driver(driver)
+            .workers(2)
+            .tls(Toy)
+            .sessions(move |_: &ConnectionInfo| Seen(s2.clone()))
+            .gate(AllowAll)
+            .events(rec.clone())
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+
+        // The hello in the header's segment: the handshake completes and data flows.
+        let mut s = client(addr(&server));
+        s.write_all(b"PROXY TCP4 203.0.113.9 127.0.0.1 7 443\r\nHELLO")
+            .expect("write");
+        let mut w = [0u8; 7];
+        if let Err(e) = s.read_exact(&mut w) {
+            std::thread::sleep(Duration::from_millis(300));
+            panic!(
+                "{driver:?}: {e}: {:?} {:?}",
+                rec.0.lock().expect("lock"),
+                server.stats()
+            );
+        }
+        assert_eq!(&w, b"WELCOME", "{driver:?}");
+        let mut c = ToyClient(s);
+        c.send(b"ping");
+        assert_eq!(c.recv_exact(4), b"ping", "{driver:?}");
+        drop(c);
+
+        // Bytes injected between the header and the hello reach the engine, which
+        // refuses them; the session sees nothing.
+        seen.lock().expect("lock").clear();
+        let mut s = client(addr(&server));
+        s.write_all(b"PROXY TCP4 203.0.113.9 127.0.0.1 7 443\r\nXYZ")
+            .expect("write");
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = s.write_all(b"HELLO");
+        let mut rest = Vec::new();
+        let _ = s.read_to_end(&mut rest);
+        assert!(
+            !rest.starts_with(b"WELCOME"),
+            "{driver:?}: handshake completed over injected bytes"
+        );
+        assert!(
+            eventually(WAIT, || server.stats().closed >= 2),
+            "{driver:?}: {:?}",
+            server.stats()
+        );
+        assert!(
+            seen.lock().expect("lock").is_empty(),
+            "{driver:?}: the session saw {:?}",
+            seen.lock().expect("lock")
+        );
+    }
+}
+
 #[test]
 fn test_tls_listener_needs_an_engine() {
     let r = ServerBuilder::new()

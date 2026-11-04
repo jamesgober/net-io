@@ -531,8 +531,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 return self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
             };
             let Some(c) = self.conn(index) else { return };
-            c.link.attach_tls(session, cin, cout);
+            let ahead = c.link.attach_tls(session, cin, cout);
             c.link.begin_handshake(accepted + timeout);
+            if let Some(ahead) = ahead {
+                self.pool.put(ahead);
+            }
+            let Some(c) = self.conn(index) else { return };
             c.wait = Wait::Handshake;
             return self.tls_turn(index);
         }
@@ -779,7 +783,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let step = guarded(|| session.on_data(&mut cx, input));
         let grow = cx.grow_to;
         if let Some(class) = grow {
-            if class > input.buf.class() {
+            if class > input.buf.class() && !input.lent() {
                 if let Some(mut bigger) = self.pool.take(class) {
                     let bytes = input.bytes();
                     bigger.spare()[..bytes.len()].copy_from_slice(bytes);
@@ -850,7 +854,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     /// Gives back what an idle connection does not need.
     fn release_idle(&mut self, index: u32) {
         let Some(c) = self.conn(index) else { return };
-        if c.input.as_ref().is_some_and(|i| i.bytes().is_empty()) {
+        if c.input
+            .as_ref()
+            .is_some_and(|i| !i.lent() && i.bytes().is_empty())
+        {
             if let Some(input) = c.input.take() {
                 self.pool.put(input.buf);
             }
@@ -875,6 +882,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 return;
             }
             match step {
+                Step::Read if c.input.as_ref().is_some_and(Input::lent) => {
+                    // The receive that holds the input is still out (the session
+                    // survived a timeout, or wrote and read again): wait for it.
+                    c.wait = Wait::Read;
+                    return self.read(index);
+                }
                 Step::Read => {
                     if let Some(input) = c.input.as_mut() {
                         if input.changed && !input.bytes().is_empty() {
@@ -972,7 +985,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     /// Input for the session: bytes read past a handshake first, then the socket.
     fn read(&mut self, index: u32) {
         let Some(c) = self.conn(index) else { return };
-        if c.link.has_read_ahead() {
+        // Under TLS the read-ahead went to the engine at attach (`Link::attach_tls`).
+        if c.link.has_read_ahead() && !c.link.has_tls() {
             if !self.ensure_input(index) {
                 return;
             }
@@ -1003,8 +1017,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             let Some(input) = c.input.as_mut() else {
                 return;
             };
-            let _ = input.spare_for_read();
-            let buffer = std::mem::replace(&mut input.buf, Buffer::placeholder());
+            let buffer = input.lend();
             c.recv = Recv::Input;
             self.submit_receive(index, token, buffer);
         } else {
@@ -1279,7 +1292,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     self.pool.put(buffer);
                     return;
                 };
-                input.buf = buffer;
+                input.give_back(buffer);
                 if closing {
                     return self.settle(index);
                 }
@@ -1352,7 +1365,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         };
         match kind {
             Recv::Input => match c.input.as_mut() {
-                Some(input) => input.buf = buffer,
+                Some(input) => input.give_back(buffer),
                 None => self.pool.put(buffer),
             },
             Recv::Cipher => c.link.tls_put_cin(buffer),
@@ -1776,7 +1789,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 c.wait == Wait::Read
                     && c.closing.is_none()
                     && c.link.phase() == Phase::Idle
-                    && c.input.as_ref().is_none_or(|n| n.bytes().is_empty())
+                    && c.input
+                        .as_ref()
+                        .is_none_or(|n| !n.lent() && n.bytes().is_empty())
                     && pick(&c.link.info)
             });
             if idle {

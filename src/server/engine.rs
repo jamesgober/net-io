@@ -2418,7 +2418,9 @@ impl<G: Gate> Worker<G> {
             self.pool.put(cin);
             return Err(CloseReason::Limit(crate::error::LimitKind::BufferBudget));
         };
-        link.attach_tls(session, cin, cout);
+        if let Some(ahead) = link.attach_tls(session, cin, cout) {
+            self.pool.put(ahead);
+        }
         link.set_deadline_scale(self.shared.deadline_scale());
         link.begin_handshake(link.info.accepted_at + link.scaled(lim.handshake_timeout));
         let r = link.tls_handshake();
