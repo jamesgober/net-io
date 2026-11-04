@@ -46,6 +46,9 @@ unsafe impl GlobalAlloc for Tracking {
 #[global_allocator]
 static GLOBAL: Tracking = Tracking;
 
+/// The live-byte count is process-wide: one measurement at a time.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Echo;
 
 impl Session for Echo {
@@ -58,6 +61,9 @@ impl Session for Echo {
 
 #[test]
 fn test_idle_connections_hold_no_buffers() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let count: u32 = std::env::var("NET_IO_IDLE_CONNECTIONS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -135,6 +141,9 @@ fn test_trimmed_connections_hold_no_buffers() {
             Step::Read
         }
     }
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let count: u32 = 100;
     let limits = Limits::builder()
         .max_connections(count + 16)
