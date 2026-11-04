@@ -211,6 +211,9 @@ mod c {
     #[cfg(target_os = "freebsd")]
     pub const CLOCK_MONOTONIC: c_int = 4;
     pub const SOCK_STREAM: c_int = 1;
+    /// FreeBSD 10 and later; macOS has no atomic flag.
+    #[cfg(target_os = "freebsd")]
+    pub const SOCK_CLOEXEC: c_int = 0x1000_0000;
     #[cfg(feature = "udp")]
     pub const SOCK_DGRAM: c_int = 2;
     #[cfg(feature = "udp")]
@@ -291,6 +294,9 @@ mod c {
     pub const SCM_RIGHTS: c_int = 1;
     #[cfg(feature = "local")]
     pub const MSG_CTRUNC: c_int = 0x20;
+    /// FreeBSD 10 and later; macOS has no atomic flag.
+    #[cfg(all(feature = "local", target_os = "freebsd"))]
+    pub const MSG_CMSG_CLOEXEC: c_int = 0x0004_0000;
     #[cfg(all(feature = "local", not(target_os = "linux")))]
     pub const SOL_LOCAL: c_int = 0;
     #[cfg(all(feature = "local", target_os = "macos"))]
@@ -640,15 +646,15 @@ fn udp_socket(v6: bool) -> io::Result<OwnedFd> {
     #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::Socket)?;
     let domain = if v6 { c::AF_INET6 } else { c::AF_INET };
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     let ty = c::SOCK_DGRAM | c::SOCK_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     let ty = c::SOCK_DGRAM;
     // SAFETY: socket(2) takes plain integers and returns a new descriptor or -1.
     let fd = cvt(unsafe { socket(domain, ty, 0) })?;
     // SAFETY: `fd` was just returned by socket(2), is open, and is owned by no one else.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         // SAFETY: as in `tcp_socket`.
         cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
@@ -934,28 +940,30 @@ pub(crate) fn udp_recv_from(
     }
 }
 
-/// A new TCP socket for `addr`'s family: close-on-exec, and on macOS with
+/// A new TCP socket for `addr`'s family: close-on-exec (atomically with
+/// `SOCK_CLOEXEC` on Linux and FreeBSD), and on macOS and FreeBSD with
 /// `SO_NOSIGPIPE` so a write to a closed peer never raises `SIGPIPE`.
 pub(crate) fn tcp_socket(v6: bool) -> io::Result<OwnedFd> {
     #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::Socket)?;
     let domain = if v6 { c::AF_INET6 } else { c::AF_INET };
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     let ty = c::SOCK_STREAM | c::SOCK_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     let ty = c::SOCK_STREAM;
     // SAFETY: socket(2) takes plain integers and returns a new descriptor or -1.
     let fd = cvt(unsafe { socket(domain, ty, 0) })?;
     // SAFETY: `fd` was just returned by socket(2), is open, and is owned by no one else.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         // SAFETY: `owned` is an open descriptor; F_SETFD with FD_CLOEXEC is fcntl(2)'s
         // documented way to set close-on-exec. macOS has no atomic flag, so a fork plus
         // exec on another thread between socket(2) and here could inherit it (documented).
         cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
-        set_int(owned.as_fd(), c::SOL_SOCKET, c::SO_NOSIGPIPE, 1)?;
     }
+    #[cfg(not(target_os = "linux"))]
+    set_int(owned.as_fd(), c::SOL_SOCKET, c::SO_NOSIGPIPE, 1)?;
     Ok(owned)
 }
 
@@ -2044,9 +2052,9 @@ pub(crate) fn recv_with_fds(
         msg_controllen: control.0.len() as u32,
         msg_flags: 0,
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     let flags = c::MSG_CMSG_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     let flags = 0;
     let n = retry_interrupted(|| {
         // SAFETY: `iov` (`IoSliceMut`, ABI-compatible with `struct iovec`) covers
@@ -2255,25 +2263,27 @@ fn encode_unix(path: &[u8]) -> io::Result<(SockaddrUn, SockLen)> {
     Ok((sa, len as SockLen))
 }
 
-/// A new Unix stream socket: close-on-exec, and on macOS with `SO_NOSIGPIPE`.
+/// A new Unix stream socket: close-on-exec (as in `tcp_socket`), and on macOS
+/// and FreeBSD with `SO_NOSIGPIPE`.
 #[cfg(feature = "local")]
 pub(crate) fn unix_socket() -> io::Result<OwnedFd> {
     #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::Socket)?;
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     let ty = c::SOCK_STREAM | c::SOCK_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     let ty = c::SOCK_STREAM;
     // SAFETY: socket(2) takes plain integers and returns a new descriptor or -1.
     let fd = cvt(unsafe { socket(c::AF_UNIX, ty, 0) })?;
     // SAFETY: `fd` was just returned by socket(2), is open, and is owned by no one else.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         // SAFETY: as in `tcp_socket`.
         cvt(unsafe { fcntl(owned.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) })?;
-        set_int(owned.as_fd(), c::SOL_SOCKET, c::SO_NOSIGPIPE, 1)?;
     }
+    #[cfg(not(target_os = "linux"))]
+    set_int(owned.as_fd(), c::SOL_SOCKET, c::SO_NOSIGPIPE, 1)?;
     Ok(owned)
 }
 
