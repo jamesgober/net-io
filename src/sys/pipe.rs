@@ -19,7 +19,6 @@ use std::ffi::c_void;
 use std::io::{self, IoSlice};
 use std::mem::ManuallyDrop;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -242,6 +241,9 @@ impl Side {
 struct Sides {
     read: Side,
     write: Side,
+    /// The close drops what is unsent. Only a stream with IO under way has
+    /// anything to drop, so the flag lives here, not in every stream.
+    abortive: bool,
 }
 
 /// The instances of one pipe name this process holds: the spare and every server
@@ -287,7 +289,6 @@ pub(crate) struct PipeStream {
     /// The server's instance count, for a server end.
     instances: Option<Held>,
     sides: Mutex<Option<Box<Sides>>>,
-    abortive: AtomicBool,
 }
 
 impl std::fmt::Debug for PipeStream {
@@ -305,7 +306,6 @@ impl PipeStream {
             handle: ManuallyDrop::new(handle),
             instances: None,
             sides: Mutex::new(None),
-            abortive: AtomicBool::new(false),
         }
     }
 
@@ -315,7 +315,6 @@ impl PipeStream {
             handle: ManuallyDrop::new(handle),
             instances: Some(instances),
             sides: Mutex::new(None),
-            abortive: AtomicBool::new(false),
         }
     }
 
@@ -337,6 +336,7 @@ impl PipeStream {
             *guard = Some(Box::new(Sides {
                 read: Side::new()?,
                 write: Side::new()?,
+                abortive: false,
             }));
         }
         match guard.as_mut() {
@@ -500,7 +500,10 @@ impl PipeStream {
 
     /// Unread bytes are dropped at close, and nothing waits for a flush.
     pub(crate) fn set_abortive(&self) {
-        self.abortive.store(true, Ordering::Relaxed);
+        let mut guard = self.sides.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(sides) = guard.as_mut() {
+            sides.abortive = true;
+        }
     }
 
     /// The process that created the pipe's server end.
@@ -583,7 +586,7 @@ impl PipeStream {
         let raw = self.handle.as_raw_handle();
         // Closing a pipe keeps what is already in it readable, so only a write the
         // kernel has not taken yet needs a moment.
-        if sides.write.pending && !self.abortive.load(Ordering::Relaxed) {
+        if sides.write.pending && !sides.abortive {
             // SAFETY: the event is open; the wait is bounded.
             let _ =
                 unsafe { WaitForSingleObject(sides.write.event.as_raw_handle(), CLOSE_FLUSH_MS) };
