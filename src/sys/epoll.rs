@@ -140,6 +140,7 @@ impl Poller {
 
     /// Registers a socket under `key` for both directions, edge-triggered.
     pub(crate) fn add(&self, sock: Sock<'_>, key: u64) -> io::Result<Registered> {
+        super::shim::check(super::shim::Op::Register)?;
         let raw = sock.as_raw_fd();
         let mut reg = EpollEvent {
             events: EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET,

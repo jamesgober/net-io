@@ -551,6 +551,7 @@ fn cvt(ret: c_int) -> io::Result<c_int> {
 }
 
 fn set_int(sock: Sock<'_>, level: c_int, name: c_int, value: c_int) -> io::Result<()> {
+    super::shim::check(super::shim::Op::SetOption)?;
     // SAFETY: `sock` is a borrowed, open descriptor for the duration of the call
     // (the borrow keeps its owner alive); `value` is a live c_int and the length
     // passed is its size, as setsockopt(2) requires for integer options.
@@ -1026,6 +1027,7 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
     }
     set_incoming_cpu(fd.as_fd(), p.incoming_cpu)?;
     bind_to(fd.as_fd(), addr)?;
+    super::shim::check(super::shim::Op::Listen)?;
     // SAFETY: `fd` is an open, bound stream socket; listen(2) takes an int backlog.
     cvt(unsafe { listen(fd.as_raw_fd(), clamp_int(p.backlog)) })?;
     set_defer_accept(fd.as_fd(), p.defer_accept)?;
@@ -1224,6 +1226,7 @@ pub(crate) fn set_user_timeout(_sock: Sock<'_>, _timeout: Duration) -> io::Resul
 
 /// Binds `sock` to `addr`.
 pub(crate) fn bind_to(sock: Sock<'_>, addr: SocketAddr) -> io::Result<()> {
+    super::shim::check(super::shim::Op::Bind)?;
     let mut buf = [0u8; 28];
     let len = encode_addr(addr, &mut buf);
     // SAFETY: `buf` holds a valid sockaddr of `len` bytes for the socket's family

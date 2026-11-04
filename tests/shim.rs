@@ -248,6 +248,9 @@ mod codes {
     pub const EPERM: Option<i32> = Some(1);
     pub const ENOBUFS: i32 = 105;
     pub const EBADF: i32 = 9;
+    pub const EADDRINUSE: i32 = 98;
+    pub const EINVAL: i32 = 22;
+    pub const ECONNREFUSED: i32 = 111;
 }
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod codes {
@@ -256,6 +259,9 @@ mod codes {
     pub const EPERM: Option<i32> = Some(1);
     pub const ENOBUFS: i32 = 55;
     pub const EBADF: i32 = 9;
+    pub const EADDRINUSE: i32 = 48;
+    pub const EINVAL: i32 = 22;
+    pub const ECONNREFUSED: i32 = 61;
 }
 #[cfg(windows)]
 mod codes {
@@ -264,6 +270,9 @@ mod codes {
     pub const EPERM: Option<i32> = None;
     pub const ENOBUFS: i32 = 10055;
     pub const EBADF: i32 = 10009;
+    pub const EADDRINUSE: i32 = 10048;
+    pub const EINVAL: i32 = 10022;
+    pub const ECONNREFUSED: i32 = 10061;
 }
 
 /// Edge cases 43 and 44: per-connection accept failures are counted and accepting continues.
@@ -502,4 +511,89 @@ fn test_reactor_wait_failure_closes_every_connection() {
         server.stats()
     );
     clear();
+}
+
+/// Each `sys` site with an error injected: a clean error to the caller, and the next
+/// call works (the shim coverage test in `src/sys/shim.rs` requires one per site).
+#[test]
+fn test_bind_listen_and_option_errors_are_clean() {
+    let _shim = Shim::take();
+    program(Op::Bind, 0, 1, Fault::Os(codes::EADDRINUSE));
+    let err = net_io::TcpListener::bind("127.0.0.1:0")
+        .map(|_| ())
+        .unwrap_err();
+    assert!(matches!(err, net_io::NetError::AddrInUse { .. }), "{err:?}");
+    program(Op::Listen, 0, 1, Fault::Os(codes::ENOBUFS));
+    assert!(net_io::TcpListener::bind("127.0.0.1:0").is_err());
+    let with_buffer = net_io::ListenOptions::new().send_buffer(64 << 10);
+    program(Op::SetOption, 0, 1, Fault::Os(codes::EINVAL));
+    assert!(net_io::TcpListener::bind_with("127.0.0.1:0", with_buffer).is_err());
+    // Nothing left behind: the same calls work now.
+    let l = net_io::TcpListener::bind_with("127.0.0.1:0", with_buffer).expect("bind");
+    let c = TcpStream::connect(l.local_addr().expect("addr")).expect("connect");
+    drop((c, l));
+}
+
+#[test]
+fn test_socket_and_connect_errors_then_a_retry_connects() {
+    let _shim = Shim::take();
+    let server = echo_server();
+    program(Op::Socket, 0, 1, Fault::Os(codes::ENOBUFS));
+    assert!(net_io::TcpConnection::connect(addr(&server)).is_err());
+    program(Op::Connect, 0, 2, Fault::Os(codes::ECONNREFUSED));
+    let mut backoff = net_io::Backoff::new()
+        .first(Duration::from_millis(5))
+        .attempts(5);
+    let mut c = net_io::TcpConnection::connect_retry(
+        addr(&server),
+        net_io::ConnectOptions::new(),
+        &mut backoff,
+    )
+    .expect("connects on the third attempt");
+    assert_eq!(backoff.attempt(), 2);
+    c.send_all(b"hi").expect("send");
+    let mut back = [0u8; 2];
+    c.recv_exact(&mut back).expect("recv");
+    assert_eq!(&back, b"hi");
+}
+
+/// A registration the driver refuses closes that connection with one event; the
+/// worker goes on serving.
+#[cfg(all(feature = "reactor", not(net_io_force_blocking)))]
+#[test]
+fn test_register_error_closes_only_that_connection() {
+    let _shim = Shim::take();
+    let server = driver_echo_server(net_io::DriverKind::Reactor);
+    program(Op::Register, 0, 1, Fault::Os(codes::ENOBUFS));
+    let mut first = client(addr(&server));
+    let _ = first.write_all(b"x");
+    let mut b = [0u8; 1];
+    assert!(!matches!(first.read(&mut b), Ok(n) if n > 0));
+    assert!(
+        eventually(WAIT, || server.stats().closed == 1),
+        "{:?}",
+        server.stats()
+    );
+    let mut c = client(addr(&server));
+    assert_eq!(round_trip(&mut c, b"after"), b"after");
+}
+
+/// Linux sets `SO_RCVTIMEO` before a pool receive; that failing closes the
+/// connection with its error. Elsewhere the site does not exist and nothing fails.
+#[test]
+fn test_receive_timeout_error_closes_the_connection() {
+    let _shim = Shim::take();
+    let server = blocking_echo_server();
+    let mut c = client(addr(&server));
+    program(Op::RecvTimeout, 0, 1, Fault::Os(codes::EINVAL));
+    let _ = c.write_all(b"ping");
+    let mut b = [0u8; 4];
+    let got = c.read(&mut b);
+    if cfg!(target_os = "linux") {
+        assert!(!matches!(got, Ok(n) if n > 0), "{got:?}");
+        assert!(eventually(WAIT, || server.stats().closed == 1));
+    }
+    clear();
+    let mut d = client(addr(&server));
+    assert_eq!(round_trip(&mut d, b"ok"), b"ok");
 }
