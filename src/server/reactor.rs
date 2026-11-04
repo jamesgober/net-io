@@ -915,7 +915,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     c.link.settle_phase(empty);
                     let idle = c.link.phase() == Phase::Idle && empty;
                     let lane = c.link.info.lane;
-                    if idle && self.shared.is_draining() {
+                    // A request the socket already reported is answered first.
+                    let readable = c.readable;
+                    if idle && self.shared.is_draining() && !readable {
                         return self.close(index, CloseReason::Drained);
                     }
                     if idle && self.shed(lane) {
@@ -1806,6 +1808,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             let idle = self.conn(i).is_some_and(|c| {
                 c.wait == Wait::Read
                     && c.closing.is_none()
+                    && !c.readable
                     && c.link.phase() == Phase::Idle
                     && c.input
                         .as_ref()

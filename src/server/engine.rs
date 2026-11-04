@@ -2977,7 +2977,8 @@ fn drive<G: Gate, S: Session>(
                 link.set_deadline_scale(w.shared.deadline_scale());
                 link.set_rescales();
                 let idle = link.phase() == Phase::Idle && input.bytes().is_empty();
-                if w.draining() && idle {
+                // A request that already arrived is answered before the drain closes.
+                if w.draining() && idle && !link.input_waiting() {
                     return CloseReason::Drained;
                 }
                 if idle && w.shed(link.info.lane) {

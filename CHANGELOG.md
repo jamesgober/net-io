@@ -46,6 +46,8 @@ review. No API change.
   kill now ends a linger, as a single kill already did.
 - An accept batch checks the door, a drain, a stop, and the control line before each
   accept, so no connection is admitted after the door closed (serve-net's drain race).
+- A drain no longer closes a connection whose next request has already arrived: it
+  is answered first, then closed (the drain race's second window).
 
 ---
 

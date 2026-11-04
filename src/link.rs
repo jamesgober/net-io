@@ -912,10 +912,15 @@ impl Link {
                         if let Err(e) = self.check_terminal() {
                             return Some(Err(e));
                         }
-                        if self.slot.drained() {
+                        // A drain closes a connection between exchanges, not one whose
+                        // next request already arrived: that one is read and answered,
+                        // and the drain closes it after (serve-net's drain race).
+                        if !self.slot.drained() {
+                            return Some(Ok(Got::Woken));
+                        }
+                        if !self.input_waiting() {
                             return Some(Err(self.fail(CloseReason::Drained, NetError::Closed)));
                         }
-                        return Some(Ok(Got::Woken));
                     }
                     Ok(Ready::Socket) => {}
                     Err(e) => return Some(Err(self.os_error("wait", e))),
@@ -1410,6 +1415,16 @@ impl Link {
             Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
             Err(e) => Err(NetError::from_os("shutdown", e)),
         }
+    }
+
+    /// Whether bytes wait in the socket now: one zero-timeout wait. A drain leaves a
+    /// connection whose next request already arrived to answer it first.
+    pub(crate) fn input_waiting(&self) -> bool {
+        self.pending.is_some()
+            || matches!(
+                self.stream.wait(Interest::Read, None, Some(Duration::ZERO)),
+                Ok(Ready::Socket)
+            )
     }
 
     /// The close reason: the first fatal condition, or `fallback`.
