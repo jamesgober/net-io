@@ -4,7 +4,11 @@
 //! process (a second call gets what is left, never a second owner of the same
 //! number), and set close-on-exec. The `LISTEN_*` variables are left in the
 //! environment (decision D-036): the pid check already keeps a child from
-//! using them.
+//! using them. A program that re-executes itself in place (`execve` without
+//! `fork`, so the pid stays) keeps them too; there a descriptor with
+//! close-on-exec set marks the variables as stale, because a descriptor that
+//! crossed `execve` never has the flag. Such a program should still clear
+//! `LISTEN_PID` before `execve`, or place the listeners at 3 again.
 
 use std::fmt;
 use std::io;
@@ -114,14 +118,18 @@ static SYSTEMD: Mutex<Taken> = Mutex::new(Taken {
 /// for another and the list is empty), `LISTEN_PIDFDID` where present (Linux:
 /// must match this process's pidfd), `LISTEN_FDS` (at most 64), and
 /// `LISTEN_FDNAMES`. Every descriptor from 3 is verified (a socket, listening,
-/// TCP or Unix stream) before any is taken. Not started by systemd: an empty
-/// list. A second call returns what earlier calls (including
-/// [`systemd_named`]) left.
+/// TCP or Unix stream, close-on-exec clear) before any is taken. Not started by
+/// systemd, or a descriptor in the range has close-on-exec set (the variables
+/// outlived a re-exec in place): an empty list. A second call returns what
+/// earlier calls (including [`systemd_named`]) left.
 ///
 /// # Errors
 ///
 /// `BadCount`, `TooMany`, `NamesMismatch`, `PidFdMismatch`, `NotASocket`,
-/// `NotListening`, `WrongKind`, `Os`; nothing is taken on an error.
+/// `NotListening`, `WrongKind`, `Os`. Nothing is taken on an error, with one
+/// exception: an OS call that fails while the verified descriptors are being
+/// taken closes those already taken, and later calls return an empty list, so
+/// no number is ever taken twice.
 ///
 /// ```no_run
 /// use net_io::{AllowAll, ListenerSpec, ServerBuilder};
@@ -163,19 +171,37 @@ fn read_once(taken: &mut Taken) -> Result<(), InheritError> {
     #[cfg(unix)]
     {
         let env = |k: &str| std::env::var(k).ok();
-        taken.left = from_systemd(&env, std::process::id(), FIRST_FD)?;
+        // Verification takes nothing, so a failure there may be retried.
+        let plan = plan_systemd(&env, std::process::id(), FIRST_FD)?;
+        // Taking can fail half way and close what it took: never read again.
+        taken.read = true;
+        taken.left = take_systemd(plan)?;
     }
     taken.read = true;
     Ok(())
 }
 
-/// The systemd protocol over `env`, with descriptors from `first` (3 outside tests).
+/// Descriptors verified and ready to take, with their names.
 #[cfg(unix)]
+type Plan = Vec<(i32, Option<String>)>;
+
+/// The systemd protocol over `env`, with descriptors from `first` (3 outside tests).
+#[cfg(all(unix, any(test, fuzzing)))]
 fn from_systemd(
     env: &dyn Fn(&str) -> Option<String>,
     pid: u32,
     first: i32,
 ) -> Result<Vec<InheritedListener>, InheritError> {
+    take_systemd(plan_systemd(env, pid, first)?)
+}
+
+/// Reads the variables and verifies every descriptor; takes nothing.
+#[cfg(unix)]
+fn plan_systemd(
+    env: &dyn Fn(&str) -> Option<String>,
+    pid: u32,
+    first: i32,
+) -> Result<Plan, InheritError> {
     // Not for this process (or not systemd at all): nothing inherited.
     match env("LISTEN_PID").and_then(|p| p.trim().parse::<u32>().ok()) {
         Some(p) if p == pid => {}
@@ -203,19 +229,38 @@ fn from_systemd(
     if names.as_ref().is_some_and(|n| n.len() != count as usize) {
         return Err(InheritError::NamesMismatch);
     }
-    // Verify every descriptor before taking any.
     let fds: Vec<i32> = (0..count as i32).map(|i| first + i).collect();
+    // A descriptor passed across `execve` has close-on-exec clear. One with it set
+    // belongs to this image: after a re-exec in place (same pid, variables kept)
+    // the numbers were reused, so the variables are stale and nothing is ours.
+    if fds.iter().any(|&fd| crate::sys::close_on_exec(fd)) {
+        return Ok(Vec::new());
+    }
+    // Verify every descriptor before taking any.
     for &fd in &fds {
         crate::sys::inherited_kind(fd).map_err(|e| kind_error(e, fd))?;
     }
-    let mut out = Vec::with_capacity(fds.len());
-    for (i, fd) in fds.into_iter().enumerate() {
+    Ok(fds
+        .into_iter()
+        .enumerate()
+        .map(|(i, fd)| {
+            let name = names
+                .as_ref()
+                .and_then(|n| n.get(i))
+                .filter(|n| !n.is_empty())
+                .cloned();
+            (fd, name)
+        })
+        .collect())
+}
+
+/// Takes the verified descriptors. A failure here (an OS call that fails on a
+/// descriptor just verified) closes the ones already taken.
+#[cfg(unix)]
+fn take_systemd(plan: Plan) -> Result<Vec<InheritedListener>, InheritError> {
+    let mut out = Vec::with_capacity(plan.len());
+    for (fd, name) in plan {
         let owned = crate::sys::claim_inherited(fd).map_err(InheritError::Os)?;
-        let name = names
-            .as_ref()
-            .and_then(|n| n.get(i))
-            .filter(|n| !n.is_empty())
-            .cloned();
         let handle =
             ListenerHandle::verified(owned, name.clone()).map_err(|e| kind_error(e, fd))?;
         out.push(InheritedListener { name, handle });
@@ -262,8 +307,9 @@ static FASTCGI: Mutex<bool> = Mutex::new(false);
 
 /// FastCGI's listening socket (`FCGI_LISTENSOCK_FILENO`, as `mod_fcgid` starts a
 /// FastCGI server): descriptor 0 is taken only if it is a socket, listening,
-/// and has no peer; otherwise `None` (a terminal, a file, a pipe, a connected
-/// socket). Taken once per process: later calls return `None`.
+/// has no peer, and has close-on-exec clear (it crossed an `execve`); otherwise
+/// `None` (a terminal, a file, a pipe, a connected socket, a socket this image
+/// opened itself). Taken once per process: later calls return `None`.
 ///
 /// # Errors
 ///
@@ -290,6 +336,10 @@ pub fn fastcgi_listener() -> Result<Option<ListenerHandle>, InheritError> {
 
 #[cfg(unix)]
 fn fastcgi_from(fd: i32) -> Result<Option<ListenerHandle>, InheritError> {
+    // Close-on-exec set: this image's own descriptor, not one a manager passed.
+    if crate::sys::close_on_exec(fd) {
+        return Ok(None);
+    }
     match crate::sys::inherited_kind(fd) {
         Ok(_) => {}
         Err(KindError::Os(e)) => return Err(InheritError::Os(e)),
@@ -431,5 +481,29 @@ mod tests {
         let h = fastcgi_from(932).unwrap().unwrap();
         assert_eq!(h.local().socket_addr(), Some(l.local_addr().unwrap()));
         assert!(fastcgi_from(-1).unwrap().is_none());
+    }
+
+    /// A descriptor with close-on-exec set did not cross an `execve`, so it is
+    /// not inherited: after an in-place re-exec that kept `LISTEN_*`, the
+    /// numbers belong to the new image.
+    #[test]
+    fn test_close_on_exec_descriptors_are_not_inherited() {
+        use std::os::fd::IntoRawFd;
+        let me = std::process::id();
+        let pid = me.to_string();
+        let _ls = place(940, 2);
+        // Descriptor 941 is the new image's own: close-on-exec, as std sets it.
+        let own = crate::sys::claim_inherited(941).unwrap().into_raw_fd();
+        assert_eq!(own, 941);
+        let got =
+            from_systemd(&env(&[("LISTEN_PID", &pid), ("LISTEN_FDS", "2")]), me, 940).unwrap();
+        assert!(got.is_empty(), "stale variables: nothing inherited");
+        // Neither number was taken: both are still open.
+        assert!(crate::sys::inherited_kind(940).is_ok());
+        assert!(crate::sys::inherited_kind(941).is_ok());
+        assert!(fastcgi_from(941).unwrap().is_none());
+        assert!(crate::sys::inherited_kind(941).is_ok());
+        crate::sys::close_number(940);
+        crate::sys::close_number(941);
     }
 }

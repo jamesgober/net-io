@@ -2215,7 +2215,7 @@ The driver interface itself becomes public (Tier 3) at `0.5.0` so an executor ad
 ```rust
 pub trait Driver: Send {
     fn kind(&self) -> DriverKind;
-    fn register(&mut self, socket: BorrowedSocket<'_>, token: Token) -> Result<(), NetError>;
+    fn register(&mut self, socket: SharedSocket, token: Token) -> Result<(), NetError>;   // the driver holds the socket until deregister
     fn submit(&mut self, operation: Operation) -> Result<(), Rejected>;   // Rejected gives the operation and its buffers back
     fn wait(&mut self, out: &mut Completions, timeout: Option<Duration>) -> Result<usize, NetError>;
     fn cancel(&mut self, token: Token, which: OperationKind) -> Result<(), NetError>;  // always followed by exactly one completion
@@ -2240,15 +2240,15 @@ pub struct SendChunks { /* up to 64 chunks: pool buffers, &'static slices; taken
 pub struct Rejected { pub operation: Operation }
 #[derive(Clone)] pub struct DriverWaker { /* eventfd, EVFILT_USER, IOCP port, or parker */ }
 impl DriverWaker { pub fn wake(&self); }
-#[cfg(unix)] pub type BorrowedSocket<'a> = BorrowedFd<'a>;
-#[cfg(windows)] pub type BorrowedSocket<'a> = std::os::windows::io::BorrowedSocket<'a>;
+#[cfg(unix)] pub type SharedSocket = Arc<dyn AsFd + Send + Sync>;
+#[cfg(windows)] pub type SharedSocket = Arc<dyn std::os::windows::io::AsSocket + Send + Sync>;
 ```
 
 ```rust
 #[cfg(feature = "reactor")] pub fn new_reactor_driver(capacity: usize) -> Result<Box<dyn Driver>, NetError>;
 ```
 
-Completion-shaped (decision D-005): operations own their buffers until the completion returns them, which is what IOCP and io_uring need; epoll and kqueue adapt by doing the non-blocking call when readiness arrives. Cancellation always ends in exactly one completion. A token's low 32 bits index a table the driver keeps, so keep them small and dense, and put a generation in the high 32 bits to catch a completion for a slot that moved on. On Windows a listener cannot be registered (D-016) and `Accept` is refused. P2, Tier 3, `0.5.0`.
+Completion-shaped (decision D-005): operations own their buffers until the completion returns them, which is what IOCP and io_uring need; epoll and kqueue adapt by doing the non-blocking call when readiness arrives. Cancellation always ends in exactly one completion. The driver does I/O on a registered socket's descriptor by number, so it holds the socket (a `SharedSocket`, any `Arc` of a socket type) from `register` until `deregister`: a socket the caller dropped early stays open, and its number cannot go to another connection whose bytes a stale operation would then read or write. `deregister` drops the driver's clone, which closes the socket when it was the last one. Keep a clone to accept from a registered listener. The descriptor `as_fd` (`as_socket`) returns at registration is the one used throughout, as every `std` socket type keeps it. Cost: one `Arc` per registered socket, made by the caller (one allocation if the socket was not shared already) and 16 bytes in the driver's table; nothing per operation. Before `0.7.0`, `register` took a `BorrowedSocket<'_>` and only the documentation asked the caller to keep the socket open, which safe code could break. A token's low 32 bits index a table the driver keeps, so keep them small and dense, and put a generation in the high 32 bits to catch a completion for a slot that moved on. On Windows a listener cannot be registered (D-016) and `Accept` is refused. P2, Tier 3, `0.5.0`.
 
 ---
 
@@ -2267,6 +2267,7 @@ impl UdpSocket {
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<Datagram, NetError>;
     pub fn send(&mut self, buf: &[u8]) -> Result<usize, NetError>;
     pub fn mark_verified(&mut self, peer: SocketAddr);
+    pub fn forget_verified(&mut self, peer: SocketAddr);
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), NetError>;
     pub fn local_addr(&self) -> Result<SocketAddr, NetError>;
     pub fn stats(&self) -> UdpStats;
@@ -2289,10 +2290,12 @@ pub struct UdpOptions { /* ... */ }
 impl UdpOptions {
     pub fn new() -> Self;
     pub fn amplification_factor(self, factor: u8) -> Self;     // 1 by default, at most 3
-    pub fn amplification_window(self, window: Duration) -> Self; // 10 s by default, at least 1 s
+    pub fn amplification_window(self, window: Duration) -> Self; // 10 s by default, at least 1 s, at most 1 hour
     pub fn source_budget(self, budget: UdpBudget) -> Self;
     pub fn global_budget(self, budget: UdpBudget) -> Self;
     pub fn source_table(self, entries: u32) -> Self;            // 65,536 by default
+    pub fn verification_lifetime(self, lifetime: Duration) -> Self; // 60 s by default, at least 1 s, at most 1 day
+    pub fn verified_table(self, entries: u32) -> Self;          // 65,536 by default
     pub fn packet_info(self, on: bool) -> Self;                 // P2, 0.6.0
     pub fn ipv6_only(self, on: bool) -> Self;
 }
@@ -2311,10 +2314,11 @@ pub enum MulticastInterface { Any, V4(Ipv4Addr), V6Index(u32) }
 pub trait UdpSession: Send + 'static {
     fn on_datagram(&mut self, cx: &mut UdpContext<'_>, from: SocketAddr, bytes: &[u8]);
 }
-pub struct UdpContext<'a> { /* send_to (guarded), mark_verified, now, worker */ }
+pub struct UdpContext<'a> { /* send_to (guarded), mark_verified, forget_verified, now */ }
 impl UdpContext<'_> {
     pub fn send_to(&mut self, bytes: &[u8], to: SocketAddr) -> Result<usize, NetError>;
     pub fn mark_verified(&mut self, peer: SocketAddr);
+    pub fn forget_verified(&mut self, peer: SocketAddr);
     pub fn now(&self) -> Instant;
 }
 pub trait UdpSessionFactory: Send + Sync + 'static { fn open(&self, listener: &ListenerInfo) -> Box<dyn UdpSession>; }  // any Fn(&ListenerInfo) -> impl UdpSession
@@ -2325,13 +2329,14 @@ UDP source addresses are trivially spoofed, so the socket protects others and it
 
 | Item | Behaviour | Errors | Cost | Grade | Tier | Version |
 |---|---|---|---|---|---|---|
-| `bind`, `bind_with` | close-on-exec; no `SO_REUSEADDR` (and `SO_EXCLUSIVEADDRUSE` on Windows), so no other socket shares the port; `IPV6_V6ONLY` on by default; on Windows `SIO_UDP_CONNRESET` is switched off; peers normalized; options checked (`factor` 1 to 3, window at least 1 s, non-zero budgets and table) | bind errors, `InvalidConfig` | one-time | P1 | 1 / 2 | `0.4.0` |
-| `recv_from`, `recv` | a datagram larger than `buf` is reported with `truncated: true` and its real length where the OS gives it (`MSG_TRUNC` on Linux, `WSAEMSGSIZE` on Windows), never as a silently cut datagram; a zero-length datagram is valid; datagrams from sources over their budget are read, dropped, and counted before returning; ICMP "port unreachable" reports (`ECONNREFUSED`, Windows `WSAECONNRESET`) never end the socket | `TimedOut`, `Os` | 1 system call plus the budget check [est. under 30 ns] | P1 | 1 | `0.4.0` |
-| `send_to`, `send` | **no amplification**: to a peer not marked verified, the bytes sent never exceed `factor x` the bytes received from it within the window (the current and the previous window, so a reply just after the boundary passes); a peer never heard from gets nothing; otherwise `Limit { which: Amplification }` and nothing is sent. Peers are keyed by IP address, not port, since the victim of amplification is an address (decision D-096). An IPv4 destination on a dual-stack socket goes out IPv4-mapped | `Limit`, `Closed` (`send` unconnected), `Os` | 1 system call plus the guard (one hash lookup [est. under 30 ns]) | P1 | 1 | `0.4.0` |
+| `bind`, `bind_with` | close-on-exec; no `SO_REUSEADDR` (and `SO_EXCLUSIVEADDRUSE` on Windows), so no other socket shares the port; `IPV6_V6ONLY` on by default; on Windows `SIO_UDP_CONNRESET` is switched off; peers normalized; options checked (`factor` 1 to 3, window 1 s to 1 hour, verification lifetime 1 s to 1 day, non-zero budgets and tables) | bind errors, `InvalidConfig` | one-time | P1 | 1 / 2 | `0.4.0` |
+| `recv_from`, `recv` | a datagram larger than `buf` is reported with `truncated: true` and its real length where the OS gives it (`MSG_TRUNC` on Linux, `WSAEMSGSIZE` on Windows), never as a silently cut datagram; a zero-length datagram is valid; datagrams from sources over their budget are read, dropped, and counted before returning; ICMP "port unreachable" reports (`ECONNREFUSED`, Windows `WSAECONNRESET`) never end the socket; a read timeout too long for the clock (`Duration::MAX`) waits without a deadline | `TimedOut`, `Os` | 1 system call plus the budget check [est. under 30 ns] | P1 | 1 | `0.4.0` |
+| `send_to`, `send` | **no amplification**: to an address and port not marked verified, the bytes sent never exceed `factor x` the bytes received from its IP within the window (the current and the previous window, so a reply just after the boundary passes); a peer never heard from gets nothing; otherwise `Limit { which: Amplification }` and nothing is sent. The allowance is pooled per IP address, not port, since the victim of amplification is an address (decision D-096); sends to a verified peer are not charged to it. The bytes are charged before the send. An IPv4 destination on a dual-stack socket goes out IPv4-mapped | `Limit`, `Closed` (`send` unconnected), `Os` | 1 system call plus the guard (two hash lookups for an unverified peer, one for a verified one [est. under 60 ns]) | P1 | 1 | `0.4.0` |
 | `stats` | counters: returned, sent, dropped over budget, refused by the guard, truncated, ICMP reports ignored, overflow datagrams, sources tracked | | none | P1 | 2 | `0.4.0` |
 | `connect` | fixes the peer; the kernel filters other sources | `Os` | one-time | P1 | 2 | `0.4.0` |
-| `mark_verified` | the protocol proved the peer can receive (a cookie, a handshake); lifts the guard for it | | O(1) | P1 | 2 | `0.4.0` |
-| source table | bounded (default 65,536 entries, about 130 bytes each [est.], 8.5 MiB full) with CLOCK eviction of unverified entries (one insertion looks at most 64 entries); when nothing can be evicted, unknown sources share one overflow budget the size of a source budget and get no send allowance (strangers lose first, verified peers keep their entries) | | O(1) | P1 | 2 | `0.4.0` |
+| `mark_verified` | the protocol proved the peer can receive at this address and port (a cookie, a handshake, an authenticated datagram); lifts the guard for that address and port, not for other ports of the IP (a new port is a new path, as in RFC 9000 section 9), for the verification lifetime (60 s by default) from the latest call. Call it again each time the protocol proves the peer again; raw datagrams never extend it, since anyone can forge one. The verified table is bounded (default 65,536 entries, about 100 bytes each [est.]); a full one gives the place of a lapsed peer, then of one not recently verified, and the peer that loses its place is limited again until it is verified again | | one hash lookup, O(1) [est. under 30 ns] | P1 | 2 | `0.4.0` (port and lifetime: `0.7.0`) |
+| `forget_verified` | the protocol is done with the peer: its verification ends now | | one hash lookup | P1 | 2 | `0.7.0` |
+| source table | bounded (default 65,536 entries, about 130 bytes each [est.], 8.5 MiB full) with CLOCK eviction (one insertion looks at most 64 entries). Only an admitted datagram marks its entry recently used; one dropped over a budget does not. While the table is full, every datagram from a source already in it moves the hand two entries, so the sources' own traffic ages the table and a spoofer cannot hold every slot by touching each once per revolution. Verified peers live in their own table and never pin a slot here. When nothing can be evicted, unknown sources share one overflow budget the size of a source budget and get no send allowance | | O(1); a full table adds two flag writes per datagram [est. under 5 ns] | P1 | 2 | `0.4.0` |
 | `recv_batch`, `send_batch` | `recvmmsg` / `sendmmsg` on Linux, a loop elsewhere | | 1 system call per batch on Linux | P2 | 3 | `0.6.0` |
 | packet info (`destination`) | `IP_PKTINFO`, `IPV6_RECVPKTINFO` (`IP_RECVDSTADDR` on FreeBSD); not reported by `recv_batch` | `Unsupported` on Windows | ancillary data parse | P2 | 3 | `0.6.0` |
 | `join_multicast` | IPv4 and IPv6 groups | `Os` | | P2 | 2 | `0.6.0` |

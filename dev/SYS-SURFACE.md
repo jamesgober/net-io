@@ -17,7 +17,7 @@ The 0.3 blocking driver declares less than the lists below allow: `std` already 
 
 | Platform | Declared in `src/sys/` (0.3) | Done through `std` instead |
 |---|---|---|
-| Linux, macOS | `socket`, `bind`, `listen`, `connect` (options before bind and a non-blocking connect), `setsockopt`, `getsockopt`, `send` (as `c_send`, for `MSG_DONTWAIT \| MSG_NOSIGNAL`), `sendmsg` (vectored sends with the same flags), `poll`, `shutdown` (the kill and drain wake, D-053, D-073), `getrlimit`, `fcntl` (macOS only, to clear `O_NONBLOCK` after `accept`) | `accept` (`accept4` with `SOCK_CLOEXEC` on Linux), `recv`, `getsockname`, `getpeername`, `close`, `SO_RCVTIMEO` (`set_read_timeout`); the wake channel is a `UnixDatagram` pair instead of `pipe`; the reserve descriptor is `File::open("/dev/null")` |
+| Linux, macOS | `socket`, `bind`, `listen`, `connect` (options before bind and a non-blocking connect), `setsockopt`, `getsockopt`, `send` (as `c_send`, for `MSG_DONTWAIT \| MSG_NOSIGNAL`), `sendmsg` (vectored sends with the same flags), `poll`, `shutdown` (the kill and drain wake, D-053, D-073), `getrlimit`, `fcntl` (every Unix: `F_GETFD` and `F_SETFD` for close-on-exec on inherited descriptors, and on macOS after `socket`) | `accept` (`accept4` with `SOCK_CLOEXEC` on Linux), `recv`, `getsockname`, `getpeername`, `close`, `SO_RCVTIMEO` (`set_read_timeout`); the wake channel is a `UnixDatagram` pair instead of `pipe`; the reserve descriptor is `File::open("/dev/null")` |
 | Windows | `WSAStartup`, `WSASocketW` (overlapped, not inheritable), `bind`, `listen`, `connect`, `setsockopt`, `getsockopt`, `WSAPoll`, `WSAGetLastError`, `SetHandleInformation` (accepted sockets, D-078) | `accept`, `recv`, `send`, `WSASend` (`write_vectored`), `ioctlsocket` (`set_nonblocking`), `closesocket`; the wake channel is a loopback UDP socket connected to itself |
 
 Not in 0.3: `getrandom`, `getentropy`, `BCryptGenRandom` (the per-source table keys std's `RandomState`, D-062), `pipe`/`pipe2`, `open`, `getpid`, `WSAIoctl`, `GetCurrentProcessId`. The layout checks of rule 2 to 4 live next to the declarations (`src/sys/unix.rs` and `src/sys/windows.rs`, `#[cfg(test)]`), not in `tests/layout.rs`, because the declarations are private to the crate.
@@ -48,6 +48,8 @@ Linked from the C library that `std` already links. All declared `extern "C"`.
 | `chmod`, `chown`, `unlink`, `rename` | Unix socket files | `chmod(2)`, `chown(2)`, `unlink(2)`, `rename(2)` | 0.4 |
 | `getpid` | `LISTEN_PID`, fork detection | `getpid(2)` | 0.3 |
 | `sendfile` | file sends (Linux `sendfile(out, in, off, n)`; macOS and FreeBSD have different signatures, declared per OS) | `sendfile(2)` | 0.6 |
+| `geteuid` | the expected peer uid of a hand-off | `geteuid(2)` | 0.4 |
+| `clock_gettime` | `CLOCK_MONOTONIC` for `monotonic_micros` | `clock_gettime(2)` | 0.4 |
 
 ### 1.1 Linux only
 
@@ -102,7 +104,9 @@ Declared per target; values from the target's system headers, cross-checked in C
 | limits | `RLIMIT_NOFILE`, `RLIM_INFINITY` | all |
 | stat | `S_IFMT`, `S_IFSOCK` | all |
 | epoll | `EPOLL_CLOEXEC`, `EPOLL_CTL_ADD`, `EPOLL_CTL_MOD`, `EPOLL_CTL_DEL`, `EPOLLIN`, `EPOLLOUT`, `EPOLLERR`, `EPOLLHUP`, `EPOLLRDHUP`, `EPOLLET`, `EPOLLEXCLUSIVE`; `EFD_CLOEXEC`, `EFD_NONBLOCK` | Linux |
-| kqueue | `EVFILT_READ`, `EVFILT_WRITE`, `EVFILT_USER`, `EV_ADD`, `EV_DELETE`, `EV_ENABLE`, `EV_DISABLE`, `EV_CLEAR`, `EV_EOF`, `EV_ERROR`, `NOTE_TRIGGER` | macOS, FreeBSD |
+| kqueue | `EVFILT_READ`, `EVFILT_WRITE`, `EVFILT_USER`, `EV_ADD`, `EV_DELETE`, `EV_ENABLE`, `EV_DISABLE`, `EV_DISPATCH`, `EV_CLEAR`, `EV_EOF`, `EV_ERROR`, `NOTE_TRIGGER` | macOS, FreeBSD |
+| CPU sets | `CPU_LEVEL_WHICH`, `CPU_WHICH_TID` | FreeBSD |
+| clocks | `CLOCK_MONOTONIC` | all, values per OS |
 | error numbers | `EINTR`, `EAGAIN`, `EWOULDBLOCK`, `EINPROGRESS`, `EALREADY`, `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`, `EPROTO`, `EPERM`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET` (Linux), `EHOSTUNREACH`, `ENETUNREACH`, `EOPNOTSUPP`, `EBADF`, `EINVAL`, `ENOTSOCK`, `ENOTCONN`, `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `ETIMEDOUT`, `EADDRINUSE`, `EADDRNOTAVAIL`, `EACCES`, `ENOENT`, `ENAMETOOLONG`, `ENOSYS` | all, values per OS (read back through `io::Error::raw_os_error`) |
 | random | `GRND_NONBLOCK` is not used (blocking until seeded is correct at start-up) | |
 
@@ -117,6 +121,7 @@ Declared per target; values from the target's system headers, cross-checked in C
 | `iovec`, `msghdr`, `cmsghdr` (plus the `CMSG_*` arithmetic written as `const fn`s) | vectored IO, ancillary data | all |
 | `pollfd` | `poll` | all |
 | `rlimit` | `getrlimit` | all |
+| `timespec` | `clock_gettime`, `kevent` timeouts | all |
 | `stat` | `fstat`, `lstat` (only `st_mode`, `st_ino`, `st_dev` are read; the full layout is declared and checked) | all |
 | `ucred` | `SO_PEERCRED` | Linux |
 | `xucred` | `LOCAL_PEERCRED` | FreeBSD |
@@ -210,7 +215,7 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 ## 5. Rules for this surface
 
 1. Every declaration has a `// SAFETY:`-commented safe wrapper in the same platform module; no raw pointer or raw descriptor crosses `src/sys/`.
-2. Every struct has a `const` assertion of size and alignment for each declared target, and a layout test (field offsets) against `libc` / `windows-sys`.
+2. Every struct has a `const` assertion of size and alignment for each declared target, and a layout test (field offsets) against `libc` / `windows-sys`. The `const` assertions are checked on every build for the target, including a cross-compiled one; the layout tests run only where the tests run.
 3. Every function signature is checked in `tests/layout.rs` by assigning the dev-dependency's function to a pointer of net-io's declared type (a mismatch fails to compile).
 4. Every constant is compared with the dev-dependency's value.
 5. A function needed by a later version is declared in that version, not earlier (no unused unsafe surface), but it must already be on this list.
@@ -226,3 +231,5 @@ Added: `sendfile` (three signatures: Linux, macOS, FreeBSD), `recvmmsg`, `sendmm
 ## 0.7.0 as built
 
 Added on Windows: `GetSecurityInfo` with `SE_KERNEL_OBJECT` 6 and `OWNER_SECURITY_INFORMATION` 1 (it returns its error code rather than setting the thread's last error); `GetFileInformationByHandleEx` with `FileAttributeTagInfo` 9 and the struct `FILE_ATTRIBUTE_TAG_INFO`, on a file opened through `std`'s `OpenOptionsExt` with `FILE_READ_ATTRIBUTES` 0x80, `FILE_FLAG_OPEN_REPARSE_POINT` 0x00200000, and `FILE_FLAG_BACKUP_SEMANTICS` 0x02000000; `IO_REPARSE_TAG_AF_UNIX` 0x80000023; `TokenOwner` 4 (tests); `GetHandleInformation` (tests). `SetHandleInformation` now also clears `HANDLE_FLAG_INHERIT` on a socket made from a `WSAPROTOCOL_INFOW`: `WSA_FLAG_NO_HANDLE_INHERIT` does not reach such a socket. `FILE_FLAG_FIRST_PIPE_INSTANCE` is now passed whenever the listener holds no instance of its name, not only for the first. Each constant and the struct have a layout test against `windows-sys`, except `SE_KERNEL_OBJECT` and `IO_REPARSE_TAG_AF_UNIX`, whose windows-sys features are not enabled: `test_owner_sid_is_the_creators_default_owner` exercises the first, and `test_layout_socket_files_match_windows_sys` reads the second back from a socket file.
+
+On Unix: the list above now names every item `src/sys/` declares: `geteuid`, `clock_gettime`, `timespec`, `EV_DISPATCH`, and FreeBSD's `CPU_LEVEL_WHICH` and `CPU_WHICH_TID` were declared before they were listed. FreeBSD now creates sockets with `SOCK_CLOEXEC` (`0x10000000`) and receives descriptors with `MSG_CMSG_CLOEXEC` (`0x00040000`), as Linux does; only macOS sets close-on-exec in a second step. Every struct has its `const` size and alignment assertion, including `cmsghdr`, `ucred`, `xucred`, `sockaddr_un`, `mmsghdr`, `timespec`, `epoll_event`, and `kevent`. The batch calls pass `IoSlice` and `IoSliceMut` as `struct iovec`, never a tuple.

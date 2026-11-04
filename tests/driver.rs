@@ -4,22 +4,16 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
 
 use net_io::{
-    BorrowedSocket, BufferPool, Completion, Completions, Driver, Operation, OperationKind,
-    OsErrorClass, SendChunks, SizeClass, Token, new_reactor_driver,
+    BufferPool, Completion, Completions, Driver, Operation, OperationKind, OsErrorClass,
+    SendChunks, SharedSocket, SizeClass, Token, new_reactor_driver,
 };
 
-fn borrowed(s: &TcpStream) -> BorrowedSocket<'_> {
-    #[cfg(unix)]
-    {
-        std::os::fd::AsFd::as_fd(s)
-    }
-    #[cfg(windows)]
-    {
-        std::os::windows::io::AsSocket::as_socket(s)
-    }
+fn shared(s: TcpStream) -> SharedSocket {
+    Arc::new(s)
 }
 
 fn pair() -> (TcpStream, TcpStream) {
@@ -49,7 +43,7 @@ fn test_echo_through_the_public_interface() {
     let mut done = Completions::new();
     let (mut client, server) = pair();
     let token = Token((1 << 32) | 3);
-    driver.register(borrowed(&server), token).expect("register");
+    driver.register(shared(server), token).expect("register");
 
     client.write_all(b"ping").expect("write");
     driver
@@ -104,7 +98,7 @@ fn test_cancel_ends_in_one_aborted_completion() {
     let mut done = Completions::new();
     let (_client, server) = pair();
     let token = Token(5);
-    driver.register(borrowed(&server), token).expect("register");
+    driver.register(shared(server), token).expect("register");
     let buffer = pool.take(SizeClass::SMALL).expect("buffer");
     driver
         .submit(Operation::Receive { token, buffer })
@@ -115,6 +109,50 @@ fn test_cancel_ends_in_one_aborted_completion() {
     let c = next(driver.as_mut(), &mut done);
     assert_eq!(c.result, Err(OsErrorClass::Aborted));
     assert!(c.buffer.is_some());
+}
+
+/// The driver keeps a registered socket open whatever the caller drops, so its
+/// descriptor cannot be reused by another connection while the registration
+/// lasts: a send on the old token reaches the old peer, never a new one. Before
+/// the driver held the socket, a dropped socket's number went to the next
+/// accept and the send reached that connection instead.
+#[test]
+fn test_registration_keeps_the_socket_until_deregister() {
+    let mut driver = new_reactor_driver(8).expect("driver");
+    let mut pool = BufferPool::standalone(1 << 20);
+    let mut done = Completions::new();
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let mut first = TcpStream::connect(l.local_addr().expect("addr")).expect("connect");
+    let (server, _) = l.accept().expect("accept");
+    server.set_nonblocking(true).expect("nonblocking");
+    let token = Token(1);
+    driver.register(shared(server), token).expect("register");
+    // The caller kept no clone. Another connection is accepted now.
+    let mut second = TcpStream::connect(l.local_addr().expect("addr")).expect("connect");
+    let (_other, _) = l.accept().expect("accept");
+    let mut buffer = pool.take(SizeClass::SMALL).expect("buffer");
+    buffer.spare()[..4].copy_from_slice(b"mine");
+    buffer.set_len(4);
+    driver
+        .submit(Operation::Send {
+            token,
+            chunks: SendChunks::from_buffer(buffer),
+        })
+        .expect("submit");
+    assert_eq!(next(driver.as_mut(), &mut done).result, Ok(4));
+    let mut got = [0u8; 4];
+    first.read_exact(&mut got).expect("read");
+    assert_eq!(&got, b"mine");
+    second
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("timeout");
+    assert!(second.read(&mut got).is_err(), "nothing reached the second");
+    // Deregistering drops the driver's clone, the last one: the peer sees the end.
+    driver.deregister(token).expect("deregister");
+    first
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    assert_eq!(first.read(&mut got).expect("end of stream"), 0);
 }
 
 #[test]
