@@ -36,7 +36,8 @@ review. No API change.
 - A `Completer::post` now reaches a connection that waits for input, not only a
   parked one, on both drivers, so a WebSocket can be written to from another thread
   (serve-net request 7). A post that arrives while the session is busy is delivered
-  at its next wait.
+  at its next wait. On the blocking driver on Linux, a connection whose session took
+  a completer waits with one `poll` before each receive so the post can wake it.
 - A session step that ends in `Step::Read` while a receive is already out (a
   survived idle timeout, a wake) gives back its idle buffers, as a fresh wait does:
   a trimmed idle connection holds about 1.8 KB, not 4.9 KB (serve-net request 4).

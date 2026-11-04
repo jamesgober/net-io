@@ -856,9 +856,12 @@ impl SessionContext<'_> {
         }
     }
 
-    /// This worker's completion queue.
+    /// This worker's completion queue. A connection whose session takes it is
+    /// woken for posts while it waits for input too; on the blocking driver on
+    /// Linux that wait then costs one `poll` before each receive.
     #[must_use]
     pub fn completer(&self) -> Completer {
+        self.link.wakeable.set(true);
         self.completer.clone()
     }
 

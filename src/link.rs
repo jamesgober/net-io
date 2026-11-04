@@ -106,6 +106,9 @@ pub(crate) struct Link {
     /// The first fatal condition seen; it becomes the close reason.
     pub(crate) terminal: Option<CloseReason>,
     likely_more: bool,
+    /// The session took a completer, so posts may come: on the pool a receive
+    /// waits on the wake channel first, as on Windows and macOS (D-163).
+    pub(crate) wakeable: std::cell::Cell<bool>,
     /// net-io chooses the phase (an accepted connection whose owner never set one).
     auto_phase: bool,
     /// Bytes went out since the last bytes came in.
@@ -242,6 +245,7 @@ impl Link {
             peer_closed: false,
             terminal: None,
             likely_more: false,
+            wakeable: std::cell::Cell::new(false),
             auto_phase: phase == Phase::Idle,
             replied: false,
             idle_timeout,
@@ -900,7 +904,7 @@ impl Link {
     where
         R: FnMut(&sys::Stream, &mut [u8]) -> io::Result<usize>,
     {
-        if sys::WAIT_BEFORE_RECV {
+        if sys::WAIT_BEFORE_RECV || self.wakeable.get() {
             if !self.likely_more {
                 match self.wait(Interest::Read, timeout) {
                     Ok(Ready::TimedOut) => return None,
