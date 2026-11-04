@@ -115,6 +115,29 @@ mod tests {
     }
 
     #[test]
+    fn test_source_keys_spread_over_shards_and_hash_per_table() {
+        // Threat T-22: sources an attacker picks (here 16,000 neighbouring /32s)
+        // cannot pile into one shard, and the same key lands differently in another
+        // table, since each table has its own random SipHash key.
+        let t = SourceTable::new(100_000, 1);
+        let mut per = [0u32; SHARDS];
+        for i in 0..16_000u32 {
+            let ip = std::net::Ipv4Addr::from(0x0a00_0000 + i);
+            let k = PrefixKey::exact(ip.into());
+            let shard = (t.hasher.hash_one(k) as usize) % SHARDS;
+            per[shard] += 1;
+        }
+        // 1,000 each on average; a flood that found a weakness would show here.
+        assert!(per.iter().all(|&n| (700..=1_300).contains(&n)), "{per:?}");
+        let other = SourceTable::new(100_000, 1);
+        let same = (0..8).all(|i| {
+            let k = PrefixKey::exact(std::net::Ipv4Addr::from(0x0a00_0000 + i).into());
+            t.hasher.hash_one(k) == other.hasher.hash_one(k)
+        });
+        assert!(!same, "two tables hash alike");
+    }
+
+    #[test]
     fn test_source_release_unknown_is_noop() {
         let t = SourceTable::new(10, 1);
         t.release(key("1.1.1.1"));
