@@ -781,7 +781,16 @@ pub(crate) fn listener_kind(sock: Sock<'_>) -> Result<super::SockKind, super::Ki
     }
 }
 
-/// Accepts one connection and makes it non-inheritable (std's `accept` does not).
+/// Accepts one connection and makes it non-inheritable. An accepted socket takes
+/// its inheritance from how the listener was created, not from the listener
+/// handle's flag: from a listener created with `WSA_FLAG_NO_HANDLE_INHERIT` (std's,
+/// net-io's, and one made from a hand-off description of either) it is never
+/// inheritable, so the call below changes nothing. From a listener someone else
+/// created inheritable (through `TcpListener::from_std`), it is inheritable until
+/// the call below, a window of microseconds in which a process started elsewhere
+/// with handle inheritance can get it. Closing that window needs `AcceptEx` into a
+/// socket made non-inheritable first, on its own overlapped path (D-016 keeps
+/// listeners off the completion ports).
 pub(crate) fn accept(listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
     #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::Accept)?;
@@ -924,7 +933,9 @@ pub(crate) fn unix_connect(sock: Sock<'_>, path: &[u8]) -> io::Result<()> {
 }
 
 /// One accept on a non-blocking AF_UNIX listener. std's `accept` cannot decode the
-/// peer's address, so this asks for none. Sockets start inheritable here.
+/// peer's address, so this asks for none. The listener comes from `unix_socket`,
+/// so the accepted socket is never inheritable (see [`accept`]); the flag is
+/// cleared anyway, for a listener adopted from elsewhere.
 #[cfg(feature = "local")]
 pub(crate) fn unix_accept(listener: Sock<'_>) -> io::Result<OwnedSocket> {
     #[cfg(any(test, net_io_shim))]
@@ -1580,6 +1591,42 @@ mod layout {
         std::fs::write(&path, b"x").unwrap();
         assert!(!is_unix_socket_file(&path).unwrap());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Accepted sockets are never inheritable when the listener was created
+    /// without inheritance, even before `accept` clears the flag.
+    #[test]
+    fn test_accepted_sockets_start_non_inheritable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        assert!(!is_inheritable(stream.as_socket()).unwrap());
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn test_accepted_unix_sockets_start_non_inheritable() {
+        let path = std::env::temp_dir().join(format!("nio-inh-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let bytes = path.to_str().unwrap().as_bytes();
+        let listener = unix_socket().unwrap();
+        unix_bind(listener.as_socket(), bytes, 1).unwrap();
+        let client = unix_socket().unwrap();
+        unix_connect(client.as_socket(), bytes).unwrap();
+        // SAFETY: the listener is open; no address is asked for.
+        let s = unsafe {
+            accept_raw(
+                raw(listener.as_socket()),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(s, c::INVALID_SOCKET);
+        // SAFETY: `s` was just accepted and is owned by no one else.
+        let accepted = unsafe { OwnedSocket::from_raw_socket(s as RawSocket) };
+        assert!(!is_inheritable(accepted.as_socket()).unwrap());
+        drop((accepted, client, listener));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(feature = "udp")]
