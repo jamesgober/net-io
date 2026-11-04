@@ -75,7 +75,11 @@ fn clear_stale(path: &Path, bytes: &[u8], options: &LocalOptions) -> Result<(), 
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(os_error("stat", e)),
     };
-    let socket_file = meta.file_attributes() & REPARSE_POINT != 0 && !meta.file_type().is_symlink();
+    // Every kind of reparse point has the attribute; only the AF_UNIX tag is a
+    // socket file. A file that cannot be read stays.
+    let socket_file = meta.file_attributes() & REPARSE_POINT != 0
+        && !meta.file_type().is_symlink()
+        && sys::is_unix_socket_file(path).unwrap_or(false);
     if !socket_file || !options.remove_stale {
         return Err(in_use(path));
     }

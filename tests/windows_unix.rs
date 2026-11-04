@@ -72,6 +72,56 @@ fn test_live_socket_and_other_files_stay() {
     std::fs::remove_file(&file).expect("remove");
 }
 
+/// Makes `path` a reparse point with a third-party tag, as a cloud or backup
+/// product would (no privilege needed for a file this user owns).
+fn make_foreign_reparse_point(path: &std::path::Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem as fs;
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(fs::FILE_FLAG_OPEN_REPARSE_POINT | fs::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .expect("open");
+    // REPARSE_GUID_DATA_BUFFER: tag, data length, reserved, GUID, then the data.
+    let mut buf = [0u8; 24 + 4];
+    buf[..4].copy_from_slice(&0x0000_1234u32.to_le_bytes());
+    buf[4..6].copy_from_slice(&4u16.to_le_bytes());
+    buf[8..24].copy_from_slice(&[7u8; 16]);
+    let mut returned = 0u32;
+    // SAFETY: the handle is open; `buf` is a complete buffer of the length given.
+    let ok = unsafe {
+        windows_sys::Win32::System::IO::DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_REPARSE_POINT,
+            buf.as_ptr().cast(),
+            buf.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+}
+
+/// A reparse point that is not an AF_UNIX socket (a cloud placeholder, an app
+/// alias, anything with another tag) is never taken for a stale socket file.
+#[test]
+fn test_other_reparse_points_stay() {
+    let p = path();
+    std::fs::write(&p, b"").expect("write");
+    make_foreign_reparse_point(&p);
+    let got = UnixListener::bind(&p).map(drop);
+    let _ = std::fs::remove_file(&p);
+    assert!(
+        matches!(got, Err(NetError::StaleSocketInUse { .. })),
+        "bind deleted a reparse point that is not a socket file: {got:?}"
+    );
+}
+
 /// A process that died left its socket file: the next bind replaces it.
 #[test]
 fn test_stale_socket_file_is_replaced() {

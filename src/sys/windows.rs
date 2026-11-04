@@ -944,6 +944,64 @@ pub(crate) fn unix_accept(listener: Sock<'_>) -> io::Result<OwnedSocket> {
     Ok(owned)
 }
 
+#[cfg(feature = "local")]
+const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
+#[cfg(feature = "local")]
+const FILE_ATTRIBUTE_TAG_INFO: i32 = 9;
+#[cfg(feature = "local")]
+const FILE_READ_ATTRIBUTES: u32 = 0x80;
+#[cfg(feature = "local")]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(feature = "local")]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+/// `FILE_ATTRIBUTE_TAG_INFO`.
+#[cfg(feature = "local")]
+#[repr(C)]
+#[derive(Default)]
+struct FileAttributeTagInfo {
+    attributes: u32,
+    tag: u32,
+}
+
+#[cfg(feature = "local")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetFileInformationByHandleEx(
+        file: *mut c_void,
+        class: i32,
+        info: *mut c_void,
+        len: u32,
+    ) -> i32;
+}
+
+/// Whether `path` is an AF_UNIX socket file: a reparse point with the tag
+/// `IO_REPARSE_TAG_AF_UNIX`, and not any other kind (a cloud placeholder, an app
+/// alias, a deduplicated file). The file itself is opened, not what it points to.
+#[cfg(feature = "local")]
+pub(crate) fn is_unix_socket_file(path: &std::path::Path) -> io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(7)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut info = FileAttributeTagInfo::default();
+    // SAFETY: the handle is open; `info` is writable for the length given.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_ATTRIBUTE_TAG_INFO,
+            (&raw mut info).cast(),
+            size_of::<FileAttributeTagInfo>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.tag == IO_REPARSE_TAG_AF_UNIX)
+}
+
 /// The process at the other end of an AF_UNIX connection.
 #[cfg(feature = "local")]
 pub(crate) fn unix_peer_pid(sock: Sock<'_>) -> io::Result<u32> {
@@ -1489,6 +1547,39 @@ mod layout {
             std::mem::offset_of!(SockaddrIn6, sin6_scope_id),
             std::mem::offset_of!(ws::SOCKADDR_IN6, Anonymous)
         );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn test_layout_socket_files_match_windows_sys() {
+        use windows_sys::Win32::Storage::FileSystem as fs;
+        assert_eq!(FILE_ATTRIBUTE_TAG_INFO, fs::FileAttributeTagInfo);
+        assert_eq!(FILE_READ_ATTRIBUTES, fs::FILE_READ_ATTRIBUTES);
+        assert_eq!(
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            fs::FILE_FLAG_OPEN_REPARSE_POINT
+        );
+        assert_eq!(FILE_FLAG_BACKUP_SEMANTICS, fs::FILE_FLAG_BACKUP_SEMANTICS);
+        assert_eq!(
+            size_of::<FileAttributeTagInfo>(),
+            size_of::<fs::FILE_ATTRIBUTE_TAG_INFO>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(FileAttributeTagInfo, tag),
+            std::mem::offset_of!(fs::FILE_ATTRIBUTE_TAG_INFO, ReparseTag)
+        );
+        // `IO_REPARSE_TAG_AF_UNIX` is not in the enabled windows-sys features: a
+        // socket file made here carries it.
+        let path = std::env::temp_dir().join(format!("nio-tag-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let sock = unix_socket().unwrap();
+        unix_bind(sock.as_socket(), path.to_str().unwrap().as_bytes(), 1).unwrap();
+        assert!(is_unix_socket_file(&path).unwrap());
+        drop(sock);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        assert!(!is_unix_socket_file(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[cfg(feature = "udp")]
