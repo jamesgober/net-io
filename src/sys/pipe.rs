@@ -1046,6 +1046,45 @@ mod tests {
         assert_eq!(accepted.owner_sid().unwrap(), expected);
     }
 
+    /// A drain closes an idle connection, but a reply its owner already handed over
+    /// (a write still under way) goes out whole.
+    #[test]
+    fn test_drain_leaves_a_pending_write_alone() {
+        let name = format!("net-io-sys-drain-{}", std::process::id());
+        let params = PipeParams {
+            max_instances: 1,
+            inbound: 1024,
+            outbound: 1024,
+        };
+        let sddl = owner_sddl(false).unwrap();
+        let server =
+            PipeServer::create(&name, params, Descriptor::from_sddl(&sddl).unwrap()).unwrap();
+        let client = pipe_connect(&name, Duration::from_secs(1)).unwrap();
+        let stream = server.accept(None).unwrap().unwrap();
+        // More than the pipe holds: the write stays in the kernel until read.
+        assert_eq!(stream.write(&[5u8; BUFFER]).unwrap(), BUFFER);
+        let slot = crate::sys::KillSlot::new();
+        let generation = slot.install(stream.as_sock());
+        slot.set_wake(Some(Arc::new(Wake::new().unwrap())));
+        slot.set_idle(true);
+        assert!(slot.drain_idle(generation));
+        let (mut got, mut buf) = (0, [0u8; 4096]);
+        let until = Instant::now() + Duration::from_secs(2);
+        while got < BUFFER && Instant::now() < until {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    client
+                        .wait(Interest::Read, None, Some(Duration::from_millis(100)))
+                        .unwrap();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(got, BUFFER, "the drain cut the reply short");
+    }
+
     #[test]
     fn test_owner_sddl_parses() {
         let text = owner_sddl(true).unwrap();
