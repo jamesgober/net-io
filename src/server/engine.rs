@@ -3101,6 +3101,13 @@ fn flush<G: Gate, S: Session>(
     link: &mut Link,
     s: &mut S,
 ) -> Result<(), CloseReason> {
+    // Read and cleared on every flush: only a step that queued nothing because the
+    // budget refused it closes here.
+    if w.output.take_refused() && w.output.is_empty() {
+        // Nothing to send because the buffer budget is spent: calling the session
+        // back now would spin the worker.
+        return Err(CloseReason::Limit(crate::error::LimitKind::BufferBudget));
+    }
     while !w.output.is_empty() {
         link.response_started = if w.output.response_open {
             w.output.bytes_since_begin > 0

@@ -20,6 +20,16 @@ review. No API change.
 
 ### Security
 
+- A session that wrote more than one 16 KiB output buffer per flush (a large
+  reply, a stream, a WebSocket echo) charged the shared buffer budget anew on every
+  flush: the output's spare buffers went to the worker's pool and were never taken
+  back. With the default budget (512 MiB on the reactor) it ran out within seconds,
+  after which other connections could get no buffer and stalled, and a session whose
+  push then took nothing was called back at once for ever, spinning the worker. Any
+  client that asks for a large reply could cause it. An output now reuses the pool's
+  buffers before charging the budget, and a flush with nothing queued because the
+  budget refused it closes that connection with `Limit(BufferBudget)`. Affects 0.6.0
+  on both drivers (found by ws-net's soak).
 - On the reactor, bytes that arrived with a PROXY header on a TLS listener reached
   the session as if they had been decrypted, once the handshake finished: a client
   (or anyone between it and a proxy in TCP mode) could put bytes in front of the

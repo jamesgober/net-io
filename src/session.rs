@@ -438,6 +438,8 @@ pub struct Output {
     limit: u32,
     used: u32,
     wipe: bool,
+    /// A push found no free buffer and the budget spent since the last flush.
+    refused: bool,
     pub(crate) response_open: bool,
     pub(crate) response_tag: Option<GateTag>,
     pub(crate) bytes_since_begin: u64,
@@ -457,6 +459,7 @@ impl Output {
             limit,
             used: 0,
             wipe,
+            refused: false,
             response_open: false,
             response_tag: None,
             bytes_since_begin: 0,
@@ -477,6 +480,7 @@ impl Output {
         let mut left = self.budget.load(Ordering::Relaxed);
         loop {
             if left < bytes {
+                self.refused = true;
                 return None;
             }
             match self.budget.compare_exchange_weak(
@@ -489,6 +493,25 @@ impl Output {
                 Err(actual) => left = actual,
             }
         }
+    }
+
+    /// Takes buffers the worker's pool already holds, so the next pushes reuse them
+    /// instead of charging the budget again. Before this, spares an output gave the
+    /// pool after a send were never taken back, and every flush of more than one
+    /// buffer charged the budget anew until it ran out (found by ws-net).
+    pub(crate) fn refill(&mut self, pool: &mut BufferPool) {
+        while self.free.len() < FREE_MAX {
+            match pool.take_cached(OUTPUT_CLASS) {
+                Some(b) => self.free.push(b),
+                None => return,
+            }
+        }
+    }
+
+    /// Whether a push was refused for want of budget since the last call: a flush
+    /// that then finds nothing queued must not call the session back at once.
+    pub(crate) fn take_refused(&mut self) -> bool {
+        std::mem::take(&mut self.refused)
     }
 
     fn room(&self) -> usize {
@@ -767,6 +790,7 @@ impl Output {
         self.response_open = false;
         self.response_tag = None;
         self.bytes_since_begin = 0;
+        self.refused = false;
     }
 }
 
@@ -791,6 +815,11 @@ impl SessionContext<'_> {
 
     /// The output queue.
     pub fn output(&mut self) -> &mut Output {
+        // Spares the output gave the pool after its last send come back first, up to
+        // what one output may hold: a few pops, no allocation.
+        if self.output.free.len() < FREE_MAX {
+            self.output.refill(self.pool);
+        }
         self.output
     }
 

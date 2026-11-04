@@ -1109,7 +1109,16 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             c.wait = after;
             return Flushed::Waiting;
         }
+        // Read and cleared on every flush: only a step that queued nothing because the
+        // budget refused it closes here.
+        let refused = output.take_refused();
         if output.is_empty() {
+            if refused {
+                // Nothing to send because the buffer budget is spent: calling the
+                // session back now would spin the worker. It closes instead.
+                self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
+                return Flushed::Waiting;
+            }
             c.link.output_done();
             return Flushed::Done;
         }
