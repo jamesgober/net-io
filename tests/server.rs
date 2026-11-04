@@ -1012,7 +1012,9 @@ fn test_multi_buffer_flushes_reuse_their_buffers() {
 /// With the buffer budget spent (here by clients that never read), a session whose
 /// push takes nothing is closed with `Limit(BufferBudget)` instead of being called
 /// back at once for ever, which spun 0.6.0's worker and stalled every connection.
-#[cfg(feature = "reactor")]
+/// Linux only: elsewhere loopback takes each output into the kernel at once, so the
+/// clients pin no buffers and the budget is never spent.
+#[cfg(all(feature = "reactor", target_os = "linux"))]
 #[test]
 fn test_spent_budget_closes_instead_of_spinning() {
     use std::io::Read;
