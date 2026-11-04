@@ -296,7 +296,9 @@ fn test_accept_resource_errors_pause_then_resume() {
         let rec = Recorder::default();
         let server = recorded_server(&rec);
         program(Op::Accept, 0, 1, Fault::Os(code));
-        let _first = client(addr(&server));
+        // The out-of-descriptors routine resets this one, and on a loaded host the
+        // reset can arrive before `connect` returns.
+        let _first = TcpStream::connect(addr(&server));
         assert!(
             eventually(WAIT, || server.stats().descriptor_pressure == 1),
             "errno {code}"
