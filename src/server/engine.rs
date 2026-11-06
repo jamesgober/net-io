@@ -316,6 +316,10 @@ pub(crate) struct Shared {
     /// The reactor runs this server (the blocking pool otherwise).
     #[cfg(feature = "reactor")]
     pub(crate) reactor: bool,
+    /// Where the next hand-over starts looking for the least-loaded worker, so
+    /// ties go round the workers (reactor only).
+    #[cfg(feature = "reactor")]
+    next_worker: AtomicUsize,
     /// Open connections by id, reactor only: kills and completions find them here.
     #[cfg(feature = "reactor")]
     conns: Box<[Mutex<HashMap<u64, RegisteredConn>>]>,
@@ -1463,20 +1467,16 @@ impl<W, G: Gate> Engine<W, G> {
             .is_empty()
     }
 
-    /// The least-loaded worker takes the connection. A full inbox refuses.
+    /// The least-loaded worker takes the connection, ties going round the workers.
+    /// A full inbox refuses.
     // A refused job goes straight back to its caller, on the path a flood takes;
     // a `Box` here would allocate there.
     #[allow(clippy::result_large_err)]
     fn hand_to_worker(&self, job: Job<G::Ticket>) -> Result<(), Job<G::Ticket>> {
         let shared = &self.shared;
-        let idx = FEEDS.with(std::cell::Cell::get).unwrap_or_else(|| {
-            shared
-                .workers
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, w)| w.load.load(Ordering::Relaxed))
-                .map_or(0, |(i, _)| i)
-        });
+        let idx = FEEDS
+            .with(std::cell::Cell::get)
+            .unwrap_or_else(|| least_loaded(&shared.workers, &shared.next_worker));
         {
             let mut inbox = self.inboxes[idx]
                 .0
@@ -1492,6 +1492,33 @@ impl<W, G: Gate> Engine<W, G> {
         shared.wake_worker(idx);
         Ok(())
     }
+}
+
+/// The worker with the fewest open connections, looking from a start that moves on
+/// by one each call: with short connections every load is usually 0, and taking the
+/// first minimum gave every connection to worker 0 (found by tls-net, D-174). Stops
+/// at the first idle worker.
+#[cfg(feature = "reactor")]
+fn least_loaded(workers: &[WorkerShared], next: &AtomicUsize) -> usize {
+    let n = workers.len();
+    if n <= 1 {
+        return 0;
+    }
+    let start = next.fetch_add(1, Ordering::Relaxed) % n;
+    let mut best = start;
+    let mut least = u32::MAX;
+    for k in 0..n {
+        let i = (start + k) % n;
+        let load = workers[i].load.load(Ordering::Relaxed);
+        if load < least {
+            least = load;
+            best = i;
+            if load == 0 {
+                break;
+            }
+        }
+    }
+    best
 }
 
 pub(crate) fn start<W, G, S>(cfg: Config<W, G, S>) -> Result<Server, NetError>
@@ -1588,6 +1615,8 @@ where
             .collect(),
         #[cfg(feature = "reactor")]
         reactor,
+        #[cfg(feature = "reactor")]
+        next_worker: AtomicUsize::new(0),
         #[cfg(feature = "reactor")]
         conns: (0..CONN_SHARDS)
             .map(|_| Mutex::new(HashMap::new()))

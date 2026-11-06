@@ -15,9 +15,15 @@
 
 ## [0.6.2] - 2026-11-06
 
-A fix for a deadlock on Windows. No API change.
+A fix for a deadlock on Windows, and for the reactor running every short
+connection on one worker. No API change.
 
 ### Fixed
+
+- The reactor gave every short connection to its first worker: with all loads at
+  0, the least-loaded choice always took worker 0, so one core served a whole
+  handshake or request-per-connection load (found by tls-net, at about half of
+  the throughput the other workers could add). Ties now go round the workers.
 
 - Windows: a process whose threads ended after using a `TcpConnection` could
   freeze entirely, every thread start and exit waiting. A thread's wake socket
