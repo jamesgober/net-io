@@ -250,9 +250,11 @@ fn test_per_worker_listeners() {
 #[test]
 fn test_accept_storm_leaves_established_connections_served() {
     const STORM: Duration = Duration::from_secs(1);
-    // Each closed client port waits out TIME_WAIT (two minutes on Windows), and the
-    // ephemeral range there is 16,384: a storm that used them all would make the
-    // next connect in this run fail.
+    // A port a client closes first waits out TIME_WAIT (two minutes on Windows),
+    // and the ephemeral range there is 16,384: the storm's clients reset instead,
+    // which leaves none, and stay under 3,000 a driver. (With the backlog Windows
+    // now honours, every connect completes; three test passes in two minutes
+    // used every port, D-175.)
     const PER_DRIVER: i64 = 3_000;
     for &driver in DRIVERS {
         let limits = Limits::builder()
@@ -280,7 +282,8 @@ fn test_accept_storm_leaves_established_connections_served() {
                 std::thread::spawn(move || {
                     let mut opened = 0u64;
                     while Instant::now() < until && left.fetch_sub(1, Ordering::Relaxed) > 0 {
-                        if TcpStream::connect(target).is_ok() {
+                        if let Ok(c) = net_io::TcpConnection::connect(target) {
+                            c.abort();
                             opened += 1;
                         }
                     }
