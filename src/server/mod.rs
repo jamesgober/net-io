@@ -1185,6 +1185,35 @@ impl ServerHandle {
         self.shared.kill(id, reason)
     }
 
+    /// Closes the connection `id` after what it already queued goes out: its session
+    /// is given no more input, the output it queued is sent, then FIN and a linger
+    /// that reads and discards until the peer closes, all within `within` from when
+    /// its worker sees the request (on the reactor only what was queued then goes
+    /// out; on the blocking pool a write already in progress finishes). The close reason is
+    /// `CloseReason::Killed(reason)`. A `kill` meanwhile (or a stop's deadline) ends
+    /// it at once with a reset. `false` if it already closed, was already killed,
+    /// or belongs to another server.
+    ///
+    /// For an ejector with a denial to deliver: `kill` resets the connection, and a
+    /// reset can destroy bytes the peer has not read yet (decision D-182).
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// # let server = net_io::serve("127.0.0.1:0", |_| Ok(()))?;
+    /// # let id = net_io::ConnectionId::new(1).unwrap();
+    /// let handle = server.handle();
+    /// handle.close_after_flush(id, net_io::KillReason(9), Duration::from_millis(100));
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn close_after_flush(
+        &self,
+        id: ConnectionId,
+        reason: KillReason,
+        within: Duration,
+    ) -> bool {
+        self.shared.close_after_flush(id, reason, within)
+    }
+
     /// Stops accepting.
     pub fn close_door(&self) {
         self.shared.close_door();

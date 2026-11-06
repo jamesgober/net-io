@@ -117,6 +117,63 @@ pub(crate) enum Got {
     Woken,
 }
 
+/// Soft closes in progress across a server, against `Limits::denial_linger_max`.
+#[derive(Debug)]
+pub(crate) struct SoftCloses {
+    live: std::sync::atomic::AtomicU32,
+    max: u32,
+}
+
+impl SoftCloses {
+    pub(crate) fn new(max: u32) -> Arc<SoftCloses> {
+        Arc::new(SoftCloses {
+            live: std::sync::atomic::AtomicU32::new(0),
+            max,
+        })
+    }
+
+    /// One place, or `None` when `max` are taken.
+    fn take(self: &Arc<Self>) -> Option<SoftPermit> {
+        use std::sync::atomic::Ordering;
+        self.live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| SoftPermit(self.clone()))
+    }
+}
+
+/// A place among the soft closes, given back when the connection closes.
+#[derive(Debug)]
+struct SoftPermit(Arc<SoftCloses>);
+
+/// A connection's soft close: allocated only on a connection that has one, so an
+/// idle connection carries one pointer for it.
+#[derive(Debug, Default)]
+struct SoftClose {
+    /// When a soft kill stops letting output go out: set when the owner first sees
+    /// it, from its bound.
+    until: Option<Instant>,
+    /// This connection's place among the server's soft closes, once it took one.
+    permit: Option<SoftPermit>,
+    /// It may close softly (it has its place, or runs outside a server).
+    placed: bool,
+    /// The server's places were all taken: the close is a reset.
+    refused: bool,
+    /// A denial went out (`send_denial_once`): the close lingers for
+    /// `Limits::denial_linger` instead of resetting at once, so the peer reads it.
+    denial: bool,
+}
+
+impl Drop for SoftPermit {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 pub(crate) struct Link {
     pub(crate) stream: sys::Stream,
     pub(crate) info: ConnectionInfo,
@@ -147,6 +204,9 @@ pub(crate) struct Link {
     auto_phase: bool,
     /// Bytes went out since the last bytes came in.
     replied: bool,
+    /// The soft close (after a denial, or `close_after_flush`), once there is one.
+    /// Boxed: one pointer on every connection, the rest only where it happens.
+    soft: Option<Box<SoftClose>>,
     /// The idle timeout in force: the limits' value, or this connection's override.
     idle_timeout: Duration,
     /// While a PROXY (or TLS) handshake runs: its deadline replaces the phase's.
@@ -282,6 +342,7 @@ impl Link {
             wakeable: std::cell::Cell::new(false),
             auto_phase: phase == Phase::Idle,
             replied: false,
+            soft: None,
             idle_timeout,
             handshake_deadline: None,
             deadline_scale: 1.0,
@@ -861,6 +922,95 @@ impl Link {
         }
     }
 
+    /// `check_terminal` for output: during a soft kill (`close_after_flush`) output
+    /// already queued still goes out, until the kill's bound.
+    fn check_sendable(&mut self) -> Result<(), NetError> {
+        if self.soft_kill_left().is_some_and(|left| !left.is_zero()) {
+            return match self.terminal {
+                None | Some(CloseReason::Killed(_)) => Ok(()),
+                Some(CloseReason::EgressDenied(code)) => Err(NetError::EgressDenied { code }),
+                Some(_) => Err(NetError::Closed),
+            };
+        }
+        self.check_terminal()
+    }
+
+    /// Where this connection takes its place for a soft close (a server's links).
+    pub(crate) fn set_soft_closes(&self, places: &Arc<SoftCloses>) {
+        self.slot.set_soft_closes(places);
+    }
+
+    /// Takes (once) this connection's place among the soft closes; `false` when the
+    /// server's `denial_linger_max` are all taken: the close is a reset instead.
+    fn soft_place(&mut self) -> bool {
+        let places = self.slot.soft_closes();
+        let soft = self.soft.get_or_insert_with(Box::default);
+        if soft.placed {
+            return true;
+        }
+        if soft.refused {
+            return false;
+        }
+        let Some(places) = places else {
+            soft.placed = true;
+            return true;
+        };
+        match places.take() {
+            Some(p) => {
+                soft.permit = Some(p);
+                soft.placed = true;
+                true
+            }
+            None => {
+                soft.refused = true;
+                false
+            }
+        }
+    }
+
+    /// When a soft kill stops letting output go out, once the owner has seen it.
+    fn soft_until(&self) -> Option<Instant> {
+        self.soft.as_ref().and_then(|s| s.until)
+    }
+
+    /// What is left of a soft kill's bound, while the kill is soft (a hard kill
+    /// upgrades it) and it has its place (without one it acts as a kill). The bound
+    /// runs from when the owner first sees the kill.
+    pub(crate) fn soft_kill_left(&mut self) -> Option<Duration> {
+        let bound = self.slot.soft_kill()?;
+        if !self.soft_place() {
+            return None;
+        }
+        let now = self.now();
+        let soft = self.soft.get_or_insert_with(Box::default);
+        let until = *soft
+            .until
+            .get_or_insert_with(|| now.checked_add(bound).unwrap_or(now + crate::time::LONGEST));
+        Some(until.saturating_duration_since(now))
+    }
+
+    /// Killed, and not by a soft kill that has its place.
+    fn hard_killed(&self) -> bool {
+        self.killed().is_some()
+            && (self.slot.soft_kill().is_none() || !self.soft.as_ref().is_some_and(|s| s.placed))
+    }
+
+    /// How long an abortive close lingers instead of resetting at once: what is left
+    /// of a soft kill, or the denial linger after a denial went out; `None` for a
+    /// reset (a hard kill, or no denial).
+    pub(crate) fn soft_close(&mut self) -> Option<Duration> {
+        if let Some(left) = self.soft_kill_left() {
+            return Some(left);
+        }
+        if self.killed().is_some() {
+            return None;
+        }
+        if !self.soft.as_ref().is_some_and(|s| s.denial) || !self.soft_place() {
+            return None;
+        }
+        Some(self.limits.denial_linger)
+    }
+
     fn timed_out(&mut self, kind: TimeoutKind) -> NetError {
         self.fail(CloseReason::for_timeout(kind), NetError::TimedOut { kind })
     }
@@ -1105,7 +1255,7 @@ impl Link {
     /// exchange deadline, and the outbound minimum rate.
     fn wait_writable(&mut self) -> Result<(), NetError> {
         loop {
-            self.check_terminal()?;
+            self.check_sendable()?;
             let now = self.now();
             let deadline = self.progress_at + self.limits.write_timeout;
             if now >= deadline {
@@ -1138,6 +1288,9 @@ impl Link {
             }
             if let Some(c) = self.rate_out.next_check(&self.limits.min_rate, now) {
                 until = until.min(c);
+            }
+            if let Some(d) = self.soft_until() {
+                until = until.min(d);
             }
             let timeout = until
                 .saturating_duration_since(now)
@@ -1174,7 +1327,7 @@ impl Link {
         // One gate check per write, for the bytes the gate has not approved yet:
         // a retry after `WouldBlock`, or the tail of a partial send offered again,
         // is not counted twice by a byte-counting gate.
-        self.check_terminal()?;
+        self.check_sendable()?;
         if self.tls.is_some() {
             let chunk = buf.len().min(TLS_RECORD);
             self.gate_check(chunk)?;
@@ -1193,7 +1346,7 @@ impl Link {
     fn send_raw(&mut self, buf: &[u8]) -> Result<usize, NetError> {
         let mut zero_writes = 0u8;
         loop {
-            self.check_terminal()?;
+            self.check_sendable()?;
             match sys::send(&self.stream, buf) {
                 Ok(0) => {
                     // Should not happen on TCP; treat once as "full", then as an error.
@@ -1280,12 +1433,12 @@ impl Link {
         }
         let now = self.now();
         self.rate_out.activate(now);
-        self.check_terminal()?;
+        self.check_sendable()?;
         self.gate_check(body.len())?;
         self.approved = 0;
         let mut zero_writes = 0u8;
         let first = loop {
-            self.check_terminal()?;
+            self.check_sendable()?;
             match sys::send_with_fds(&self.stream, body, fds) {
                 Ok(0) => {
                     zero_writes += 1;
@@ -1333,7 +1486,7 @@ impl Link {
         }
         let now = self.now();
         self.rate_out.activate(now);
-        self.check_terminal()?;
+        self.check_sendable()?;
         if self.tls.is_some() {
             let take = total.min(self.tls_budget());
             self.gate_check(take)?;
@@ -1342,7 +1495,7 @@ impl Link {
         self.gate_check(total.saturating_sub(self.approved))?;
         let mut zero_writes = 0u8;
         loop {
-            self.check_terminal()?;
+            self.check_sendable()?;
             match sys::send_vectored(&self.stream, bufs) {
                 Ok(n) if n > 0 => {
                     self.sent(n);
@@ -1428,11 +1581,11 @@ impl Link {
         let mut sent = 0u64;
         while sent < len {
             let take = (len - sent).min(FILE_CHUNK) as usize;
-            self.check_terminal()?;
+            self.check_sendable()?;
             self.gate_check(take.saturating_sub(self.approved))?;
             self.approved = take;
             loop {
-                self.check_terminal()?;
+                self.check_sendable()?;
                 match self.send_file_once(file, offset + sent, take) {
                     Ok(0) => return Err(self.file_truncated(sent)),
                     Ok(n) => {
@@ -1787,7 +1940,7 @@ impl Link {
         if self.phase == Phase::Idle {
             self.progress_at = now;
         }
-        self.check_terminal()?;
+        self.check_sendable()?;
         self.gate_check(bytes.saturating_sub(self.approved))
     }
 
@@ -1849,13 +2002,16 @@ impl Link {
         if let Some(c) = self.rate_out.next_check(&self.limits.min_rate, now) {
             until = until.min(c);
         }
+        if let Some(d) = self.soft_until() {
+            until = until.min(d);
+        }
         until
     }
 
     /// The checks of a wait for room to write, at the time its timer fired.
     #[cfg(feature = "reactor")]
     pub(crate) fn write_check(&mut self, now: Instant) -> Result<(), NetError> {
-        self.check_terminal()?;
+        self.check_sendable()?;
         if now >= self.progress_at + self.limits.write_timeout {
             return Err(self.timed_out(TimeoutKind::Write));
         }
@@ -2020,7 +2176,7 @@ impl Link {
     pub(crate) fn check_seal(&mut self, bytes: usize) -> Result<(), NetError> {
         let now = self.now();
         self.rate_out.activate(now);
-        self.check_terminal()?;
+        self.check_sendable()?;
         self.gate_check(bytes)
     }
 
@@ -2036,7 +2192,7 @@ impl Link {
     /// Closes the socket after the driver let go of it.
     #[cfg(feature = "reactor")]
     pub(crate) fn finish_reactor(mut self, reason: CloseReason) -> CloseReason {
-        if reason.is_abortive() {
+        if reason.is_abortive() && self.soft_close().is_none() {
             self.stream.set_abortive();
         }
         self.slot.begin_close();
@@ -2069,16 +2225,30 @@ impl Link {
 
     pub(crate) fn finish(mut self, reason: CloseReason) -> CloseReason {
         let mut reason = reason;
-        if !reason.is_abortive() {
+        // After a denial or during a soft kill, an abortive reason still closes
+        // gracefully, with the shorter linger: the peer reads what was sent.
+        let soft = if reason.is_abortive() {
+            self.soft_close()
+        } else {
+            None
+        };
+        let graceful = !reason.is_abortive() || soft.is_some();
+        if graceful {
             self.tls_close_notify();
-        }
-        if !reason.is_abortive() && self.linger_gracefully() {
-            // A kill arrived during the linger: close abortively at once.
-            if let Some(k) = self.killed() {
-                reason = CloseReason::Killed(k);
+            let within = soft.unwrap_or(self.limits.graceful_linger);
+            if self.linger_gracefully(within) {
+                // A kill arrived during the linger: close abortively at once.
+                if let Some(k) = self.killed() {
+                    reason = CloseReason::Killed(k);
+                }
             }
         }
-        if reason.is_abortive() {
+        let abort = if soft.is_some() {
+            self.hard_killed()
+        } else {
+            reason.is_abortive()
+        };
+        if abort {
             self.stream.set_abortive();
         }
         // No kill can start after this, and one in flight finishes first.
@@ -2094,7 +2264,7 @@ impl Link {
 
     /// Closes without the linger: never blocks (used when a connection is dropped).
     pub(crate) fn finish_quick(mut self, reason: CloseReason) -> CloseReason {
-        if reason.is_abortive() {
+        if reason.is_abortive() && self.soft_close().is_none() {
             self.stream.set_abortive();
         } else {
             let _ = self.stream.shutdown(Shutdown::Write);
@@ -2155,12 +2325,16 @@ impl Link {
         if let Some(n) = sent {
             self.bytes_out += n as u64;
             self.replied = true;
+            if n > 0 && !self.limits.denial_linger.is_zero() {
+                self.soft.get_or_insert_with(Box::default).denial = true;
+            }
         }
     }
 
     /// FIN, then read and discard up to the linger budget so unread input does not
-    /// turn into an RST that destroys the last response. Returns `true` if killed meanwhile.
-    fn linger_gracefully(&mut self) -> bool {
+    /// turn into an RST that destroys the last response, for at most `within`.
+    /// Returns `true` if killed meanwhile (a soft kill does not count).
+    fn linger_gracefully(&mut self, within: Duration) -> bool {
         let _ = self.stream.shutdown(Shutdown::Write);
         if self.peer_closed || !self.stream.half_closes() {
             return false;
@@ -2173,11 +2347,11 @@ impl Link {
         {
             return false;
         }
-        let deadline = self.now() + self.limits.graceful_linger;
+        let deadline = self.now() + within;
         let mut left = self.limits.graceful_linger_bytes as usize;
         let mut scratch = [0u8; 2048];
         while left > 0 {
-            if self.killed().is_some() {
+            if self.hard_killed() {
                 return true;
             }
             let now = self.now();
@@ -2200,7 +2374,7 @@ impl Link {
                 Err(_) => break,
             }
         }
-        self.killed().is_some()
+        self.hard_killed()
     }
 }
 

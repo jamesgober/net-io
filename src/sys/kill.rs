@@ -8,6 +8,7 @@
 //! owner's wait is bounded by one system call in the killer.
 
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 #[cfg(not(net_io_loom))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +27,10 @@ const KILLING: u64 = 8;
 const IDLE: u64 = 16;
 /// A drain shut the read side of the idle connection.
 const DRAINED: u64 = 32;
+/// With `KILLED`: the kill lets the owner flush first (`Server::close_after_flush`).
+/// Reads end, queued output still goes out until the bound, then a graceful close.
+/// A hard kill clears it.
+const SOFT: u64 = 64;
 const REASON_SHIFT: u32 = 16;
 const GEN_SHIFT: u32 = 32;
 
@@ -45,6 +50,11 @@ pub(crate) trait KillSink: Send + Sync + std::fmt::Debug {
 pub(crate) struct KillSlot {
     state: AtomicU64,
     raw: AtomicU64,
+    /// A soft kill's bound in microseconds, written before its `KILLED | SOFT`.
+    soft_bound: AtomicU64,
+    /// The server's soft-close places (`Limits::denial_linger_max`), set once for a
+    /// slot a server's worker owns.
+    soft_closes: std::sync::OnceLock<Arc<crate::link::SoftCloses>>,
     wake: Mutex<Option<Arc<Wake>>>,
     sink: Mutex<Option<(Arc<dyn KillSink>, u32)>>,
 }
@@ -54,6 +64,8 @@ impl KillSlot {
         KillSlot {
             state: AtomicU64::new(0),
             raw: AtomicU64::new(0),
+            soft_bound: AtomicU64::new(0),
+            soft_closes: std::sync::OnceLock::new(),
             wake: Mutex::new(None),
             sink: Mutex::new(None),
         }
@@ -111,8 +123,87 @@ impl KillSlot {
         (s & KILLED != 0).then_some(KillReason(((s >> REASON_SHIFT) & 0xFFFF) as u16))
     }
 
+    /// A server's slot: where its connections take a place for a soft close.
+    pub(crate) fn set_soft_closes(&self, places: &Arc<crate::link::SoftCloses>) {
+        let _ = self.soft_closes.get_or_init(|| places.clone());
+    }
+
+    /// The soft-close places, for a server's slot.
+    pub(crate) fn soft_closes(&self) -> Option<&Arc<crate::link::SoftCloses>> {
+        self.soft_closes.get()
+    }
+
+    /// The bound of a soft kill (`close_after_flush`), while it is not upgraded.
+    pub(crate) fn soft_kill(&self) -> Option<Duration> {
+        let s = self.state.load(Ordering::Acquire);
+        (s & (KILLED | SOFT) == KILLED | SOFT)
+            .then(|| Duration::from_micros(self.soft_bound.load(Ordering::Relaxed)))
+    }
+
+    /// A kill that lets the owner flush first: reads end, output already queued goes
+    /// out until `bound`, then FIN and a linger bounded by what is left of it. Only
+    /// the owner is woken: the socket is not shut, so a linger can still read the
+    /// peer's FIN (an owner without a wake channel has its read side shut, as for a
+    /// kill). Returns `false` if it already closed, is closing, or was killed.
+    pub(crate) fn kill_soft(&self, generation: u32, reason: KillReason, bound: Duration) -> bool {
+        let mut s = self.state.load(Ordering::Acquire);
+        loop {
+            if gen_of(s) != generation || s & ACTIVE == 0 || s & (CLOSING | KILLED) != 0 {
+                return false;
+            }
+            if s & KILLING != 0 {
+                std::hint::spin_loop();
+                s = self.state.load(Ordering::Acquire);
+                continue;
+            }
+            let micros = u64::try_from(bound.as_micros()).unwrap_or(u64::MAX);
+            self.soft_bound.store(micros, Ordering::Relaxed);
+            let new = (s & !(0xFFFF << REASON_SHIFT))
+                | KILLED
+                | KILLING
+                | SOFT
+                | (u64::from(reason.0) << REASON_SHIFT);
+            match self
+                .state
+                .compare_exchange_weak(s, new, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => s = actual,
+            }
+        }
+        let raw = self.raw.load(Ordering::Relaxed) as RawSock;
+        let wake = self
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let reactor = self
+            .sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        // A pool owner inside an exchange on a system that receives without waiting
+        // first (Linux) is in a blocking receive the wake channel cannot end: its read
+        // side is shut, as for a kill (the exchange is cut either way; output still
+        // goes out), and so is an owner with no way to be woken. A reactor hears it
+        // through its sink; everyone else is woken. Both linger with the read side open.
+        let blocked = !super::WAIT_BEFORE_RECV && s & IDLE == 0;
+        if !reactor && (wake.is_none() || blocked) {
+            // SAFETY: the KILLING bit is set; the owner's `begin_close` waits for it to
+            // clear before it closes the socket, so `raw` is open for this call.
+            unsafe { super::shutdown_read_raw(raw) };
+        }
+        if let Some(w) = wake {
+            w.wake();
+        }
+        self.tell_sink();
+        self.state.fetch_and(!KILLING, Ordering::Release);
+        true
+    }
+
     /// Kills the connection of `generation`: sets the flag, wakes the owner.
-    /// Returns `false` if it already closed, is closing, or was already killed.
+    /// Returns `false` if it already closed, is closing, or was already killed
+    /// (a soft kill is upgraded: the owner stops flushing and closes with a reset).
     pub(crate) fn kill(&self, generation: u32, reason: KillReason) -> bool {
         self.kill_with(generation, reason, |raw, wake| {
             // SAFETY: the KILLING bit is set; the owner's `begin_close` waits for it to
@@ -133,7 +224,12 @@ impl KillSlot {
     ) -> bool {
         let mut s = self.state.load(Ordering::Acquire);
         loop {
-            if gen_of(s) != generation || s & ACTIVE == 0 || s & (CLOSING | KILLED) != 0 {
+            let upgrade = s & (KILLED | SOFT) == KILLED | SOFT;
+            if gen_of(s) != generation
+                || s & ACTIVE == 0
+                || s & CLOSING != 0
+                || (s & KILLED != 0 && !upgrade)
+            {
                 return false;
             }
             if s & KILLING != 0 {
@@ -143,7 +239,7 @@ impl KillSlot {
                 s = self.state.load(Ordering::Acquire);
                 continue;
             }
-            let new = (s & !(0xFFFF << REASON_SHIFT))
+            let new = (s & !((0xFFFF << REASON_SHIFT) | SOFT))
                 | KILLED
                 | KILLING
                 | (u64::from(reason.0) << REASON_SHIFT);
@@ -302,6 +398,25 @@ mod tests {
         assert_eq!(calls, 1);
         assert_eq!(slot.killed(), Some(KillReason(7)));
         assert_eq!(slot.begin_close(), Some(KillReason(7)));
+    }
+
+    #[test]
+    fn test_soft_kill_is_upgraded_by_a_kill_once() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slot = KillSlot::new();
+        let generation = slot.install(super::super::AsSock::sock(&l));
+        slot.set_wake(Some(Arc::new(Wake::new().unwrap())));
+        assert!(slot.kill_soft(generation, KillReason(3), Duration::from_millis(250)));
+        assert!(!slot.kill_soft(generation, KillReason(4), Duration::from_secs(1)));
+        assert_eq!(slot.killed(), Some(KillReason(3)));
+        assert_eq!(slot.soft_kill(), Some(Duration::from_millis(250)));
+        assert!(!slot.is_open(generation));
+        let mut calls = 0;
+        assert!(slot.kill_with(generation, KillReason(5), |_, _| calls += 1));
+        assert!(!slot.kill_with(generation, KillReason(6), |_, _| calls += 1));
+        assert_eq!(calls, 1);
+        assert_eq!(slot.soft_kill(), None);
+        assert_eq!(slot.begin_close(), Some(KillReason(5)));
     }
 
     #[test]

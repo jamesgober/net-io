@@ -468,6 +468,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             WakeSource::Reactor,
             Phase::Idle,
         );
+        link.set_soft_closes(&shared.soft_closes);
         slot.set_sink(self.notes.clone(), index);
         let mut cell = self.cells.pop().unwrap_or_else(|| {
             Box::new(GateCell {
@@ -1781,7 +1782,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 Flushed::Waiting => {}
             },
             Wait::FlushClose => match self.flush(index, Wait::FlushClose) {
-                Flushed::Done => self.session_closed(index),
+                Flushed::Done => match self.conn(index).and_then(|c| c.link.killed()) {
+                    Some(k) => self.close(index, CloseReason::Killed(k)),
+                    None => self.session_closed(index),
+                },
                 Flushed::Waiting => {}
             },
             _ => {}
@@ -1901,9 +1905,20 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             let index = *index;
             let Some(c) = self.conn(index) else { continue };
             let Some(k) = c.link.killed() else { continue };
+            let soft = c.link.soft_kill_left().is_some();
             if c.closing.is_none() {
-                self.close(index, CloseReason::Killed(k));
-            } else {
+                if soft && c.wait != Wait::FlushClose {
+                    // `close_after_flush`: no more input or session calls; what is
+                    // queued goes out (the write timer now ends at the kill's bound),
+                    // then the graceful close.
+                    match self.flush(index, Wait::FlushClose) {
+                        Flushed::Done => self.close(index, CloseReason::Killed(k)),
+                        Flushed::Waiting => self.arm_timer(index),
+                    }
+                } else if !soft {
+                    self.close(index, CloseReason::Killed(k));
+                }
+            } else if !soft {
                 // A kill during the linger ends it at once, abortively.
                 c.closing = Some(CloseReason::Killed(k));
                 if matches!(c.wait, Wait::Linger(_)) {
@@ -2069,7 +2084,14 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         // A kill wins over whatever was about to happen.
         let reason = c.link.killed().map_or(reason, CloseReason::Killed);
         c.closing = Some(reason);
-        if !reason.is_abortive() {
+        // After a denial or during a soft kill an abortive reason still closes
+        // gracefully, with the shorter linger, so the peer reads what was sent.
+        let soft = if reason.is_abortive() {
+            c.link.soft_close()
+        } else {
+            None
+        };
+        if !reason.is_abortive() || soft.is_some() {
             if c.link.tls_released() {
                 // `close_notify` needs the output buffer; without one the close is a
                 // plain FIN.
@@ -2078,7 +2100,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             let Some(c) = self.conn(index) else { return };
             let linger = c.link.begin_graceful_close(c.readable);
             if linger && c.sending == Sending::None {
-                let until = c.link.now() + c.link.limits.graceful_linger;
+                let until = c.link.now() + soft.unwrap_or(c.link.limits.graceful_linger);
                 c.linger_left = c.link.limits.graceful_linger_bytes;
                 c.wait = Wait::Linger(until);
                 self.arm_timer(index);
@@ -2261,6 +2283,7 @@ mod tests {
             size_of::<ConnectionInfo>()
         );
         // 512 is the goal (register R-18); this keeps it from growing meanwhile.
-        assert!(size <= 900, "{size} bytes per idle connection");
+        // 904: D-182's soft close added one pointer (896 before).
+        assert!(size <= 904, "{size} bytes per idle connection");
     }
 }

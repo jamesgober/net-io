@@ -885,6 +885,8 @@ impl Limits {
     pub fn buffer_budget(&self) -> Option<u64>;
     pub fn drain_timeout(&self) -> Option<Duration>;
     pub fn graceful_linger(&self) -> Option<(Duration, u32)>;
+    pub fn denial_linger(&self) -> Option<Duration>;              // 0.8.0
+    pub fn denial_linger_max(&self) -> Option<u32>;               // 0.8.0
     pub fn refusal_bytes_max(&self) -> Option<u16>;
     pub fn tick(&self) -> Option<Duration>;
     pub fn pressure(&self) -> Option<Pressure>;
@@ -921,6 +923,8 @@ impl LimitsBuilder {
     pub fn buffer_budget(self, bytes: u64) -> Self;
     pub fn drain_timeout(self, d: Duration) -> Self;
     pub fn graceful_linger(self, d: Duration, bytes: u32) -> Self;
+    pub fn denial_linger(self, d: Duration) -> Self;            // 0.8.0; zero: reset at once
+    pub fn denial_linger_max(self, n: u32) -> Self;             // 0.8.0; server-wide soft closes at once
     pub fn refusal_bytes_max(self, n: u16) -> Self;             // at most 512
     pub fn tick(self, d: Duration) -> Self;                     // 1 ms to 100 ms
     pub fn pressure(self, p: Pressure) -> Self;                 // P2, 0.6.0
@@ -989,6 +993,8 @@ assert!(Limits::builder().max_connections(100).build().is_ok()); // max_per_sour
 | `buffer_budget` | 512 MiB | 64 MiB | total memory | at least `workers x 64 KiB x 2` (checked) |
 | `drain_timeout` | 30 s | 30 s | hung shutdowns | matches common orchestrator grace periods |
 | `graceful_linger` | 2 s, 64 KiB | same | RST on unread data at close | enough for the peer to see the last response |
+| `denial_linger` | 100 ms | same | a reset that destroys a denial before the peer reads it (Windows discards unsent data on an abortive close) | the linger after a denial went out: FIN, then reads discarded until the peer closes or this passes (D-182, `0.8.0`); its bytes cap is `graceful_linger`'s |
+| `denial_linger_max` | `max_connections` / 16 (at least 1) | same | a denial storm holding slots and pool workers through lingers | soft closes at once, server-wide; past it a denial resets at once and `close_after_flush` acts as `kill` (`0.8.0`) |
 | `refusal_bytes_max` | 512 B | same | refusals used as amplifiers | one canned status line and headers |
 | `tick` | 1 ms | 10 ms | timer resolution | blocking reads re-arm `SO_RCVTIMEO` only when the target moves by more than a tick |
 
@@ -1715,6 +1721,7 @@ A `Server` must not be used in a process created by `fork` after it was built: t
 pub struct ServerHandle { /* shared door, control, worker queues */ }
 impl ServerHandle {
     pub fn kill(&self, id: ConnectionId, reason: KillReason) -> bool;
+    pub fn close_after_flush(&self, id: ConnectionId, reason: KillReason, within: Duration) -> bool; // 0.8.0
     pub fn close_door(&self);
     pub fn request_stop(&self);
     pub fn wake_all(&self);
@@ -1725,6 +1732,8 @@ impl ServerHandle {
 ```
 
 `Send + Sync + Clone`, safe to call from any thread, including signal-handling threads. `kill` finds the owning worker from the id block, aborts the connection, and returns `false` if it was already closed or belongs to another server (under 1 µs to enqueue [est.]; the RST reaches the wire within 1 ms p99 [est.]). `request_stop` makes `Server::wait_for_stop` return after the drain; it does not block. `wake_all` interrupts every worker's wait so a control-line change is seen at once. P0 (`wake_all` P1), Tier 2, `0.3.0`.
+
+`close_after_flush` (`0.8.0`, D-182) is the graceful kill, for an ejector with a denial still to deliver: the connection's session gets no more input, what it already queued is sent, then FIN and a linger that reads and discards until the peer closes, all within `within` from when its worker sees the request; the close reason is `Killed(reason)`. On the reactor only what was queued at that moment goes out; on the blocking pool a write in progress finishes. A `kill` (or a stop's deadline) during it ends it at once with a reset. Cost: one atomic exchange and a wake, like `kill`; the connection keeps its slot and descriptor for at most `within`. On a Linux pool worker blocked inside an exchange the read side is shut, as a kill does, because its blocking receive does not wait on the wake channel; the linger then ends at once.
 
 ```rust,no_run
 // Ctrl-C style stop from another thread.
@@ -1814,9 +1823,9 @@ pub trait Gate: Send + Sync + 'static {
 
 | Method | net-io's reaction | Cost | Grade | Tier | Version |
 |---|---|---|---|---|---|
-| `admit` | `Ok`: the lane and the ticket are stored, the connection proceeds. `Err(refusal)`: closed abortively without reading; `Refusal::WithBytes` first writes its bytes with one non-blocking attempt (no retry) | hook cost plus under 20 ns [est.] | P0 | 3 | `0.3.0` (`Adopt`, `Dialed` `0.4.0`) |
-| `readmit` | `Err`: closed abortively; the per-source cap moves from the proxy's address to the real client's before `readmit` runs | hook cost | P0 | 3 | `0.4.0` |
-| `check` | `Err(Denial { code })`: every pending chunk net-io owns is overwritten with zeroes and dropped; if no byte of the current response has left, the session's `on_denied(code, ..)` output is written with one bounded attempt (the denial itself is not checked again); then abortive close with `EgressDenied(code)` | one call; with `AllowAll` it compiles to nothing; target under 2 ns with a one-atomic gate [est.] | P0 | 3 | `0.3.0` |
+| `admit` | `Ok`: the lane and the ticket are stored, the connection proceeds. `Err(refusal)`: closed abortively without reading; `Refusal::WithBytes` first writes its bytes with one non-blocking attempt (no retry), then closes with FIN at once (from `0.8.0`; RST when nothing was sent or `denial_linger` is zero; the accept thread never waits) | hook cost plus under 20 ns [est.] | P0 | 3 | `0.3.0` (`Adopt`, `Dialed` `0.4.0`) |
+| `readmit` | `Err`: closed abortively, or after `WithBytes`'s bytes with FIN and the denial linger (`0.8.0`); the per-source cap moves from the proxy's address to the real client's before `readmit` runs | hook cost | P0 | 3 | `0.4.0` |
+| `check` | `Err(Denial { code })`: every pending chunk net-io owns is overwritten with zeroes and dropped; if no byte of the current response has left, the session's `on_denied(code, ..)` output is written with one bounded attempt (the denial itself is not checked again); then the close with `EgressDenied(code)`: from `0.8.0`, when the denial went out, FIN and a linger of at most `denial_linger` (100 ms) that reads and discards, so the peer reads the denial instead of a reset (D-182); abortive when nothing went out or `denial_linger` is zero | one call; with `AllowAll` it compiles to nothing; target under 2 ns with a one-atomic gate [est.] | P0 | 3 | `0.3.0` |
 | `closed` | the ticket is given back with the reason (release counts, record strikes for `SlowPeer`, `ProxyInvalid`, `ProxyUntrusted`, `TlsFailed`, `HelloRefused`, timeouts) | hook cost | P0 | 3 | `0.3.0` |
 
 Rules:
@@ -1881,7 +1890,7 @@ pub enum Refusal {
 }
 ```
 
-`WithBytes` lets a gate answer a refused connection with a canned protocol reply (for example `HTTP/1.1 503` with `Retry-After`) straight from the accept path: one non-blocking write of at most 512 bytes, only on TCP after the handshake completed (so it cannot amplify a spoofed source), then RST. Longer bytes fail fast: the refusal is sent as `Reset` and a `LimitHit` event is emitted. The code appears in `RefusalCause::Gate(code)`, events, and stats. P0, Tier 3, `0.3.0`.
+`WithBytes` lets a gate answer a refused connection with a canned protocol reply (for example `HTTP/1.1 503` with `Retry-After`) straight from the accept path: one non-blocking write of at most 512 bytes, only on TCP after the handshake completed (so it cannot amplify a spoofed source), then FIN (RST before `0.8.0`, and still when `denial_linger` is zero): a reset could destroy the reply before the peer reads it. Nothing is read, so input the peer already sent still turns the close into a reset. Longer bytes fail fast: the refusal is sent as `Reset` and a `LimitHit` event is emitted. The code appears in `RefusalCause::Gate(code)`, events, and stats. P0, Tier 3, `0.3.0`.
 
 ### `WriteCheck`, `Denial`
 

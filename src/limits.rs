@@ -184,6 +184,8 @@ pub struct Limits {
     buffer_budget: Option<u64>,
     drain_timeout: Option<Duration>,
     graceful_linger: Option<(Duration, u32)>,
+    denial_linger: Option<Duration>,
+    denial_linger_max: Option<u32>,
     refusal_bytes_max: Option<u16>,
     tick: Option<Duration>,
     pressure: Option<Pressure>,
@@ -214,11 +216,19 @@ pub(crate) struct Effective {
     pub drain_timeout: Duration,
     pub graceful_linger: Duration,
     pub graceful_linger_bytes: u32,
+    pub denial_linger: Duration,
+    /// Soft closes (denial lingers and `close_after_flush`) at once, server-wide.
+    pub denial_linger_max: u32,
     pub refusal_bytes_max: u16,
     pub tick: Duration,
     pub pressure: Option<Pressure>,
     /// Slots each of the most important lanes keeps free from the less important.
     pub lane_reserve: [u32; RESERVED_LANES],
+}
+
+/// The default cap on soft closes: a sixteenth of the connection cap, at least 1.
+fn soft_close_cap(max_connections: u32) -> u32 {
+    (max_connections / 16).max(1)
 }
 
 impl Effective {
@@ -256,6 +266,8 @@ impl Effective {
             drain_timeout: Duration::from_secs(30),
             graceful_linger: Duration::from_secs(2),
             graceful_linger_bytes: 64 * 1024,
+            denial_linger: Duration::from_millis(100),
+            denial_linger_max: soft_close_cap(max_connections),
             refusal_bytes_max: 512,
             tick: Duration::from_millis(if blocking { 10 } else { 1 }),
             pressure: None,
@@ -405,6 +417,10 @@ impl Limits {
             drain_timeout: self.drain_timeout.unwrap_or(d.drain_timeout),
             graceful_linger,
             graceful_linger_bytes,
+            denial_linger: self.denial_linger.unwrap_or(d.denial_linger),
+            denial_linger_max: self
+                .denial_linger_max
+                .unwrap_or_else(|| soft_close_cap(max_connections)),
             refusal_bytes_max: self.refusal_bytes_max.unwrap_or(d.refusal_bytes_max),
             tick: self.tick.unwrap_or(d.tick),
             pressure: self.pressure,
@@ -440,6 +456,8 @@ impl Limits {
             buffer_budget,
             drain_timeout,
             graceful_linger,
+            denial_linger,
+            denial_linger_max,
             refusal_bytes_max,
             tick,
             pressure
@@ -466,6 +484,8 @@ impl Limits {
             buffer_budget: Some(e.buffer_budget),
             drain_timeout: Some(e.drain_timeout),
             graceful_linger: Some((e.graceful_linger, e.graceful_linger_bytes)),
+            denial_linger: Some(e.denial_linger),
+            denial_linger_max: Some(e.denial_linger_max),
             refusal_bytes_max: Some(e.refusal_bytes_max),
             tick: Some(e.tick),
             pressure: None,
@@ -565,6 +585,17 @@ impl Limits {
     #[must_use]
     pub fn graceful_linger(&self) -> Option<(Duration, u32)> {
         self.graceful_linger
+    }
+    /// How long a connection that was sent a denial lingers before it closes.
+    #[must_use]
+    pub fn denial_linger(&self) -> Option<Duration> {
+        self.denial_linger
+    }
+    /// How many connections may close softly (linger after a denial, or
+    /// `close_after_flush`) at once, server-wide.
+    #[must_use]
+    pub fn denial_linger_max(&self) -> Option<u32> {
+        self.denial_linger_max
     }
     /// The largest refusal reply.
     #[must_use]
@@ -694,6 +725,27 @@ impl LimitsBuilder {
         self
     }
 
+    /// How long a connection that was sent a denial (a `Session::on_denied` reply,
+    /// or a `Refusal::WithBytes` after a PROXY header) lingers before it closes:
+    /// FIN after the denial, then reads are discarded until the peer closes or this
+    /// passes, so the peer reads the denial instead of a reset. Default 100 ms; zero
+    /// closes with a reset at once, as before 0.8. A kill ends the linger.
+    pub fn denial_linger(mut self, time: Duration) -> Self {
+        self.limits.denial_linger = Some(time);
+        self
+    }
+
+    /// How many connections may close softly at once, server-wide: lingering after a
+    /// denial, or flushing and lingering after `ServerHandle::close_after_flush`. Past
+    /// it a denial closes with a reset at once and a `close_after_flush` acts as a
+    /// `kill`, so a storm of denials costs at most this many slots for at most the
+    /// linger each. Default: a sixteenth of `max_connections` (at least 1); zero
+    /// turns soft closes off. Read from the server's limits, not a listener's.
+    pub fn denial_linger_max(mut self, n: u32) -> Self {
+        self.limits.denial_linger_max = Some(n);
+        self
+    }
+
     /// Connection slots reserved for `lane` (lanes 0 to 7; applied from `0.6.0`).
     pub fn lane_reserve(mut self, lane: Lane, slots: u32) -> Self {
         match self.limits.lane_reserve.get_mut(usize::from(lane.0)) {
@@ -781,6 +833,9 @@ impl LimitsBuilder {
         }
         if l.graceful_linger.is_some_and(|(d, _)| long(d)) {
             return Err(invalid("graceful_linger", TOO_LONG));
+        }
+        if l.denial_linger.is_some_and(long) {
+            return Err(invalid("denial_linger", TOO_LONG));
         }
         if l.max_connections.is_some_and(|n| n > MAX_CONNECTIONS) {
             return Err(invalid(

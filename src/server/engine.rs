@@ -349,6 +349,8 @@ pub(crate) struct Shared {
     /// The global cap, for `pressure`.
     #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
     max_open: u32,
+    /// Soft closes in progress, against `Limits::denial_linger_max` (D-182).
+    pub(crate) soft_closes: Arc<crate::link::SoftCloses>,
     /// The server's limits, for listeners added later.
     pub(crate) base_limits: Limits,
     /// The server's trusted proxies, for listeners added later.
@@ -835,13 +837,33 @@ impl Shared {
     }
 
     pub(crate) fn kill(&self, id: ConnectionId, reason: KillReason) -> bool {
+        self.with_slot(id, |slot, generation| slot.kill(generation, reason))
+    }
+
+    /// A soft kill: the owner sends what is queued, then closes gracefully, all
+    /// within `within` (`ServerHandle::close_after_flush`).
+    pub(crate) fn close_after_flush(
+        &self,
+        id: ConnectionId,
+        reason: KillReason,
+        within: Duration,
+    ) -> bool {
+        let within = within.min(crate::time::LONGEST);
+        self.with_slot(id, |slot, generation| {
+            slot.kill_soft(generation, reason, within)
+        })
+    }
+
+    /// Runs `f` on the kill slot of connection `id` with its generation; `false`
+    /// when no open connection of this server has that id.
+    fn with_slot(&self, id: ConnectionId, f: impl FnOnce(&KillSlot, u32) -> bool) -> bool {
         #[cfg(feature = "reactor")]
         if self.reactor {
             let found = self
                 .conn_shard(id.get())
                 .get(&id.get())
                 .map(|c| (c.slot.clone(), c.generation));
-            return found.is_some_and(|(slot, generation)| slot.kill(generation, reason));
+            return found.is_some_and(|(slot, generation)| f(&slot, generation));
         }
         for w in &self.workers {
             if w.current.load(Ordering::Acquire) != id.get() {
@@ -851,7 +873,7 @@ impl Shared {
             if w.current.load(Ordering::Acquire) != id.get() {
                 return false;
             }
-            return w.slot.kill(generation, reason);
+            return f(&w.slot, generation);
         }
         false
     }
@@ -1675,6 +1697,7 @@ where
             .collect(),
         driver,
         max_open: limits.max_connections,
+        soft_closes: crate::link::SoftCloses::new(limits.denial_linger_max),
         listeners: Mutex::new(entries),
         next_listener: AtomicU32::new(next_listener),
         spawn_accept: OnceLock::new(),
@@ -2045,13 +2068,21 @@ impl<W, G: Gate> Engine<W, G> {
         co: &mut Coalescer,
     ) {
         let shared = &self.shared;
+        let mut sent = false;
         if let Some(b) = bytes {
             let max = usize::from(self.limits.refusal_bytes_max);
             if b.len() <= max {
-                let _ = sys::send(&stream, b);
+                sent = sys::send(&stream, b).is_ok_and(|n| n > 0);
             }
         }
-        let _ = sys::set_linger(stream.sock(), Some(Duration::ZERO));
+        if sent && !self.limits.denial_linger.is_zero() {
+            // The reply is followed by FIN, not a reset, which could destroy it before
+            // the peer reads it (D-182). The accept thread does not linger: nothing is
+            // read, and input the peer already sent still turns the close into a reset.
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        } else {
+            let _ = sys::set_linger(stream.sock(), Some(Duration::ZERO));
+        }
         drop(stream);
         shared.refused.fetch_add(1, Ordering::Relaxed);
         shared.refused_by[cause.index()].fetch_add(1, Ordering::Relaxed);
@@ -2712,6 +2743,7 @@ impl<G: Gate> Worker<G> {
             WakeSource::Fixed(ws.wake.clone()),
             Phase::Idle,
         );
+        link.set_soft_closes(&shared.soft_closes);
         ws.current.store(link.info.id.get(), Ordering::Release);
         if self.gated {
             link.gate = Some(cell as Box<dyn ErasedGate>);
