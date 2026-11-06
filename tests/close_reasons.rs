@@ -478,3 +478,95 @@ fn reason_refused_by_the_session_factory() {
     let _c = client(addr(&s));
     rec.expect_one(CloseReason::Refused(RefusalCause::Session));
 }
+
+/// Threat T-14, on the wire: a gate that revokes the connection mid-stream; the
+/// client captures everything it receives, and nothing past the bytes the gate
+/// approved arrives, on both drivers.
+#[test]
+fn test_revoked_stream_sends_nothing_past_the_approval() {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Clone)]
+    struct Revoke {
+        approved: Arc<AtomicU64>,
+        checks: Arc<AtomicU64>,
+    }
+    impl Gate for Revoke {
+        type Ticket = ();
+        fn admit(
+            &self,
+            _: &ConnectionInfo,
+            _: AdmitStage,
+        ) -> Result<Admitted<()>, net_io::Refusal> {
+            Ok(Admitted {
+                lane: Lane(0),
+                ticket: (),
+                tag: GateTag(0),
+            })
+        }
+        fn readmit(&self, _: &mut (), _: &ConnectionInfo) -> Result<(), net_io::Refusal> {
+            Ok(())
+        }
+        fn check(&self, _: &mut (), w: &WriteCheck) -> Result<(), Denial> {
+            if self.checks.fetch_add(1, Ordering::SeqCst) >= 3 {
+                return Err(Denial { code: 9 });
+            }
+            self.approved
+                .fetch_add(u64::from(w.bytes), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    struct Stream(u32);
+    impl Session for Stream {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            self.on_writable(cx)
+        }
+        fn on_writable(&mut self, cx: &mut SessionContext<'_>) -> Step {
+            if self.0 == 0 {
+                return Step::Close;
+            }
+            self.0 -= 1;
+            let _ = cx.output().push(&[b'd'; 1024]);
+            Step::Write
+        }
+    }
+    for &driver in common::DRIVERS {
+        let gate = Revoke {
+            approved: Arc::new(AtomicU64::new(0)),
+            checks: Arc::new(AtomicU64::new(0)),
+        };
+        let rec = Recorder::default();
+        let s = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(2)
+            .sessions(|_: &ConnectionInfo| Stream(100))
+            .gate(gate.clone())
+            .events(rec.clone())
+            .build()
+            .expect("build");
+        s.open_door().expect("open");
+        let mut c = client(addr(&s));
+        c.write_all(b"go").expect("write");
+        let mut wire = Vec::new();
+        let _ = c.read_to_end(&mut wire);
+        rec.expect_one(CloseReason::EgressDenied(9));
+        let approved = gate.approved.load(Ordering::SeqCst);
+        assert!(
+            approved > 0 && approved < 100 * 1024,
+            "{driver:?}: {approved}"
+        );
+        assert!(
+            wire.len() as u64 <= approved,
+            "{driver:?}: {} bytes on the wire, {approved} approved",
+            wire.len()
+        );
+        assert!(
+            wire.iter().all(|&b| b == b'd'),
+            "{driver:?}: no denial bytes mid-stream"
+        );
+    }
+}

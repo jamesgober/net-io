@@ -45,11 +45,14 @@
 //!
 //! ## Status
 //!
-//! `0.6.0`: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
-//! Linux, macOS, FreeBSD, and Windows. TCP, Unix domain sockets (AF_UNIX on
-//! Windows), Windows named pipes, and UDP with batches and sessions; zero-copy file
-//! sends; the PROXY protocol, the TLS seam, systemd and FastCGI inheritance, listener
-//! hand-off on Unix and Windows, and the public [`Driver`] interface.
+//! `0.7.0`: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
+//! Linux, macOS, FreeBSD, and Windows. TCP with a client that reconnects with
+//! backoff, Unix domain sockets (AF_UNIX on Windows), Windows named pipes, and UDP
+//! with batches and sessions; zero-copy file sends and file receives; the PROXY
+//! protocol, the TLS seam, systemd and FastCGI inheritance, listener hand-off on Unix
+//! and Windows, and the public [`Driver`] interface. Hardened: every review finding
+//! of medium severity or above fixed, an attack test per threat, continuous fuzzing,
+//! and a 24-hour soak.
 
 #![doc(html_root_url = "https://docs.rs/net-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -97,6 +100,7 @@ mod proxy;
 #[cfg(feature = "proxy")]
 mod proxy_parse;
 mod rate;
+mod retry;
 mod server;
 mod session;
 mod sys;
@@ -125,6 +129,22 @@ pub mod __fuzz {
     pub fn systemd_env(data: &[u8]) {
         crate::inherit::fuzz_systemd_env(data);
     }
+
+    /// The timing wheel against a model.
+    pub fn wheel(data: &[u8]) {
+        crate::wheel::fuzz_wheel(data);
+    }
+
+    /// The minimum-rate counter's invariants.
+    pub fn rate(data: &[u8]) {
+        crate::rate::fuzz_rate(data);
+    }
+
+    /// The UDP guard's tables, verification, and budgets against a model.
+    #[cfg(feature = "udp")]
+    pub fn udp(data: &[u8]) {
+        crate::udp::fuzz_udp(data);
+    }
 }
 
 /// Fault injection for net-io's own tests, compiled only with `--cfg net_io_shim`.
@@ -144,8 +164,8 @@ pub use control::{ControlLine, ControlState, NoControl, SimpleControl};
 #[cfg(feature = "reactor")]
 pub use driver::new_reactor_driver;
 pub use driver::{
-    BorrowedSocket, Completion, Completions, Driver, DriverKind, DriverWaker, Operation,
-    OperationKind, Rejected, SendChunks, Token,
+    Completion, Completions, Driver, DriverKind, DriverWaker, Operation, OperationKind, Rejected,
+    SendChunks, SharedSocket, Token,
 };
 pub use error::{
     CloseReason, ConfigReason, Direction, ErrorClass, KillReason, LimitKind, NetError,
@@ -165,7 +185,7 @@ pub use info::{
 #[cfg(unix)]
 pub use inherit::fastcgi_listener;
 pub use inherit::{InheritError, InheritedListener, systemd, systemd_named};
-pub use limits::{Limits, LimitsBuilder, MinRate, Pressure, SizeClass};
+pub use limits::{Limits, LimitsBuilder, MinRate, Pressure, SizeClass, descriptor_limit};
 #[cfg(all(unix, feature = "local"))]
 pub use local::{Descriptors, UnixConnection, UnixListener};
 #[cfg(feature = "local")]
@@ -181,6 +201,7 @@ pub use proxy_parse::{
     ProxyAddress, ProxyCommand, ProxyHeader, ProxyParser, ProxyProgress, ProxySsl, ProxyTransport,
     Tlv, Tlvs, encode_v1, encode_v2,
 };
+pub use retry::Backoff;
 #[cfg(feature = "udp")]
 pub use server::UdpOnly;
 pub use server::{
@@ -190,7 +211,7 @@ pub use server::{
 pub use session::{
     Input, Output, OutputFull, Phase, Session, SessionContext, SessionFactory, Step, SwapError,
 };
-pub use tcp::{ConnectOptions, ListenerInfo, TcpConnection, TcpListener};
+pub use tcp::{ConnectOptions, Drained, Health, ListenerInfo, TcpConnection, TcpListener};
 pub use time::{Clock, ManualClock, MonotonicClock, monotonic_micros};
 pub use tls::{
     NoTls, NoTlsSession, TlsAcceptor, TlsCloseKind, TlsError, TlsEvent, TlsFailure, TlsInfo,

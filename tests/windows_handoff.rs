@@ -157,6 +157,11 @@ fn child_handoff_receiver() {
         .parse()
         .expect("pid");
     let mut channel = PipeConnection::connect(&pipe, WAIT).expect("connect");
+    assert_eq!(
+        channel.server_pid().expect("server pid"),
+        parent,
+        "the parent serves the pipe, not a process that took its name"
+    );
     let expect = HandoffPeer {
         uid: None,
         pid: Some(parent),

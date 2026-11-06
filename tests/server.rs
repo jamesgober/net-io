@@ -531,10 +531,11 @@ fn test_request_stop_ends_wait_for_stop() {
 #[test]
 fn test_reply_returns_an_auto_phase_connection_to_idle() {
     // The session never sets a phase: after its reply the idle timeout applies, not the read timeout.
+    // 1 s against 30 s, so a loaded host cannot idle the connection out between the two round trips.
     let server = ServerBuilder::new()
         .listener(ListenerSpec::tcp("127.0.0.1:0"))
         .limits(limits(|b| {
-            b.idle_timeout(Duration::from_millis(200))
+            b.idle_timeout(Duration::from_secs(1))
                 .read_timeout(Duration::from_secs(30))
         }))
         .sessions(|_: &ConnectionInfo| Echo)
@@ -547,7 +548,7 @@ fn test_reply_returns_an_auto_phase_connection_to_idle() {
     assert_eq!(round_trip(&mut c, b"two"), b"two");
     let start = Instant::now();
     assert!(closed_by_server(&mut c));
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < Duration::from_secs(10));
     assert!(eventually(WAIT, || server
         .stats()
         .closed_for(CloseReason::Idle)
@@ -799,6 +800,182 @@ fn test_session_survives_a_timeout_with_a_partial_message_held() {
         d.write_all(b"two\n").expect("write");
         std::io::Read::read_exact(&mut d, &mut back[..4]).expect("other client");
         assert_eq!(&back[..4], b"two\n", "{driver:?}");
+    }
+}
+
+/// An event sink that panics on every close loses those events and nothing else:
+/// caps come back and drain finishes, on both drivers (review finding).
+#[test]
+fn test_panicking_event_sink_loses_only_its_events() {
+    struct Bad;
+    impl net_io::EventSink for Bad {
+        fn event(&self, e: &net_io::Event) {
+            assert!(!matches!(e, net_io::Event::Closed { .. }), "sink bug");
+        }
+    }
+    for &driver in DRIVERS {
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(1)
+            .sessions(|_: &ConnectionInfo| Echo)
+            .gate(AllowAll)
+            .events(Bad)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        // One worker: a client that arrives while the last one's close is still
+        // being finished (here, past the sink's panic) is refused `Busy`, which is
+        // a refusal, not a lost slot; it tries again.
+        let served = |n: usize| {
+            for _ in 0..100 {
+                let mut c = client(addr(&server));
+                c.write_all(b"hi").expect("write");
+                let mut back = [0u8; 2];
+                if std::io::Read::read_exact(&mut c, &mut back).is_ok() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("{driver:?} round {n}: never served: {:?}", server.stats());
+        };
+        for n in 0..3 {
+            served(n);
+            assert!(eventually(Duration::from_secs(5), || server.stats().open == 0));
+        }
+        assert!(
+            eventually(Duration::from_secs(5), || server.stats().open == 0),
+            "{driver:?}: {:?}",
+            server.stats()
+        );
+        // The worker and its slot came back each time: a lost one never serves.
+        served(3);
+        let started = Instant::now();
+        let _ = server.shutdown(Instant::now() + Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(4), "{driver:?}");
+    }
+}
+
+/// A handler that gates its own accepted connection and is refused: the connection
+/// closes, its slots come back, and the worker serves the next one (review finding).
+#[test]
+fn test_handler_refused_by_its_own_gate_releases_the_connection() {
+    struct No;
+    impl net_io::Gate for No {
+        type Ticket = ();
+        fn admit(
+            &self,
+            _: &ConnectionInfo,
+            _: net_io::AdmitStage,
+        ) -> Result<net_io::Admitted<()>, net_io::Refusal> {
+            Err(net_io::Refusal::Reset { code: 7 })
+        }
+        fn readmit(&self, _: &mut (), _: &ConnectionInfo) -> Result<(), net_io::Refusal> {
+            Ok(())
+        }
+        fn check(&self, _: &mut (), _: &net_io::WriteCheck) -> Result<(), net_io::Denial> {
+            Ok(())
+        }
+    }
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(DriverKind::Blocking)
+        .workers(1)
+        .handler(|conn: &mut TcpConnection| {
+            let mut b = [0u8; 1];
+            conn.recv(&mut b)?;
+            if b[0] == b'g' {
+                conn.set_gate(Arc::new(No))?;
+            }
+            conn.send_all(b"ok")
+        })
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    for _ in 0..3 {
+        let mut c = client(addr(&server));
+        c.write_all(b"g").expect("write");
+        assert!(closed_by_server(&mut c));
+        // One worker: the next client waits for this close, or the pool says Busy.
+        assert!(eventually(Duration::from_secs(5), || server.stats().open == 0));
+    }
+    assert!(
+        eventually(Duration::from_secs(5), || server.stats().open == 0
+            && server.stats().closed == 3),
+        "{:?}",
+        server.stats()
+    );
+    let mut c = client(addr(&server));
+    c.write_all(b"x").expect("write");
+    let mut back = [0u8; 2];
+    std::io::Read::read_exact(&mut c, &mut back).expect("served");
+    assert_eq!(&back, b"ok");
+}
+
+/// A listener cannot lift the server's cap: its own `max_connections` is refused at
+/// build, and admission counts against the server's cap (review finding).
+#[test]
+fn test_listener_cannot_set_the_global_cap() {
+    let raised = Limits::builder()
+        .max_connections(100_000)
+        .build()
+        .expect("limits");
+    let result = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0").limits(raised))
+        .limits(limits(|b| b.max_connections(4)))
+        .handler(echo_handler)
+        .gate(AllowAll)
+        .build();
+    assert!(
+        matches!(
+            result,
+            Err(NetError::InvalidConfig {
+                field: "max_connections",
+                ..
+            })
+        ),
+        "{:?}",
+        result.err()
+    );
+}
+
+/// A session that sets "no idle limit" as `Duration::MAX`, and a client connect with
+/// a `Duration::MAX` timeout, work instead of panicking (review finding).
+#[test]
+fn test_duration_max_is_held_to_a_year_not_a_panic() {
+    struct Forever;
+    impl Session for Forever {
+        fn on_open(&mut self, cx: &mut SessionContext<'_>) -> Step {
+            cx.set_idle_timeout(Some(Duration::MAX));
+            Step::Read
+        }
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            Step::Write
+        }
+    }
+    for &driver in DRIVERS {
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(1)
+            .sessions(|_: &ConnectionInfo| Forever)
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let options = net_io::ConnectOptions::new().timeout(Duration::MAX);
+        let mut c = TcpConnection::connect_with(addr(&server), options).expect("connect");
+        for _ in 0..3 {
+            c.send_all(b"ping").expect("send");
+            let mut back = [0u8; 4];
+            c.recv_exact(&mut back).expect("recv");
+            assert_eq!(&back, b"ping", "{driver:?}");
+        }
+        assert_eq!(server.stats().session_panics, 0, "{driver:?}");
+        assert_eq!(server.stats().closed, 0, "{driver:?}");
     }
 }
 

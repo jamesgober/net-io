@@ -17,6 +17,7 @@ use crate::limits::Effective;
 use crate::rate::Rate;
 use crate::session::Phase;
 use crate::sys::{self, AsSock, Interest, KillSlot, Ready, Wake};
+use crate::tcp::Health;
 use crate::time::Clock;
 use crate::tls::{TlsError, TlsEvent, TlsFailure, TlsSession};
 
@@ -403,6 +404,51 @@ impl Link {
         self.tls.is_some()
     }
 
+    /// Both TLS buffers, for the pool, while the connection waits between
+    /// exchanges with nothing in them: the handshake is done, every byte of
+    /// ciphertext was consumed, all plaintext delivered, and no event is pending.
+    /// `None` (nothing taken) otherwise. The engine keeps nothing in the caller's
+    /// buffers between steps (D-066), so the next read starts in fresh ones (D-181).
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_release(&mut self) -> Option<(Buffer, Buffer)> {
+        let t = self.tls.as_mut()?;
+        let idle = t.done
+            && !t.eof
+            && t.event.is_none()
+            && t.start >= t.cin.len()
+            && t.plain_at >= t.plain_end
+            && t.cin.capacity() > 0
+            && t.cout.capacity() > 0;
+        if !idle {
+            return None;
+        }
+        t.start = 0;
+        t.plain_at = 0;
+        t.plain_end = 0;
+        t.data_from = 0;
+        t.data_to = 0;
+        let cin = std::mem::replace(&mut t.cin, Buffer::placeholder());
+        let cout = std::mem::replace(&mut t.cout, Buffer::placeholder());
+        Some((cin, cout))
+    }
+
+    /// Whether the TLS buffers went back to the pool (`tls_release`).
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_released(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.cin.capacity() == 0)
+    }
+
+    /// Gives a released connection its TLS buffers again.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_restore(&mut self, mut cin: Buffer, mut cout: Buffer) {
+        cin.set_len(0);
+        cout.set_len(0);
+        if let Some(t) = self.tls.as_mut() {
+            t.cin = cin;
+            t.cout = cout;
+        }
+    }
+
     /// The TLS buffers, for their pool.
     pub(crate) fn take_tls_buffers(&mut self) -> Option<(Buffer, Buffer)> {
         self.tls.take().map(|t| (t.cin, t.cout))
@@ -468,7 +514,16 @@ impl Link {
                 TlsNext::Plain => return Ok(Pump::Plain),
                 TlsNext::Handshaken => return Ok(Pump::Handshaken),
                 TlsNext::Eof => return Ok(Pump::Eof),
-                TlsNext::Transmit => self.send_raw_all(t.cout.as_slice())?,
+                TlsNext::Transmit => {
+                    // Records the engine wrote on its own are not the session's reply:
+                    // they must not end an exchange, and they go out under the
+                    // outbound rate like any send.
+                    let replied = self.replied;
+                    self.rate_out.activate(self.now());
+                    let r = self.send_raw_all(t.cout.as_slice());
+                    self.replied = replied;
+                    r?;
+                }
                 TlsNext::NeedInput => {
                     if let Some(p) = self.tls_fill(t)? {
                         return Ok(p);
@@ -713,22 +768,26 @@ impl Link {
     }
 
     /// Ends a handshake. `rest` holds bytes read past it (`buffer[at..]`), served
-    /// before the socket. The connection waits for its first exchange again.
+    /// before the socket. The connection waits for its first exchange again. A
+    /// buffer with nothing past the header comes back for its pool at once, so an
+    /// idle connection holds no read buffer.
     #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
-    pub(crate) fn end_handshake(&mut self, rest: Option<(Buffer, usize)>) {
+    #[must_use]
+    pub(crate) fn end_handshake(&mut self, rest: Option<(Buffer, usize)>) -> Option<Buffer> {
         self.handshake_deadline = None;
+        let mut unused = None;
         if let Some((buffer, at)) = rest {
             if at < buffer.len() {
                 self.pending_at = at;
                 self.pending = Some(buffer);
             } else {
-                self.pending = Some(buffer);
-                self.pending_at = usize::MAX;
+                unused = Some(buffer);
             }
         }
         self.phase = Phase::Idle;
         self.progress_at = self.now();
         self.rate_in.deactivate();
+        unused
     }
 
     /// The handshake buffer, for its pool.
@@ -775,7 +834,9 @@ impl Link {
     /// This connection's idle timeout from its next idle wait on (`None`: the
     /// limits' value again). At least one tick.
     pub(crate) fn set_idle_timeout(&mut self, timeout: Option<Duration>) {
-        self.idle_timeout = timeout.map_or(self.limits.idle_timeout, |t| t.max(self.limits.tick));
+        self.idle_timeout = timeout.map_or(self.limits.idle_timeout, |t| {
+            crate::time::bounded(t).max(self.limits.tick)
+        });
     }
 
     pub(crate) fn killed(&self) -> Option<KillReason> {
@@ -1053,6 +1114,11 @@ impl Link {
             if self.exchange_deadline.is_some_and(|d| now >= d) {
                 return Err(self.timed_out(TimeoutKind::Exchange));
             }
+            // A handshake flight that the peer drains a byte at a time still ends at
+            // the handshake deadline, not at a write timeout each byte restarts.
+            if self.handshake_deadline.is_some_and(|d| now >= d) {
+                return Err(self.timed_out(TimeoutKind::Handshake));
+            }
             if self.rate_out.too_slow(&self.limits.min_rate, now) {
                 return Err(self.fail(
                     CloseReason::SlowPeer {
@@ -1065,6 +1131,9 @@ impl Link {
             }
             let mut until = deadline;
             if let Some(d) = self.exchange_deadline {
+                until = until.min(d);
+            }
+            if let Some(d) = self.handshake_deadline {
                 until = until.min(d);
             }
             if let Some(c) = self.rate_out.next_check(&self.limits.min_rate, now) {
@@ -1111,6 +1180,9 @@ impl Link {
             self.gate_check(chunk)?;
             return self.write_tls(&buf[..chunk]);
         }
+        // One offer is at most what `WriteCheck::bytes` can say, so the gate's
+        // count stays exact for a single enormous write.
+        let buf = &buf[..buf.len().min(u32::MAX as usize)];
         self.gate_check(buf.len().saturating_sub(self.approved))?;
         let n = self.send_raw(buf)?;
         self.approved = buf.len() - n;
@@ -1370,7 +1442,11 @@ impl Link {
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.wait_writable()?,
-                    Err(e) if sent == 0 && sys::send_file_refused(&e) => return Ok(0),
+                    Err(e) if sent == 0 && sys::send_file_refused(&e) => {
+                        // The copy that follows asks the gate for these bytes itself.
+                        self.approved = 0;
+                        return Ok(0);
+                    }
                     Err(e) => return Err(self.os_error("sendfile", e)),
                 }
             }
@@ -1422,6 +1498,75 @@ impl Link {
         Ok(sent)
     }
 
+    /// Receives up to `len` bytes into `file` at `offset`, under the same deadlines,
+    /// minimum rate, kill, and drain as `read`; returns the count, short of `len` only
+    /// when the peer closed. Linux splices socket to pipe to file (no copy through
+    /// user space) unless TLS is on or bytes were read ahead; elsewhere, and when the
+    /// socket or the file turns `splice` down, it copies through a 64 KiB buffer.
+    pub(crate) fn recv_file(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        offset.checked_add(len).ok_or_else(|| {
+            NetError::from_os("recv", io::Error::from(io::ErrorKind::InvalidInput))
+        })?;
+        #[cfg(target_os = "linux")]
+        let pipe = if self.tls.is_none() {
+            Some(sys::splice_pipe().map_err(|e| self.os_error("pipe", e))?)
+        } else {
+            None
+        };
+        // Off for good once the socket or the file turns `splice` down.
+        #[cfg(target_os = "linux")]
+        let refused = std::cell::Cell::new(pipe.is_none());
+        let mut buf = vec![0u8; FILE_COPY.min(usize::try_from(len).unwrap_or(usize::MAX))];
+        let mut got = 0u64;
+        while got < len {
+            let take = usize::try_from(len - got).map_or(buf.len(), |n| n.min(buf.len()));
+            let at = offset + got;
+            // Set when the bytes went straight into the file, not into `buf`.
+            let spliced = std::cell::Cell::new(false);
+            #[cfg(target_os = "linux")]
+            let result = match &pipe {
+                Some(pipe) if !refused.get() => {
+                    self.read_raw_with(&mut buf[..take], |stream, b| {
+                        if !refused.get() {
+                            match sys::splice_to_file(stream.sock(), pipe, file, at, b.len()) {
+                                Ok(n) => {
+                                    spliced.set(true);
+                                    return Ok(n);
+                                }
+                                Err(e) if sys::send_file_refused(&e) => refused.set(true),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        sys::recv(stream, b)
+                    })
+                }
+                _ => self.read(&mut buf[..take]),
+            };
+            #[cfg(not(target_os = "linux"))]
+            let result = self.read(&mut buf[..take]);
+            match result? {
+                Got::Data(n) => {
+                    if !spliced.get() {
+                        sys::write_file_at(file, &buf[..n], at)
+                            .map_err(|e| self.os_error("write", e))?;
+                    }
+                    got += n as u64;
+                }
+                Got::Eof => break,
+                Got::Woken => {}
+            }
+        }
+        Ok(got)
+    }
+
     fn file_truncated(&mut self, sent: u64) -> NetError {
         self.fail(
             CloseReason::Io(OsErrorClass::FileTruncated),
@@ -1458,6 +1603,83 @@ impl Link {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
             Err(e) => Err(NetError::from_os("shutdown", e)),
+        }
+    }
+
+    /// What the next read would find, looked at without waiting and without
+    /// consuming anything: one zero-timeout wait and, when the socket is readable,
+    /// a one-byte peek (TCP; other streams report `Readable`).
+    pub(crate) fn probe(&mut self) -> Result<Health, NetError> {
+        self.check_terminal()?;
+        let held = self
+            .tls
+            .as_ref()
+            .is_some_and(|t| t.plain_at < t.plain_end || t.start < t.cin.len());
+        if self.pending.is_some() || held {
+            return Ok(Health::Readable);
+        }
+        if self.peer_closed {
+            return Ok(Health::PeerClosed);
+        }
+        match self.stream.wait(Interest::Read, None, Some(Duration::ZERO)) {
+            Ok(Ready::Socket) => {}
+            Ok(_) => {
+                return match sys::take_error(self.stream.sock()) {
+                    Ok(None) => Ok(Health::Open),
+                    Ok(Some(e)) | Err(e) => Err(self.os_error("probe", e)),
+                };
+            }
+            Err(e) => return Err(NetError::from_os("poll", e)),
+        }
+        if self.stream.tcp().is_none() {
+            return Ok(Health::Readable);
+        }
+        let mut one = [0u8; 1];
+        match self.stream.peek(&mut one) {
+            Ok(0) => Ok(Health::PeerClosed),
+            Ok(_) => Ok(Health::Readable),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Health::Open),
+            Err(e) => Err(self.os_error("recv", e)),
+        }
+    }
+
+    /// FIN, then reads and discards until the peer's FIN, `within`, or a kill.
+    /// Returns whether the peer closed, and how many bytes were discarded.
+    pub(crate) fn drain_for(&mut self, within: Duration) -> (bool, u64) {
+        self.tls_close_notify();
+        let _ = self.stream.shutdown(Shutdown::Write);
+        if self.peer_closed {
+            return (true, 0);
+        }
+        let deadline = self.now().checked_add(within);
+        let mut discarded = 0u64;
+        let mut scratch = [0u8; 4096];
+        loop {
+            if self.killed().is_some() {
+                return (false, discarded);
+            }
+            let now = self.now();
+            let timeout = match deadline {
+                Some(d) if now >= d => return (false, discarded),
+                Some(d) => d
+                    .saturating_duration_since(now)
+                    .max(Duration::from_millis(1)),
+                None => Duration::from_secs(1),
+            };
+            match self.wait(Interest::Read, timeout) {
+                Ok(Ready::Socket) => {}
+                Ok(_) => continue,
+                Err(_) => return (false, discarded),
+            }
+            match self.stream.read(&mut scratch) {
+                Ok(0) => {
+                    self.peer_closed = true;
+                    return (true, discarded);
+                }
+                Ok(n) => discarded += n as u64,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => return (false, discarded),
+            }
         }
     }
 
@@ -1510,6 +1732,13 @@ impl Link {
         let now = self.now();
         self.bytes_in += n as u64;
         self.progress_at = now;
+        // As on the pool: any ciphertext starts an exchange, so records that carry no
+        // plaintext fall under the read deadline and the inbound rate instead of
+        // moving the idle deadline for ever.
+        if self.phase == Phase::Idle {
+            self.phase = Phase::Receiving;
+            self.rate_in.activate(now);
+        }
         self.rate_in.record(now, n);
         self.check_rate_in(now)
     }
@@ -1537,6 +1766,16 @@ impl Link {
         self.sent(n);
         let now = self.now();
         self.check_rate_out(now)
+    }
+
+    /// As `note_sent`, for records the TLS engine wrote on its own: not the
+    /// session's reply, so the exchange does not end on them.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn note_engine_sent(&mut self, n: usize) -> Result<(), NetError> {
+        let replied = self.replied;
+        let r = self.note_sent(n);
+        self.replied = replied;
+        r
     }
 
     /// Before a send: the output deadline starts, a dead connection stops here,
@@ -1894,8 +2133,26 @@ impl Link {
     }
 
     /// One send attempt without the gate check, for the denial bytes after a denial.
+    /// Under TLS the denial is a record like any other: encrypted into the output
+    /// buffer and sent once, or not sent at all if the engine cannot encrypt it
+    /// (the output buffer is out with a send, or the denial does not fit).
     pub(crate) fn send_denial_once(&mut self, buf: &[u8]) {
-        if let Ok(n) = sys::send(&self.stream, buf) {
+        let sent = match self.tls.as_mut() {
+            Some(t) => {
+                t.cout.set_len(0);
+                match t.session.encrypt(buf, t.cout.spare()) {
+                    Ok(n) if n > 0 => {
+                        t.cout.set_len(n);
+                        let r = sys::send(&self.stream, t.cout.as_slice());
+                        t.cout.set_len(0);
+                        r.ok()
+                    }
+                    _ => None,
+                }
+            }
+            None => sys::send(&self.stream, buf).ok(),
+        };
+        if let Some(n) = sent {
             self.bytes_out += n as u64;
             self.replied = true;
         }

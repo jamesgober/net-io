@@ -112,6 +112,9 @@ pub struct ListenerHandle {
     name: Option<String>,
     local: Endpoint,
     sock: sys::OwnedSock,
+    /// After `sock`, so the socket closes before its value is freed.
+    #[cfg(all(windows, feature = "local"))]
+    adopted: Option<sys::Adoption>,
 }
 
 impl ListenerHandle {
@@ -124,12 +127,7 @@ impl ListenerHandle {
     ) -> Result<ListenerHandle, KindError> {
         let kind = sys::listener_kind(sys::AsSock::sock(&sock))?;
         let (kind, local) = endpoint_of(kind)?;
-        Ok(ListenerHandle {
-            kind,
-            name,
-            local,
-            sock,
-        })
+        Ok(ListenerHandle::new(kind, name, local, sock))
     }
 
     pub(crate) fn new(
@@ -143,10 +141,16 @@ impl ListenerHandle {
             name,
             local,
             sock,
+            #[cfg(all(windows, feature = "local"))]
+            adopted: None,
         }
     }
 
     pub(crate) fn into_sock(self) -> sys::OwnedSock {
+        #[cfg(all(windows, feature = "local"))]
+        if let Some(adoption) = self.adopted {
+            adoption.keep_for_good();
+        }
         self.sock
     }
 
@@ -639,7 +643,17 @@ impl SharedListeners {
 /// since the pipe's security descriptor decides who gets to the pipe. The message
 /// must be intact and never seen before, and every socket a listener bound to the
 /// address the manifest names. All or nothing: on any error every received socket
-/// is closed.
+/// is closed, also those listed after the one that failed. A description that
+/// names a socket this process already owns (the same one twice, one from an
+/// earlier hand-off, or a forged one) is refused, so no socket gets two owners.
+/// Received sockets are not inheritable.
+///
+/// Windows makes each socket in this process when the sender describes it, so a
+/// message that arrives damaged (`Truncated`, `BadChecksum`, or a bad manifest)
+/// leaves the sockets it described open here, unclaimed, until this process
+/// exits: their descriptions cannot be trusted enough to claim them. Only a
+/// process the pipe's security descriptor admits can cause that; set
+/// `expect.pid` to narrow it to the one expected sender.
 ///
 /// # Errors
 ///
@@ -708,16 +722,40 @@ fn adopt_shared(
         }
         seen.push(nonce);
     }
-    let mut handles = Vec::with_capacity(records.len());
-    for (i, (record, blob)) in records
-        .into_iter()
-        .zip(blobs.chunks_exact(sys::SHARED_SOCKET))
-        .enumerate()
-    {
+    // Every description is claimed before anything is checked: Windows made the
+    // duplicate in this process when the sender described it, so one never turned
+    // into a socket here stays open with no owner. A failure below drops them all.
+    let mut claimed = Vec::with_capacity(records.len());
+    let mut failed = None;
+    for (i, blob) in blobs.chunks_exact(sys::SHARED_SOCKET).enumerate() {
         let index = i as u8;
-        let blob: &[u8; sys::SHARED_SOCKET] =
-            blob.try_into().map_err(|_| HandoffError::Truncated)?;
-        let sock = sys::socket_from_shared(blob).map_err(HandoffError::Os)?;
+        let got = <&[u8; sys::SHARED_SOCKET]>::try_from(blob)
+            .map_err(|_| HandoffError::Truncated)
+            .and_then(|blob| {
+                sys::socket_from_shared(blob).map_err(|e| match e.kind() {
+                    io::ErrorKind::AlreadyExists => HandoffError::VerifyFailed {
+                        index,
+                        why: "names a socket this process already owns",
+                    },
+                    _ => HandoffError::Os(e),
+                })
+            });
+        match got {
+            Ok(sock) => claimed.push(sock),
+            Err(e) => {
+                failed.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    if claimed.len() != records.len() {
+        return Err(HandoffError::CountMismatch);
+    }
+    let mut handles = Vec::with_capacity(records.len());
+    for (i, (record, (sock, adoption))) in records.into_iter().zip(claimed).enumerate() {
+        let index = i as u8;
         let got = sys::listener_kind(sys::AsSock::sock(&sock)).map_err(|e| {
             HandoffError::VerifyFailed {
                 index,
@@ -734,7 +772,9 @@ fn adopt_shared(
             index,
             why: why(&e),
         })?;
-        handles.push(ListenerHandle::new(kind, record.name, local, sock));
+        let mut handle = ListenerHandle::new(kind, record.name, local, sock);
+        handle.adopted = Some(adoption);
+        handles.push(handle);
     }
     Ok(handles)
 }
@@ -989,6 +1029,142 @@ mod tests {
             receive_shared(&mut rx, &HandoffPeer::default(), until),
             Err(HandoffError::BadChecksum)
         ));
+    }
+
+    /// A pipe pair for one test, (sender, receiver).
+    #[cfg(all(windows, feature = "local"))]
+    fn pipe_pair(tag: &str) -> (crate::pipe::PipeConnection, crate::pipe::PipeConnection) {
+        use std::time::Duration;
+        let name = format!("net-io-handoff-{tag}-{}", std::process::id());
+        let listener = crate::pipe::PipeListener::create(&name).unwrap();
+        let tx = crate::pipe::PipeConnection::connect(&name, Duration::from_secs(1)).unwrap();
+        let (rx, _) = listener.accept().unwrap();
+        (tx, rx)
+    }
+
+    /// A frame as `share_listeners` builds it, from any records and descriptions.
+    #[cfg(all(windows, feature = "local"))]
+    fn frame(records: &[Record], blobs: &[[u8; sys::SHARED_SOCKET]]) -> Vec<u8> {
+        let mut tail = vec![0u8; NONCE];
+        sys::random_bytes(&mut tail).unwrap();
+        for b in blobs {
+            tail.extend_from_slice(b);
+        }
+        let mut crc = crate::crc32c::Crc32c::new();
+        crc.update(&tail);
+        let mut out = encode(records);
+        out.extend_from_slice(&tail);
+        out.extend_from_slice(&crc.finish().to_be_bytes());
+        out
+    }
+
+    #[cfg(all(windows, feature = "local"))]
+    fn tcp_record(addr: std::net::SocketAddr) -> Record {
+        Record {
+            kind: SockKind::Tcp(addr),
+            name: None,
+        }
+    }
+
+    /// The sockets a failed hand-off received, also those after the one that
+    /// failed, are closed: none keeps listening here.
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_a_failed_hand_off_leaves_no_socket_open() {
+        use std::net::{TcpListener as Std, TcpStream};
+        use std::os::windows::io::AsSocket;
+        use std::time::{Duration, Instant};
+        let (a, b) = (
+            Std::bind("127.0.0.1:0").unwrap(),
+            Std::bind("127.0.0.1:0").unwrap(),
+        );
+        let addr_b = b.local_addr().unwrap();
+        let me = std::process::id();
+        let blobs = [
+            sys::share_socket(a.as_socket(), me).unwrap(),
+            sys::share_socket(b.as_socket(), me).unwrap(),
+        ];
+        // The first record names the wrong address.
+        let records = [tcp_record(addr_b), tcp_record(addr_b)];
+        let (mut tx, mut rx) = pipe_pair("leak");
+        tx.send_all(&frame(&records, &blobs)).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        assert!(matches!(
+            receive_shared(&mut rx, &HandoffPeer::default(), until),
+            Err(HandoffError::VerifyFailed { index: 0, .. })
+        ));
+        drop((a, b));
+        assert!(
+            TcpStream::connect_timeout(&addr_b, Duration::from_secs(1)).is_err(),
+            "the second socket still listens in this process"
+        );
+    }
+
+    /// Fails the test without closing handles that may have two owners.
+    #[cfg(all(windows, feature = "local"))]
+    fn refused(got: Result<Vec<ListenerHandle>, HandoffError>) -> HandoffError {
+        match got {
+            Ok(handles) => {
+                std::mem::forget(handles);
+                panic!("one socket was adopted twice");
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// One description twice in a frame, or again in a later frame with a fresh
+    /// nonce, would give one socket two owners: refused.
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_a_socket_is_never_adopted_twice() {
+        use std::net::TcpListener as Std;
+        use std::os::windows::io::AsSocket;
+        use std::time::{Duration, Instant};
+        let a = Std::bind("127.0.0.1:0").unwrap();
+        let addr = a.local_addr().unwrap();
+        let me = std::process::id();
+        let until = Instant::now() + Duration::from_secs(5);
+        let (mut tx, mut rx) = pipe_pair("twice");
+
+        let blob = sys::share_socket(a.as_socket(), me).unwrap();
+        let records = [tcp_record(addr), tcp_record(addr)];
+        tx.send_all(&frame(&records, &[blob, blob])).unwrap();
+        assert!(matches!(
+            refused(receive_shared(&mut rx, &HandoffPeer::default(), until)),
+            HandoffError::VerifyFailed { index: 1, .. }
+        ));
+
+        let blob = sys::share_socket(a.as_socket(), me).unwrap();
+        tx.send_all(&frame(&records[..1], &[blob])).unwrap();
+        let first = receive_shared(&mut rx, &HandoffPeer::default(), until).unwrap();
+        tx.send_all(&frame(&records[..1], &[blob])).unwrap();
+        assert!(matches!(
+            refused(receive_shared(&mut rx, &HandoffPeer::default(), until)),
+            HandoffError::VerifyFailed { index: 0, .. }
+        ));
+        // Once that socket is closed, a new description of the listener works.
+        drop(first);
+        let blob = sys::share_socket(a.as_socket(), me).unwrap();
+        tx.send_all(&frame(&records[..1], &[blob])).unwrap();
+        let again = receive_shared(&mut rx, &HandoffPeer::default(), until).unwrap();
+        assert_eq!(again[0].local().socket_addr(), Some(addr));
+    }
+
+    /// A received listener is not inherited by processes this one starts.
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_received_sockets_are_not_inheritable() {
+        use std::net::TcpListener as Std;
+        use std::os::windows::io::AsSocket;
+        use std::time::{Duration, Instant};
+        let a = Std::bind("127.0.0.1:0").unwrap();
+        let addr = a.local_addr().unwrap();
+        let (mut tx, mut rx) = pipe_pair("inherit");
+        let blob = sys::share_socket(a.as_socket(), std::process::id()).unwrap();
+        tx.send_all(&frame(&[tcp_record(addr)], &[blob])).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let got = receive_shared(&mut rx, &HandoffPeer::default(), until).unwrap();
+        assert!(!sys::is_inheritable(got[0].as_socket()).unwrap());
     }
 
     #[cfg(all(windows, feature = "local"))]

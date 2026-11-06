@@ -33,6 +33,11 @@ impl Rate {
         let want = cfg.window.as_nanos() / width.as_nanos().max(1);
         if want > MAX_BUCKETS as u128 {
             width = cfg.window / MAX_BUCKETS as u32;
+        } else if want < 2 {
+            // One bucket covers nothing at its own boundary, which is when the timer's
+            // check runs: a silent peer would never be too slow (found by the `rate`
+            // fuzz target, with a window under twice the check interval).
+            width = cfg.window / 2;
         }
         let n = usize::try_from(cfg.window.as_nanos() / width.as_nanos().max(1))
             .unwrap_or(MAX_BUCKETS)
@@ -117,7 +122,10 @@ impl Rate {
             .saturating_sub(u128::from(self.head) * width);
         let covered = (width * (self.n as u128 - 1) + into_current).min(active.as_nanos());
         let moved: u64 = self.buckets[..self.n].iter().map(|&b| u64::from(b)).sum();
-        let required = u128::from(cfg.bytes_per_sec) * covered / 1_000_000_000;
+        // Rounded up: at 1 B/s over 200 ms the requirement is one byte, not none, so a
+        // silent peer is too slow whatever the rate and window (found by the `rate`
+        // fuzz target).
+        let required = (u128::from(cfg.bytes_per_sec) * covered).div_ceil(1_000_000_000);
         u128::from(moved) < required
     }
 
@@ -150,6 +158,35 @@ mod tests {
         let mut r = Rate::new(&rate(), t);
         r.activate(t);
         assert!(!r.too_slow(&rate(), t + Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn test_rate_silent_peer_is_too_slow_at_a_low_rate() {
+        let cfg = MinRate {
+            bytes_per_sec: 1,
+            window: Duration::from_millis(200),
+            grace: Duration::from_millis(1),
+            check: Duration::from_millis(50),
+        };
+        let t0 = Instant::now();
+        let mut r = Rate::new(&cfg, t0);
+        r.activate(t0);
+        assert!(r.too_slow(&cfg, t0 + Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn test_rate_short_window_still_measures_at_check_boundaries() {
+        let cfg = MinRate {
+            bytes_per_sec: 97,
+            window: Duration::from_millis(200),
+            grace: Duration::from_millis(1_921),
+            check: Duration::from_millis(101),
+        };
+        let t0 = Instant::now();
+        let mut r = Rate::new(&cfg, t0);
+        r.activate(t0);
+        // Exactly on a multiple of the check interval.
+        assert!(r.too_slow(&cfg, t0 + Duration::from_millis(2_222)));
     }
 
     #[test]
@@ -234,5 +271,62 @@ mod tests {
             let quiet = now + window + cfg.check + Duration::from_millis(1);
             assert!(r.too_slow(&cfg, quiet), "{cfg:?} silent peer not flagged");
         }
+    }
+}
+
+/// The fuzz target `rate`: arbitrary arrivals and clock steps never panic, a
+/// counter is never too slow before its grace ends or while inactive, and a peer
+/// that sent nothing for a whole window after its grace is too slow.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_rate(data: &[u8]) {
+    let Some((head, ops)) = data.split_first_chunk::<4>() else {
+        return;
+    };
+    let cfg = MinRate {
+        bytes_per_sec: u32::from(head[0]) * 16 + 1,
+        window: Duration::from_millis(u64::from(head[1]) * 40 + 200),
+        grace: Duration::from_millis(u64::from(head[2]) * 20 + 1),
+        check: Duration::from_millis(u64::from(head[3]) % 200 + 1),
+    };
+    if cfg.window < cfg.check {
+        return;
+    }
+    let start = Instant::now();
+    let mut now = start;
+    let mut r = Rate::new(&cfg, now);
+    let mut active_at = None;
+    for op in ops.chunks(3) {
+        let arg = op.get(1..).map_or(0u64, |b| {
+            b.iter().fold(0u64, |a, &x| (a << 8) | u64::from(x))
+        });
+        match op[0] % 5 {
+            0 => {
+                r.activate(now);
+                active_at.get_or_insert(now);
+            }
+            1 => {
+                r.deactivate();
+                active_at = None;
+            }
+            2 => r.record(now, arg as usize),
+            3 => now += Duration::from_micros(arg * 97),
+            _ => {
+                let slow = r.too_slow(&cfg, now);
+                match active_at {
+                    None => assert!(!slow, "too slow while inactive"),
+                    Some(at) if now < at + cfg.grace => assert!(!slow, "too slow in its grace"),
+                    _ => {}
+                }
+                let _ = r.next_check(&cfg, now);
+            }
+        }
+    }
+    if let Some(at) = active_at {
+        // Silence for a full window after the grace: too slow, whatever came before.
+        let later = now.max(at + cfg.grace) + cfg.window + cfg.check;
+        assert!(
+            r.too_slow(&cfg, later),
+            "silent for a window and not too slow"
+        );
     }
 }

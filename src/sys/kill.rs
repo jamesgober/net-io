@@ -177,9 +177,10 @@ impl KillSlot {
     }
 
     /// A drain closes an idle connection: when the connection of `generation` is
-    /// waiting for its next exchange, shut its read side (under the same guard as a
-    /// kill) and wake its owner, who then closes it with `Drained`. A reply already
-    /// in progress still goes out: writes are untouched. Returns `false` when the
+    /// waiting for its next exchange, shut its read side (Unix; Windows uses the
+    /// wake channel alone) under the same guard as a kill, and wake its owner, who
+    /// then closes it with `Drained`. A reply already in progress still goes out:
+    /// writes are untouched. Returns `false` when the
     /// connection is not idle, already drained, killed, or closing.
     pub(crate) fn drain_idle(&self, generation: u32) -> bool {
         let mut s = self.state.load(Ordering::Acquire);
@@ -209,12 +210,14 @@ impl KillSlot {
         // An owner with a wake channel is reached through it alone and decides at
         // its wait, where it can see a request that already arrived: a shut read
         // side cannot be opened again, and a drain that saw that request too late
-        // would cut it short (D-178). Only an owner without a wake channel has its
-        // read side shut.
+        // would cut it short (D-178). On Windows the cancel would also end a pipe
+        // write already reported as sent (D-156). Only an owner without a wake
+        // channel has its read side shut (Unix) or its IO cancelled (Windows).
         if wake.is_none() {
-            // A request that already arrived is read and answered first; the mark
-            // is taken back, and a later pass closes the connection at its next
-            // wait (D-176).
+            // A request that already arrived is read and answered first: the read
+            // side, once shut, stays shut, and the rest of that exchange would read
+            // as end of stream. The mark is taken back, and a later pass closes the
+            // connection at its next wait (D-176).
             #[cfg(unix)]
             // SAFETY: the KILLING bit is set, so `raw` is open for this call (as below).
             if unsafe { super::input_waiting_raw(raw) } {

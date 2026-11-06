@@ -34,6 +34,11 @@ struct EpollEvent {
     data: u64,
 }
 
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<EpollEvent>() == 12 && align_of::<EpollEvent>() == 1);
+#[cfg(not(target_arch = "x86_64"))]
+const _: () = assert!(size_of::<EpollEvent>() == 16 && align_of::<EpollEvent>() == 8);
+
 unsafe extern "C" {
     fn epoll_create1(flags: c_int) -> c_int;
     fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut EpollEvent) -> c_int;
@@ -135,6 +140,8 @@ impl Poller {
 
     /// Registers a socket under `key` for both directions, edge-triggered.
     pub(crate) fn add(&self, sock: Sock<'_>, key: u64) -> io::Result<Registered> {
+        #[cfg(any(test, net_io_shim))]
+        super::shim::check(super::shim::Op::Register)?;
         let raw = sock.as_raw_fd();
         let mut reg = EpollEvent {
             events: EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET,

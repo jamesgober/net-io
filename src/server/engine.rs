@@ -99,6 +99,9 @@ const NO_LISTENER: u32 = u32::MAX;
 /// How often a drain looks again for connections that became idle.
 const DRAIN_PASS: Duration = Duration::from_millis(10);
 
+/// Accept errors in a row, none of them a connection, before the accept loop pauses.
+const SKIPS_BEFORE_PAUSE: u32 = 64;
+
 /// Increments `counter` unless it already reached `cap`; `true` when a slot was taken.
 #[inline]
 fn take_slot(counter: &AtomicU32, cap: u32) -> bool {
@@ -392,9 +395,10 @@ type SpawnAccept = Box<
 >;
 
 impl Shared {
+    /// A sink that panics loses that event and nothing else.
     pub(crate) fn event(&self, e: Event) {
         if let Some(s) = &self.sink {
-            s.event(&e);
+            let _ = guarded(|| s.event(&e));
         }
     }
 
@@ -735,16 +739,23 @@ impl Shared {
             let mine = |w: &&WorkerShared| {
                 w.listener.load(Ordering::Acquire) == id && w.current.load(Ordering::Acquire) != 0
             };
-            for w in self.workers.iter().filter(mine) {
-                if !w.slot.drained() {
+            // The generation first, then whose connection it is: read the other way
+            // round, the worker's next connection (another listener's) could be hit.
+            for w in &self.workers {
+                let generation = w.slot.generation();
+                if mine(&w) && !w.slot.drained() {
                     w.idle_cause.store(IDLE_DRAIN, Ordering::Release);
-                    w.slot.drain_idle(w.slot.generation());
+                    w.slot.drain_idle(generation);
                 }
             }
             let now = Instant::now();
             if now >= deadline && !killed_at_deadline {
                 killed_at_deadline = true;
-                for w in self.workers.iter().filter(mine) {
+                for w in &self.workers {
+                    let generation = w.slot.generation();
+                    if !mine(&w) {
+                        continue;
+                    }
                     let claimed = w
                         .kill_cause
                         .compare_exchange(
@@ -754,7 +765,7 @@ impl Shared {
                             Ordering::Acquire,
                         )
                         .is_ok();
-                    if w.slot.kill(w.slot.generation(), DRAIN_KILL) {
+                    if w.slot.kill(generation, DRAIN_KILL) {
                         killed += 1;
                     } else if claimed {
                         w.kill_cause.store(CAUSE_USER, Ordering::Release);
@@ -892,7 +903,8 @@ impl Shared {
     pub(crate) fn drain(&self, deadline: Instant) -> DrainReport {
         let start = Instant::now();
         self.close_door();
-        if !self.draining.swap(true, Ordering::AcqRel) {
+        let first = !self.draining.swap(true, Ordering::AcqRel);
+        if first {
             self.drained_graceful.store(0, Ordering::Relaxed);
             self.drained_killed.store(0, Ordering::Relaxed);
             self.event(Event::DrainStarted {
@@ -906,7 +918,15 @@ impl Shared {
             // pass for connections that finish an exchange during the drain.
             self.drain_idle_pass();
             let now = Instant::now();
-            if now >= deadline && !killed_at_deadline {
+            // A stop that arrives during the drain (the control line escalating to
+            // `Stopping`, or `request_stop`) ends it now, not at the drain's deadline.
+            let stop = self.stopping.load(Ordering::Acquire)
+                || self.control.state() == ControlState::Stopping;
+            if stop {
+                self.kill_all(CAUSE_STOP);
+                killed_at_deadline = true;
+            } else if now >= deadline {
+                // Every pass, not once: a connection admitted late is killed too.
                 killed_at_deadline = true;
                 self.kill_all(CAUSE_DRAIN);
             }
@@ -929,10 +949,13 @@ impl Shared {
             killed: self.drained_killed.load(Ordering::Relaxed),
             took: start.elapsed(),
         };
-        self.event(Event::DrainFinished {
-            graceful: report.graceful,
-            killed: report.killed,
-        });
+        // One drain, one event, however many threads waited on it.
+        if first {
+            self.event(Event::DrainFinished {
+                graceful: report.graceful,
+                killed: report.killed,
+            });
+        }
         report
     }
 
@@ -959,6 +982,7 @@ impl Shared {
             return self.command(CMD_KILL_ALL);
         }
         for w in &self.workers {
+            let generation = w.slot.generation();
             if w.current.load(Ordering::Acquire) != 0 {
                 // Claim the cause first (the owner reads it once it sees the kill). A
                 // concurrent drain or stop that already claimed it keeps its cause.
@@ -966,7 +990,7 @@ impl Shared {
                     .kill_cause
                     .compare_exchange(CAUSE_USER, cause, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok();
-                if !w.slot.kill(w.slot.generation(), DRAIN_KILL) && claimed {
+                if !w.slot.kill(generation, DRAIN_KILL) && claimed {
                     // Already closed, or a user's kill won: that reason stands.
                     w.kill_cause.store(CAUSE_USER, Ordering::Release);
                 }
@@ -985,12 +1009,13 @@ impl Shared {
             return self.command(CMD_SHED);
         }
         for w in &self.workers {
+            let generation = w.slot.generation();
             if w.current.load(Ordering::Acquire) != 0
                 && w.lane.load(Ordering::Acquire) >= from_lane.0
                 && !w.slot.drained()
             {
                 w.idle_cause.store(IDLE_SHED, Ordering::Release);
-                if !w.slot.drain_idle(w.slot.generation()) {
+                if !w.slot.drain_idle(generation) {
                     w.idle_cause.store(IDLE_DRAIN, Ordering::Release);
                 }
             }
@@ -1851,6 +1876,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
     let mut view = ControlView::new();
     let mut coalescer = Coalescer::new();
     let mut pause_until: Option<Instant> = None;
+    let mut skipped = 0u32;
     loop {
         if shared.stopping.load(Ordering::Acquire) || conf.removed.load(Ordering::Acquire) {
             return;
@@ -1914,6 +1940,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
             let outcome = match rt {
                 ListenerRuntime::Tcp(l) => match acceptor.accept(l.std()) {
                     Accepted::Conn((stream, peer)) => {
+                        skipped = 0;
                         engine.admit_tcp(stream, peer, conf, &mut ids, &view, &mut coalescer);
                         continue;
                     }
@@ -1922,6 +1949,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
                 #[cfg(all(unix, feature = "local"))]
                 ListenerRuntime::Unix(l) => match acceptor.accept_unix(l.std()) {
                     Accepted::Conn(stream) => {
+                        skipped = 0;
                         engine.admit_unix(l, stream, conf, &mut ids, &view, &mut coalescer);
                         continue;
                     }
@@ -1932,6 +1960,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
                 #[cfg(all(windows, feature = "local"))]
                 ListenerRuntime::AfUnix(l) => match acceptor.accept_af_unix(l.std()) {
                     Accepted::Conn(stream) => {
+                        skipped = 0;
                         engine.admit_af_unix(l, stream, conf, &mut ids, &view, &mut coalescer);
                         continue;
                     }
@@ -1940,11 +1969,15 @@ fn accept_loop<W: super::Workload, G: Gate>(
                 #[cfg(all(windows, feature = "local"))]
                 ListenerRuntime::Pipe(l) => match l.accept_or_wake(&wake) {
                     Ok(Some(stream)) => {
+                        skipped = 0;
                         engine.admit_pipe(l, stream, conf, &mut ids, &view, &mut coalescer);
                         continue;
                     }
                     // The wake: the top of the loop decides what it meant.
                     Ok(None) => break,
+                    // Someone else holds the name now (D-154): this listener is gone,
+                    // and pausing would hide that.
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Accepted::Failed(e),
                     // Out of instances or handles: the same pause as out of descriptors.
                     Err(_) => acceptor.pause(),
                 },
@@ -1954,11 +1987,30 @@ fn accept_loop<W: super::Workload, G: Gate>(
             drop(admitting);
             match outcome {
                 Accepted::Conn(()) => {}
-                Accepted::Skipped(class) => shared.event(Event::AcceptError {
-                    listener: conf.id,
-                    class,
-                }),
+                Accepted::Skipped(class) => {
+                    shared.event(Event::AcceptError {
+                        listener: conf.id,
+                        class,
+                    });
+                    // An error that never consumes a backlog entry (the network
+                    // subsystem failing) would otherwise spin: after a batch of them
+                    // in a row, pause as for descriptor pressure.
+                    skipped += 1;
+                    if skipped >= SKIPS_BEFORE_PAUSE {
+                        skipped = 0;
+                        if let Accepted::Pause(backoff) = acceptor.pause() {
+                            pause_until = Some(engine.clock.now() + backoff);
+                            break;
+                        }
+                    }
+                }
                 Accepted::Again => {
+                    skipped = 0;
+                    // A flood that stopped reports its folded tail now, not at the next
+                    // refusal, which may be hours away.
+                    if let Some(sink) = &shared.sink {
+                        coalescer.flush(&**sink);
+                    }
                     rt.wait(&wake);
                     break;
                 }
@@ -2165,7 +2217,9 @@ impl<W, G: Gate> Engine<W, G> {
         let lim = &conf.limits;
         let count = &conf.count;
         // Caps before any byte is read.
-        if !take_slot(&shared.open, lim.max_connections) {
+        // The server's cap, whatever the listener's limits say (a listener has
+        // `max_per_listener`; its own `max_connections` is refused at build).
+        if !take_slot(&shared.open, shared.max_open) {
             {
                 self.refuse(stream, peer, RefusalCause::GlobalCap, None, co);
                 return Err(Some(RefusalCause::GlobalCap));
@@ -2232,7 +2286,7 @@ impl<W, G: Gate> Engine<W, G> {
         // What is left must cover what the more important lanes keep for themselves.
         let reserved = lim.reserved_above(info.lane);
         if reserved > 0
-            && shared.open.load(Ordering::Acquire).saturating_add(reserved) > lim.max_connections
+            && shared.open.load(Ordering::Acquire).saturating_add(reserved) > shared.max_open
         {
             let _ = guarded(|| {
                 self.gate.closed(
@@ -2285,15 +2339,9 @@ impl<W, G: Gate> Engine<W, G> {
             return Err(Some(RefusalCause::Busy));
         }
         shared.accepted.fetch_add(1, Ordering::Relaxed);
-        shared.event(Event::Accepted {
-            id: event_id,
-            peer,
-            listener: conf.id,
-        });
-        shared.event(Event::Admitted {
-            id: event_id,
-            lane: event_lane,
-        });
+        // `Accepted` and `Admitted` come from the worker that takes the job
+        // (`announce`): from here, it could close the connection before they went out.
+        let _ = (peer, event_lane);
         Ok(event_id)
     }
 
@@ -2425,6 +2473,8 @@ pub struct Worker<G: Gate> {
     clock: ClockRef,
     /// Recycled PROXY facts (D-061): reused when no one else holds them.
     facts_pool: Vec<Arc<ProxyFacts>>,
+    /// A job's slots are taken and `end` has not given them back yet.
+    holding: bool,
 }
 
 fn worker_loop<W: Serve, G: Gate>(engine: &Arc<Engine<W, G>>, idx: usize) {
@@ -2454,9 +2504,26 @@ fn worker_loop<W: Serve, G: Gate>(engine: &Arc<Engine<W, G>>, idx: usize) {
         view: ControlView::new(),
         clock: engine.clock.clone(),
         facts_pool: Vec::new(),
+        holding: false,
     };
     while let Some(job) = engine.next_job() {
-        engine.work.serve(&mut w, job);
+        let (listener, source, info) = (job.listener.clone(), job.source, job.info.clone());
+        w.holding = true;
+        let served = guarded(|| engine.work.serve(&mut w, job)).is_some();
+        if w.holding {
+            // The job ended without `end`: a panic got past every inner boundary
+            // (the gate, the session, the TLS engine, and the event sink each have
+            // their own), or the link left the connection. The socket is already
+            // closed; what it held goes back, so the caps, `busy`, and any drain stay
+            // right and the worker serves the next job.
+            let reason = if served {
+                CloseReason::SessionError
+            } else {
+                CloseReason::SessionPanicked
+            };
+            w.abandon(&info, &listener, source, reason);
+        }
+        w.holding = false;
     }
 }
 
@@ -2500,7 +2567,7 @@ impl<G: Gate> Worker<G> {
         link.set_deadline_scale(self.shared.deadline_scale());
         link.begin_handshake(link.info.accepted_at + link.scaled(lim.handshake_timeout));
         let r = link.tls_handshake();
-        link.end_handshake(None);
+        let _ = link.end_handshake(None);
         match r {
             Ok(()) => Ok(()),
             Err(_) => Err(link.reason_or(CloseReason::TlsFailed)),
@@ -2570,11 +2637,15 @@ impl<G: Gate> Worker<G> {
         let (facts, real, consumed) = match outcome {
             Ok(v) => v,
             Err(reason) => {
-                link.end_handshake(Some((buf, usize::MAX)));
+                if let Some(b) = link.end_handshake(Some((buf, usize::MAX))) {
+                    self.pool.put(b);
+                }
                 return Err(reason);
             }
         };
-        link.end_handshake(Some((buf, consumed)));
+        if let Some(b) = link.end_handshake(Some((buf, consumed))) {
+            self.pool.put(b);
+        }
         proxy_resolved(
             &self.shared,
             link,
@@ -2602,6 +2673,7 @@ impl<G: Gate> Worker<G> {
         let shared = self.shared.clone();
         let limits = listener.limits.clone();
         info.worker = WorkerId(self.idx as u16);
+        announce(&shared, &info, &listener);
         let mut cell = self.gate_cell.take().unwrap_or_else(|| {
             Box::new(GateCell {
                 gate: self.gate.clone(),
@@ -2646,9 +2718,11 @@ impl<G: Gate> Worker<G> {
         } else {
             self.gate_cell = Some(cell);
         }
-        // Queued before its listener was removed: close it unread.
+        // Queued before its listener was removed, or before a stop: close it unread.
         let failed = if listener.removed.load(Ordering::Acquire) {
             Some(CloseReason::Drained)
+        } else if self.shared.stopping.load(Ordering::Acquire) {
+            Some(CloseReason::Shutdown)
         } else {
             failed
         };
@@ -2734,6 +2808,7 @@ impl<G: Gate> Worker<G> {
         ws.current.store(0, Ordering::Release);
         ws.listener.store(NO_LISTENER, Ordering::Release);
         count_drained(&shared, reason);
+        self.holding = false;
         shared.release(&listener, source);
         record_close(&shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
         shared.busy.fetch_sub(1, Ordering::AcqRel);
@@ -2743,6 +2818,34 @@ impl<G: Gate> Worker<G> {
 
     fn draining(&self) -> bool {
         self.shared.draining.load(Ordering::Acquire)
+    }
+
+    /// `end` for a job whose link was lost to a panic or left the connection.
+    fn abandon(
+        &mut self,
+        info: &ConnectionInfo,
+        listener: &ListenerConf,
+        source: Option<PrefixKey>,
+        reason: CloseReason,
+    ) {
+        let shared = self.shared.clone();
+        let ws = &shared.workers[self.idx];
+        self.output.reset();
+        self.input_buf = None;
+        if self.gate_cell.is_none() {
+            self.gate_cell = Some(Box::new(GateCell {
+                gate: self.gate.clone(),
+                ticket: None,
+            }));
+        }
+        ws.current.store(0, Ordering::Release);
+        ws.listener.store(NO_LISTENER, Ordering::Release);
+        count_drained(&shared, reason);
+        shared.release(listener, source);
+        let lifetime = self.clock.now().saturating_duration_since(info.accepted_at);
+        record_close(&shared, ws, info, reason, 0, 0, lifetime);
+        shared.busy.fetch_sub(1, Ordering::AcqRel);
+        shared.notify_progress();
     }
 
     /// The control line's reaction for a running connection.
@@ -2870,6 +2973,20 @@ impl<F: SessionFactory> Serve for Sessions<F> {
 /// Counts one close and tells the event sink. Both drivers end here.
 /// Counts a close for a running drain's report. Before the connection is released:
 /// a drain ends when the last one is, and reads its report then.
+/// The events of a connection's start, sent by the worker that took it, before
+/// anything that worker does with it.
+pub(crate) fn announce(shared: &Shared, info: &ConnectionInfo, listener: &ListenerConf) {
+    shared.event(Event::Accepted {
+        id: info.id,
+        peer: info.peer.socket_addr(),
+        listener: listener.id,
+    });
+    shared.event(Event::Admitted {
+        id: info.id,
+        lane: info.lane,
+    });
+}
+
 pub(crate) fn count_drained(shared: &Shared, reason: CloseReason) {
     if shared.draining.load(Ordering::Acquire) {
         if reason == CloseReason::DrainDeadline {

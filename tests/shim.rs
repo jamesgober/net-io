@@ -245,6 +245,9 @@ mod codes {
     pub const EPERM: Option<i32> = Some(1);
     pub const ENOBUFS: i32 = 105;
     pub const EBADF: i32 = 9;
+    pub const EADDRINUSE: i32 = 98;
+    pub const EINVAL: i32 = 22;
+    pub const ECONNREFUSED: i32 = 111;
 }
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod codes {
@@ -253,6 +256,9 @@ mod codes {
     pub const EPERM: Option<i32> = Some(1);
     pub const ENOBUFS: i32 = 55;
     pub const EBADF: i32 = 9;
+    pub const EADDRINUSE: i32 = 48;
+    pub const EINVAL: i32 = 22;
+    pub const ECONNREFUSED: i32 = 61;
 }
 #[cfg(windows)]
 mod codes {
@@ -261,6 +267,9 @@ mod codes {
     pub const EPERM: Option<i32> = None;
     pub const ENOBUFS: i32 = 10055;
     pub const EBADF: i32 = 10009;
+    pub const EADDRINUSE: i32 = 10048;
+    pub const EINVAL: i32 = 10022;
+    pub const ECONNREFUSED: i32 = 10061;
 }
 
 /// Edge cases 43 and 44: per-connection accept failures are counted and accepting continues.
@@ -414,4 +423,189 @@ fn test_keepalive_timeout_is_an_io_error_not_a_deadline() {
         "{s:?}"
     );
     assert_eq!(s.timeouts, 0, "not counted as a deadline");
+}
+
+/// A file streamed to a fast reader gives way to the rest of the worker: at least
+/// one look at the OS for every 256 KiB of file (D-141). Linux, where each piece is a
+/// `sendfile` in the worker's own thread.
+#[cfg(all(target_os = "linux", feature = "reactor", not(net_io_force_blocking)))]
+#[test]
+fn test_file_stream_looks_at_the_os_every_256_kib() {
+    use net_io::__shim::{counted, start_counting, stop_counting};
+    use std::sync::Arc;
+
+    struct Stream(Arc<std::fs::File>, u64);
+    impl Session for Stream {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            cx.output()
+                .push_file(self.0.clone(), 0, self.1)
+                .expect("push");
+            Step::Close
+        }
+    }
+
+    let _shim = Shim::take();
+    let len: u64 = 64 << 20;
+    let path = std::env::temp_dir().join(format!("nio-shim-bulk-{}", std::process::id()));
+    std::fs::write(&path, vec![7u8; len as usize]).expect("write");
+    let file = Arc::new(std::fs::File::open(&path).expect("open"));
+    let server = net_io::ServerBuilder::new()
+        .listener(net_io::ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(net_io::DriverKind::Reactor)
+        .workers(1)
+        .sessions(move |_: &ConnectionInfo| Stream(file.clone(), len))
+        .gate(net_io::AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    std::thread::sleep(Duration::from_millis(100));
+    let mut c = client(addr(&server));
+    start_counting();
+    c.write_all(b"go").expect("write");
+    let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    loop {
+        match c.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => total += n as u64,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    stop_counting();
+    let _ = std::fs::remove_file(&path);
+    let (waits, sends) = (counted(Op::Wait), counted(Op::Send));
+    println!("{total} bytes: {waits} waits, {sends} sends");
+    assert_eq!(total, len);
+    let pieces = len / (256 << 10);
+    assert!(sends >= pieces, "{sends} sends for {pieces} pieces");
+    assert!(waits >= pieces, "{waits} waits for {pieces} pieces");
+}
+
+/// The reactor's wait failing: every connection on the worker closes at once with its
+/// close counted and its caps returned, instead of waiting for completions that will
+/// never be read (review finding).
+#[cfg(all(feature = "reactor", not(net_io_force_blocking)))]
+#[test]
+fn test_reactor_wait_failure_closes_every_connection() {
+    let _shim = Shim::take();
+    let server = driver_echo_server(net_io::DriverKind::Reactor);
+    let mut clients: Vec<TcpStream> = (0..4).map(|_| client(addr(&server))).collect();
+    for c in &mut clients {
+        assert_eq!(round_trip(c, b"hi"), b"hi");
+    }
+    assert!(eventually(WAIT, || server.stats().open == 4));
+    // EBADF on Unix, WSAEINVAL-like on Windows: anything but an interrupt.
+    program(Op::Wait, 0, 1_000, Fault::Os(9));
+    for c in &mut clients {
+        let _ = c.write_all(b"x");
+    }
+    assert!(
+        eventually(WAIT, || server.stats().open == 0
+            && server.stats().closed >= 4),
+        "{:?}",
+        server.stats()
+    );
+    clear();
+}
+
+/// Each `sys` site with an error injected: a clean error to the caller, and the next
+/// call works (the shim coverage test in `src/sys/shim.rs` requires one per site).
+#[test]
+fn test_bind_listen_and_option_errors_are_clean() {
+    let _shim = Shim::take();
+    program(Op::Bind, 0, 1, Fault::Os(codes::EADDRINUSE));
+    let err = net_io::TcpListener::bind("127.0.0.1:0")
+        .map(|_| ())
+        .unwrap_err();
+    assert!(matches!(err, net_io::NetError::AddrInUse { .. }), "{err:?}");
+    program(Op::Listen, 0, 1, Fault::Os(codes::ENOBUFS));
+    assert!(net_io::TcpListener::bind("127.0.0.1:0").is_err());
+    let with_buffer = net_io::ListenOptions::new().send_buffer(64 << 10);
+    program(Op::SetOption, 0, 1, Fault::Os(codes::EINVAL));
+    assert!(net_io::TcpListener::bind_with("127.0.0.1:0", with_buffer).is_err());
+    // Nothing left behind: the same calls work now.
+    let l = net_io::TcpListener::bind_with("127.0.0.1:0", with_buffer).expect("bind");
+    let c = TcpStream::connect(l.local_addr().expect("addr")).expect("connect");
+    drop((c, l));
+}
+
+#[test]
+fn test_socket_and_connect_errors_then_a_retry_connects() {
+    let _shim = Shim::take();
+    let server = echo_server();
+    program(Op::Socket, 0, 1, Fault::Os(codes::ENOBUFS));
+    assert!(net_io::TcpConnection::connect(addr(&server)).is_err());
+    program(Op::Connect, 0, 2, Fault::Os(codes::ECONNREFUSED));
+    let mut backoff = net_io::Backoff::new()
+        .first(Duration::from_millis(5))
+        .attempts(5);
+    let mut c = net_io::TcpConnection::connect_retry(
+        addr(&server),
+        net_io::ConnectOptions::new(),
+        &mut backoff,
+    )
+    .expect("connects on the third attempt");
+    assert_eq!(backoff.attempt(), 2);
+    c.send_all(b"hi").expect("send");
+    let mut back = [0u8; 2];
+    c.recv_exact(&mut back).expect("recv");
+    assert_eq!(&back, b"hi");
+}
+
+/// A registration the driver refuses closes that connection with one event; the
+/// worker goes on serving.
+#[cfg(all(feature = "reactor", not(net_io_force_blocking)))]
+#[test]
+fn test_register_error_closes_only_that_connection() {
+    let _shim = Shim::take();
+    let server = driver_echo_server(net_io::DriverKind::Reactor);
+    program(Op::Register, 0, 1, Fault::Os(codes::ENOBUFS));
+    let mut first = client(addr(&server));
+    let _ = first.write_all(b"x");
+    let mut b = [0u8; 1];
+    assert!(!matches!(first.read(&mut b), Ok(n) if n > 0));
+    assert!(
+        eventually(WAIT, || server.stats().closed == 1),
+        "{:?}",
+        server.stats()
+    );
+    let mut c = client(addr(&server));
+    assert_eq!(round_trip(&mut c, b"after"), b"after");
+}
+
+/// Linux sets `SO_RCVTIMEO` before a pool receive; that failing closes the
+/// connection with its error. Elsewhere the site does not exist and nothing fails.
+#[test]
+fn test_receive_timeout_error_closes_the_connection() {
+    let _shim = Shim::take();
+    // Two receives before the reply: the second is inside the exchange, where Linux
+    // receives under `SO_RCVTIMEO` (an exchange's first receive waits first, D-178).
+    let server = net_io::serve("127.0.0.1:0", |conn: &mut net_io::TcpConnection| {
+        let mut buf = [0u8; 8];
+        let a = conn.recv(&mut buf)?;
+        let b = conn.recv(&mut buf[a..])?;
+        conn.send_all(&buf[..a + b])
+    })
+    .expect("serve");
+    let mut c = client(addr(&server));
+    program(Op::RecvTimeout, 0, 1, Fault::Os(codes::EINVAL));
+    let _ = c.write_all(b"pi");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let _ = c.write_all(b"ng");
+    let mut b = [0u8; 4];
+    let got = c.read(&mut b);
+    if cfg!(target_os = "linux") {
+        assert!(!matches!(got, Ok(n) if n > 0), "{got:?}");
+        assert!(eventually(WAIT, || server.stats().closed == 1));
+    }
+    clear();
+    let mut d = client(addr(&server));
+    d.write_all(b"pi").expect("write");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    d.write_all(b"ng").expect("write");
+    let mut back = [0u8; 4];
+    d.read_exact(&mut back).expect("served after the fault");
+    assert_eq!(&back, b"ping");
 }

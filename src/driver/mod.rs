@@ -71,12 +71,47 @@ impl DriverKind {
     }
 }
 
-/// A borrowed socket, as a [`Driver`] registers it.
+/// A socket as a [`Driver`] registers it: shared, so the driver keeps it open
+/// until [`Driver::deregister`] whatever the caller drops. Any `Arc` of a socket
+/// type converts (`Arc<TcpStream>`, `Arc<TcpListener>`, `Arc<OwnedFd>`); keep a
+/// clone to accept from a listener or to read the socket's options.
+///
+/// The driver works on the descriptor `as_fd` returns at registration, so the
+/// value must keep returning the same one while registered, as every `std`
+/// socket type does.
+///
+/// ```
+/// use std::sync::Arc;
+/// let listener = Arc::new(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+/// let shared: net_io::SharedSocket = listener.clone();
+/// # let _ = shared;
+/// ```
 #[cfg(unix)]
-pub type BorrowedSocket<'a> = std::os::fd::BorrowedFd<'a>;
-/// A borrowed socket, as a [`Driver`] registers it.
+pub type SharedSocket = Arc<dyn std::os::fd::AsFd + Send + Sync>;
+/// A socket as a [`Driver`] registers it: shared, so the driver keeps it open
+/// until [`Driver::deregister`] whatever the caller drops. Any `Arc` of a socket
+/// type converts (`Arc<TcpStream>`, `Arc<TcpListener>`, `Arc<OwnedSocket>`); keep
+/// a clone to read the socket's options.
+///
+/// The driver works on the handle `as_socket` returns at registration, so the
+/// value must keep returning the same one while registered, as every `std`
+/// socket type does.
+///
+/// ```
+/// use std::sync::Arc;
+/// let stream = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+/// let shared: net_io::SharedSocket = stream.clone();
+/// # let _ = shared;
+/// ```
 #[cfg(windows)]
-pub type BorrowedSocket<'a> = std::os::windows::io::BorrowedSocket<'a>;
+pub type SharedSocket = Arc<dyn std::os::windows::io::AsSocket + Send + Sync>;
+
+/// A borrowed socket, as the server's own reactor registers it.
+#[cfg(unix)]
+pub(crate) type BorrowedSocket<'a> = std::os::fd::BorrowedFd<'a>;
+/// A borrowed socket, as the server's own reactor registers it.
+#[cfg(windows)]
+pub(crate) type BorrowedSocket<'a> = std::os::windows::io::BorrowedSocket<'a>;
 
 /// Names a registered socket. The low 32 bits index a dense table inside the
 /// driver, so keep them small; the high bits are free for a generation.
@@ -422,18 +457,22 @@ pub fn new_reactor_driver(capacity: usize) -> Result<Box<dyn Driver>, NetError> 
 
 /// A driver: one per worker, used from one thread. See the module docs.
 ///
-/// Unstable until `1.0.0`. A socket must stay open from [`Driver::register`] until
-/// [`Driver::deregister`] returns.
+/// Unstable until `1.0.0`. The driver holds each registered socket (a
+/// [`SharedSocket`]) from [`Driver::register`] until [`Driver::deregister`], so the
+/// descriptor it does I/O on can never close and be reused by another connection
+/// while an operation or a cached readiness refers to it.
 pub trait Driver: Send {
     /// Which driver this is.
     fn kind(&self) -> DriverKind;
 
-    /// Adds a non-blocking socket under `token`.
+    /// Adds a non-blocking socket under `token`. The driver keeps `socket` until
+    /// [`Driver::deregister`]: dropping the caller's own clones before then does
+    /// not close it.
     ///
     /// # Errors
     ///
     /// `Os` when the OS refuses.
-    fn register(&mut self, socket: BorrowedSocket<'_>, token: Token) -> Result<(), NetError>;
+    fn register(&mut self, socket: SharedSocket, token: Token) -> Result<(), NetError>;
 
     /// Starts an operation; its completion arrives through [`Driver::wait`].
     ///
@@ -460,7 +499,8 @@ pub trait Driver: Send {
     /// `Os` when the OS refuses.
     fn cancel(&mut self, token: Token, which: OperationKind) -> Result<(), NetError>;
 
-    /// Removes the socket; no completion arrives for it afterwards.
+    /// Removes the socket; no completion arrives for it afterwards. The driver
+    /// drops its clone of the socket, which closes it if no other clone is left.
     ///
     /// # Errors
     ///

@@ -55,6 +55,12 @@ struct Timespec {
     tv_nsec: i64,
 }
 
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<Kevent>() == 32 && align_of::<Kevent>() == 8);
+#[cfg(target_os = "freebsd")]
+const _: () = assert!(size_of::<Kevent>() == 64 && align_of::<Kevent>() == 8);
+const _: () = assert!(size_of::<Timespec>() == 16 && align_of::<Timespec>() == 8);
+
 unsafe extern "C" {
     fn kqueue() -> c_int;
     fn kevent(
@@ -208,6 +214,8 @@ impl Poller {
     /// Registers a socket under `key` for reading, edge-triggered. Writing waits
     /// through [`WriteArm`].
     pub(crate) fn add(&self, sock: Sock<'_>, key: u64) -> io::Result<Registered> {
+        #[cfg(any(test, net_io_shim))]
+        super::shim::check(super::shim::Op::Register)?;
         let raw = sock.as_raw_fd();
         let changes = [change(raw as usize, EVFILT_READ, EV_ADD | EV_CLEAR, 0, key)];
         // SAFETY: `kq` and `raw` are open; one live change, no events asked for.

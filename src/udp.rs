@@ -59,6 +59,8 @@ pub struct UdpOptions {
     source: UdpBudget,
     global: Option<UdpBudget>,
     table: u32,
+    verified_for: Duration,
+    verified_table: u32,
     ipv6_only: bool,
     packet_info: bool,
 }
@@ -71,7 +73,8 @@ impl Default for UdpOptions {
 
 impl UdpOptions {
     /// Factor 1, a 10 s window, [`UdpBudget::SOURCE_DEFAULT`] per source, no
-    /// global budget, 65,536 sources, IPv6-only for IPv6 addresses.
+    /// global budget, 65,536 sources, verification for 60 s and up to 65,536
+    /// verified peers, IPv6-only for IPv6 addresses.
     pub fn new() -> UdpOptions {
         UdpOptions {
             factor: 1,
@@ -79,6 +82,8 @@ impl UdpOptions {
             source: UdpBudget::SOURCE_DEFAULT,
             global: None,
             table: 65_536,
+            verified_for: Duration::from_secs(60),
+            verified_table: 65_536,
             ipv6_only: true,
             packet_info: false,
         }
@@ -92,10 +97,28 @@ impl UdpOptions {
     }
 
     /// How long received bytes count toward a source's send allowance (10 s by
-    /// default, at least 1 s). The allowance spans the current and the previous
-    /// window, so a reply just after a window boundary is not refused.
+    /// default, at least 1 s, at most 1 hour). The allowance spans the current and
+    /// the previous window, so a reply just after a window boundary is not refused.
     pub fn amplification_window(mut self, window: Duration) -> UdpOptions {
         self.window = window;
+        self
+    }
+
+    /// How long one [`UdpSocket::mark_verified`] lasts (60 s by default, at least
+    /// 1 s, at most 1 day). Each call starts it again, so a protocol that proves
+    /// its peer on every authenticated datagram never sees it lapse; a peer that
+    /// went away stops being an unlimited target once it does.
+    pub fn verification_lifetime(mut self, lifetime: Duration) -> UdpOptions {
+        self.verified_for = lifetime;
+        self
+    }
+
+    /// How many verified peers (address and port) are held (65,536 by default,
+    /// about 100 bytes each). Past that, a new verification takes the place of
+    /// one that lapsed or was least recently verified; that peer is limited
+    /// again until it is verified again.
+    pub fn verified_table(mut self, entries: u32) -> UdpOptions {
+        self.verified_table = entries;
         self
     }
 
@@ -145,8 +168,30 @@ impl UdpOptions {
         if self.window < Duration::from_secs(1) {
             return invalid("amplification_window", ConfigReason::TooSmall { min: 1 });
         }
+        if self.window > Duration::from_secs(MAX_WINDOW_SECS) {
+            return invalid(
+                "amplification_window",
+                ConfigReason::TooLarge {
+                    max: MAX_WINDOW_SECS,
+                },
+            );
+        }
+        if self.verified_for < Duration::from_secs(1) {
+            return invalid("verification_lifetime", ConfigReason::TooSmall { min: 1 });
+        }
+        if self.verified_for > Duration::from_secs(MAX_VERIFIED_SECS) {
+            return invalid(
+                "verification_lifetime",
+                ConfigReason::TooLarge {
+                    max: MAX_VERIFIED_SECS,
+                },
+            );
+        }
         if self.table == 0 {
             return invalid("source_table", ConfigReason::Zero);
+        }
+        if self.verified_table == 0 {
+            return invalid("verified_table", ConfigReason::Zero);
         }
         for (field, b) in [
             ("source_budget", Some(self.source)),
@@ -260,7 +305,7 @@ struct Entry {
     received: [u64; 2],
     sent: [u64; 2],
     window_at: Instant,
-    verified: bool,
+    /// Set by an admitted datagram, cleared by the hand.
     referenced: bool,
 }
 
@@ -272,36 +317,67 @@ impl Entry {
             received: [0; 2],
             sent: [0; 2],
             window_at: now,
-            verified: false,
-            referenced: true,
+            referenced: false,
         }
     }
 
     /// Index 0 is the current window, 1 the previous one.
     fn roll(&mut self, window: Duration, now: Instant) {
         let gone = now.saturating_duration_since(self.window_at);
-        if gone >= window * 2 {
+        if gone >= window.saturating_mul(2) {
             self.received = [0; 2];
             self.sent = [0; 2];
             self.window_at = now;
         } else if gone >= window {
             self.received = [0, self.received[0]];
             self.sent = [0, self.sent[0]];
-            self.window_at += window;
+            self.window_at = self.window_at.checked_add(window).unwrap_or(now);
         }
     }
+}
+
+/// A peer the application verified: its address and port, until a deadline.
+#[derive(Clone, Copy, Debug)]
+struct Proof {
+    key: PeerKey,
+    until: Instant,
+    /// Set by a verification, cleared by the hand.
+    referenced: bool,
+}
+
+/// A verified peer: the normalized IP and the port. Flow label and scope are not
+/// part of it.
+type PeerKey = (IpAddr, u16);
+
+fn peer_key(peer: SocketAddr) -> PeerKey {
+    (normalize(peer.ip()), peer.port())
 }
 
 /// How many entries one insertion may look at before it gives up and uses the
 /// overflow budget.
 const SWEEP: usize = 64;
 
-/// The source table: a bounded map with CLOCK eviction of unverified entries.
+/// How far the hand moves for each datagram from a source already in a full
+/// table. Above 1, so a spoofer that touches each of its entries once per
+/// revolution cannot keep them all recently used.
+const TURN: usize = 2;
+
+/// The longest amplification window (1 hour).
+const MAX_WINDOW_SECS: u64 = 3_600;
+
+/// The longest verification lifetime (1 day).
+const MAX_VERIFIED_SECS: u64 = 86_400;
+
+/// The source table, a bounded map with CLOCK eviction, and the table of verified
+/// peers, bounded the same way.
 #[derive(Debug)]
 struct Guard {
     index: HashMap<IpAddr, u32>,
     slots: Vec<Entry>,
     hand: usize,
+    proofs: HashMap<PeerKey, u32>,
+    proved: Vec<Proof>,
+    proof_hand: usize,
     overflow: Bucket,
     global: Option<Bucket>,
     options: UdpOptions,
@@ -313,40 +389,33 @@ impl Guard {
             index: HashMap::new(),
             slots: Vec::new(),
             hand: 0,
+            proofs: HashMap::new(),
+            proved: Vec::new(),
+            proof_hand: 0,
             overflow: Bucket::full(&options.source, now),
             global: options.global.map(|g| Bucket::full(&g, now)),
             options,
         }
     }
 
-    fn find(&mut self, ip: IpAddr) -> Option<usize> {
-        let i = *self.index.get(&ip)? as usize;
-        self.slots[i].referenced = true;
-        Some(i)
-    }
-
-    /// Finds or makes room for `ip`. `force` (verification) may evict a
-    /// recently used unverified entry; plain traffic may not.
-    fn slot(&mut self, ip: IpAddr, now: Instant, force: bool) -> Option<usize> {
-        if let Some(i) = self.find(ip) {
-            return Some(i);
+    /// Finds or makes room for `ip`; the flag says it was already there. A
+    /// newcomer takes the first entry the hand finds not recently used.
+    fn slot(&mut self, ip: IpAddr, now: Instant) -> Option<(usize, bool)> {
+        if let Some(&i) = self.index.get(&ip) {
+            return Some((i as usize, true));
         }
         let entry = Entry::new(ip, &self.options.source, now);
         if self.slots.len() < self.options.table as usize {
             self.slots.push(entry);
             let i = self.slots.len() - 1;
             self.index.insert(ip, i as u32);
-            return Some(i);
+            return Some((i, false));
         }
         let n = self.slots.len();
-        let looks = if force { 2 * n } else { SWEEP.min(2 * n) };
-        for _ in 0..looks {
+        for _ in 0..SWEEP.min(2 * n) {
             let i = self.hand;
             self.hand = (self.hand + 1) % n;
             let e = &mut self.slots[i];
-            if e.verified {
-                continue;
-            }
             if e.referenced {
                 e.referenced = false;
                 continue;
@@ -354,66 +423,144 @@ impl Guard {
             self.index.remove(&e.ip);
             *e = entry;
             self.index.insert(ip, i as u32);
-            return Some(i);
+            return Some((i, false));
         }
         None
     }
 
-    /// Charges a received datagram; `false` drops it. `overflow` is set when the
-    /// source found no room in the table.
-    fn admit(&mut self, ip: IpAddr, len: usize, now: Instant, overflow: &mut bool) -> bool {
-        let source = self.options.source;
-        let ok = match self.slot(ip, now, false) {
-            Some(i) => {
-                let window = self.options.window;
-                let e = &mut self.slots[i];
-                if e.bucket.take(&source, len, now) {
-                    e.roll(window, now);
-                    e.received[0] += len as u64;
-                    true
-                } else {
-                    false
-                }
-            }
-            None => {
-                *overflow = true;
-                self.overflow.take(&source, len, now)
-            }
-        };
-        if !ok {
-            return false;
+    /// While the table is full, moves the hand [`TURN`] entries: the sources'
+    /// own traffic ages the table, not only newcomers.
+    fn turn(&mut self) {
+        let n = self.slots.len();
+        if n < self.options.table as usize || n == 0 {
+            return;
         }
-        match (&mut self.global, &self.options.global) {
-            (Some(bucket), Some(budget)) => bucket.take(budget, len, now),
-            _ => true,
+        for _ in 0..TURN {
+            self.slots[self.hand].referenced = false;
+            self.hand = (self.hand + 1) % n;
         }
     }
 
-    /// Whether `len` bytes may go to `ip` now.
-    fn may_send(&mut self, ip: IpAddr, len: usize, now: Instant) -> bool {
-        let Some(i) = self.find(ip) else {
+    /// Charges a received datagram; `false` drops it. `overflow` is set when the
+    /// source found no room in the table. Only an admitted datagram marks its
+    /// entry recently used and counts toward the send allowance.
+    fn admit(&mut self, ip: IpAddr, len: usize, now: Instant, overflow: &mut bool) -> bool {
+        let source = self.options.source;
+        let at = match self.slot(ip, now) {
+            Some((i, known)) => {
+                if known {
+                    self.turn();
+                }
+                if !self.slots[i].bucket.take(&source, len, now) {
+                    return false;
+                }
+                Some(i)
+            }
+            None => {
+                *overflow = true;
+                if !self.overflow.take(&source, len, now) {
+                    return false;
+                }
+                None
+            }
+        };
+        if let (Some(bucket), Some(budget)) = (&mut self.global, &self.options.global) {
+            if !bucket.take(budget, len, now) {
+                return false;
+            }
+        }
+        if let Some(i) = at {
+            let window = self.options.window;
+            let e = &mut self.slots[i];
+            e.referenced = true;
+            e.roll(window, now);
+            e.received[0] = e.received[0].saturating_add(len as u64);
+        }
+        true
+    }
+
+    /// Whether `len` bytes may go to `to` now. A verified peer is not limited; to
+    /// anyone else the bytes are charged against the allowance of its IP, so a
+    /// short send leaves it smaller, never larger.
+    fn charge(&mut self, to: SocketAddr, len: usize, now: Instant) -> bool {
+        if self.is_verified(to, now) {
+            return true;
+        }
+        let Some(&i) = self.index.get(&normalize(to.ip())) else {
             return len == 0;
         };
         let window = self.options.window;
         let factor = u64::from(self.options.factor);
-        let e = &mut self.slots[i];
-        if e.verified {
-            return true;
-        }
+        let e = &mut self.slots[i as usize];
         e.roll(window, now);
-        let allowed = factor * (e.received[0] + e.received[1]);
-        e.sent[0] + e.sent[1] + len as u64 <= allowed
-    }
-
-    fn sent(&mut self, ip: IpAddr, len: usize) {
-        if let Some(&i) = self.index.get(&ip) {
-            self.slots[i as usize].sent[0] += len as u64;
+        let allowed = factor.saturating_mul(e.received[0].saturating_add(e.received[1]));
+        let total = e.sent[0]
+            .saturating_add(e.sent[1])
+            .saturating_add(len as u64);
+        if total > allowed {
+            return false;
         }
+        e.sent[0] = e.sent[0].saturating_add(len as u64);
+        true
     }
 
-    fn verify(&mut self, ip: IpAddr, now: Instant) {
-        if let Some(i) = self.slot(ip, now, true) {
-            self.slots[i].verified = true;
+    fn is_verified(&self, peer: SocketAddr, now: Instant) -> bool {
+        self.proofs
+            .get(&peer_key(peer))
+            .is_some_and(|&i| now < self.proved[i as usize].until)
+    }
+
+    /// Verifies `peer` for the lifetime from `now`. A full table gives the place
+    /// of a lapsed or not recently verified peer, or failing that within one
+    /// sweep, of the peer under the hand: a verification always lands.
+    fn verify(&mut self, peer: SocketAddr, now: Instant) {
+        let key = peer_key(peer);
+        let until = now.checked_add(self.options.verified_for).unwrap_or(now);
+        if let Some(&i) = self.proofs.get(&key) {
+            let p = &mut self.proved[i as usize];
+            p.until = until;
+            p.referenced = true;
+            return;
+        }
+        let proof = Proof {
+            key,
+            until,
+            referenced: true,
+        };
+        if self.proved.len() < self.options.verified_table as usize {
+            self.proved.push(proof);
+            self.proofs.insert(key, (self.proved.len() - 1) as u32);
+            return;
+        }
+        let n = self.proved.len();
+        let mut found = None;
+        for _ in 0..SWEEP.min(2 * n) {
+            let i = self.proof_hand;
+            self.proof_hand = (i + 1) % n;
+            let p = &mut self.proved[i];
+            if now >= p.until || !p.referenced {
+                found = Some(i);
+                break;
+            }
+            p.referenced = false;
+        }
+        let at = found.unwrap_or_else(|| {
+            let i = self.proof_hand;
+            self.proof_hand = (i + 1) % n;
+            i
+        });
+        let old = self.proved[at].key;
+        self.proofs.remove(&old);
+        self.proved[at] = proof;
+        self.proofs.insert(key, at as u32);
+    }
+
+    /// Ends `peer`'s verification now.
+    fn forget(&mut self, peer: SocketAddr, now: Instant) {
+        if let Some(&i) = self.proofs.get(&peer_key(peer)) {
+            let p = &mut self.proved[i as usize];
+            p.until = now;
+            p.referenced = false;
         }
     }
 }
@@ -569,7 +716,10 @@ impl UdpSocket {
     ///
     /// `TimedOut { kind: Read }` (only with a read timeout), `Os`.
     pub fn recv_from(&mut self, buf: &mut [u8]) -> Result<Datagram, NetError> {
-        let deadline = self.read_timeout.map(|t| Instant::now() + t);
+        // A timeout past the clock's range has no deadline.
+        let deadline = self
+            .read_timeout
+            .and_then(|t| Instant::now().checked_add(t));
         loop {
             let (len, from, truncated, destination) = match self.recv_one(buf) {
                 Ok(got) => got,
@@ -759,12 +909,10 @@ impl UdpSocket {
         let now = Instant::now();
         let mut allowed = 0;
         for d in datagrams.iter().take(64) {
-            let ip = normalize(d.to.ip());
-            if !self.guard.may_send(ip, d.bytes.len(), now) {
+            if !self.guard.charge(d.to, d.bytes.len(), now) {
                 self.stats.refused += 1;
                 break;
             }
-            self.guard.sent(ip, d.bytes.len());
             allowed += 1;
         }
         if allowed == 0 && !datagrams.is_empty() {
@@ -843,16 +991,16 @@ impl UdpSocket {
         self.recv_from(buf)
     }
 
-    /// Sends one datagram. To a source not marked verified, the bytes sent within
-    /// the window never exceed `factor` times the bytes received from it; a
-    /// source never heard from gets nothing (an empty datagram aside).
+    /// Sends one datagram. To an address and port not marked verified, the bytes
+    /// sent within the window never exceed `factor` times the bytes received
+    /// from its IP; a source never heard from gets nothing (an empty datagram
+    /// aside). The bytes are charged before the send.
     ///
     /// # Errors
     ///
     /// `Limit { which: Amplification }` (nothing was sent), `Os`.
     pub fn send_to(&mut self, buf: &[u8], to: SocketAddr) -> Result<usize, NetError> {
-        let ip = normalize(to.ip());
-        if !self.guard.may_send(ip, buf.len(), Instant::now()) {
+        if !self.guard.charge(to, buf.len(), Instant::now()) {
             self.stats.refused += 1;
             return Err(NetError::Limit {
                 which: LimitKind::Amplification,
@@ -863,7 +1011,6 @@ impl UdpSocket {
             .inner
             .send_to(buf, wire)
             .map_err(|e| NetError::from_os("sendto", e))?;
-        self.guard.sent(ip, n);
         self.stats.sent += 1;
         Ok(n)
     }
@@ -875,8 +1022,7 @@ impl UdpSocket {
     /// `Closed` when not connected; as [`UdpSocket::send_to`].
     pub fn send(&mut self, buf: &[u8]) -> Result<usize, NetError> {
         let peer = self.peer.ok_or(NetError::Closed)?;
-        let ip = normalize(peer.ip());
-        if !self.guard.may_send(ip, buf.len(), Instant::now()) {
+        if !self.guard.charge(peer, buf.len(), Instant::now()) {
             self.stats.refused += 1;
             return Err(NetError::Limit {
                 which: LimitKind::Amplification,
@@ -886,7 +1032,6 @@ impl UdpSocket {
             .inner
             .send(buf)
             .map_err(|e| NetError::from_os("send", e))?;
-        self.guard.sent(ip, n);
         self.stats.sent += 1;
         Ok(n)
     }
@@ -905,10 +1050,20 @@ impl UdpSocket {
         Ok(())
     }
 
-    /// The protocol proved `peer` can receive (a cookie, a handshake): the guard
-    /// no longer limits sends to it, and its table entry is kept.
+    /// The protocol proved `peer` can receive at this address and port (a cookie,
+    /// a handshake, an authenticated datagram): the guard does not limit sends to
+    /// it for the verification lifetime (60 s by default), counted from the latest
+    /// call. Call it again each time the protocol proves the peer again; a raw
+    /// datagram from the address never extends it, since anyone can forge one.
+    /// Other ports of the same IP stay limited: a new port is a new path.
     pub fn mark_verified(&mut self, peer: SocketAddr) {
-        self.guard.verify(normalize(peer.ip()), Instant::now());
+        self.guard.verify(peer, Instant::now());
+    }
+
+    /// The protocol is done with `peer` (its connection closed): sends to it are
+    /// limited again from now, without waiting for the lifetime to run out.
+    pub fn forget_verified(&mut self, peer: SocketAddr) {
+        self.guard.forget(peer, Instant::now());
     }
 
     /// How long a receive waits (`None`: forever, the default).
@@ -1012,6 +1167,11 @@ impl UdpContext<'_> {
         self.socket.mark_verified(peer);
     }
 
+    /// As [`UdpSocket::forget_verified`].
+    pub fn forget_verified(&mut self, peer: SocketAddr) {
+        self.socket.forget_verified(peer);
+    }
+
     /// The time.
     #[must_use]
     pub fn now(&self) -> Instant {
@@ -1054,12 +1214,136 @@ impl std::os::windows::io::AsSocket for UdpSocket {
     }
 }
 
+/// The fuzz target `udp`: arbitrary datagrams, sends, verifications, and clock
+/// steps against the guard. It checks that the tables stay consistent and within
+/// their bounds, that no peer is verified that a model says is not, that an
+/// unverified peer is never sent more than the factor times what the guard holds
+/// as received from it, and that the global budget admits no more than its burst
+/// plus its rate.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz_udp(data: &[u8]) {
+    let Some((head, ops)) = data.split_first_chunk::<5>() else {
+        return;
+    };
+    let global = UdpBudget {
+        datagrams_per_sec: u32::from(head[3]) + 1,
+        bytes_per_sec: u32::from(head[3]) * 64 + 64,
+        burst: u32::from(head[4] % 16) + 1,
+    };
+    let options = UdpOptions::new()
+        .source_table(u32::from(head[0] % 16) + 1)
+        .verified_table(u32::from(head[1] % 8) + 1)
+        .amplification_factor(head[2] % 3 + 1)
+        .amplification_window(Duration::from_secs(u64::from(head[2] >> 2) % 8 + 1))
+        .verification_lifetime(Duration::from_secs(u64::from(head[4] >> 4) + 1))
+        .source_budget(UdpBudget {
+            datagrams_per_sec: 20,
+            bytes_per_sec: 4_000,
+            burst: 4,
+        })
+        .global_budget(global);
+    if options.validate().is_err() {
+        return;
+    }
+    let start = Instant::now();
+    let mut now = start;
+    let mut guard = Guard::new(options.clone(), now);
+    // The model: when each peer's verification ends, if it is verified.
+    let mut proven: HashMap<PeerKey, Instant> = HashMap::new();
+    let mut admitted = 0u64;
+    for op in ops.chunks(4) {
+        let n = op.get(1).copied().unwrap_or(0);
+        // Mapped and plain forms of the same IPv4 address, and IPv6 addresses.
+        let host = match n % 3 {
+            0 => IpAddr::from([10, 0, 0, n >> 2]),
+            1 => IpAddr::V6(std::net::Ipv4Addr::new(10, 0, 0, n >> 2).to_ipv6_mapped()),
+            _ => IpAddr::from([0xfd00, 0, 0, 0, 0, 0, 0, u16::from(n >> 2)]),
+        };
+        let peer = SocketAddr::new(host, u16::from(op.get(2).copied().unwrap_or(0) % 4));
+        let arg = usize::from(op.get(3).copied().unwrap_or(0)) * 8;
+        match op[0] % 6 {
+            0 => {
+                let mut overflow = false;
+                let from = crate::addr::normalize_socket(peer);
+                if guard.admit(from.ip(), arg, now, &mut overflow) {
+                    admitted += 1;
+                }
+            }
+            1 => {
+                let verified = guard.is_verified(peer, now);
+                let sent = guard.charge(peer, arg, now);
+                if sent && !verified && arg > 0 {
+                    let i = guard.index[&normalize(peer.ip())] as usize;
+                    let e = &guard.slots[i];
+                    let allowed = u64::from(options.factor)
+                        .saturating_mul(e.received[0].saturating_add(e.received[1]));
+                    assert!(
+                        e.sent[0].saturating_add(e.sent[1]) <= allowed,
+                        "sent past the factor"
+                    );
+                }
+            }
+            2 => {
+                guard.verify(peer, now);
+                proven.insert(peer_key(peer), now + options.verified_for);
+            }
+            3 => {
+                guard.forget(peer, now);
+                proven.remove(&peer_key(peer));
+            }
+            4 => now += Duration::from_millis(arg as u64 * 13),
+            _ => {
+                let model = proven.get(&peer_key(peer)).is_some_and(|&t| now < t);
+                assert!(
+                    model || !guard.is_verified(peer, now),
+                    "verified without a live proof"
+                );
+            }
+        }
+        assert_eq!(guard.index.len(), guard.slots.len());
+        assert!(guard.slots.len() <= options.table as usize);
+        for (ip, &i) in &guard.index {
+            assert_eq!(guard.slots[i as usize].ip, *ip, "index points elsewhere");
+        }
+        assert_eq!(guard.proofs.len(), guard.proved.len());
+        assert!(guard.proved.len() <= options.verified_table as usize);
+        for (key, &i) in &guard.proofs {
+            assert_eq!(guard.proved[i as usize].key, *key, "proof points elsewhere");
+        }
+        let elapsed = now.saturating_duration_since(start).as_secs_f64();
+        let most = f64::from(global.burst) + f64::from(global.datagrams_per_sec) * elapsed + 1.0;
+        assert!(
+            admitted as f64 <= most,
+            "{admitted} admitted, at most {most}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ip(n: u8) -> IpAddr {
         IpAddr::from([10, 0, 0, n])
+    }
+
+    /// The fuzz target's checks on pseudo-random input, so they run in every test
+    /// build and not only under cargo-fuzz.
+    #[test]
+    fn test_guard_holds_under_random_operations() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..2_000 {
+            let len = 5 + (x % 400) as usize;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            fuzz_udp(&data);
+        }
     }
 
     #[test]
@@ -1080,21 +1364,29 @@ mod tests {
         assert!(!bucket.take(&b, 1_001, t + Duration::from_secs(5)));
     }
 
+    fn at(n: u8, port: u16) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, n], port))
+    }
+
     #[test]
     fn test_amplification_factor_one_until_verified() {
         // Edge case 94: a 1-byte request, a 2-byte reply refused until verified.
         let t = Instant::now();
         let mut g = Guard::new(UdpOptions::new(), t);
         let mut o = false;
-        assert!(!g.may_send(ip(1), 1, t), "never heard from");
-        assert!(g.may_send(ip(1), 0, t));
+        let a = at(1, 1_000);
+        assert!(!g.charge(a, 1, t), "never heard from");
+        assert!(g.charge(a, 0, t));
         assert!(g.admit(ip(1), 1, t, &mut o));
-        assert!(!g.may_send(ip(1), 2, t));
-        assert!(g.may_send(ip(1), 1, t));
-        g.sent(ip(1), 1);
-        assert!(!g.may_send(ip(1), 1, t), "the allowance is spent");
-        g.verify(ip(1), t);
-        assert!(g.may_send(ip(1), 10_000, t));
+        assert!(!g.charge(a, 2, t));
+        assert!(g.charge(a, 1, t));
+        assert!(!g.charge(a, 1, t), "the allowance is spent");
+        g.verify(a, t);
+        assert!(g.charge(a, 10_000, t));
+        assert!(
+            !g.charge(at(1, 2_000), 1, t),
+            "another port is not verified, and the IP's allowance is spent"
+        );
     }
 
     #[test]
@@ -1104,12 +1396,15 @@ mod tests {
         let mut g = Guard::new(UdpOptions::new().amplification_factor(3), t);
         let mut o = false;
         assert!(g.admit(ip(1), 100, t, &mut o));
-        assert!(g.may_send(ip(1), 300, t));
-        assert!(!g.may_send(ip(1), 301, t));
+        assert!(!g.charge(at(1, 9), 301, t));
+        assert!(g.charge(at(1, 9), 300, t));
+        assert!(!g.charge(at(1, 9), 1, t));
         // Just after the window edge the previous window still counts.
-        assert!(g.may_send(ip(1), 300, t + w + Duration::from_millis(1)));
+        assert!(g.admit(ip(2), 100, t, &mut o));
+        assert!(g.charge(at(2, 9), 300, t + w + Duration::from_millis(1)));
         // Two windows later it is gone.
-        assert!(!g.may_send(ip(1), 1, t + 3 * w));
+        assert!(g.admit(ip(3), 100, t, &mut o));
+        assert!(!g.charge(at(3, 9), 1, t + 3 * w));
     }
 
     #[test]
@@ -1146,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_table_evicts_strangers_and_keeps_verified() {
+    fn test_full_table_evicts_strangers() {
         // Edge case 93.
         let t = Instant::now();
         let mut g = Guard::new(UdpOptions::new().source_table(4), t);
@@ -1154,34 +1449,210 @@ mod tests {
         for n in 1..=4 {
             assert!(g.admit(ip(n), 10, t, &mut o));
         }
-        g.verify(ip(1), t);
-        g.verify(ip(2), t);
-        // Recently used entries survive one pass of the hand; the next newcomer
-        // takes an unverified one.
+        // Recently used entries survive one pass of the hand; the newcomer takes
+        // the first entry it then finds.
         assert!(g.admit(ip(5), 10, t, &mut o));
-        assert!(!o, "an unverified entry was evicted");
-        assert!(g.index.contains_key(&ip(1)) && g.index.contains_key(&ip(2)));
+        assert!(!o, "an entry was evicted");
+        assert!(g.index.contains_key(&ip(5)));
         assert_eq!(g.slots.len(), 4);
-        // Fill with verified peers: strangers share the overflow budget.
-        for n in [3, 4, 5] {
-            if g.index.contains_key(&ip(n)) {
-                g.verify(ip(n), t);
-            }
-        }
-        for n in 6..=7 {
-            g.verify(ip(n), t);
-        }
+    }
+
+    #[test]
+    fn test_overflow_strangers_get_nothing_and_verified_peers_stay_answered() {
+        let t = Instant::now();
+        let mut g = Guard::new(UdpOptions::new().source_table(64), t);
         let mut o = false;
-        assert!(g.admit(ip(9), 10, t, &mut o));
+        let source = |n: u8| IpAddr::from([10, 0, 1, n]);
+        for n in 0..64u8 {
+            assert!(g.admit(source(n), 10, t, &mut o));
+        }
+        let peer = SocketAddr::from((source(0), 7));
+        g.verify(peer, t);
+        assert!(g.admit(ip(200), 10, t, &mut o));
         assert!(o, "no room: the overflow budget");
         assert!(
-            !g.may_send(ip(9), 1, t),
+            !g.charge(at(200, 9), 1, t),
             "an overflow stranger gets no allowance"
         );
+        assert!(g.charge(peer, 10_000, t), "verification needs no entry");
+    }
+
+    /// Verification proves one address and port, for its lifetime from the
+    /// latest proof, and ends early when the application says so.
+    #[test]
+    fn test_verification_is_per_port_and_expires() {
+        let t = Instant::now();
+        let s = Duration::from_secs;
+        let mut g = Guard::new(UdpOptions::new(), t);
+        let a = at(1, 1_000);
+        g.verify(a, t);
+        assert!(g.charge(a, 10_000, t));
+        assert!(!g.charge(at(1, 2_000), 1, t), "another port is a new path");
+        assert!(g.charge(a, 10_000, t + s(59)));
+        assert!(!g.charge(a, 1, t + s(61)), "the proof lapsed");
+        g.verify(a, t + s(61));
+        g.verify(a, t + s(100));
         assert!(
-            g.index.contains_key(&ip(1)),
-            "verified peers keep their entries"
+            g.charge(a, 10_000, t + s(159)),
+            "a new proof starts it again"
         );
+        g.forget(a, t + s(150));
+        assert!(!g.charge(a, 1, t + s(151)));
+        // IPv4-mapped and plain IPv4 are one peer.
+        let mapped = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped(), 3_000));
+        g.verify(mapped, t);
+        assert!(g.charge(at(1, 3_000), 10_000, t));
+    }
+
+    /// The verified table is bounded; a full one gives up a lapsed peer first,
+    /// then one not recently verified.
+    #[test]
+    fn test_verified_table_is_bounded() {
+        let t = Instant::now();
+        let s = Duration::from_secs;
+        let mut g = Guard::new(UdpOptions::new().verified_table(2), t);
+        g.verify(at(1, 1), t);
+        g.verify(at(2, 1), t);
+        g.verify(at(3, 1), t);
+        assert_eq!(g.proved.len(), 2);
+        assert!(!g.is_verified(at(1, 1), t));
+        assert!(g.is_verified(at(2, 1), t) && g.is_verified(at(3, 1), t));
+        let mut g = Guard::new(
+            UdpOptions::new()
+                .verified_table(2)
+                .verification_lifetime(s(1)),
+            t,
+        );
+        g.verify(at(1, 1), t);
+        g.verify(at(2, 1), t + s(2));
+        g.verify(at(3, 1), t + s(2));
+        assert!(g.is_verified(at(2, 1), t + s(2)), "the lapsed one went");
+        assert!(g.is_verified(at(3, 1), t + s(2)));
+    }
+
+    /// Verified peers never lock newcomers out of the table.
+    #[test]
+    fn test_verified_peers_leave_room_for_newcomers() {
+        let t = Instant::now();
+        let mut g = Guard::new(UdpOptions::new().source_table(4), t);
+        let mut o = false;
+        for n in 1..=4 {
+            assert!(g.admit(ip(n), 10, t, &mut o));
+            g.verify(at(n, 1), t);
+        }
+        let later = t + Duration::from_millis(10);
+        assert!(g.admit(ip(9), 100, later, &mut o));
+        assert!(!o, "a newcomer finds a slot");
+        assert!(g.charge(at(9, 1), 100, later), "and its allowance");
+    }
+
+    /// A datagram dropped over budget does not keep its entry recently used.
+    #[test]
+    fn test_dropped_datagrams_do_not_keep_entries() {
+        let t = Instant::now();
+        let budget = UdpBudget {
+            datagrams_per_sec: 1,
+            bytes_per_sec: 10_000,
+            burst: 1,
+        };
+        let options = UdpOptions::new().source_table(64).source_budget(budget);
+        let mut g = Guard::new(options, t);
+        let mut o = false;
+        for n in 0..64u8 {
+            assert!(g.admit(IpAddr::from([10, 0, 1, n]), 10, t, &mut o));
+        }
+        // A newcomer's sweep clears every bit and finds nothing.
+        assert!(g.admit(ip(200), 10, t, &mut o));
+        assert!(o);
+        // Every source sends again at once and is dropped over its budget.
+        for n in 0..64u8 {
+            assert!(!g.admit(IpAddr::from([10, 0, 1, n]), 10, t, &mut o));
+        }
+        let mut o = false;
+        assert!(g.admit(ip(201), 10, t, &mut o));
+        assert!(!o, "the dropped traffic did not keep the table full");
+    }
+
+    /// A full table's own traffic turns the hand, so a spoofer touching every
+    /// entry once per revolution cannot hold every slot.
+    #[test]
+    fn test_full_table_traffic_turns_the_hand() {
+        let t = Instant::now();
+        let mut g = Guard::new(UdpOptions::new().source_table(64), t);
+        let mut o = false;
+        for n in 0..64u8 {
+            assert!(g.admit(IpAddr::from([10, 0, 1, n]), 10, t, &mut o));
+        }
+        assert!(g.admit(ip(200), 10, t, &mut o));
+        assert!(o, "every entry was recently used");
+        // The spoofer touches each entry once, admitted.
+        let later = t + Duration::from_secs(1);
+        for n in 0..64u8 {
+            assert!(g.admit(IpAddr::from([10, 0, 1, n]), 10, later, &mut o));
+        }
+        let mut o = false;
+        assert!(g.admit(ip(201), 10, later, &mut o));
+        assert!(!o, "a newcomer finds a slot");
+    }
+
+    /// A window, lifetime, or read timeout too large for the clock is refused or
+    /// clamped, never a panic.
+    #[test]
+    fn test_huge_durations_never_panic() {
+        for options in [
+            UdpOptions::new().amplification_window(Duration::MAX),
+            UdpOptions::new().amplification_window(Duration::from_secs(3_601)),
+            UdpOptions::new().verification_lifetime(Duration::MAX),
+            UdpOptions::new().verification_lifetime(Duration::from_millis(999)),
+            UdpOptions::new().verified_table(0),
+        ] {
+            assert!(matches!(
+                options.validate(),
+                Err(NetError::InvalidConfig { .. })
+            ));
+        }
+        // The guard itself saturates, validated or not.
+        let t = Instant::now();
+        let options = UdpOptions::new()
+            .amplification_window(Duration::MAX)
+            .verification_lifetime(Duration::MAX);
+        let mut g = Guard::new(options, t);
+        let mut o = false;
+        assert!(g.admit(ip(1), 10, t, &mut o));
+        assert!(g.charge(at(1, 1), 10, t + Duration::from_secs(1)));
+        g.verify(at(1, 1), t);
+        let mut s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_read_timeout(Some(Duration::MAX)).unwrap();
+        let c = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        c.send_to(b"hi", s.local_addr().unwrap()).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(s.recv_from(&mut buf).unwrap().len, 2);
+    }
+
+    /// A verified address does not verify another port of the same IP, through
+    /// the socket.
+    #[test]
+    fn test_verified_port_does_not_cover_the_ip() {
+        let mut server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        a.send_to(b"hello", server.local_addr().unwrap()).unwrap();
+        let mut buf = [0u8; 16];
+        let d = server.recv_from(&mut buf).unwrap();
+        server.mark_verified(d.from);
+        assert_eq!(server.send_to(&[1u8; 1_000], d.from).unwrap(), 1_000);
+        assert!(matches!(
+            server.send_to(&[1u8; 1_000], b.local_addr().unwrap()),
+            Err(NetError::Limit {
+                which: LimitKind::Amplification
+            })
+        ));
+        server.forget_verified(d.from);
+        assert!(server.send_to(&[1u8; 1_000], d.from).is_err());
+        assert_eq!(server.send_to(&[1u8; 5], d.from).unwrap(), 5);
     }
 
     #[test]

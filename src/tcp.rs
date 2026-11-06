@@ -15,6 +15,7 @@ use crate::limits::{Effective, Limits};
 use crate::link::{ClockRef, Got, Link, WakeSource};
 use crate::opts::{ListenOptions, SocketOptions, TcpOptions};
 use crate::proxy::ProxyMode;
+use crate::retry::Backoff;
 use crate::session::Phase;
 use crate::sys::{self, AddrFailure, AsSock, Interest, KillSlot, Ready};
 
@@ -76,6 +77,14 @@ pub(crate) fn bind_error(addr: SocketAddr, e: io::Error) -> NetError {
 }
 
 fn connect_error(addr: SocketAddr, after: Duration, e: io::Error) -> NetError {
+    // A reset during the handshake (a server refusing at its cap after the accept,
+    // a listen queue that overflowed) is a reset, as `NetError::from_os` maps it.
+    if matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+    ) {
+        return NetError::ConnectionReset;
+    }
     match sys::classify_addr_error(&e) {
         AddrFailure::Refused => NetError::ConnectionRefused { addr },
         AddrFailure::HostUnreachable => NetError::HostUnreachable { addr },
@@ -88,6 +97,23 @@ fn connect_error(addr: SocketAddr, after: Duration, e: io::Error) -> NetError {
             source: e,
         },
     }
+}
+
+/// Whether a connect error is one a restarting or failing-over server produces, or
+/// a shortage of local ports that passes (the backoff bounds the wait either way).
+fn reconnectable(e: &NetError) -> bool {
+    e.is_retryable()
+        || matches!(
+            e,
+            NetError::ConnectionRefused { .. }
+                | NetError::HostUnreachable { .. }
+                | NetError::NetworkUnreachable { .. }
+                | NetError::ConnectionReset
+                | NetError::NoAddresses
+                | NetError::AddrNotAvailable { .. }
+                | NetError::Os { op: "resolve", .. }
+        )
+        || matches!(e, NetError::Os { op: "connect", source } if sys::out_of_ports(source))
 }
 
 fn resolve<A: ToSocketAddrs>(addr: A) -> Result<Vec<SocketAddr>, NetError> {
@@ -214,7 +240,7 @@ impl TcpListener {
         &self,
         timeout: Duration,
     ) -> Result<Option<(TcpConnection, ConnectionInfo)>, NetError> {
-        self.accept_until(Some(Instant::now() + timeout))
+        self.accept_until(Some(Instant::now() + crate::time::bounded(timeout)))
     }
 
     fn accept_until(
@@ -454,9 +480,9 @@ impl ConnectOptions {
         ConnectOptions::default()
     }
 
-    /// The total time for all attempts.
+    /// The total time for all attempts (held to at most 365 days).
     pub fn timeout(mut self, total: Duration) -> ConnectOptions {
-        self.timeout = total;
+        self.timeout = crate::time::bounded(total);
         self
     }
 
@@ -493,6 +519,39 @@ impl ConnectOptions {
         self.attempt_delay = d.clamp(Duration::from_millis(100), Duration::from_secs(2));
         self
     }
+}
+
+/// What [`TcpConnection::probe`] found, without waiting or consuming anything.
+///
+/// ```
+/// assert_ne!(net_io::Health::Open, net_io::Health::PeerClosed);
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    /// Connected, nothing waiting: safe to send a request on.
+    Open,
+    /// Bytes are waiting (on a TLS connection, possibly only records), or, on a
+    /// stream other than TCP, bytes or the end of the stream.
+    Readable,
+    /// The peer sent FIN: the next read returns 0. A pooled connection in this state
+    /// should be closed, not reused.
+    PeerClosed,
+}
+
+/// What [`TcpConnection::drain`] saw before closing.
+///
+/// ```
+/// let d = net_io::Drained::default();
+/// assert!(!d.peer_closed && d.discarded == 0);
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Drained {
+    /// The peer's FIN arrived in time: both sides finished, nothing was reset.
+    pub peer_closed: bool,
+    /// Bytes read and dropped while waiting for it.
+    pub discarded: u64,
 }
 
 /// A connected TCP socket that carries its own limits.
@@ -543,6 +602,46 @@ impl TcpConnection {
     ) -> Result<TcpConnection, NetError> {
         let addrs = resolve(addr)?;
         TcpConnection::connect_addrs(&addrs, &options)
+    }
+
+    /// Connects, and after a failure a restarting or failing-over server produces
+    /// (refused, timed out, unreachable, reset, no addresses, resolution failed), or
+    /// a shortage of local ports (every ephemeral port in use or in TIME_WAIT),
+    /// sleeps for [`Backoff::next_delay`] and tries again, resolving `addr` again
+    /// each time. Any other error returns at once.
+    ///
+    /// ```no_run
+    /// use net_io::{Backoff, ConnectOptions, TcpConnection};
+    /// use std::time::Duration;
+    ///
+    /// let mut backoff = Backoff::new().give_up_after(Duration::from_secs(60));
+    /// let conn = TcpConnection::connect_retry("db.internal:5433", ConnectOptions::new(), &mut backoff)?;
+    /// backoff.reset();
+    /// # let _ = conn;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The last connect error once `backoff` is spent; a non-transient error at once.
+    pub fn connect_retry<A: ToSocketAddrs>(
+        addr: A,
+        options: ConnectOptions,
+        backoff: &mut Backoff,
+    ) -> Result<TcpConnection, NetError> {
+        loop {
+            let err = match TcpConnection::connect_with(&addr, options.clone()) {
+                Ok(conn) => return Ok(conn),
+                Err(e) => e,
+            };
+            if !reconnectable(&err) {
+                return Err(err);
+            }
+            match backoff.next_delay() {
+                Some(d) => std::thread::sleep(d),
+                None => return Err(err),
+            }
+        }
     }
 
     /// Resolves `host` with the standard library and connects to the addresses in
@@ -787,6 +886,36 @@ impl TcpConnection {
         self.link()?.send_file(file, offset, len)
     }
 
+    /// Receives up to `len` bytes into `file` at `offset`, for snapshot and log
+    /// shipping; returns the count, which is short of `len` only when the peer
+    /// closed. On Linux the bytes go socket to pipe to file by `splice`, without a
+    /// copy through user space; with TLS, on other systems, and for a file `splice`
+    /// turns down, they are copied through a 64 KiB buffer. The read deadlines, the
+    /// minimum rate, kills, and drains apply as for [`TcpConnection::recv`]. The
+    /// file's position does not matter, and on Unix it does not move; a file opened
+    /// for appending is written at its end whatever `offset` says.
+    ///
+    /// ```no_run
+    /// let mut conn = net_io::connect("127.0.0.1:7000")?;
+    /// let file = std::fs::File::create("snapshot.bin")?;
+    /// let got = conn.recv_file(&file, 0, 1 << 30)?;
+    /// println!("received {got} bytes");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`TcpConnection::recv`]; `Os` when the file cannot be written, and the
+    /// connection is then closed.
+    pub fn recv_file(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        self.link()?.recv_file(file, offset, len)
+    }
+
     /// Sends every slice, advancing them in place (no copy).
     ///
     /// # Errors
@@ -794,6 +923,53 @@ impl TcpConnection {
     /// As [`TcpConnection::send`].
     pub fn send_all_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> Result<(), NetError> {
         self.link()?.write_all_vectored(bufs)
+    }
+
+    /// What the next read would find, without waiting and without consuming: one
+    /// zero-timeout wait, and a one-byte peek when the socket is readable. Use it
+    /// before reusing an idle pooled connection; a request sent on a connection
+    /// whose peer already closed is lost.
+    ///
+    /// ```no_run
+    /// use net_io::Health;
+    /// let mut conn = net_io::connect("127.0.0.1:7000")?;
+    /// if conn.probe()? != Health::Open {
+    ///     conn = net_io::connect("127.0.0.1:7000")?;
+    /// }
+    /// # let _ = conn;
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// `ConnectionReset` when the peer reset it, `Killed`, `Closed` after a fatal
+    /// error, `Os`.
+    pub fn probe(&mut self) -> Result<Health, NetError> {
+        self.link()?.probe()
+    }
+
+    /// Client-side drain: FIN, then reads and discards until the peer's FIN arrives
+    /// or `within` passes, then closes. Closing after the peer's FIN leaves nothing
+    /// unread, so neither side sees a reset.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// let conn = net_io::connect("127.0.0.1:7000")?;
+    /// let drained = conn.drain(Duration::from_secs(2));
+    /// println!("clean: {}, discarded {} bytes", drained.peer_closed, drained.discarded);
+    /// # Ok::<(), net_io::NetError>(())
+    /// ```
+    pub fn drain(mut self, within: Duration) -> Drained {
+        let Some(mut link) = self.link.take() else {
+            return Drained::default();
+        };
+        let (peer_closed, discarded) = link.drain_for(within);
+        let reason = link.reason_or(CloseReason::SessionClosed);
+        link.finish_quick(reason);
+        Drained {
+            peer_closed,
+            discarded,
+        }
     }
 
     /// Half-close: `Write` sends FIN and keeps reading; `Read` stops reading.
@@ -1219,6 +1395,35 @@ impl std::os::windows::io::AsSocket for TcpConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The soak's pooled client gave up at once on a reset during connect (a server
+    /// refusing at its cap) and on Windows port exhaustion: both pass, so a reconnect
+    /// waits for them under its backoff.
+    #[test]
+    fn test_connect_resets_and_port_shortage_are_reconnectable() {
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let reset = connect_error(
+            addr,
+            Duration::ZERO,
+            io::Error::from(io::ErrorKind::ConnectionReset),
+        );
+        assert!(matches!(reset, NetError::ConnectionReset));
+        assert!(reconnectable(&reset));
+        #[cfg(windows)]
+        let shortages = [10055, 10048, 10049];
+        #[cfg(unix)]
+        let shortages = [sys::errno::EADDRNOTAVAIL, sys::errno::EADDRINUSE];
+        for code in shortages {
+            let short = connect_error(addr, Duration::ZERO, io::Error::from_raw_os_error(code));
+            assert!(reconnectable(&short), "{code}: {short:?}");
+        }
+        let denied = connect_error(
+            addr,
+            Duration::ZERO,
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+        assert!(!reconnectable(&denied), "{denied:?}");
+    }
 
     #[test]
     fn test_listen_accept_echo_round_trip() {

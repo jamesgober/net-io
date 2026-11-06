@@ -29,9 +29,34 @@ pub enum Op {
     Reserve,
     /// Setting the receive timeout (`SO_RCVTIMEO`).
     RecvTimeout,
+    /// Binding a socket to an address.
+    Bind,
+    /// `listen` on a bound socket.
+    Listen,
+    /// Setting an integer socket option (`setsockopt`).
+    SetOption,
+    /// Registering a socket with a driver (`epoll_ctl`, `kevent`, a completion port).
+    Register,
 }
 
-const OPS: usize = 8;
+const OPS: usize = 12;
+
+/// Every site, for the test that each one has a call site and an injected-error test.
+#[cfg(test)]
+const ALL: [Op; OPS] = [
+    Op::Socket,
+    Op::Connect,
+    Op::Accept,
+    Op::Recv,
+    Op::Send,
+    Op::Wait,
+    Op::Reserve,
+    Op::RecvTimeout,
+    Op::Bind,
+    Op::Listen,
+    Op::SetOption,
+    Op::Register,
+];
 
 /// What a matching call does instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +211,37 @@ pub(crate) fn io(op: Op, len: usize) -> io::Result<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every site the shim knows is wired into `sys` and has a test that injects an
+    /// error there; a new site without both fails here.
+    #[test]
+    fn test_every_site_is_called_and_tested() {
+        let sys = [
+            include_str!("unix.rs"),
+            include_str!("windows.rs"),
+            include_str!("epoll.rs"),
+            include_str!("kqueue.rs"),
+            include_str!("iocp.rs"),
+            include_str!("poll.rs"),
+            include_str!("../accept.rs"),
+        ]
+        .concat();
+        let tests = [
+            include_str!("../../tests/shim.rs"),
+            include_str!("../accept.rs"),
+            include_str!("../udp.rs"),
+            include_str!("shim.rs"),
+        ]
+        .concat();
+        for op in ALL {
+            let name = format!("Op::{op:?}");
+            let called = sys.matches(&format!("shim::{name}")).count()
+                + sys.matches(&format!("shim::Op::{op:?})")).count();
+            assert!(called > 0, "{name} has no call site in sys");
+            let injected = tests.matches(&format!("{name}, ")).count();
+            assert!(injected > 0, "{name} has no injected-error test");
+        }
+    }
 
     #[test]
     fn test_shim_skip_then_fault_then_pass() {

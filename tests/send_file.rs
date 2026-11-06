@@ -238,3 +238,145 @@ fn test_gate_counts_file_bytes_once_on_both_drivers() {
         assert_eq!(counted.load(Ordering::SeqCst), len as u64 + 8, "{driver:?}");
     }
 }
+
+/// An empty file for `recv_file` to fill, removed on drop.
+fn out_file(temp: &mut Option<Temp>, append: bool) -> File {
+    let t = Temp::new(if append { 10 } else { 0 });
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(!append)
+        .append(append)
+        .open(&t.0)
+        .expect("open");
+    *temp = Some(t);
+    file
+}
+
+/// A peer that sends `body`, then `tail`, then closes.
+fn sender(body: usize, tail: &'static [u8]) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let at = l.local_addr().expect("addr");
+    let t = std::thread::spawn(move || {
+        let (mut c, _) = l.accept().expect("accept");
+        c.write_all(&expected(0, body)).expect("body");
+        c.write_all(tail).expect("tail");
+    });
+    (at, t)
+}
+
+#[test]
+fn test_recv_file_takes_exactly_len_and_leaves_the_rest() {
+    let (at, peer) = sender(3 << 20, b"tail");
+    let mut conn = net_io::connect(at).expect("connect");
+    let mut temp = None;
+    let file = out_file(&mut temp, false);
+    let got = conn.recv_file(&file, 50, 3 << 20).expect("recv_file");
+    assert_eq!(got, 3 << 20);
+    // Nothing past `len` went into the file: the tail is still on the connection.
+    let mut tail = [0u8; 4];
+    conn.recv_exact(&mut tail).expect("tail");
+    assert_eq!(&tail, b"tail");
+    peer.join().expect("peer");
+    let written = std::fs::read(&temp.as_ref().expect("temp").0).expect("read");
+    assert_eq!(written.len(), 50 + (3 << 20));
+    assert!(written[..50].iter().all(|&b| b == 0));
+    assert!(written[50..] == expected(0, 3 << 20)[..], "file differs");
+}
+
+#[test]
+fn test_recv_file_stops_at_the_peers_close() {
+    let (at, peer) = sender(1 << 20, b"");
+    let mut conn = net_io::connect(at).expect("connect");
+    let mut temp = None;
+    let file = out_file(&mut temp, false);
+    let got = conn.recv_file(&file, 0, 64 << 20).expect("recv_file");
+    assert_eq!(got, 1 << 20);
+    peer.join().expect("peer");
+    let written = std::fs::read(&temp.as_ref().expect("temp").0).expect("read");
+    assert!(written == expected(0, 1 << 20), "file differs");
+}
+
+#[test]
+fn test_recv_file_honours_the_read_timeout() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let at = l.local_addr().expect("addr");
+    let limits = net_io::Limits::builder()
+        .read_timeout(Duration::from_millis(300))
+        .build()
+        .expect("limits");
+    let mut conn =
+        net_io::TcpConnection::connect_with(at, net_io::ConnectOptions::new().limits(limits))
+            .expect("connect");
+    let (silent, _) = l.accept().expect("accept");
+    let mut temp = None;
+    let file = out_file(&mut temp, false);
+    let started = std::time::Instant::now();
+    let err = conn.recv_file(&file, 0, 1 << 20).unwrap_err();
+    assert!(matches!(err, NetError::TimedOut { .. }), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    drop(silent);
+}
+
+/// Linux: `splice` turns down a file opened for appending after the bytes reached
+/// the pipe; they are copied out of it, and none is lost.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_recv_file_into_a_file_splice_refuses_loses_nothing() {
+    let (at, peer) = sender(1 << 20, b"");
+    let mut conn = net_io::connect(at).expect("connect");
+    let mut temp = None;
+    let file = out_file(&mut temp, true);
+    let got = conn.recv_file(&file, 0, 1 << 20).expect("recv_file");
+    assert_eq!(got, 1 << 20);
+    peer.join().expect("peer");
+    let written = std::fs::read(&temp.as_ref().expect("temp").0).expect("read");
+    assert_eq!(written.len(), 10 + (1 << 20));
+    assert!(written[10..] == expected(0, 1 << 20)[..], "file differs");
+}
+
+/// `recv_file` against a `recv` and a positioned write per 64 KiB, 1 GiB each over
+/// loopback; prints both rates. Run with `--ignored --nocapture` in release.
+#[cfg(unix)]
+#[test]
+#[ignore = "a benchmark"]
+fn bench_recv_file() {
+    const TOTAL: u64 = 1 << 30;
+    fn feed() -> std::net::SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let at = l.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut c, _) = l.accept().expect("accept");
+            let block = vec![b'x'; 1 << 20];
+            for _ in 0..(TOTAL >> 20) {
+                c.write_all(&block).expect("write");
+            }
+        });
+        at
+    }
+    for round in 0..3 {
+        let mut temp = None;
+        let file = out_file(&mut temp, false);
+        let mut conn = net_io::connect(feed()).expect("connect");
+        let started = std::time::Instant::now();
+        assert_eq!(conn.recv_file(&file, 0, TOTAL).expect("recv_file"), TOTAL);
+        let spliced = started.elapsed();
+        let mut temp2 = None;
+        let file2 = out_file(&mut temp2, false);
+        let mut conn = net_io::connect(feed()).expect("connect");
+        let mut buf = vec![0u8; 64 << 10];
+        let started = std::time::Instant::now();
+        let mut got = 0u64;
+        while got < TOTAL {
+            let n = conn.recv(&mut buf).expect("recv");
+            std::os::unix::fs::FileExt::write_all_at(&file2, &buf[..n], got).expect("write");
+            got += n as u64;
+        }
+        let copied = started.elapsed();
+        let rate = |d: Duration| TOTAL as f64 / d.as_secs_f64() / f64::from(1 << 30);
+        println!(
+            "round {round}: recv_file {:.2} GiB/s, recv and write {:.2} GiB/s",
+            rate(spliced),
+            rate(copied)
+        );
+    }
+}

@@ -5,7 +5,7 @@ mod common;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{DRIVERS, addr, client, eventually, round_trip};
@@ -316,4 +316,66 @@ fn test_per_worker_is_refused_where_it_cannot_work() {
         .gate(AllowAll)
         .build();
     assert!(built.is_err());
+}
+
+/// The control line escalating from `Draining` (long deadline) to `Stopping` ends the
+/// drain at once: a handler mid-exchange is killed within a pass, not at the drain's
+/// deadline; and one drain emits one `DrainFinished` (review findings).
+#[test]
+fn test_stopping_during_a_drain_kills_at_once() {
+    #[derive(Clone, Default)]
+    struct Count(Arc<AtomicU64>);
+    impl net_io::EventSink for Count {
+        fn event(&self, e: &net_io::Event) {
+            if matches!(e, net_io::Event::DrainFinished { .. }) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+    let control = Arc::new(SimpleControl::new());
+    let finished = Count::default();
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(net_io::DriverKind::Blocking)
+        .workers(2)
+        .handler(|conn: &mut net_io::TcpConnection| {
+            let mut b = [0u8; 64];
+            // The first byte starts an exchange; then the handler waits mid-exchange.
+            conn.recv(&mut b)?;
+            conn.recv(&mut b)?;
+            Ok(())
+        })
+        .control(control.clone())
+        .events(finished.clone())
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let mut c = client(addr(&server));
+    c.write_all(b"x").expect("write");
+    assert!(eventually(WAIT, || server.stats().open == 1));
+    control.set(
+        ControlState::Draining,
+        Some(Instant::now() + Duration::from_secs(600)),
+    );
+    server.handle().wake_all();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        server.stats().open,
+        1,
+        "the drain closed a busy handler early"
+    );
+    let stopped = Instant::now();
+    control.set(ControlState::Stopping, None);
+    server.handle().wake_all();
+    assert!(
+        eventually(Duration::from_secs(3), || server.stats().open == 0),
+        "still open {:?} after Stopping",
+        stopped.elapsed()
+    );
+    assert!(eventually(WAIT, || finished.0.load(Ordering::SeqCst) >= 1));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(finished.0.load(Ordering::SeqCst), 1, "one drain, one event");
+    drop(c);
 }

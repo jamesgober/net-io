@@ -56,6 +56,16 @@ pub(crate) fn classify_accept(e: &io::Error) -> super::AcceptFailure {
 }
 
 /// Maps a bind or connect error to its own variant.
+/// A connect that failed for want of a local port (every ephemeral port in use or
+/// in TIME_WAIT): it passes once ports come free, so a reconnect may wait for it.
+pub(crate) fn out_of_ports(e: &io::Error) -> bool {
+    use errno::*;
+    matches!(
+        e.raw_os_error(),
+        Some(WSAEADDRINUSE | WSAENOBUFS | WSAEADDRNOTAVAIL)
+    )
+}
+
 pub(crate) fn classify_addr_error(e: &io::Error) -> super::AddrFailure {
     use super::AddrFailure as F;
     use errno::*;
@@ -379,6 +389,8 @@ pub(super) fn startup() {
 }
 
 fn set_int(sock: Sock<'_>, level: i32, name: i32, value: i32) -> io::Result<()> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::SetOption)?;
     // SAFETY: `sock` is open for the call; `value` is a live i32 and the length
     // passed is its size, as setsockopt requires for integer and DWORD options.
     let ret = unsafe {
@@ -643,6 +655,8 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
         set_int(s.as_socket(), c::SOL_SOCKET, c::SO_RCVBUF, clamp_int(n))?;
     }
     bind_to(s.as_socket(), addr)?;
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::Listen)?;
     // SAFETY: `s` is an open, bound stream socket.
     cvt(unsafe { listen(raw(s.as_socket()), backlog_arg(p.backlog)) })?;
     if p.fast_open.is_some() {
@@ -662,6 +676,26 @@ pub(crate) fn send_file_refused(e: &io::Error) -> bool {
 /// path relies on.
 pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
+/// Writes all of `buf` to `file` at `offset`. Windows moves the file's position.
+pub(crate) fn write_file_at(
+    file: &std::fs::File,
+    mut buf: &[u8],
+    mut offset: u64,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        match std::os::windows::fs::FileExt::seek_write(file, buf, offset) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Whether this OS can pin a thread.
@@ -715,6 +749,8 @@ pub(crate) fn set_user_timeout(sock: Sock<'_>, timeout: Duration) -> io::Result<
 
 /// Binds `sock` to `addr`.
 pub(crate) fn bind_to(sock: Sock<'_>, addr: SocketAddr) -> io::Result<()> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::Bind)?;
     let mut buf = [0u8; 28];
     let len = encode_addr(addr, &mut buf);
     // SAFETY: `buf` holds a valid SOCKADDR of `len` bytes and lives for the call.
@@ -781,7 +817,16 @@ pub(crate) fn listener_kind(sock: Sock<'_>) -> Result<super::SockKind, super::Ki
     }
 }
 
-/// Accepts one connection and makes it non-inheritable (std's `accept` does not).
+/// Accepts one connection and makes it non-inheritable. An accepted socket takes
+/// its inheritance from how the listener was created, not from the listener
+/// handle's flag: from a listener created with `WSA_FLAG_NO_HANDLE_INHERIT` (std's,
+/// net-io's, and one made from a hand-off description of either) it is never
+/// inheritable, so the call below changes nothing. From a listener someone else
+/// created inheritable (through `TcpListener::from_std`), it is inheritable until
+/// the call below, a window of microseconds in which a process started elsewhere
+/// with handle inheritance can get it. Closing that window needs `AcceptEx` into a
+/// socket made non-inheritable first, on its own overlapped path (D-016 keeps
+/// listeners off the completion ports).
 pub(crate) fn accept(listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
     #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::Accept)?;
@@ -924,7 +969,9 @@ pub(crate) fn unix_connect(sock: Sock<'_>, path: &[u8]) -> io::Result<()> {
 }
 
 /// One accept on a non-blocking AF_UNIX listener. std's `accept` cannot decode the
-/// peer's address, so this asks for none. Sockets start inheritable here.
+/// peer's address, so this asks for none. The listener comes from `unix_socket`,
+/// so the accepted socket is never inheritable (see [`accept`]); the flag is
+/// cleared anyway, for a listener adopted from elsewhere.
 #[cfg(feature = "local")]
 pub(crate) fn unix_accept(listener: Sock<'_>) -> io::Result<OwnedSocket> {
     #[cfg(any(test, net_io_shim))]
@@ -942,6 +989,64 @@ pub(crate) fn unix_accept(listener: Sock<'_>) -> io::Result<OwnedSocket> {
         return Err(io::Error::last_os_error());
     }
     Ok(owned)
+}
+
+#[cfg(feature = "local")]
+const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
+#[cfg(feature = "local")]
+const FILE_ATTRIBUTE_TAG_INFO: i32 = 9;
+#[cfg(feature = "local")]
+const FILE_READ_ATTRIBUTES: u32 = 0x80;
+#[cfg(feature = "local")]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(feature = "local")]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+/// `FILE_ATTRIBUTE_TAG_INFO`.
+#[cfg(feature = "local")]
+#[repr(C)]
+#[derive(Default)]
+struct FileAttributeTagInfo {
+    attributes: u32,
+    tag: u32,
+}
+
+#[cfg(feature = "local")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetFileInformationByHandleEx(
+        file: *mut c_void,
+        class: i32,
+        info: *mut c_void,
+        len: u32,
+    ) -> i32;
+}
+
+/// Whether `path` is an AF_UNIX socket file: a reparse point with the tag
+/// `IO_REPARSE_TAG_AF_UNIX`, and not any other kind (a cloud placeholder, an app
+/// alias, a deduplicated file). The file itself is opened, not what it points to.
+#[cfg(feature = "local")]
+pub(crate) fn is_unix_socket_file(path: &std::path::Path) -> io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(7)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut info = FileAttributeTagInfo::default();
+    // SAFETY: the handle is open; `info` is writable for the length given.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_ATTRIBUTE_TAG_INFO,
+            (&raw mut info).cast(),
+            size_of::<FileAttributeTagInfo>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.tag == IO_REPARSE_TAG_AF_UNIX)
 }
 
 /// The process at the other end of an AF_UNIX connection.
@@ -982,10 +1087,53 @@ pub(crate) fn share_socket(sock: Sock<'_>, pid: u32) -> io::Result<[u8; SHARED_S
     Ok(out)
 }
 
-/// The socket a description from [`share_socket`] names. Windows hands back the same
-/// socket if a description is used twice, so the caller keeps each to one use.
+/// Sockets made from descriptions and still owned in this process, by handle value.
+/// Windows hands back the socket it made before when a description is used again,
+/// and the provider-reserved field could name any socket here, so a value on this
+/// list is refused rather than given a second owner (two closes of one handle).
 #[cfg(feature = "local")]
-pub(crate) fn socket_from_shared(blob: &[u8; SHARED_SOCKET]) -> io::Result<OwnedSocket> {
+static ADOPTED: std::sync::Mutex<Vec<RawSocket>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "local")]
+fn adopted() -> std::sync::MutexGuard<'static, Vec<RawSocket>> {
+    ADOPTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A socket's place on the adopted list. Kept after the socket, so dropping both
+/// closes the socket first and then frees its value.
+#[cfg(feature = "local")]
+#[derive(Debug)]
+pub(crate) struct Adoption(RawSocket);
+
+#[cfg(feature = "local")]
+impl Adoption {
+    /// The socket moves to an owner that does not carry this: its value stays
+    /// taken for the life of the process, so a later description that names it
+    /// is refused even after that owner closes it (a reused value fails closed).
+    pub(crate) fn keep_for_good(self) {
+        std::mem::forget(self);
+    }
+}
+
+#[cfg(feature = "local")]
+impl Drop for Adoption {
+    fn drop(&mut self) {
+        let mut list = adopted();
+        if let Some(at) = list.iter().position(|&s| s == self.0) {
+            list.swap_remove(at);
+        }
+    }
+}
+
+/// The socket a description from [`share_socket`] names, not inheritable.
+/// `AlreadyExists` when it names a socket this process already owns through an
+/// earlier description: that one keeps its single owner, and nothing is closed.
+#[cfg(feature = "local")]
+pub(crate) fn socket_from_shared(
+    blob: &[u8; SHARED_SOCKET],
+) -> io::Result<(OwnedSocket, Adoption)> {
     startup();
     let mut info = std::mem::MaybeUninit::<WsaProtocolInfo>::uninit();
     // SAFETY: `info` has room for the bytes, and any bytes are a valid WsaProtocolInfo.
@@ -1006,8 +1154,42 @@ pub(crate) fn socket_from_shared(blob: &[u8; SHARED_SOCKET]) -> io::Result<Owned
     if s == c::INVALID_SOCKET {
         return Err(last_error());
     }
-    // SAFETY: `s` was just created, is open, and is owned by no one else.
-    Ok(unsafe { OwnedSocket::from_raw_socket(s as RawSocket) })
+    let mut list = adopted();
+    if list.contains(&(s as RawSocket)) {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
+    list.push(s as RawSocket);
+    drop(list);
+    let adoption = Adoption(s as RawSocket);
+    // SAFETY: `s` is open and was not on the list, so this call made it: nothing
+    // else in the process owns it.
+    let sock = unsafe { OwnedSocket::from_raw_socket(s as RawSocket) };
+    // The flag passed above does not reach a socket made from a description (the
+    // sender's duplicate is inheritable), so it is cleared here.
+    // SAFETY: the handle is open; clearing the flag is the call's documented use.
+    if unsafe { SetHandleInformation(s as *mut c_void, c::HANDLE_FLAG_INHERIT, 0) } == 0 {
+        let e = io::Error::last_os_error();
+        drop((sock, adoption));
+        return Err(e);
+    }
+    Ok((sock, adoption))
+}
+
+#[cfg(test)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetHandleInformation(handle: *mut c_void, flags: *mut u32) -> i32;
+}
+
+/// Whether a process this one starts with handle inheritance would get `sock`.
+#[cfg(test)]
+pub(crate) fn is_inheritable(sock: Sock<'_>) -> io::Result<bool> {
+    let mut flags = 0u32;
+    // SAFETY: the socket is open for the call; `flags` is written during it.
+    if unsafe { GetHandleInformation(raw(sock) as *mut c_void, &raw mut flags) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & c::HANDLE_FLAG_INHERIT != 0)
 }
 
 /// Bytes from the OS's preferred random source.
@@ -1148,7 +1330,12 @@ fn backlog_arg(n: u32) -> i32 {
 pub(crate) fn set_linger(sock: Sock<'_>, linger: Option<Duration>) -> io::Result<()> {
     let value = Linger {
         l_onoff: u16::from(linger.is_some()),
-        l_linger: linger.map_or(0, |d| u16::try_from(d.as_secs()).unwrap_or(u16::MAX)),
+        // Whole seconds, rounded up: a sub-second linger truncated to 0 would reset
+        // the connection, the opposite of what was asked. Zero stays the reset.
+        l_linger: linger.map_or(0, |d| {
+            let secs = d.as_secs() + u64::from(d.subsec_nanos() > 0);
+            u16::try_from(secs).unwrap_or(u16::MAX)
+        }),
     };
     // SAFETY: `value` is a live repr(C) LINGER and the length is its size.
     let ret = unsafe {
@@ -1425,6 +1612,75 @@ mod layout {
             std::mem::offset_of!(SockaddrIn6, sin6_scope_id),
             std::mem::offset_of!(ws::SOCKADDR_IN6, Anonymous)
         );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn test_layout_socket_files_match_windows_sys() {
+        use windows_sys::Win32::Storage::FileSystem as fs;
+        assert_eq!(FILE_ATTRIBUTE_TAG_INFO, fs::FileAttributeTagInfo);
+        assert_eq!(FILE_READ_ATTRIBUTES, fs::FILE_READ_ATTRIBUTES);
+        assert_eq!(
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            fs::FILE_FLAG_OPEN_REPARSE_POINT
+        );
+        assert_eq!(FILE_FLAG_BACKUP_SEMANTICS, fs::FILE_FLAG_BACKUP_SEMANTICS);
+        assert_eq!(
+            size_of::<FileAttributeTagInfo>(),
+            size_of::<fs::FILE_ATTRIBUTE_TAG_INFO>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(FileAttributeTagInfo, tag),
+            std::mem::offset_of!(fs::FILE_ATTRIBUTE_TAG_INFO, ReparseTag)
+        );
+        // `IO_REPARSE_TAG_AF_UNIX` is not in the enabled windows-sys features: a
+        // socket file made here carries it.
+        let path = std::env::temp_dir().join(format!("nio-tag-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let sock = unix_socket().unwrap();
+        unix_bind(sock.as_socket(), path.to_str().unwrap().as_bytes(), 1).unwrap();
+        assert!(is_unix_socket_file(&path).unwrap());
+        drop(sock);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        assert!(!is_unix_socket_file(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Accepted sockets are never inheritable when the listener was created
+    /// without inheritance, even before `accept` clears the flag.
+    #[test]
+    fn test_accepted_sockets_start_non_inheritable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        assert!(!is_inheritable(stream.as_socket()).unwrap());
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn test_accepted_unix_sockets_start_non_inheritable() {
+        let path = std::env::temp_dir().join(format!("nio-inh-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let bytes = path.to_str().unwrap().as_bytes();
+        let listener = unix_socket().unwrap();
+        unix_bind(listener.as_socket(), bytes, 1).unwrap();
+        let client = unix_socket().unwrap();
+        unix_connect(client.as_socket(), bytes).unwrap();
+        // SAFETY: the listener is open; no address is asked for.
+        let s = unsafe {
+            accept_raw(
+                raw(listener.as_socket()),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(s, c::INVALID_SOCKET);
+        // SAFETY: `s` was just accepted and is owned by no one else.
+        let accepted = unsafe { OwnedSocket::from_raw_socket(s as RawSocket) };
+        assert!(!is_inheritable(accepted.as_socket()).unwrap());
+        drop((accepted, client, listener));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(feature = "udp")]
