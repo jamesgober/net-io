@@ -98,6 +98,10 @@ soak, and a database consumer's transport needs.
   coalesced tail waited for the next refusal; a persistent accept error spun the
   accept thread; an invalid lane reservation could be hidden by a later one; a
   pipe listener whose name was taken paused instead of failing.
+- Windows: a process whose threads ended after using a `TcpConnection` could
+  freeze entirely, every thread start and exit waiting: the thread's wake socket
+  was closed by a thread-local destructor, under the loader lock. A thread's wake
+  now goes to a list of spares for the next thread instead.
 - Everything fixed in 0.6.1: posts reach connections waiting for input, an idle
   trim releases buffers with a receive out, a stop ends lingers, and a drain
   answers a request that already arrived.
