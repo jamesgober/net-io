@@ -113,7 +113,7 @@ soak, and a database consumer's transport needs.
   connection to answer first (also in 0.6.2).
 - The Windows reactor held a graceful close to the full linger (2 s) when the
   peer reset after reading its reply, as a TLS client that skips `close_notify`
-  does; connections, buffers, and cap slots piled up under short connections.
+  does, so connections, buffers, and cap slots piled up under short connections.
   A reset now ends the linger (also in 0.6.2).
 - Everything fixed in 0.6.1: posts reach connections waiting for input, an idle
   trim releases buffers with a receive out, a stop ends lingers, and a drain
