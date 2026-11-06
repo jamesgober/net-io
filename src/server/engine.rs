@@ -355,6 +355,9 @@ pub(crate) struct Shared {
     pub(crate) trusted: Option<Arc<TrustedProxies>>,
     queue_notify: OnceLock<Box<dyn Fn() + Send + Sync>>,
     queue_len: AtomicUsize,
+    /// Accept threads between their door check and the end of an admission: a
+    /// drain is not over while one is (D-179).
+    admitting: AtomicUsize,
     control: Arc<dyn ControlLine>,
     sink: Option<Arc<dyn EventSink>>,
     open: AtomicU32,
@@ -496,9 +499,9 @@ impl Shared {
     }
 
     pub(crate) fn close_door(&self) {
-        let closed = self.door.swap(false, Ordering::AcqRel);
+        let closed = self.door.swap(false, Ordering::SeqCst);
         for e in self.lock_listeners().iter() {
-            if e.conf.door.swap(false, Ordering::AcqRel) {
+            if e.conf.door.swap(false, Ordering::SeqCst) {
                 e.conf.wake.wake();
             }
         }
@@ -885,6 +888,11 @@ impl Shared {
     }
 
     fn idle(&self) -> bool {
+        // Read after the door closed (sequentially consistent with the accept
+        // thread's count and door check): an admission past its check is seen here.
+        if self.admitting.load(Ordering::SeqCst) != 0 {
+            return false;
+        }
         #[cfg(feature = "reactor")]
         if self.reactor {
             return self.open.load(Ordering::Acquire) == 0;
@@ -1143,6 +1151,25 @@ impl Wakes {
 thread_local! {
     /// On an accept thread of a per-worker group: the worker it feeds.
     static FEEDS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// One accept thread inside an admission, for the drain (see `Shared::admitting`).
+struct Admitting<'a>(&'a Shared);
+
+impl<'a> Admitting<'a> {
+    fn enter(shared: &'a Shared) -> Admitting<'a> {
+        shared.admitting.fetch_add(1, Ordering::SeqCst);
+        Admitting(shared)
+    }
+}
+
+impl Drop for Admitting<'_> {
+    fn drop(&mut self) {
+        self.0.admitting.fetch_sub(1, Ordering::SeqCst);
+        if self.0.draining.load(Ordering::Acquire) {
+            self.0.notify_progress();
+        }
+    }
 }
 
 /// Binds (or adopts) the socket of `spec` and builds its settings.
@@ -1656,6 +1683,7 @@ where
         trusted: cfg.trusted.clone(),
         queue_notify: OnceLock::new(),
         queue_len: AtomicUsize::new(0),
+        admitting: AtomicUsize::new(0),
         control: cfg.control.unwrap_or_else(|| Arc::new(NoControl)),
         sink,
         open: AtomicU32::new(0),
@@ -1893,11 +1921,16 @@ fn accept_loop<W: super::Workload, G: Gate>(
             pause_until = None;
         }
         for _ in 0..batch {
+            // Counted before the door is read: a drain that closes the door either
+            // stops this accept or waits for this admission to finish, so a
+            // connection it takes is queued and served, never closed unread when the
+            // stop that follows the drain finds it (D-179).
+            let admitting = Admitting::enter(shared);
             // Each admission sees the door, a drain, a stop, and the control line as
             // they are now, not as they were when the batch began: three loads and the
             // line's epoch, against an accept's system call.
-            if !shared.door.load(Ordering::Acquire)
-                || !conf.door.load(Ordering::Acquire)
+            if !shared.door.load(Ordering::SeqCst)
+                || !conf.door.load(Ordering::SeqCst)
                 || shared.draining.load(Ordering::Acquire)
                 || shared.stopping.load(Ordering::Acquire)
                 || view.moved(shared.control.as_ref())
@@ -1949,6 +1982,9 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     Err(_) => acceptor.pause(),
                 },
             };
+            // No connection in hand: nothing for a drain to wait for, and what follows
+            // may wait for the next connection.
+            drop(admitting);
             match outcome {
                 Accepted::Conn(()) => {}
                 Accepted::Skipped(class) => {

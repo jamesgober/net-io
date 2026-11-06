@@ -207,12 +207,13 @@ impl KillSlot {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        // Windows has no read-side shutdown that wakes a wait: its cancel ends every
-        // operation on the handle, a pipe write already reported as sent included
-        // (`CancelIoEx` with no `OVERLAPPED`), and the reply would be cut short. Every
-        // Windows wait also watches the wake channel, so the channel alone reaches
-        // the owner; the cancel is left for an owner without one.
-        if !cfg!(windows) || wake.is_none() {
+        // An owner with a wake channel is reached through it alone and decides at
+        // its wait, where it can see a request that already arrived: a shut read
+        // side cannot be opened again, and a drain that saw that request too late
+        // would cut it short (D-178). On Windows the cancel would also end a pipe
+        // write already reported as sent (D-156). Only an owner without a wake
+        // channel has its read side shut (Unix) or its IO cancelled (Windows).
+        if wake.is_none() {
             // A request that already arrived is read and answered first: the read
             // side, once shut, stays shut, and the rest of that exchange would read
             // as end of stream. The mark is taken back, and a later pass closes the
@@ -235,7 +236,14 @@ impl KillSlot {
         true
     }
 
-    /// Whether a drain shut this connection's read side.
+    /// The owner keeps a connection a drain marked (its next request had already
+    /// arrived): a later pass may mark it again.
+    #[inline]
+    pub(crate) fn undrain(&self) {
+        self.state.fetch_and(!DRAINED, Ordering::AcqRel);
+    }
+
+    /// Whether a drain marked this connection.
     #[inline]
     pub(crate) fn drained(&self) -> bool {
         self.state.load(Ordering::Acquire) & DRAINED != 0

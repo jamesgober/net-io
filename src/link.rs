@@ -953,8 +953,12 @@ impl Link {
     where
         R: FnMut(&sys::Stream, &mut [u8]) -> io::Result<usize>,
     {
-        if sys::WAIT_BEFORE_RECV || self.wakeable.get() {
-            if !self.likely_more {
+        // Between exchanges Linux waits first too, so a drain reaches the owner
+        // through its wake channel and the owner decides; a drain that shut the read
+        // side could cut short a request whose first bytes it saw too late (D-178).
+        let linux_idle = !sys::WAIT_BEFORE_RECV && self.phase == Phase::Idle;
+        if sys::WAIT_BEFORE_RECV || self.wakeable.get() || linux_idle {
+            if !self.likely_more || linux_idle {
                 match self.wait(Interest::Read, timeout) {
                     Ok(Ready::TimedOut) => return None,
                     Ok(Ready::Woken) => {
@@ -967,9 +971,16 @@ impl Link {
                         if !self.slot.drained() {
                             return Some(Ok(Got::Woken));
                         }
+                        if self.phase != Phase::Idle {
+                            // Marked while it was leaving its wait: a later pass marks
+                            // it again at its next one.
+                            self.slot.undrain();
+                            return Some(Ok(Got::Woken));
+                        }
                         if !self.input_waiting() {
                             return Some(Err(self.fail(CloseReason::Drained, NetError::Closed)));
                         }
+                        self.slot.undrain();
                     }
                     Ok(Ready::Socket) => {}
                     Err(e) => return Some(Err(self.os_error("wait", e))),

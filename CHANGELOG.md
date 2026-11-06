@@ -115,6 +115,13 @@ soak, and a database consumer's transport needs.
   peer reset after reading its reply, as a TLS client that skips `close_notify`
   does, so connections, buffers, and cap slots piled up under short connections.
   A reset now ends the linger (also in 0.6.2).
+- A drain could still close a connection in the middle of an exchange when it
+  landed just as the connection's request arrived: it is now the connection's
+  own thread that decides, through its wake channel, on every system (the Linux
+  pool waits before an idle-phase receive for this).
+- A connection an accept thread was admitting as a drain began could be closed
+  unread by the stop that followed (a reset after 0 bytes, seen in the Windows
+  hand-off test). A drain now waits for admissions in progress.
 - Everything fixed in 0.6.1: posts reach connections waiting for input, an idle
   trim releases buffers with a receive out, a stop ends lingers, and a drain
   answers a request that already arrived.
