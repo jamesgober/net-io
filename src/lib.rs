@@ -45,11 +45,14 @@
 //!
 //! ## Status
 //!
-//! `0.6.0`: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
-//! Linux, macOS, FreeBSD, and Windows. TCP, Unix domain sockets (AF_UNIX on
-//! Windows), Windows named pipes, and UDP with batches and sessions; zero-copy file
-//! sends; the PROXY protocol, the TLS seam, systemd and FastCGI inheritance, listener
-//! hand-off on Unix and Windows, and the public [`Driver`] interface.
+//! `0.7.0`: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
+//! Linux, macOS, FreeBSD, and Windows. TCP with a client that reconnects with
+//! backoff, Unix domain sockets (AF_UNIX on Windows), Windows named pipes, and UDP
+//! with batches and sessions; zero-copy file sends and file receives; the PROXY
+//! protocol, the TLS seam, systemd and FastCGI inheritance, listener hand-off on Unix
+//! and Windows, and the public [`Driver`] interface. Hardened: every review finding
+//! of medium severity or above fixed, an attack test per threat, continuous fuzzing,
+//! and a 24-hour soak.
 
 #![doc(html_root_url = "https://docs.rs/net-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]

@@ -1,0 +1,36 @@
+name: Soak (macOS)
+
+# The release soak on macOS (register R-42): GitHub's hosted runners stop a job at
+# 6 hours, so each driver runs 5.5 hours in its own job. Linux and Windows run the
+# full 24 hours on the build host. Started by hand before a release, or by pushing
+# the release candidate to a `soak/` branch.
+on:
+  push:
+    branches: ["soak/**"]
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Soak length in seconds per driver
+        default: "19800"
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: Soak ${{ matrix.driver }} (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: [reactor, blocking]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Soak
+        run: cargo test --release --all-features --test soak -- --nocapture
+        env:
+          NET_IO_SOAK_SECS: ${{ inputs.seconds || '19800' }}
+          NET_IO_SOAK_SAMPLE_SECS: "60"
+          NET_IO_SOAK_DRIVER: ${{ matrix.driver }}
