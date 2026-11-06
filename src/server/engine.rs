@@ -3169,6 +3169,7 @@ fn drive<G: Gate, S: Session>(
     s: &mut S,
     input: &mut Input,
 ) -> CloseReason {
+    link.hear_drains();
     let Some(mut step) = call(w, link, s, |s, cx| s.on_open(cx)).0 else {
         return CloseReason::SessionPanicked;
     };
@@ -3192,8 +3193,12 @@ fn drive<G: Gate, S: Session>(
                 link.set_rescales();
                 let idle = link.phase() == Phase::Idle && input.bytes().is_empty();
                 // A request that already arrived is answered before the drain closes.
-                if w.draining() && idle && !link.input_waiting() {
-                    return CloseReason::Drained;
+                if w.draining() && idle && !link.drain_kept() && !link.input_waiting() {
+                    match drain_reached(w, link, s) {
+                        Ok(next) => step = next,
+                        Err(reason) => return reason,
+                    }
+                    continue;
                 }
                 if idle && w.shed(link.info.lane) {
                     return CloseReason::Shed;
@@ -3219,7 +3224,12 @@ fn drive<G: Gate, S: Session>(
                     // request 7) reaches the session now; a drain, a kill, or the
                     // control line is seen at the top of the loop.
                     Ok(Got::Woken) => {
-                        if let Some((token, value)) = take_post(w, link) {
+                        if link.take_drain_reached() {
+                            match drain_reached(w, link, s) {
+                                Ok(next) => step = next,
+                                Err(reason) => return reason,
+                            }
+                        } else if let Some((token, value)) = take_post(w, link) {
                             match call(w, link, s, |s, cx| s.on_wake(cx, token, value)).0 {
                                 Some(next) => step = next,
                                 None => return CloseReason::SessionPanicked,
@@ -3267,6 +3277,27 @@ fn drive<G: Gate, S: Session>(
                 };
             }
             _ => return link.reason_or(CloseReason::SessionError),
+        }
+    }
+}
+
+/// A drain reached the connection between exchanges: the session's `on_drain`
+/// decides, once. `Close` flushes what it queued and closes with `Drained`; any other
+/// step keeps the connection through the drain (its deadline still bounds it).
+fn drain_reached<G: Gate, S: Session>(
+    w: &mut Worker<G>,
+    link: &mut Link,
+    s: &mut S,
+) -> Result<Step, CloseReason> {
+    match call(w, link, s, |s, cx| s.on_drain(cx)).0 {
+        None => Err(CloseReason::SessionPanicked),
+        Some(Step::Close) => {
+            flush(w, link, s)?;
+            Err(CloseReason::Drained)
+        }
+        Some(next) => {
+            link.keep_through_drain();
+            Ok(next)
         }
     }
 }

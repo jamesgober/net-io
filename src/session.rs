@@ -71,6 +71,16 @@ pub trait Session: Send + 'static {
         Step::Close
     }
 
+    /// A drain reached the connection between exchanges (idle, nothing unread), once.
+    /// `Close` (the default) closes it with `Drained` after flushing what this queued,
+    /// as before `0.8.0`. Any other step keeps it: the drain no longer closes it
+    /// between exchanges, and the session closes it itself (a WebSocket sends its
+    /// 1001 Close and reads the peer's), or the drain deadline does.
+    fn on_drain(&mut self, cx: &mut SessionContext<'_>) -> Step {
+        let _ = cx;
+        Step::Close
+    }
+
     /// The peer sent FIN; the session may keep writing (half-close).
     fn on_peer_closed(&mut self, cx: &mut SessionContext<'_>) -> Step {
         let _ = cx;

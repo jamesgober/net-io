@@ -117,6 +117,13 @@ pub(crate) enum Got {
     Woken,
 }
 
+/// `Link::drains` bits.
+const DRAIN_HOOK: u8 = 1;
+const DRAIN_REACHED: u8 = 2;
+const DRAIN_KEPT: u8 = 4;
+/// Not a drain bit: net-io still picks the phase (the owner never set one).
+const AUTO_PHASE: u8 = 8;
+
 /// Soft closes in progress across a server, against `Limits::denial_linger_max`.
 #[derive(Debug)]
 pub(crate) struct SoftCloses {
@@ -200,10 +207,13 @@ pub(crate) struct Link {
     /// The session took a completer, so posts may come: on the pool a receive
     /// waits on the wake channel first, as on Windows and macOS (D-163).
     pub(crate) wakeable: std::cell::Cell<bool>,
-    /// net-io chooses the phase (an accepted connection whose owner never set one).
-    auto_phase: bool,
     /// Bytes went out since the last bytes came in.
     replied: bool,
+    /// `DRAIN_HOOK`: the owner hears a drain at its idle wait (`Session::on_drain`)
+    /// instead of the read closing with `Drained`; `DRAIN_REACHED`: that news;
+    /// `DRAIN_KEPT`: the session kept the connection through the drain; and
+    /// `AUTO_PHASE`: net-io picks the phase (the owner never set one). One byte.
+    drains: u8,
     /// The soft close (after a denial, or `close_after_flush`), once there is one.
     /// Boxed: one pointer on every connection, the rest only where it happens.
     soft: Option<Box<SoftClose>>,
@@ -340,9 +350,9 @@ impl Link {
             terminal: None,
             likely_more: false,
             wakeable: std::cell::Cell::new(false),
-            auto_phase: phase == Phase::Idle,
             replied: false,
             soft: None,
+            drains: if phase == Phase::Idle { AUTO_PHASE } else { 0 },
             idle_timeout,
             handshake_deadline: None,
             deadline_scale: 1.0,
@@ -369,7 +379,7 @@ impl Link {
 
     /// The owner sets the phase; net-io stops choosing it.
     pub(crate) fn set_phase(&mut self, phase: Phase) {
-        self.auto_phase = false;
+        self.drains &= !AUTO_PHASE;
         if phase == self.phase {
             return;
         }
@@ -391,7 +401,7 @@ impl Link {
     /// waits under the idle timeout and a drain can close it at once. Input left
     /// over (a pipelined request) keeps the read deadline and inbound rate.
     pub(crate) fn settle_phase(&mut self, done: bool) {
-        if done && self.auto_phase && self.replied && self.phase == Phase::Receiving {
+        if done && self.drains & AUTO_PHASE != 0 && self.replied && self.phase == Phase::Receiving {
             let now = self.now();
             self.phase = Phase::Idle;
             self.progress_at = now;
@@ -935,6 +945,29 @@ impl Link {
         self.check_terminal()
     }
 
+    /// A session owner: a drain that reaches the idle wait is reported (`Got::Woken`
+    /// with `take_drain_reached`) for `Session::on_drain` instead of closing.
+    pub(crate) fn hear_drains(&mut self) {
+        self.drains |= DRAIN_HOOK;
+    }
+
+    /// Whether a drain reached the idle wait since the last call.
+    pub(crate) fn take_drain_reached(&mut self) -> bool {
+        let reached = self.drains & DRAIN_REACHED != 0;
+        self.drains &= !DRAIN_REACHED;
+        reached
+    }
+
+    /// The session kept the connection through the drain: its waits no longer count
+    /// as idle for a drain, so no pass marks it again.
+    pub(crate) fn keep_through_drain(&mut self) {
+        self.drains |= DRAIN_KEPT;
+    }
+
+    pub(crate) fn drain_kept(&self) -> bool {
+        self.drains & DRAIN_KEPT != 0
+    }
+
     /// Where this connection takes its place for a soft close (a server's links).
     pub(crate) fn set_soft_closes(&self, places: &Arc<SoftCloses>) {
         self.slot.set_soft_closes(places);
@@ -1117,8 +1150,9 @@ impl Link {
                 .saturating_duration_since(now)
                 .max(Duration::from_millis(1));
 
-            // Waiting for the next exchange: a drain may close the connection now.
-            let idle = self.phase == Phase::Idle;
+            // Waiting for the next exchange: a drain may close the connection now
+            // (unless the session kept it through the drain).
+            let idle = self.phase == Phase::Idle && !self.drain_kept();
             if idle {
                 self.slot.set_idle(true);
             }
@@ -1173,6 +1207,12 @@ impl Link {
                             return Some(Ok(Got::Woken));
                         }
                         if !self.input_waiting() {
+                            if self.drains & DRAIN_HOOK != 0 {
+                                // The session hears it (`on_drain`) and decides.
+                                self.slot.undrain();
+                                self.drains |= DRAIN_REACHED;
+                                return Some(Ok(Got::Woken));
+                            }
                             return Some(Err(self.fail(CloseReason::Drained, NetError::Closed)));
                         }
                         self.slot.undrain();

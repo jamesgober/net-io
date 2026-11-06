@@ -175,6 +175,8 @@ struct Conn<S> {
     linger_left: u32,
     /// The session runs; before that a handshake does.
     opened: bool,
+    /// The session kept it through a drain (`Session::on_drain` returned other than `Close`).
+    drain_kept: bool,
     /// Reading waits for the buffer budget (edge case 11).
     paused: bool,
     /// The last send moved nothing: once is retried, twice is an error.
@@ -510,6 +512,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             proxy: None,
             linger_left: 0,
             opened: false,
+            drain_kept: false,
             paused: false,
             zero_send: false,
         };
@@ -1037,8 +1040,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     let lane = c.link.info.lane;
                     // A request the socket already reported is answered first.
                     let readable = c.readable;
-                    if idle && self.shared.is_draining() && !readable {
-                        return self.close(index, CloseReason::Drained);
+                    let kept = c.drain_kept;
+                    if idle && self.shared.is_draining() && !readable && !kept {
+                        return self.drain_reached(index, CloseReason::Drained);
                     }
                     if idle && self.shed(lane) {
                         return self.close(index, CloseReason::Shed);
@@ -2042,6 +2046,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             let idle = self.conn(i).is_some_and(|c| {
                 c.wait == Wait::Read
                     && c.closing.is_none()
+                    && !c.drain_kept
                     && !c.readable
                     && c.link.phase() == Phase::Idle
                     && c.input
@@ -2050,7 +2055,34 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     && pick(&c.link.info)
             });
             if idle {
-                self.close(i, reason);
+                if reason == CloseReason::Drained {
+                    self.drain_reached(i, reason);
+                } else {
+                    self.close(i, reason);
+                }
+            }
+        }
+    }
+
+    /// A drain reached an idle connection: its session's `on_drain` decides, once.
+    /// `Close` flushes what it queued and closes; any other step keeps the connection
+    /// through the drain (the drain deadline still bounds it).
+    fn drain_reached(&mut self, index: u32, reason: CloseReason) {
+        let Some(c) = self.conn(index) else { return };
+        if c.drain_kept {
+            return;
+        }
+        match self.call(index, |s, cx| s.on_drain(cx)) {
+            None => self.close(index, CloseReason::SessionPanicked),
+            Some(Step::Close) => match self.flush(index, Wait::FlushClose) {
+                Flushed::Done => self.close(index, reason),
+                Flushed::Waiting => {}
+            },
+            Some(next) => {
+                if let Some(c) = self.conn(index) {
+                    c.drain_kept = true;
+                }
+                self.run(index, next);
             }
         }
     }

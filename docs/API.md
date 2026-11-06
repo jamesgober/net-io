@@ -1399,6 +1399,7 @@ pub trait Session: Send + 'static {
     fn on_writable(&mut self, cx: &mut SessionContext<'_>) -> Step { let _ = cx; Step::Read }
     fn on_wake(&mut self, cx: &mut SessionContext<'_>, token: u32, value: u64) -> Step { let _ = (cx, token, value); Step::Abort }
     fn on_timeout(&mut self, cx: &mut SessionContext<'_>, which: TimeoutKind) -> Step { let _ = (cx, which); Step::Close }
+    fn on_drain(&mut self, cx: &mut SessionContext<'_>) -> Step { let _ = cx; Step::Close }   // 0.8.0
     fn on_peer_closed(&mut self, cx: &mut SessionContext<'_>) -> Step { let _ = cx; Step::Close }
     fn on_denied(&mut self, code: u16, output: &mut Output) { let _ = (code, output); }
     fn on_close(&mut self, info: &ConnectionInfo, reason: CloseReason) { let _ = (info, reason); }
@@ -1412,6 +1413,7 @@ pub trait Session: Send + 'static {
 | `on_writable` | after a `Step::Write` flushed all pending output | P0 | `0.3.0` |
 | `on_wake` | when another thread posted a completion for this connection through its [`Completer`](#completer) (after `Step::Park`) | P0 | `0.3.0` (blocking), `0.5.0` (reactor) |
 | `on_timeout` | when a deadline passed that the session may handle (`Read`, `Write`, `Exchange`, `Park`, `Idle`). Returning `Close` or `Abort` closes with the timeout's own reason (`Idle`, `ReadTimeout`, `WriteTimeout`, `ExchangeDeadline`, `ParkDeadline`) and that reason's close style (graceful for `Idle`, abortive for the others); anything else re-arms with the same limits. The default returns `Close` | P0 | `0.3.0` |
+| `on_drain` | once, when a drain reaches the connection between exchanges (idle, nothing unread). `Close` (the default) flushes what it queued and closes with `Drained`, as before; any other step keeps the connection through the drain, and the session closes it itself or the drain deadline does (a WebSocket's 1001 Close; serve-net request 7, D-183) | P1 | `0.8.0` |
 | `on_peer_closed` | the peer sent FIN; the session may keep writing (half-close) | P1 | `0.3.0` |
 | `on_denied` | the gate denied a write and no byte of the current response has left yet; write the protocol's refusal for `code` (for example a 403, a WebSocket close 1008, a database error frame) into `output`; net-io sends it with one bounded attempt and closes abortively | P0 | `0.3.0` |
 | `on_close` | exactly once, with the one close reason | P0 | `0.3.0` |
