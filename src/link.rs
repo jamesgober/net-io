@@ -71,17 +71,22 @@ thread_local! {
     static THREAD_WAKE: std::cell::OnceCell<ThreadWake> = const { std::cell::OnceCell::new() };
 }
 
-/// Wakes of threads that ended, for the next thread that needs one. A
+/// Wakes of threads that ended, for the next thread that needs one (Windows). A
 /// thread-local destructor runs under the Windows loader lock, where closing a
 /// socket can deadlock the whole process against a thread that is loading a
-/// Winsock extension (D-173), so a thread's wake is never closed when it ends.
+/// Winsock extension (D-173), so there a thread's wake is never closed when it
+/// ends. Elsewhere it closes with its thread, which returns its descriptors.
 static SPARE_WAKES: std::sync::Mutex<Vec<Arc<Wake>>> = std::sync::Mutex::new(Vec::new());
 
-/// A thread's wake channel; given back to `SPARE_WAKES` when the thread ends.
+/// A thread's wake channel; on Windows given back to `SPARE_WAKES` when the thread
+/// ends.
 struct ThreadWake(Option<Arc<Wake>>);
 
 impl Drop for ThreadWake {
     fn drop(&mut self) {
+        if !cfg!(windows) {
+            return;
+        }
         if let Some(w) = self.0.take() {
             match SPARE_WAKES.lock() {
                 Ok(mut spare) => spare.push(w),
@@ -1935,8 +1940,9 @@ impl Link {
 mod tests {
     use super::*;
 
-    /// A thread's wake outlives the thread: it goes back to the spares instead of
-    /// being closed by a thread-local destructor (D-173).
+    /// On Windows a thread's wake outlives the thread: it goes back to the spares
+    /// instead of being closed by a thread-local destructor (D-173).
+    #[cfg(windows)]
     #[test]
     fn test_thread_wake_is_kept_when_its_thread_ends() {
         let weak = std::thread::spawn(|| Arc::downgrade(&thread_wake().expect("wake")))
