@@ -84,6 +84,11 @@ soak, and a database consumer's transport needs.
 
 ### Fixed
 
+- `TcpConnection::connect_retry` gave up at once on two errors that pass: a
+  reset during the connect (a server refusing at its cap) and, on Windows, every
+  ephemeral port in use or in TIME_WAIT (10048, 10055); both are retried under
+  the backoff now, and a reset during the connect reads as `ConnectionReset`.
+  Found by the 0.7 soak's pooled client.
 - A session that survived a timeout with part of a message held could panic a
   reactor worker (also in 0.6.1).
 - The accept batch admitted connections after the door closed; a stop during a

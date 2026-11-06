@@ -77,6 +77,14 @@ pub(crate) fn bind_error(addr: SocketAddr, e: io::Error) -> NetError {
 }
 
 fn connect_error(addr: SocketAddr, after: Duration, e: io::Error) -> NetError {
+    // A reset during the handshake (a server refusing at its cap after the accept,
+    // a listen queue that overflowed) is a reset, as `NetError::from_os` maps it.
+    if matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+    ) {
+        return NetError::ConnectionReset;
+    }
     match sys::classify_addr_error(&e) {
         AddrFailure::Refused => NetError::ConnectionRefused { addr },
         AddrFailure::HostUnreachable => NetError::HostUnreachable { addr },
@@ -91,7 +99,8 @@ fn connect_error(addr: SocketAddr, after: Duration, e: io::Error) -> NetError {
     }
 }
 
-/// Whether a connect error is one a restarting or failing-over server produces.
+/// Whether a connect error is one a restarting or failing-over server produces, or
+/// a shortage of local ports that passes (the backoff bounds the wait either way).
 fn reconnectable(e: &NetError) -> bool {
     e.is_retryable()
         || matches!(
@@ -101,8 +110,10 @@ fn reconnectable(e: &NetError) -> bool {
                 | NetError::NetworkUnreachable { .. }
                 | NetError::ConnectionReset
                 | NetError::NoAddresses
+                | NetError::AddrNotAvailable { .. }
                 | NetError::Os { op: "resolve", .. }
         )
+        || matches!(e, NetError::Os { op: "connect", source } if sys::out_of_ports(source))
 }
 
 fn resolve<A: ToSocketAddrs>(addr: A) -> Result<Vec<SocketAddr>, NetError> {
@@ -594,7 +605,8 @@ impl TcpConnection {
     }
 
     /// Connects, and after a failure a restarting or failing-over server produces
-    /// (refused, timed out, unreachable, reset, no addresses, resolution failed),
+    /// (refused, timed out, unreachable, reset, no addresses, resolution failed), or
+    /// a shortage of local ports (every ephemeral port in use or in TIME_WAIT),
     /// sleeps for [`Backoff::next_delay`] and tries again, resolving `addr` again
     /// each time. Any other error returns at once.
     ///
@@ -1383,6 +1395,35 @@ impl std::os::windows::io::AsSocket for TcpConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The soak's pooled client gave up at once on a reset during connect (a server
+    /// refusing at its cap) and on Windows port exhaustion: both pass, so a reconnect
+    /// waits for them under its backoff.
+    #[test]
+    fn test_connect_resets_and_port_shortage_are_reconnectable() {
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let reset = connect_error(
+            addr,
+            Duration::ZERO,
+            io::Error::from(io::ErrorKind::ConnectionReset),
+        );
+        assert!(matches!(reset, NetError::ConnectionReset));
+        assert!(reconnectable(&reset));
+        #[cfg(windows)]
+        let shortages = [10055, 10048, 10049];
+        #[cfg(unix)]
+        let shortages = [sys::errno::EADDRNOTAVAIL, sys::errno::EADDRINUSE];
+        for code in shortages {
+            let short = connect_error(addr, Duration::ZERO, io::Error::from_raw_os_error(code));
+            assert!(reconnectable(&short), "{code}: {short:?}");
+        }
+        let denied = connect_error(
+            addr,
+            Duration::ZERO,
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+        assert!(!reconnectable(&denied), "{denied:?}");
+    }
 
     #[test]
     fn test_listen_accept_echo_round_trip() {
