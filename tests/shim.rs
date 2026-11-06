@@ -128,18 +128,15 @@ fn test_receive_error_closes_only_that_connection() {
 }
 
 /// B-13: system calls per echo round trip on an established connection, counted
-/// at net-io's own call sites: at most 2 on Linux (receive, send) and 3 on Windows
-/// and macOS (wait, receive, send; decisions D-052, D-083).
+/// at net-io's own call sites: at most 3 on the blocking pool everywhere (wait,
+/// receive, send; decisions D-052, D-083, and on Linux D-178, which waits before
+/// an exchange's first receive so a drain reaches the owner through its wake).
 #[test]
 fn test_system_calls_per_echo_round_trip() {
     use net_io::__shim::{counted, start_counting, stop_counting};
     let _shim = Shim::take();
-    // Linux: recv, send. Windows and macOS wait first (D-052, D-083).
-    let budget = if cfg!(any(windows, not(target_os = "linux"))) {
-        3.0
-    } else {
-        2.0
-    };
+    // Every system waits before an exchange's first receive (D-052, D-083, D-178).
+    let budget = 3.0;
     for name in ["blocking handler", "sessions"] {
         // One server at a time: the count is process-wide, and a worker still starting
         // makes its first wait inside the other server's measurement.
