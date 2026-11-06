@@ -1377,6 +1377,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 if let Some(b) = done.buffer {
                     self.give_back(index, kind, b);
                 }
+                if matches!(wait, Wait::Linger(_)) {
+                    // The peer reset it: nothing more can arrive, so the linger is
+                    // over. Reading again kept it to its deadline on Windows, where
+                    // the receive after a reset does not complete (D-177).
+                    return self.finish_closing(index);
+                }
                 if closing || wait == Wait::Closing {
                     return self.settle(index);
                 }
