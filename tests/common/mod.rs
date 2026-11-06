@@ -77,8 +77,11 @@ pub fn refused(addr: SocketAddr) -> bool {
     match TcpStream::connect(addr) {
         Err(_) => true,
         Ok(mut s) => {
-            s.set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("timeout");
+            // macOS refuses `setsockopt` on a connection that already ended: the
+            // server reset it, which is the refusal.
+            if s.set_read_timeout(Some(Duration::from_secs(5))).is_err() {
+                return true;
+            }
             closed_by_server(&mut s)
         }
     }
