@@ -1936,13 +1936,12 @@ impl Link {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
     /// On Windows a thread's wake outlives the thread: it goes back to the spares
     /// instead of being closed by a thread-local destructor (D-173).
-    #[cfg(windows)]
     #[test]
     fn test_thread_wake_is_kept_when_its_thread_ends() {
         let weak = std::thread::spawn(|| Arc::downgrade(&thread_wake().expect("wake")))
