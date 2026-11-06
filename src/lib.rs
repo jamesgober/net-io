@@ -136,6 +136,12 @@ pub mod __fuzz {
     pub fn rate(data: &[u8]) {
         crate::rate::fuzz_rate(data);
     }
+
+    /// The UDP guard's tables, verification, and budgets against a model.
+    #[cfg(feature = "udp")]
+    pub fn udp(data: &[u8]) {
+        crate::udp::fuzz_udp(data);
+    }
 }
 
 /// Fault injection for net-io's own tests, compiled only with `--cfg net_io_shim`.

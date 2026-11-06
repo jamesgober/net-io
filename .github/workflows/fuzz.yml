@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [proxy, manifest, systemd_env, cidr, trusted, wheel, rate]
+        target: [proxy, manifest, systemd_env, cidr, trusted, wheel, rate, udp]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly

@@ -338,7 +338,7 @@ jobs:
       - name: Fuzz
         working-directory: fuzz
         run: |
-          for t in proxy manifest systemd_env cidr trusted wheel rate; do
+          for t in proxy manifest systemd_env cidr trusted wheel rate udp; do
             # The prebuilt cargo-fuzz is a musl binary; name the target explicitly.
             cargo fuzz run --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=30 -rss_limit_mb=1024
           done

@@ -1214,12 +1214,136 @@ impl std::os::windows::io::AsSocket for UdpSocket {
     }
 }
 
+/// The fuzz target `udp`: arbitrary datagrams, sends, verifications, and clock
+/// steps against the guard. It checks that the tables stay consistent and within
+/// their bounds, that no peer is verified that a model says is not, that an
+/// unverified peer is never sent more than the factor times what the guard holds
+/// as received from it, and that the global budget admits no more than its burst
+/// plus its rate.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz_udp(data: &[u8]) {
+    let Some((head, ops)) = data.split_first_chunk::<5>() else {
+        return;
+    };
+    let global = UdpBudget {
+        datagrams_per_sec: u32::from(head[3]) + 1,
+        bytes_per_sec: u32::from(head[3]) * 64 + 64,
+        burst: u32::from(head[4] % 16) + 1,
+    };
+    let options = UdpOptions::new()
+        .source_table(u32::from(head[0] % 16) + 1)
+        .verified_table(u32::from(head[1] % 8) + 1)
+        .amplification_factor(head[2] % 3 + 1)
+        .amplification_window(Duration::from_secs(u64::from(head[2] >> 2) % 8 + 1))
+        .verification_lifetime(Duration::from_secs(u64::from(head[4] >> 4) + 1))
+        .source_budget(UdpBudget {
+            datagrams_per_sec: 20,
+            bytes_per_sec: 4_000,
+            burst: 4,
+        })
+        .global_budget(global);
+    if options.validate().is_err() {
+        return;
+    }
+    let start = Instant::now();
+    let mut now = start;
+    let mut guard = Guard::new(options.clone(), now);
+    // The model: when each peer's verification ends, if it is verified.
+    let mut proven: HashMap<PeerKey, Instant> = HashMap::new();
+    let mut admitted = 0u64;
+    for op in ops.chunks(4) {
+        let n = op.get(1).copied().unwrap_or(0);
+        // Mapped and plain forms of the same IPv4 address, and IPv6 addresses.
+        let host = match n % 3 {
+            0 => IpAddr::from([10, 0, 0, n >> 2]),
+            1 => IpAddr::V6(std::net::Ipv4Addr::new(10, 0, 0, n >> 2).to_ipv6_mapped()),
+            _ => IpAddr::from([0xfd00, 0, 0, 0, 0, 0, 0, u16::from(n >> 2)]),
+        };
+        let peer = SocketAddr::new(host, u16::from(op.get(2).copied().unwrap_or(0) % 4));
+        let arg = usize::from(op.get(3).copied().unwrap_or(0)) * 8;
+        match op[0] % 6 {
+            0 => {
+                let mut overflow = false;
+                let from = crate::addr::normalize_socket(peer);
+                if guard.admit(from.ip(), arg, now, &mut overflow) {
+                    admitted += 1;
+                }
+            }
+            1 => {
+                let verified = guard.is_verified(peer, now);
+                let sent = guard.charge(peer, arg, now);
+                if sent && !verified && arg > 0 {
+                    let i = guard.index[&normalize(peer.ip())] as usize;
+                    let e = &guard.slots[i];
+                    let allowed = u64::from(options.factor)
+                        .saturating_mul(e.received[0].saturating_add(e.received[1]));
+                    assert!(
+                        e.sent[0].saturating_add(e.sent[1]) <= allowed,
+                        "sent past the factor"
+                    );
+                }
+            }
+            2 => {
+                guard.verify(peer, now);
+                proven.insert(peer_key(peer), now + options.verified_for);
+            }
+            3 => {
+                guard.forget(peer, now);
+                proven.remove(&peer_key(peer));
+            }
+            4 => now += Duration::from_millis(arg as u64 * 13),
+            _ => {
+                let model = proven.get(&peer_key(peer)).is_some_and(|&t| now < t);
+                assert!(
+                    model || !guard.is_verified(peer, now),
+                    "verified without a live proof"
+                );
+            }
+        }
+        assert_eq!(guard.index.len(), guard.slots.len());
+        assert!(guard.slots.len() <= options.table as usize);
+        for (ip, &i) in &guard.index {
+            assert_eq!(guard.slots[i as usize].ip, *ip, "index points elsewhere");
+        }
+        assert_eq!(guard.proofs.len(), guard.proved.len());
+        assert!(guard.proved.len() <= options.verified_table as usize);
+        for (key, &i) in &guard.proofs {
+            assert_eq!(guard.proved[i as usize].key, *key, "proof points elsewhere");
+        }
+        let elapsed = now.saturating_duration_since(start).as_secs_f64();
+        let most = f64::from(global.burst) + f64::from(global.datagrams_per_sec) * elapsed + 1.0;
+        assert!(
+            admitted as f64 <= most,
+            "{admitted} admitted, at most {most}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ip(n: u8) -> IpAddr {
         IpAddr::from([10, 0, 0, n])
+    }
+
+    /// The fuzz target's checks on pseudo-random input, so they run in every test
+    /// build and not only under cargo-fuzz.
+    #[test]
+    fn test_guard_holds_under_random_operations() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..2_000 {
+            let len = 5 + (x % 400) as usize;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            fuzz_udp(&data);
+        }
     }
 
     #[test]
