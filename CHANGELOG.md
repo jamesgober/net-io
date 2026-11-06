@@ -20,6 +20,10 @@ reactor running every short connection on one worker. No API change.
 
 ### Fixed
 
+- On the Linux pool a drain could close a handler in the middle of an exchange:
+  it shut the read side of a connection whose next request had already arrived,
+  and the rest of that request read as end of stream. A drain now leaves such a
+  connection to answer first, and closes it at its next wait.
 - Windows: a backlog past 200 was silently cut to 200 pending connections (the
   default 1,024 included), so a server whose accept thread fell behind on a busy
   host dropped SYNs and those clients waited about 21 s to fail (found by

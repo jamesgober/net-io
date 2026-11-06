@@ -1665,6 +1665,24 @@ pub(crate) unsafe fn shutdown_read_raw(raw: RawSock) {
     let _ = unsafe { shutdown(raw, c::SHUT_RD) };
 }
 
+/// Whether `raw` has input waiting (bytes, the peer's FIN, or an error): one
+/// zero-timeout `poll`.
+///
+/// # Safety
+///
+/// `raw` must be an open socket for the duration of the call.
+pub(crate) unsafe fn input_waiting_raw(raw: RawSock) -> bool {
+    let mut fd = PollFd {
+        fd: raw,
+        events: c::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `fd` is a live local, one entry; `raw` is open by this function's
+    // contract; a zero timeout never blocks.
+    let n = unsafe { poll(&raw mut fd, 1, 0) };
+    n > 0 && fd.revents != 0
+}
+
 fn clamp_int(n: u32) -> c_int {
     c_int::try_from(n).unwrap_or(c_int::MAX)
 }

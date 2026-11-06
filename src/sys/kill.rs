@@ -201,6 +201,17 @@ impl KillSlot {
             }
         }
         let raw = self.raw.load(Ordering::Relaxed) as RawSock;
+        // A request that already arrived is read and answered first: the read side,
+        // once shut, stays shut, and the rest of that exchange would read as end of
+        // stream. The mark is taken back, and a later pass closes the connection at
+        // its next wait (D-176).
+        #[cfg(unix)]
+        // SAFETY: the KILLING bit is set, so `raw` is open for this call (as below).
+        if unsafe { super::input_waiting_raw(raw) } {
+            self.state
+                .fetch_and(!(DRAINED | KILLING), Ordering::Release);
+            return false;
+        }
         // SAFETY: the KILLING bit is set; the owner's `begin_close` waits for it to
         // clear before it closes the socket, so `raw` is open for this call.
         unsafe { super::shutdown_read_raw(raw) };
@@ -309,6 +320,38 @@ mod tests {
         );
         slot.set_idle(false);
         assert_eq!(slot.begin_close(), Some(KillReason(2)));
+    }
+
+    /// A drain leaves an idle connection whose next request already arrived: its
+    /// read side stays open, so the whole exchange can be read; once the input is
+    /// read, the drain goes through (D-176, a Linux pool race seen in CI).
+    #[cfg(unix)]
+    #[test]
+    fn test_drain_leaves_a_connection_with_input_waiting() {
+        use std::io::{Read, Write};
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (mut conn, _) = l.accept().unwrap();
+        let slot = KillSlot::new();
+        let generation = slot.install(super::super::AsSock::sock(&conn));
+        slot.set_idle(true);
+        peer.write_all(b"req").unwrap();
+        let raw = super::super::raw_of(super::super::AsSock::sock(&conn));
+        let waited = std::time::Instant::now();
+        // SAFETY: `conn` is open for the whole loop.
+        while !unsafe { super::super::input_waiting_raw(raw) } {
+            assert!(waited.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::yield_now();
+        }
+        assert!(!slot.drain_idle(generation), "input waiting: left alone");
+        assert!(!slot.drained());
+        let mut b = [0u8; 3];
+        conn.read_exact(&mut b).unwrap();
+        peer.write_all(b"rest").unwrap();
+        let mut rest = [0u8; 4];
+        conn.read_exact(&mut rest).expect("read side still open");
+        assert!(slot.drain_idle(generation), "nothing waiting: drained");
+        assert!(slot.drained());
     }
 
     #[test]
