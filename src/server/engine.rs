@@ -349,6 +349,10 @@ pub(crate) struct Shared {
     /// The global cap, for `pressure`.
     #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
     max_open: u32,
+    /// Workers shared by every listener without workers of its own: the first
+    /// `shared_workers` of `workers`.
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    shared_workers: usize,
     /// Soft closes in progress, against `Limits::denial_linger_max` (D-182).
     pub(crate) soft_closes: Arc<crate::link::SoftCloses>,
     /// The server's limits, for listeners added later.
@@ -622,7 +626,7 @@ impl Shared {
             },
         })?);
         let (mut entry, info) =
-            bind_listener(spec, id, &self.base_limits, self.driver, &self.layout)?;
+            bind_listener(spec, id, &self.base_limits, self.driver, &self.layout, None)?;
         let Some(spawn) = self.spawn_accept.get() else {
             return Err(NetError::ShuttingDown);
         };
@@ -1135,6 +1139,10 @@ pub(crate) struct ListenerConf {
     /// queued connections close with `Drained`.
     pub(crate) removed: AtomicBool,
     wake: Wakes,
+    /// Reactor workers of its own: the first index and how many (`None`: the
+    /// server's shared workers).
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    pub(crate) workers: Option<(usize, usize)>,
 }
 
 #[cfg(feature = "reactor")]
@@ -1201,8 +1209,31 @@ fn bind_listener(
     base: &Limits,
     driver: DriverKind,
     layout: &Layout,
+    dedicated: Option<(usize, usize)>,
 ) -> Result<(ListenerEntry, ListenerInfo), NetError> {
     let per_worker = spec.options.is_some_and(|o| o.per_worker);
+    if let Some(n) = spec.workers {
+        let reason = if n == 0 {
+            crate::error::ConfigReason::Zero
+        } else {
+            crate::error::ConfigReason::Inconsistent
+        };
+        #[cfg(feature = "udp")]
+        let udp = spec.udp.is_some();
+        #[cfg(not(feature = "udp"))]
+        let udp = false;
+        if n == 0
+            || per_worker
+            || udp
+            || driver.resolve() != DriverKind::Reactor
+            || dedicated.is_none()
+        {
+            return Err(NetError::InvalidConfig {
+                field: "workers",
+                reason,
+            });
+        }
+    }
     if per_worker && !cfg!(target_os = "linux") {
         return Err(NetError::Unsupported {
             feature: "per-worker listeners",
@@ -1386,6 +1417,7 @@ fn bind_listener(
         door: AtomicBool::new(false),
         removed: AtomicBool::new(false),
         wake,
+        workers: dedicated,
     });
     Ok((
         ListenerEntry {
@@ -1548,9 +1580,10 @@ impl<W, G: Gate> Engine<W, G> {
     #[allow(clippy::result_large_err)]
     fn hand_to_worker(&self, job: Job<G::Ticket>) -> Result<(), Job<G::Ticket>> {
         let shared = &self.shared;
-        let idx = FEEDS
-            .with(std::cell::Cell::get)
-            .unwrap_or_else(|| least_loaded(&shared.workers, &shared.next_worker));
+        let (base, len) = job.listener.workers.unwrap_or((0, shared.shared_workers));
+        let idx = FEEDS.with(std::cell::Cell::get).unwrap_or_else(|| {
+            base + least_loaded(&shared.workers[base..base + len], &shared.next_worker)
+        });
         {
             let mut inbox = self.inboxes[idx]
                 .0
@@ -1604,15 +1637,35 @@ where
     let driver = cfg.driver;
     let reactor = driver == DriverKind::Reactor;
     let limits = cfg.limits.effective(driver);
+    // Listeners with workers of their own get them after the server's shared ones,
+    // in listener order (`ListenerSpec::workers`).
+    let shared_workers = usize::from(cfg.workers);
+    let mut ranges = Vec::with_capacity(cfg.listeners.len());
+    let mut total = shared_workers;
+    for spec in &cfg.listeners {
+        ranges.push(spec.workers.filter(|&n| n > 0).map(|n| {
+            let range = (total, usize::from(n));
+            total += usize::from(n);
+            range
+        }));
+    }
+    let Ok(all_workers) = u16::try_from(total) else {
+        return Err(NetError::InvalidConfig {
+            field: "workers",
+            reason: crate::error::ConfigReason::TooLarge {
+                max: u64::from(u16::MAX),
+            },
+        });
+    };
     let layout = Layout {
-        workers: cfg.workers,
+        workers: all_workers,
         placement: cfg.placement.clone(),
     };
     let mut entries = Vec::with_capacity(cfg.listeners.len());
     let mut infos = Vec::with_capacity(cfg.listeners.len());
-    for (i, spec) in cfg.listeners.into_iter().enumerate() {
+    for (i, (spec, range)) in cfg.listeners.into_iter().zip(ranges).enumerate() {
         let id = ListenerId(u16::try_from(i).unwrap_or(u16::MAX));
-        let (entry, info) = bind_listener(spec, id, &cfg.limits, driver, &layout)?;
+        let (entry, info) = bind_listener(spec, id, &cfg.limits, driver, &layout, range)?;
         entries.push(entry);
         infos.push(info);
     }
@@ -1622,8 +1675,8 @@ where
     } else {
         Some(Arc::new(cfg.sink))
     };
-    let mut worker_wakes = Vec::with_capacity(usize::from(cfg.workers));
-    for _ in 0..cfg.workers {
+    let mut worker_wakes = Vec::with_capacity(total);
+    for _ in 0..all_workers {
         worker_wakes.push(
             Wake::new()
                 .map(Arc::new)
@@ -1634,10 +1687,10 @@ where
         );
     }
     #[cfg(feature = "reactor")]
-    let mut backends = Vec::with_capacity(usize::from(cfg.workers));
+    let mut backends = Vec::with_capacity(total);
     #[cfg(feature = "reactor")]
     if reactor {
-        for _ in 0..cfg.workers {
+        for _ in 0..all_workers {
             backends.push(Some(Backend::new(1024)?));
         }
     }
@@ -1698,6 +1751,7 @@ where
         driver,
         max_open: limits.max_connections,
         soft_closes: crate::link::SoftCloses::new(limits.denial_linger_max),
+        shared_workers,
         listeners: Mutex::new(entries),
         next_listener: AtomicU32::new(next_listener),
         spawn_accept: OnceLock::new(),
@@ -1745,7 +1799,7 @@ where
         work: cfg.work,
         gated: TypeId::of::<G>() != TypeId::of::<AllowAll>(),
         gate: Arc::new(cfg.gate),
-        queue: Mutex::new(VecDeque::with_capacity(usize::from(cfg.workers))),
+        queue: Mutex::new(VecDeque::with_capacity(total)),
         queue_cv: Condvar::new(),
         clock: cfg.clock.map_or(ClockRef::Monotonic, ClockRef::Custom),
         wipe: cfg.wipe,
@@ -1776,13 +1830,13 @@ where
             .spawn(move || accept_loop(&e, &conf, &rt, slot))
     }));
 
-    let mut threads = Vec::with_capacity(usize::from(cfg.workers));
+    let mut threads = Vec::with_capacity(total);
     let spawn_error = |e: std::io::Error| NetError::DriverSetup {
         driver: DriverKind::Blocking,
         source: e,
     };
     let mut failure = None;
-    for i in 0..usize::from(cfg.workers) {
+    for i in 0..total {
         let e = engine.clone();
         let cpu = layout.cpu_of(i);
         match std::thread::Builder::new()

@@ -170,6 +170,8 @@ pub struct ListenerSpec {
     pub(crate) udp: Option<crate::udp::UdpOptions>,
     pub(crate) adopt: Option<ListenerHandle>,
     pub(crate) lockdown_allowed: bool,
+    /// Reactor workers of this listener's own (`ListenerSpec::workers`).
+    pub(crate) workers: Option<u16>,
 }
 
 impl ListenerSpec {
@@ -206,6 +208,7 @@ impl ListenerSpec {
             udp: None,
             adopt: None,
             lockdown_allowed: false,
+            workers: None,
         }
     }
 
@@ -213,6 +216,23 @@ impl ListenerSpec {
     /// comes in through while everything else is refused.
     pub fn lockdown_allowed(mut self, on: bool) -> ListenerSpec {
         self.lockdown_allowed = on;
+        self
+    }
+
+    /// On the reactor, `n` workers of this listener's own, besides the server's
+    /// `workers`: its connections run only there, and no other listener's do, so a
+    /// flood on a public listener cannot take an admin listener's threads (serve-net
+    /// request 6). Fixed at build: `Server::add_listener` refuses it, as do the
+    /// blocking driver (keep its threads with `Limits::lane_reserve`) and per-worker
+    /// listeners (`InvalidConfig`). Each worker is a thread and an event loop.
+    ///
+    /// ```
+    /// use net_io::ListenerSpec;
+    /// let admin = ListenerSpec::tcp("127.0.0.1:9900").workers(1);
+    /// # let _ = admin;
+    /// ```
+    pub fn workers(mut self, n: u16) -> ListenerSpec {
+        self.workers = Some(n);
         self
     }
 
@@ -285,6 +305,7 @@ impl ListenerSpec {
             tls: false,
             unix: Some((path.into(), options)),
             lockdown_allowed: false,
+            workers: None,
             #[cfg(all(windows, feature = "local"))]
             pipe: None,
             #[cfg(feature = "udp")]
@@ -324,6 +345,7 @@ impl ListenerSpec {
             udp: None,
             adopt: Some(handle),
             lockdown_allowed: false,
+            workers: None,
         }
     }
 

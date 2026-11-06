@@ -1668,10 +1668,13 @@ impl ListenerSpec {
     pub fn tls(self, on: bool) -> Self;                                             // P0, 0.4.0
     pub fn limits(self, limits: Limits) -> Self;                                    // per-listener caps and deadlines
     pub fn lockdown_allowed(self, on: bool) -> Self;                                // P2, 0.6.0
+    pub fn workers(self, n: u16) -> Self;                                           // P2, 0.8.0, reactor only
 }
 ```
 
 One listener of a server. P0, Tier 2, `0.3.0` unless marked.
+
+`workers(n)` (`0.8.0`, D-186) gives a listener `n` reactor workers of its own, after the server's shared `workers`: its connections run only there and no other listener's do, so a flood on a public listener cannot take an admin listener's threads. Fixed at build: `add_listener`, the blocking driver (which keeps threads with `Limits::lane_reserve`), per-worker listeners and UDP refuse it with `InvalidConfig { field: "workers" }`. Cost: a thread and an event loop per dedicated worker, and its idle memory; the hand-off looks over the listener's own range instead of every worker.
 
 `unix` (feature `local`; on Windows, AF_UNIX) binds as `UnixListener::bind_with` at `build` and removes its file at shutdown only if it is still the one it created. Its connections carry `Transport::Unix`, the peer's credentials, and no IP address, so the per-source cap does not apply; `require_uid` refusals count as `RefusalCause::Credentials`. A `BlockingHandler` receives them as a `TcpConnection` (`info().transport` is `Unix`, `peer_addr` is unspecified, socket options fail). With `proxy`, every peer is trusted and no trusted list is needed: the socket file's mode decides who may connect (decision D-093). A name longer than 64 bytes, or a repeated name, fails `build` with `InvalidConfig { field: "name" }`.
 
