@@ -15,10 +15,16 @@
 
 ## [0.6.2] - 2026-11-06
 
-A fix for a deadlock on Windows, and for the reactor running every short
-connection on one worker. No API change.
+Two fixes for Windows (a deadlock, and a backlog cut to 200), and one for the
+reactor running every short connection on one worker. No API change.
 
 ### Fixed
+
+- Windows: a backlog past 200 was silently cut to 200 pending connections (the
+  default 1,024 included), so a server whose accept thread fell behind on a busy
+  host dropped SYNs and those clients waited about 21 s to fail (found by
+  ws-net). It is asked for as `SOMAXCONN_HINT` now, up to 65,535, and
+  `ListenerInfo::backlog` reports what Windows applies.
 
 - The reactor gave every short connection to its first worker: with all loads at
   0, the least-loaded choice always took worker 0, so one core served a whole

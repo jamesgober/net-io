@@ -57,6 +57,7 @@ What differs between operating systems, what net-io does about it, and what an o
 ## Windows
 
 - **The reactor** runs on an I/O completion port per worker. A receive that finds no bytes pends, and an idle connection waits with a zero-byte receive, so it pins no memory. That adds one system call per exchange: wait, receive, send, zero-byte receive. A call that finishes at once completes without a trip through the port (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, unless a layered provider without real handles is installed).
+- **Backlog.** A plain `listen` backlog is capped at 200 pending connections; net-io asks for one past 200 as `SOMAXCONN_HINT`, which Windows holds to 65,535, and reports that value in `ListenerInfo::backlog`. Before 0.6.2 a server whose accept thread fell behind on a loaded host dropped SYNs past the 200th, and those clients waited about 21 s for a timeout.
 - **UDP packet info** is `Unsupported`; it needs `WSARecvMsg`, and no consumer has asked.
 - **`user_timeout`** is `TCP_MAXRT`, in whole seconds.
 - **Pending sends** pin the output's pages in the kernel until the peer takes them. The output budget bounds this per connection, and the write deadline cancels it.
