@@ -552,11 +552,12 @@ fn test_soak_with_normal_and_hostile_peers() {
 
     // The baseline after one server has run and stopped: the first sockets and
     // completion ports make handles the OS keeps for the life of the process.
-    let workers: u16 = if driver == DriverKind::Blocking {
-        256
-    } else {
-        4
-    };
+    // The driver that runs: `Auto` is the pool without the `reactor` feature or
+    // with `net_io_force_blocking`, and the pool needs a thread per connection.
+    let pool = driver == DriverKind::Blocking
+        || (driver == DriverKind::Auto
+            && (cfg!(not(feature = "reactor")) || cfg!(net_io_force_blocking)));
+    let workers: u16 = if pool { 256 } else { 4 };
     warm_up(driver, workers);
     let (_, baseline_descriptors) = sample();
     let recent = Recent::default();

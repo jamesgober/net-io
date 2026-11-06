@@ -596,6 +596,8 @@ fn test_engine_panic_closes_only_that_connection() {
             s.write_all(b"BOOM!").expect("write");
             let mut rest = Vec::new();
             let _ = s.read_to_end(&mut rest);
+            // One worker: the next client waits for this close, or the pool says Busy.
+            assert!(eventually(WAIT, || server.stats().open == 0));
         }
         assert!(
             eventually(WAIT, || server.stats().closed == 3
