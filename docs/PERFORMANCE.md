@@ -100,7 +100,7 @@ Counted by the fault-injection shim on CI (`tests/shim.rs`).
 
 | Platform | Target | Blocking handler | Reactor sessions | 16 KiB message |
 |---|---|---|---|---|
-| Linux | 2 / 3 | 2.00 | 3.00 | 4.00 |
+| Linux | 3 / 3 | 3.00 (2.00 before 0.6.2; D-178) | 3.00 | 4.00 |
 | macOS | 3 / 3 | 3.00 | 3.00 (3.05 to 3.13 in 0.5; D-135 closes R-24) | 4.00 |
 | Windows | 3 / 3 | 3.00 | 3.50 (4 in 0.5; register R-22) | 3.87 |
 
@@ -201,7 +201,7 @@ Counted at net-io's own call sites by the fault-injection shim (`tests/shim.rs::
 
 | Platform | Target | Measured (blocking handler, sessions) |
 |---|---|---|
-| Linux (WSL2) | 2 | 2.00, 2.00 (one `recv`, one `send`) |
+| Linux (WSL2) | 3 | 3.00 from 0.6.2 (`poll`, `recv`, `send`; D-178); 2.00 before, one `recv` and one `send` |
 | Windows 11 | 3 | 3.00, 3.00 (`WSAPoll`, `recv`, `send`; D-052) |
 | macOS (CI) | 3 | asserted at most 3 (`poll`, `recv`, `send`; D-083) |
 

@@ -128,18 +128,15 @@ fn test_receive_error_closes_only_that_connection() {
 }
 
 /// B-13: system calls per echo round trip on an established connection, counted
-/// at net-io's own call sites: at most 2 on Linux (receive, send) and 3 on Windows
-/// and macOS (wait, receive, send; decisions D-052, D-083).
+/// at net-io's own call sites: at most 3 on the blocking pool everywhere (wait,
+/// receive, send; decisions D-052, D-083, and on Linux D-178, which waits before
+/// an exchange's first receive so a drain reaches the owner through its wake).
 #[test]
 fn test_system_calls_per_echo_round_trip() {
     use net_io::__shim::{counted, start_counting, stop_counting};
     let _shim = Shim::take();
-    // Linux: recv, send. Windows and macOS wait first (D-052, D-083).
-    let budget = if cfg!(any(windows, not(target_os = "linux"))) {
-        3.0
-    } else {
-        2.0
-    };
+    // Every system waits before an exchange's first receive (D-052, D-083, D-178).
+    let budget = 3.0;
     for name in ["blocking handler", "sessions"] {
         // One server at a time: the count is process-wide, and a worker still starting
         // makes its first wait inside the other server's measurement.
@@ -583,10 +580,20 @@ fn test_register_error_closes_only_that_connection() {
 #[test]
 fn test_receive_timeout_error_closes_the_connection() {
     let _shim = Shim::take();
-    let server = blocking_echo_server();
+    // Two receives before the reply: the second is inside the exchange, where Linux
+    // receives under `SO_RCVTIMEO` (an exchange's first receive waits first, D-178).
+    let server = net_io::serve("127.0.0.1:0", |conn: &mut net_io::TcpConnection| {
+        let mut buf = [0u8; 8];
+        let a = conn.recv(&mut buf)?;
+        let b = conn.recv(&mut buf[a..])?;
+        conn.send_all(&buf[..a + b])
+    })
+    .expect("serve");
     let mut c = client(addr(&server));
     program(Op::RecvTimeout, 0, 1, Fault::Os(codes::EINVAL));
-    let _ = c.write_all(b"ping");
+    let _ = c.write_all(b"pi");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let _ = c.write_all(b"ng");
     let mut b = [0u8; 4];
     let got = c.read(&mut b);
     if cfg!(target_os = "linux") {
@@ -595,5 +602,10 @@ fn test_receive_timeout_error_closes_the_connection() {
     }
     clear();
     let mut d = client(addr(&server));
-    assert_eq!(round_trip(&mut d, b"ok"), b"ok");
+    d.write_all(b"pi").expect("write");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    d.write_all(b"ng").expect("write");
+    let mut back = [0u8; 4];
+    d.read_exact(&mut back).expect("served after the fault");
+    assert_eq!(&back, b"ping");
 }

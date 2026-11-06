@@ -840,3 +840,63 @@ fn test_close_after_reply_ends_with_the_clients_close() {
         }
     }
 }
+
+/// Idle TLS connections hold no buffers on the reactor: with a budget for about 32
+/// connections' pairs of 64 KiB buffers, 100 connections that each finish an
+/// exchange and wait all stay open and are served again, and a new one is served
+/// too (D-181; tls-net found the reactor capped at budget / 128 KiB connections).
+#[cfg(feature = "reactor")]
+#[test]
+fn test_idle_tls_connections_hold_no_buffers() {
+    struct Echo;
+    impl Session for Echo {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            Step::Write
+        }
+    }
+    let limits = Limits::builder()
+        .buffer_budget(4 << 20)
+        .max_connections(256)
+        .max_per_source(256, net_io::PrefixPolicy::DEFAULT)
+        .build()
+        .expect("limits");
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+        .driver(net_io::DriverKind::Reactor)
+        .workers(2)
+        .limits(limits)
+        .tls(Toy)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let mut held = Vec::new();
+    for i in 0..100u32 {
+        let mut c = ToyClient::connect(&server);
+        c.send(format!("hello {i}").as_bytes());
+        assert_eq!(
+            c.recv_exact(format!("hello {i}").len()),
+            format!("hello {i}").as_bytes()
+        );
+        held.push(c);
+    }
+    for (i, c) in held.iter_mut().enumerate() {
+        c.send(b"again");
+        assert_eq!(c.recv_exact(5), b"again", "connection {i}");
+    }
+    let mut last = ToyClient::connect(&server);
+    last.send(b"new");
+    assert_eq!(last.recv_exact(3), b"new");
+    assert_eq!(
+        server
+            .stats()
+            .closed_for(CloseReason::Limit(net_io::LimitKind::BufferBudget)),
+        0,
+        "{:?}",
+        server.stats()
+    );
+    assert_eq!(server.stats().open, 101, "{:?}", server.stats());
+}

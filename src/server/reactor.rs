@@ -370,6 +370,20 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     /// Reading resumes, oldest connection first, as buffers free up.
     fn resume_starved(&mut self) {
         while let Some(&(index, token)) = self.starved.front() {
+            if self
+                .conn(index)
+                .is_some_and(|c| c.token == token && c.paused && c.link.tls_released())
+            {
+                if !self.tls_retake(index) {
+                    return;
+                }
+                self.starved.pop_front();
+                if let Some(c) = self.conn(index) {
+                    c.paused = false;
+                }
+                self.read(index);
+                continue;
+            }
             let class = match self.conn(index) {
                 Some(c)
                     if c.token == token
@@ -726,6 +740,33 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
 
     // ---- the TLS machine ----------------------------------------------------------
 
+    /// Takes the TLS buffers back for a connection that released them while idle
+    /// (D-181); `false`, with nothing taken, when the budget is spent.
+    fn tls_retake(&mut self, index: u32) -> bool {
+        let Some(c) = self.conn(index) else {
+            return false;
+        };
+        if !c.link.tls_released() {
+            return true;
+        }
+        let class = c.link.limits.read_class_max;
+        let Some(cin) = self.pool.take(class) else {
+            return false;
+        };
+        let Some(cout) = self.pool.take(SizeClass::LARGE) else {
+            self.pool.put(cin);
+            return false;
+        };
+        match self.conn(index) {
+            Some(c) => c.link.tls_restore(cin, cout),
+            None => {
+                self.pool.put(cin);
+                self.pool.put(cout);
+            }
+        }
+        true
+    }
+
     /// Turns the machine until it waits for something. Plaintext goes to the
     /// session's input; the handshake's end starts the session.
     fn tls_turn(&mut self, index: u32) {
@@ -765,6 +806,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                         }
                     };
                     c.recv = Recv::Cipher;
+                    c.readable = false;
                     self.submit_receive(index, token, cin);
                     self.arm_timer(index);
                     return;
@@ -1094,6 +1136,47 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             return self.input_arrived(index);
         }
         if c.link.has_tls() {
+            if c.recv != Recv::None || c.paused {
+                return self.arm_timer(index);
+            }
+            if c.link.phase() == Phase::Idle && !c.readable {
+                // Between exchanges with nothing held: the buffers go back to the
+                // pool and the wait takes none, as a plaintext connection's does, so
+                // idle TLS connections do not hold the budget (D-181).
+                if let Some((cin, cout)) = c.link.tls_release() {
+                    self.pool.put(cin);
+                    self.pool.put(cout);
+                }
+            }
+            let Some(c) = self.conn(index) else { return };
+            if c.link.tls_released() {
+                if !c.readable {
+                    let token = c.token;
+                    c.recv = Recv::Zero;
+                    if self
+                        .driver
+                        .submit(Operation::ReceiveZero { token })
+                        .is_err()
+                    {
+                        if let Some(c) = self.conn(index) {
+                            c.recv = Recv::None;
+                        }
+                        return self.close(index, CloseReason::Io(OsErrorClass::Other(0)));
+                    }
+                    return self.arm_timer(index);
+                }
+                if !self.tls_retake(index) {
+                    // Reading pauses until a buffer comes back (edge case 11).
+                    if let Some(c) = self.conn(index) {
+                        if !c.paused {
+                            c.paused = true;
+                            let token = c.token;
+                            self.starved.push_back((index, token));
+                        }
+                    }
+                    return self.arm_timer(index);
+                }
+            }
             self.arm_timer(index);
             return self.tls_turn(index);
         }
@@ -1265,6 +1348,15 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
         let total = output.pending_in_send();
         let tls = c.link.has_tls();
+        if tls && c.link.tls_released() {
+            // Records need the output buffer back first; with the budget spent the
+            // connection closes, as an output with nothing queued does (D-169).
+            if !self.tls_retake(index) {
+                self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
+                return Flushed::Waiting;
+            }
+            return self.flush(index, after);
+        }
         let token = c.token;
         let checked = if tls {
             let take = total.min(c.link.tls_write_budget());
@@ -1978,6 +2070,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let reason = c.link.killed().map_or(reason, CloseReason::Killed);
         c.closing = Some(reason);
         if !reason.is_abortive() {
+            if c.link.tls_released() {
+                // `close_notify` needs the output buffer; without one the close is a
+                // plain FIN.
+                let _ = self.tls_retake(index);
+            }
+            let Some(c) = self.conn(index) else { return };
             let linger = c.link.begin_graceful_close(c.readable);
             if linger && c.sending == Sending::None {
                 let until = c.link.now() + c.link.limits.graceful_linger;

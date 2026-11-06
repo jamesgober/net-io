@@ -404,6 +404,51 @@ impl Link {
         self.tls.is_some()
     }
 
+    /// Both TLS buffers, for the pool, while the connection waits between
+    /// exchanges with nothing in them: the handshake is done, every byte of
+    /// ciphertext was consumed, all plaintext delivered, and no event is pending.
+    /// `None` (nothing taken) otherwise. The engine keeps nothing in the caller's
+    /// buffers between steps (D-066), so the next read starts in fresh ones (D-181).
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_release(&mut self) -> Option<(Buffer, Buffer)> {
+        let t = self.tls.as_mut()?;
+        let idle = t.done
+            && !t.eof
+            && t.event.is_none()
+            && t.start >= t.cin.len()
+            && t.plain_at >= t.plain_end
+            && t.cin.capacity() > 0
+            && t.cout.capacity() > 0;
+        if !idle {
+            return None;
+        }
+        t.start = 0;
+        t.plain_at = 0;
+        t.plain_end = 0;
+        t.data_from = 0;
+        t.data_to = 0;
+        let cin = std::mem::replace(&mut t.cin, Buffer::placeholder());
+        let cout = std::mem::replace(&mut t.cout, Buffer::placeholder());
+        Some((cin, cout))
+    }
+
+    /// Whether the TLS buffers went back to the pool (`tls_release`).
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_released(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.cin.capacity() == 0)
+    }
+
+    /// Gives a released connection its TLS buffers again.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_restore(&mut self, mut cin: Buffer, mut cout: Buffer) {
+        cin.set_len(0);
+        cout.set_len(0);
+        if let Some(t) = self.tls.as_mut() {
+            t.cin = cin;
+            t.cout = cout;
+        }
+    }
+
     /// The TLS buffers, for their pool.
     pub(crate) fn take_tls_buffers(&mut self) -> Option<(Buffer, Buffer)> {
         self.tls.take().map(|t| (t.cin, t.cout))

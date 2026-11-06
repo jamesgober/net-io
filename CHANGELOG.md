@@ -122,6 +122,10 @@ soak, and a database consumer's transport needs.
 - A connection an accept thread was admitting as a drain began could be closed
   unread by the stop that followed (a reset after 0 bytes, seen in the Windows
   hand-off test). A drain now waits for admissions in progress.
+- Idle TLS connections on the reactor kept two 64 KiB buffers each until they
+  closed, so the default budget capped a server at about 4,096 TLS connections,
+  and idle TLS peers could spend the budget every connection draws from. They
+  give the buffers back while they wait, as plaintext connections do.
 - Everything fixed in 0.6.1: posts reach connections waiting for input, an idle
   trim releases buffers with a receive out, a stop ends lingers, and a drain
   answers a request that already arrived.
