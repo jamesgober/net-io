@@ -223,12 +223,16 @@ pub struct Input {
     pub(crate) buf: Buffer,
     pub(crate) start: usize,
     pub(crate) changed: bool,
+    /// The buffer travels with a receive on the reactor: `buf` is a stand-in, and
+    /// the unconsumed bytes are in the lent buffer until it comes back.
+    lent: bool,
 }
 
 impl Input {
     pub(crate) fn new(buf: Buffer) -> Input {
         Input {
             buf,
+            lent: false,
             start: 0,
             changed: false,
         }
@@ -256,7 +260,7 @@ impl Input {
     /// The unconsumed bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        &self.buf.as_slice()[self.start..]
+        self.buf.as_slice().get(self.start..).unwrap_or(&[])
     }
 
     /// Consumes `n` bytes (saturating at the length).
@@ -275,7 +279,7 @@ impl Input {
     /// Whether the buffer is full: the session must consume or grow it.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.buf.len() == self.buf.capacity() && self.start == 0
+        !self.lent && self.buf.len() == self.buf.capacity() && self.start == 0
     }
 
     /// The buffer's size class.
@@ -325,6 +329,28 @@ impl Input {
             self.start = 0;
         }
         self.buf.spare()
+    }
+
+    /// Hands the buffer to a receive (compacted first when the free tail is small),
+    /// leaving an empty stand-in until [`Input::give_back`].
+    #[cfg(feature = "reactor")]
+    pub(crate) fn lend(&mut self) -> Buffer {
+        let _ = self.spare_for_read();
+        self.lent = true;
+        std::mem::replace(&mut self.buf, Buffer::placeholder())
+    }
+
+    /// The lent buffer is back, with what the receive added.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn give_back(&mut self, buf: Buffer) {
+        self.buf = buf;
+        self.lent = false;
+    }
+
+    /// Whether a receive holds the buffer.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn lent(&self) -> bool {
+        self.lent
     }
 
     pub(crate) fn filled(&mut self, n: usize) {
@@ -412,6 +438,8 @@ pub struct Output {
     limit: u32,
     used: u32,
     wipe: bool,
+    /// A push found no free buffer and the budget spent since the last flush.
+    refused: bool,
     pub(crate) response_open: bool,
     pub(crate) response_tag: Option<GateTag>,
     pub(crate) bytes_since_begin: u64,
@@ -431,6 +459,7 @@ impl Output {
             limit,
             used: 0,
             wipe,
+            refused: false,
             response_open: false,
             response_tag: None,
             bytes_since_begin: 0,
@@ -451,6 +480,7 @@ impl Output {
         let mut left = self.budget.load(Ordering::Relaxed);
         loop {
             if left < bytes {
+                self.refused = true;
                 return None;
             }
             match self.budget.compare_exchange_weak(
@@ -463,6 +493,25 @@ impl Output {
                 Err(actual) => left = actual,
             }
         }
+    }
+
+    /// Takes buffers the worker's pool already holds, so the next pushes reuse them
+    /// instead of charging the budget again. Before this, spares an output gave the
+    /// pool after a send were never taken back, and every flush of more than one
+    /// buffer charged the budget anew until it ran out (found by ws-net).
+    pub(crate) fn refill(&mut self, pool: &mut BufferPool) {
+        while self.free.len() < FREE_MAX {
+            match pool.take_cached(OUTPUT_CLASS) {
+                Some(b) => self.free.push(b),
+                None => return,
+            }
+        }
+    }
+
+    /// Whether a push was refused for want of budget since the last call: a flush
+    /// that then finds nothing queued must not call the session back at once.
+    pub(crate) fn take_refused(&mut self) -> bool {
+        std::mem::take(&mut self.refused)
     }
 
     fn room(&self) -> usize {
@@ -741,6 +790,7 @@ impl Output {
         self.response_open = false;
         self.response_tag = None;
         self.bytes_since_begin = 0;
+        self.refused = false;
     }
 }
 
@@ -765,6 +815,11 @@ impl SessionContext<'_> {
 
     /// The output queue.
     pub fn output(&mut self) -> &mut Output {
+        // Spares the output gave the pool after its last send come back first, up to
+        // what one output may hold: a few pops, no allocation.
+        if self.output.free.len() < FREE_MAX {
+            self.output.refill(self.pool);
+        }
         self.output
     }
 
@@ -830,9 +885,12 @@ impl SessionContext<'_> {
         }
     }
 
-    /// This worker's completion queue.
+    /// This worker's completion queue. A connection whose session takes it is
+    /// woken for posts while it waits for input too; on the blocking driver on
+    /// Linux that wait then costs one `poll` before each receive.
     #[must_use]
     pub fn completer(&self) -> Completer {
+        self.link.wakeable.set(true);
         self.completer.clone()
     }
 

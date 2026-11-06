@@ -106,6 +106,9 @@ pub(crate) struct Link {
     /// The first fatal condition seen; it becomes the close reason.
     pub(crate) terminal: Option<CloseReason>,
     likely_more: bool,
+    /// The session took a completer, so posts may come: on the pool a receive
+    /// waits on the wake channel first, as on Windows and macOS (D-163).
+    pub(crate) wakeable: std::cell::Cell<bool>,
     /// net-io chooses the phase (an accepted connection whose owner never set one).
     auto_phase: bool,
     /// Bytes went out since the last bytes came in.
@@ -242,6 +245,7 @@ impl Link {
             peer_closed: false,
             terminal: None,
             likely_more: false,
+            wakeable: std::cell::Cell::new(false),
             auto_phase: phase == Phase::Idle,
             replied: false,
             idle_timeout,
@@ -319,15 +323,32 @@ impl Link {
 
     /// Puts TLS on this connection: from now on reads return plaintext and
     /// writes encrypt. `cin` must hold the largest record the engine needs.
+    ///
+    /// Bytes read past a PROXY header are ciphertext: they move into `cin` here, so
+    /// the engine reads them first and nothing reaches the session unencrypted. The
+    /// emptied read-ahead buffer is returned for its pool.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    #[must_use]
     pub(crate) fn attach_tls(
         &mut self,
         session: Box<dyn TlsSession>,
         mut cin: Buffer,
         mut cout: Buffer,
-    ) {
+    ) -> Option<Buffer> {
         cin.set_len(0);
         cout.set_len(0);
+        let ahead = self.pending.take();
+        if let Some(p) = ahead.as_ref() {
+            let rest = p.as_slice().get(self.pending_at..).unwrap_or(&[]);
+            if rest.len() > cin.capacity() {
+                // Cannot happen with the pool's classes; fail closed if it does.
+                self.terminal.get_or_insert(CloseReason::TlsFailed);
+            } else {
+                cin.spare()[..rest.len()].copy_from_slice(rest);
+                cin.set_len(rest.len());
+            }
+        }
+        self.pending_at = 0;
         self.tls = Some(Box::new(TlsLayer {
             session,
             cin,
@@ -341,6 +362,7 @@ impl Link {
             data_from: 0,
             data_to: 0,
         }));
+        ahead
     }
 
     /// Whether TLS is on this connection.
@@ -882,7 +904,7 @@ impl Link {
     where
         R: FnMut(&sys::Stream, &mut [u8]) -> io::Result<usize>,
     {
-        if sys::WAIT_BEFORE_RECV {
+        if sys::WAIT_BEFORE_RECV || self.wakeable.get() {
             if !self.likely_more {
                 match self.wait(Interest::Read, timeout) {
                     Ok(Ready::TimedOut) => return None,
@@ -890,10 +912,15 @@ impl Link {
                         if let Err(e) = self.check_terminal() {
                             return Some(Err(e));
                         }
-                        if self.slot.drained() {
+                        // A drain closes a connection between exchanges, not one whose
+                        // next request already arrived: that one is read and answered,
+                        // and the drain closes it after (serve-net's drain race).
+                        if !self.slot.drained() {
+                            return Some(Ok(Got::Woken));
+                        }
+                        if !self.input_waiting() {
                             return Some(Err(self.fail(CloseReason::Drained, NetError::Closed)));
                         }
-                        return Some(Ok(Got::Woken));
                     }
                     Ok(Ready::Socket) => {}
                     Err(e) => return Some(Err(self.os_error("wait", e))),
@@ -1388,6 +1415,16 @@ impl Link {
             Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
             Err(e) => Err(NetError::from_os("shutdown", e)),
         }
+    }
+
+    /// Whether bytes wait in the socket now: one zero-timeout wait. A drain leaves a
+    /// connection whose next request already arrived to answer it first.
+    pub(crate) fn input_waiting(&self) -> bool {
+        self.pending.is_some()
+            || matches!(
+                self.stream.wait(Interest::Read, None, Some(Duration::ZERO)),
+                Ok(Ready::Socket)
+            )
     }
 
     /// The close reason: the first fatal condition, or `fallback`.

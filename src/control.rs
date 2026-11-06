@@ -146,6 +146,11 @@ impl ControlView {
         self.state
     }
 
+    /// Whether the line moved since the last `refresh`: one load, nothing acted on.
+    pub(crate) fn moved(&self, line: &dyn ControlLine) -> bool {
+        line.epoch() != self.epoch
+    }
+
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
     }

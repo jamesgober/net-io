@@ -531,8 +531,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 return self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
             };
             let Some(c) = self.conn(index) else { return };
-            c.link.attach_tls(session, cin, cout);
+            let ahead = c.link.attach_tls(session, cin, cout);
             c.link.begin_handshake(accepted + timeout);
+            if let Some(ahead) = ahead {
+                self.pool.put(ahead);
+            }
+            let Some(c) = self.conn(index) else { return };
             c.wait = Wait::Handshake;
             return self.tls_turn(index);
         }
@@ -779,7 +783,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let step = guarded(|| session.on_data(&mut cx, input));
         let grow = cx.grow_to;
         if let Some(class) = grow {
-            if class > input.buf.class() {
+            if class > input.buf.class() && !input.lent() {
                 if let Some(mut bigger) = self.pool.take(class) {
                     let bytes = input.bytes();
                     bigger.spare()[..bytes.len()].copy_from_slice(bytes);
@@ -850,13 +854,17 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     /// Gives back what an idle connection does not need.
     fn release_idle(&mut self, index: u32) {
         let Some(c) = self.conn(index) else { return };
-        if c.input.as_ref().is_some_and(|i| i.bytes().is_empty()) {
+        if c.input
+            .as_ref()
+            .is_some_and(|i| !i.lent() && i.bytes().is_empty())
+        {
             if let Some(input) = c.input.take() {
                 self.pool.put(input.buf);
             }
         }
         let Some(c) = self.conn(index) else { return };
-        if c.output.as_ref().is_some_and(|o| o.is_empty()) {
+        // A send in flight holds the output's chunks, so it looks empty: leave it.
+        if c.sending == Sending::None && c.output.as_ref().is_some_and(|o| o.is_empty()) {
             if let Some(mut output) = c.output.take() {
                 output.reset();
                 self.outputs.push(output);
@@ -874,7 +882,23 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             if c.closing.is_some() {
                 return;
             }
+            if step == Step::Read {
+                if let Some((token, value)) = c.posted.take() {
+                    // A post that arrived while the session was busy.
+                    match self.call(index, |s, cx| s.on_wake(cx, token, value)) {
+                        Some(next) => step = next,
+                        None => return self.close(index, CloseReason::SessionPanicked),
+                    }
+                    continue;
+                }
+            }
             match step {
+                Step::Read if c.input.as_ref().is_some_and(Input::lent) => {
+                    // The receive that holds the input is still out (the session
+                    // survived a timeout, or wrote and read again): wait for it.
+                    c.wait = Wait::Read;
+                    return self.read(index);
+                }
                 Step::Read => {
                     if let Some(input) = c.input.as_mut() {
                         if input.changed && !input.bytes().is_empty() {
@@ -891,7 +915,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     c.link.settle_phase(empty);
                     let idle = c.link.phase() == Phase::Idle && empty;
                     let lane = c.link.info.lane;
-                    if idle && self.shared.is_draining() {
+                    // A request the socket already reported is answered first.
+                    let readable = c.readable;
+                    if idle && self.shared.is_draining() && !readable {
                         return self.close(index, CloseReason::Drained);
                     }
                     if idle && self.shed(lane) {
@@ -972,7 +998,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     /// Input for the session: bytes read past a handshake first, then the socket.
     fn read(&mut self, index: u32) {
         let Some(c) = self.conn(index) else { return };
-        if c.link.has_read_ahead() {
+        // Under TLS the read-ahead went to the engine at attach (`Link::attach_tls`).
+        if c.link.has_read_ahead() && !c.link.has_tls() {
             if !self.ensure_input(index) {
                 return;
             }
@@ -989,6 +1016,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             return self.tls_turn(index);
         }
         if c.recv != Recv::None || c.paused {
+            // A receive is already out (a session step that ended in `Read` while
+            // idle: a timeout, a wake): give back what the connection does not need
+            // while it waits, as a new wait would (serve-net request 4).
+            self.release_idle(index);
             return self.arm_timer(index);
         }
         let token = c.token;
@@ -1003,8 +1034,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             let Some(input) = c.input.as_mut() else {
                 return;
             };
-            let _ = input.spare_for_read();
-            let buffer = std::mem::replace(&mut input.buf, Buffer::placeholder());
+            let buffer = input.lend();
             c.recv = Recv::Input;
             self.submit_receive(index, token, buffer);
         } else {
@@ -1079,7 +1109,16 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             c.wait = after;
             return Flushed::Waiting;
         }
+        // Read and cleared on every flush: only a step that queued nothing because the
+        // budget refused it closes here.
+        let refused = output.take_refused();
         if output.is_empty() {
+            if refused {
+                // Nothing to send because the buffer budget is spent: calling the
+                // session back now would spin the worker. It closes instead.
+                self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
+                return Flushed::Waiting;
+            }
             c.link.output_done();
             return Flushed::Done;
         }
@@ -1279,7 +1318,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     self.pool.put(buffer);
                     return;
                 };
-                input.buf = buffer;
+                input.give_back(buffer);
                 if closing {
                     return self.settle(index);
                 }
@@ -1352,7 +1391,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         };
         match kind {
             Recv::Input => match c.input.as_mut() {
-                Some(input) => input.buf = buffer,
+                Some(input) => input.give_back(buffer),
                 None => self.pool.put(buffer),
             },
             Recv::Cipher => c.link.tls_put_cin(buffer),
@@ -1696,9 +1735,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
     }
 
+    /// A post reaches the session at once when it is parked or waiting for input
+    /// (serve-net request 7: a WebSocket waits for input and is written to from
+    /// other threads); otherwise it waits until the connection's next wait.
     fn posted(&mut self, index: u32, token: u32, value: u64) {
         let Some(c) = self.conn(index) else { return };
-        if matches!(c.wait, Wait::Park(_)) {
+        if c.closing.is_none() && matches!(c.wait, Wait::Park(_) | Wait::Read) {
             match self.call(index, |s, cx| s.on_wake(cx, token, value)) {
                 Some(step) => self.run(index, step),
                 None => self.close(index, CloseReason::SessionPanicked),
@@ -1775,8 +1817,11 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             let idle = self.conn(i).is_some_and(|c| {
                 c.wait == Wait::Read
                     && c.closing.is_none()
+                    && !c.readable
                     && c.link.phase() == Phase::Idle
-                    && c.input.as_ref().is_none_or(|n| n.bytes().is_empty())
+                    && c.input
+                        .as_ref()
+                        .is_none_or(|n| !n.lent() && n.bytes().is_empty())
                     && pick(&c.link.info)
             });
             if idle {
@@ -1785,10 +1830,19 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
     }
 
+    /// Closes every connection; one already lingering after a graceful close stops
+    /// lingering, as a kill would make it (a linger on an injected clock that does not
+    /// move would otherwise hold a stop for ever: serve-net 0.5 item 2).
     fn close_all(&mut self, reason: CloseReason) {
         for i in 0..self.slots.len() as u32 {
-            if self.conn(i).is_some_and(|c| c.closing.is_none()) {
+            let (open, lingering) = match self.conn(i) {
+                Some(c) => (c.closing.is_none(), matches!(c.wait, Wait::Linger(_))),
+                None => continue,
+            };
+            if open {
                 self.close(i, reason);
+            } else if lingering {
+                self.finish_closing(i);
             }
         }
     }

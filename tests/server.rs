@@ -725,3 +725,351 @@ fn test_per_source_cap_per_listener() {
     }
     assert_eq!(server.stats().refused_for(RefusalCause::SourceCap), 1);
 }
+
+/// Lines: each complete line is answered; a session that survives its read timeout
+/// keeps waiting for the rest of a partial one.
+struct Lines {
+    timeouts: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Session for Lines {
+    fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+        while let Some(end) = input.bytes().iter().position(|&b| b == b'\n') {
+            let line = input.bytes()[..=end].to_vec();
+            input.consume(end + 1);
+            cx.output().push(&line).expect("push");
+        }
+        Step::Write
+    }
+
+    fn on_writable(&mut self, _: &mut SessionContext<'_>) -> Step {
+        Step::Read
+    }
+
+    fn on_timeout(&mut self, _: &mut SessionContext<'_>, _: net_io::TimeoutKind) -> Step {
+        self.timeouts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Step::Read
+    }
+}
+
+/// A complete line plus the start of the next, then silence past the read timeout:
+/// the session survives the timeout while its partial line is with the receive in
+/// flight, and the line completes later (review finding: the reactor indexed the
+/// stand-in buffer and the worker panicked).
+#[test]
+fn test_session_survives_a_timeout_with_a_partial_message_held() {
+    for &driver in DRIVERS {
+        let timeouts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let t2 = timeouts.clone();
+        let limits = Limits::builder()
+            .read_timeout(Duration::from_millis(300))
+            .idle_timeout(Duration::from_millis(300))
+            .build()
+            .expect("limits");
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0").limits(limits))
+            .driver(driver)
+            // One reactor worker serves both clients; the pool needs one each.
+            .workers(if driver == DriverKind::Blocking { 2 } else { 1 })
+            .sessions(move |_: &ConnectionInfo| Lines {
+                timeouts: t2.clone(),
+            })
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = client(addr(&server));
+        c.write_all(b"one\npar").expect("write");
+        let mut back = [0u8; 4];
+        std::io::Read::read_exact(&mut c, &mut back).expect("first line");
+        assert_eq!(&back, b"one\n", "{driver:?}");
+        assert!(
+            eventually(Duration::from_secs(5), || timeouts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2),
+            "{driver:?}: no timeout"
+        );
+        c.write_all(b"tial\n").expect("write");
+        let mut back = [0u8; 8];
+        std::io::Read::read_exact(&mut c, &mut back).expect("second line");
+        assert_eq!(&back, b"partial\n", "{driver:?}");
+        // The worker is still alive for others.
+        let mut d = client(addr(&server));
+        d.write_all(b"two\n").expect("write");
+        std::io::Read::read_exact(&mut d, &mut back[..4]).expect("other client");
+        assert_eq!(&back[..4], b"two\n", "{driver:?}");
+    }
+}
+
+/// A post from another thread reaches a connection that waits for input, not only a
+/// parked one, on both drivers: a server push with nothing from the client (serve-net
+/// request 7).
+#[test]
+fn test_post_wakes_a_connection_waiting_for_input() {
+    use std::io::Read;
+    struct Push(mpsc::Sender<(net_io::Completer, net_io::ConnectionId)>);
+    impl Session for Push {
+        fn on_open(&mut self, cx: &mut SessionContext<'_>) -> Step {
+            let _ = self.0.send((cx.completer(), cx.info().id));
+            Step::Read
+        }
+        fn on_data(&mut self, _: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            Step::Read
+        }
+        fn on_wake(&mut self, cx: &mut SessionContext<'_>, token: u32, value: u64) -> Step {
+            let _ = cx
+                .output()
+                .push(format!("woke {token} {value}\n").as_bytes());
+            Step::Write
+        }
+        fn on_writable(&mut self, _: &mut SessionContext<'_>) -> Step {
+            Step::Read
+        }
+    }
+    for &driver in DRIVERS {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(2)
+            .sessions(move |_: &ConnectionInfo| Push(tx.lock().expect("lock").clone()))
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = client(addr(&server));
+        let (completer, id) = rx.recv_timeout(Duration::from_secs(5)).expect("opened");
+        // Let the connection settle into its read wait.
+        std::thread::sleep(Duration::from_millis(100));
+        std::thread::spawn(move || completer.post(id, 3, 42).expect("post"))
+            .join()
+            .expect("poster");
+        let mut line = [0u8; 10];
+        c.read_exact(&mut line).expect("pushed line");
+        assert_eq!(&line, b"woke 3 42\n", "{driver:?}");
+        // Still a normal connection afterwards.
+        c.write_all(b"x").expect("write");
+        assert_eq!(server.stats().closed, 0, "{driver:?}");
+    }
+}
+
+/// serve-net 0.5 item 2: with an injected clock on the reactor, a connection that
+/// answered its deadline and closed gracefully, then `shutdown`: it returns.
+#[test]
+fn test_manual_clock_close_then_shutdown_returns() {
+    use std::io::Read;
+    struct Late;
+    impl Session for Late {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            let at = cx.now() + Duration::from_secs(1);
+            cx.set_exchange_deadline(Some(at));
+            cx.set_phase(Phase::Receiving);
+            Step::Read
+        }
+        fn on_timeout(&mut self, cx: &mut SessionContext<'_>, _: net_io::TimeoutKind) -> Step {
+            let _ = cx.output().push(b"408\n");
+            Step::Write
+        }
+        fn on_writable(&mut self, _: &mut SessionContext<'_>) -> Step {
+            Step::Close
+        }
+    }
+    for &driver in DRIVERS {
+        let clock = Arc::new(net_io::ManualClock::new());
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(1)
+            .clock(clock.clone())
+            .sessions(|_: &ConnectionInfo| Late)
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = client(addr(&server));
+        c.write_all(b"go").expect("write");
+        // Advance until the deadline fires: on a loaded host the session may set it
+        // after a first advance.
+        c.set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let mut reply = [0u8; 4];
+        let mut got = false;
+        for _ in 0..50 {
+            clock.advance(Duration::from_secs(2));
+            if c.read_exact(&mut reply).is_ok() {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "{driver:?}: no 408");
+        assert_eq!(&reply, b"408\n", "{driver:?}");
+        let started = Instant::now();
+        let _ = server.shutdown(Instant::now() + Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{driver:?}: shutdown took {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// A session that writes several output buffers per flush, for well past the 3 s in
+/// which ws-net saw 0.6.0's budget run out: its buffers are reused, the stream never
+/// stalls, and nothing closes for want of budget, on both drivers.
+#[test]
+fn test_multi_buffer_flushes_reuse_their_buffers() {
+    use std::io::Read;
+    static BLOCK: [u8; 48 << 10] = [b'w'; 48 << 10];
+    struct Writer(bool);
+    impl Session for Writer {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            self.0 = true;
+            self.on_writable(cx)
+        }
+        fn on_writable(&mut self, cx: &mut SessionContext<'_>) -> Step {
+            if !self.0 {
+                return Step::Read;
+            }
+            // Three MEDIUM buffers a flush, through the copying path.
+            let mut at = 0;
+            while at < BLOCK.len() {
+                let n = cx.output().push_partial(&BLOCK[at..]);
+                if n == 0 {
+                    break;
+                }
+                at += n;
+            }
+            Step::Write
+        }
+    }
+    for &driver in DRIVERS {
+        let limits = Limits::builder()
+            .buffer_budget(512 << 10)
+            .build()
+            .expect("limits");
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            // Two: the pool gives each connection its own worker.
+            .workers(2)
+            .limits(limits)
+            .sessions(|_: &ConnectionInfo| Writer(false))
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let at = addr(&server);
+        let streamer = std::thread::spawn(move || {
+            let mut c = client(at);
+            c.write_all(b"go").expect("write");
+            let mut buf = vec![0u8; 256 << 10];
+            let started = Instant::now();
+            let mut total = 0u64;
+            while started.elapsed() < Duration::from_secs(5) {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n as u64,
+                }
+            }
+            total
+        });
+        // Well into the stream, another connection still gets buffers: the stream's
+        // outputs reuse theirs instead of spending the budget (0.6.0 spent it in a few
+        // flushes, and this round trip then waited for a buffer that never came).
+        std::thread::sleep(Duration::from_secs(3));
+        let mut other = client(at);
+        other
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        other.write_all(b"x").expect("write");
+        let mut first = [0u8; 1];
+        let answered = other.read_exact(&mut first).is_ok();
+        let total = streamer.join().expect("streamer");
+        assert!(
+            answered,
+            "{driver:?}: no buffer for a second connection, {:?}",
+            server.stats()
+        );
+        assert!(total > 16 << 20, "{driver:?}: {total} bytes streamed");
+        assert_eq!(
+            server
+                .stats()
+                .closed_for(CloseReason::Limit(net_io::LimitKind::BufferBudget)),
+            0,
+            "{driver:?}"
+        );
+    }
+}
+
+/// With the buffer budget spent (here by clients that never read), a session whose
+/// push takes nothing is closed with `Limit(BufferBudget)` instead of being called
+/// back at once for ever, which spun 0.6.0's worker and stalled every connection.
+/// Linux only: elsewhere loopback takes each output into the kernel at once, so the
+/// clients pin no buffers and the budget is never spent.
+#[cfg(all(feature = "reactor", target_os = "linux"))]
+#[test]
+fn test_spent_budget_closes_instead_of_spinning() {
+    use std::io::Read;
+    static BLOCK: [u8; 64 << 10] = [b's'; 64 << 10];
+    struct Fill;
+    impl Session for Fill {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            self.on_writable(cx)
+        }
+        fn on_writable(&mut self, cx: &mut SessionContext<'_>) -> Step {
+            let _ = cx.output().push_partial(&BLOCK);
+            Step::Write
+        }
+    }
+    let limits = Limits::builder()
+        .buffer_budget(512 << 10)
+        .write_timeout(Duration::from_secs(30))
+        .min_rate(MinRate::off())
+        .build()
+        .expect("limits");
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp_with(
+            "127.0.0.1:0",
+            ListenOptions::new().send_buffer(4096),
+        ))
+        .driver(DriverKind::Reactor)
+        .workers(1)
+        .limits(limits)
+        .sessions(|_: &ConnectionInfo| Fill)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let at = addr(&server);
+    // Clients that never read: each pins its output's buffers.
+    let mut held = Vec::new();
+    for _ in 0..12 {
+        let mut c = client(at);
+        c.write_all(b"go").expect("write");
+        held.push(c);
+    }
+    assert!(
+        eventually(Duration::from_secs(10), || server
+            .stats()
+            .closed_for(CloseReason::Limit(net_io::LimitKind::BufferBudget))
+            >= 1),
+        "{:?}",
+        server.stats()
+    );
+    // The worker is not spinning: a reader that drains gets data.
+    let mut c = client(at);
+    c.write_all(b"go").expect("write");
+    let mut b = [0u8; 1024];
+    let _ = c.read(&mut b);
+    drop(held);
+}
