@@ -13,6 +13,22 @@
 
 ---
 
+## [0.6.2] - 2026-11-06
+
+A fix for a deadlock on Windows. No API change.
+
+### Fixed
+
+- Windows: a process whose threads ended after using a `TcpConnection` could
+  freeze entirely, every thread start and exit waiting. A thread's wake socket
+  was closed by its thread-local destructor, which runs under the loader lock,
+  and that deadlocked against a thread loading a Winsock extension (the IOCP
+  driver and `TransmitFile` do). A thread's wake now goes to a list of spares
+  for the next thread instead. Affects 0.3.0 to 0.6.1 on Windows; seen as the
+  library tests hanging in about 1 run in 14.
+
+---
+
 ## [0.6.1] - 2026-11-04
 
 A patch for serve-net's requests 4 and 7 and three defects found by the 0.7
