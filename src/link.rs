@@ -142,12 +142,17 @@ impl SoftCloses {
     /// One place, or `None` when `max` are taken.
     fn take(self: &Arc<Self>) -> Option<SoftPermit> {
         use std::sync::atomic::Ordering;
-        self.live
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.max).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| SoftPermit(self.clone()))
+        let mut n = self.live.load(Ordering::Acquire);
+        while n < self.max {
+            match self
+                .live
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(SoftPermit(self.clone())),
+                Err(seen) => n = seen,
+            }
+        }
+        None
     }
 }
 
