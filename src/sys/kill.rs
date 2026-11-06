@@ -201,33 +201,46 @@ impl KillSlot {
             }
         }
         let raw = self.raw.load(Ordering::Relaxed) as RawSock;
-        // A request that already arrived is read and answered first: the read side,
-        // once shut, stays shut, and the rest of that exchange would read as end of
-        // stream. The mark is taken back, and a later pass closes the connection at
-        // its next wait (D-176).
-        #[cfg(unix)]
-        // SAFETY: the KILLING bit is set, so `raw` is open for this call (as below).
-        if unsafe { super::input_waiting_raw(raw) } {
-            self.state
-                .fetch_and(!(DRAINED | KILLING), Ordering::Release);
-            return false;
-        }
-        // SAFETY: the KILLING bit is set; the owner's `begin_close` waits for it to
-        // clear before it closes the socket, so `raw` is open for this call.
-        unsafe { super::shutdown_read_raw(raw) };
-        if let Some(w) = self
+        let wake = self
             .wake
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-        {
+            .clone();
+        // An owner with a wake channel is reached through it alone and decides at
+        // its wait, where it can see a request that already arrived: a shut read
+        // side cannot be opened again, and a drain that saw that request too late
+        // would cut it short (D-178). Only an owner without a wake channel has its
+        // read side shut.
+        if wake.is_none() {
+            // A request that already arrived is read and answered first; the mark
+            // is taken back, and a later pass closes the connection at its next
+            // wait (D-176).
+            #[cfg(unix)]
+            // SAFETY: the KILLING bit is set, so `raw` is open for this call (as below).
+            if unsafe { super::input_waiting_raw(raw) } {
+                self.state
+                    .fetch_and(!(DRAINED | KILLING), Ordering::Release);
+                return false;
+            }
+            // SAFETY: the KILLING bit is set; the owner's `begin_close` waits for it to
+            // clear before it closes the socket, so `raw` is open for this call.
+            unsafe { super::shutdown_read_raw(raw) };
+        }
+        if let Some(w) = wake {
             w.wake();
         }
         self.state.fetch_and(!KILLING, Ordering::Release);
         true
     }
 
-    /// Whether a drain shut this connection's read side.
+    /// The owner keeps a connection a drain marked (its next request had already
+    /// arrived): a later pass may mark it again.
+    #[inline]
+    pub(crate) fn undrain(&self) {
+        self.state.fetch_and(!DRAINED, Ordering::AcqRel);
+    }
+
+    /// Whether a drain marked this connection.
     #[inline]
     pub(crate) fn drained(&self) -> bool {
         self.state.load(Ordering::Acquire) & DRAINED != 0

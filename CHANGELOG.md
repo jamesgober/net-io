@@ -25,10 +25,15 @@ worker, and for a drain that could cut a request short on Linux. No API change.
   peer reset after reading its reply, as a TLS client that skips `close_notify`
   does, so connections, buffers, and cap slots piled up under short
   connections. A reset now ends the linger.
-- On the Linux pool a drain could close a handler in the middle of an exchange:
-  it shut the read side of a connection whose next request had already arrived,
-  and the rest of that request read as end of stream. A drain now leaves such a
-  connection to answer first, and closes it at its next wait.
+- A drain could close a connection in the middle of an exchange: it shut the
+  read side of a connection whose next request had already arrived (or arrived
+  as the drain looked), and the rest of that request read as end of stream. The
+  connection's own thread now decides, through its wake channel, on every
+  system; the Linux pool waits before an idle-phase receive for this.
+- A connection an accept thread was admitting as a drain began could be closed
+  unread by the stop that followed (a reset after 0 bytes, seen in a Windows
+  hand-off between two processes). A drain now waits for admissions in
+  progress.
 - Windows: a backlog past 200 was silently cut to 200 pending connections (the
   default 1,024 included), so a server whose accept thread fell behind on a busy
   host dropped SYNs and those clients waited about 21 s to fail (found by

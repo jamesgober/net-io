@@ -53,6 +53,8 @@ fn handoff_between_processes_refuses_nothing_under_load() {
     let addr = old.listeners()[0].local.socket_addr().expect("tcp");
 
     let stop = Arc::new(AtomicBool::new(false));
+    // What each failure was, for the report.
+    let why = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let (failed, by_a, by_b) = (
         Arc::new(AtomicU32::new(0)),
         Arc::new(AtomicU32::new(0)),
@@ -60,18 +62,29 @@ fn handoff_between_processes_refuses_nothing_under_load() {
     );
     let load = {
         let (stop, failed, by_a, by_b) = (stop.clone(), failed.clone(), by_a.clone(), by_b.clone());
+        let why = why.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
-                let got = TcpStream::connect(addr).ok().map(|mut s| {
-                    let _ = s.set_read_timeout(Some(WAIT));
-                    let mut out = Vec::new();
-                    let _ = s.read_to_end(&mut out);
-                    out
-                });
+                let got = TcpStream::connect(addr)
+                    .map_err(|e| format!("connect: {e}"))
+                    .and_then(|mut s| {
+                        let _ = s.set_read_timeout(Some(WAIT));
+                        let mut out = Vec::new();
+                        match s.read_to_end(&mut out) {
+                            Ok(_) => Ok(out),
+                            Err(e) => Err(format!("read after {:?}: {e}", out)),
+                        }
+                    });
                 match got.as_deref() {
-                    Some(b"A") => by_a.fetch_add(1, Ordering::AcqRel),
-                    Some(b"B") => by_b.fetch_add(1, Ordering::AcqRel),
-                    _ => failed.fetch_add(1, Ordering::AcqRel),
+                    Ok(b"A") => by_a.fetch_add(1, Ordering::AcqRel),
+                    Ok(b"B") => by_b.fetch_add(1, Ordering::AcqRel),
+                    other => {
+                        let at = by_a.load(Ordering::Acquire) + by_b.load(Ordering::Acquire);
+                        if let Ok(mut w) = why.lock() {
+                            w.push(format!("after {at}: {other:?}"));
+                        }
+                        failed.fetch_add(1, Ordering::AcqRel)
+                    }
                 };
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -123,7 +136,12 @@ fn handoff_between_processes_refuses_nothing_under_load() {
         by_b.load(Ordering::Acquire),
         failed.load(Ordering::Acquire),
     );
-    assert_eq!(f, 0, "refused or broken connections (A {a}, B {b})");
+    assert_eq!(
+        f,
+        0,
+        "refused or broken connections (A {a}, B {b}): {:?}",
+        why.lock().map(|w| w.clone()).unwrap_or_default()
+    );
     assert!(a > 0 && b > 0, "both processes served (A {a}, B {b})");
     assert_eq!(report.killed, 0);
 }
