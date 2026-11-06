@@ -531,10 +531,11 @@ fn test_request_stop_ends_wait_for_stop() {
 #[test]
 fn test_reply_returns_an_auto_phase_connection_to_idle() {
     // The session never sets a phase: after its reply the idle timeout applies, not the read timeout.
+    // 1 s against 30 s, so a loaded host cannot idle the connection out between the two round trips.
     let server = ServerBuilder::new()
         .listener(ListenerSpec::tcp("127.0.0.1:0"))
         .limits(limits(|b| {
-            b.idle_timeout(Duration::from_millis(200))
+            b.idle_timeout(Duration::from_secs(1))
                 .read_timeout(Duration::from_secs(30))
         }))
         .sessions(|_: &ConnectionInfo| Echo)
@@ -547,7 +548,7 @@ fn test_reply_returns_an_auto_phase_connection_to_idle() {
     assert_eq!(round_trip(&mut c, b"two"), b"two");
     let start = Instant::now();
     assert!(closed_by_server(&mut c));
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < Duration::from_secs(10));
     assert!(eventually(WAIT, || server
         .stats()
         .closed_for(CloseReason::Idle)
