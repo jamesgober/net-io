@@ -419,6 +419,12 @@ fn slow_reader(at: SocketAddr, stop: &AtomicBool, counts: &Counts, limit: Durati
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
+            // The server's reset is pending on the socket, but Linux hands back what
+            // is already in the receive buffer first: at 64 bytes a second that is
+            // minutes, so the reset is read from `SO_ERROR` instead.
+            if matches!(c.take_error(), Ok(Some(_)) | Err(_)) {
+                break;
+            }
             std::thread::sleep(Duration::from_secs(1));
             if stop.load(Ordering::Relaxed) {
                 return;
