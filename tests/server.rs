@@ -1114,3 +1114,72 @@ fn test_short_connections_spread_over_reactor_workers() {
     let used = seen.lock().expect("lock").len();
     assert_eq!(used, 4, "connections used {used} of 4 workers");
 }
+
+/// A session that answers and closes, with a client that closes at once: with a
+/// FIN, a reset, or a reset from unread data, the server's close ends with the
+/// client's, not at the linger's 2 s deadline. On the Windows reactor a reset held
+/// every such close to the deadline (D-177; tls-net's handshake benchmark).
+#[test]
+fn test_close_after_reply_ends_with_a_reset() {
+    use std::io::Read;
+    struct Reply;
+    impl Session for Reply {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            let _ = cx.output().push(&[b'r'; 70]);
+            Step::Close
+        }
+    }
+    for &driver in DRIVERS {
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(2)
+            .sessions(|_: &ConnectionInfo| Reply)
+            .gate(AllowAll)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let at = addr(&server);
+        let mut closed = 0u64;
+        for how in ["fin", "reset", "unread"] {
+            let mut worst = Duration::ZERO;
+            for _ in 0..10 {
+                match how {
+                    "fin" => {
+                        let mut c = client(at);
+                        c.write_all(b"GET").expect("write");
+                        let mut b = [0u8; 70];
+                        c.read_exact(&mut b).expect("reply");
+                    }
+                    "reset" => {
+                        let mut c = TcpConnection::connect(at).expect("connect");
+                        c.send_all(b"GET").expect("send");
+                        let mut b = [0u8; 70];
+                        c.recv_exact(&mut b).expect("reply");
+                        c.abort();
+                    }
+                    _ => {
+                        let mut c = client(at);
+                        c.write_all(b"GET").expect("write");
+                        let mut b = [0u8; 10];
+                        c.read_exact(&mut b).expect("part of the reply");
+                    }
+                }
+                closed += 1;
+                let t = Instant::now();
+                assert!(
+                    eventually(WAIT, || server.stats().closed >= closed),
+                    "{driver:?} {how}: {:?}",
+                    server.stats()
+                );
+                worst = worst.max(t.elapsed());
+            }
+            assert!(
+                worst < Duration::from_millis(500),
+                "{driver:?} {how}: a close waited {worst:?}"
+            );
+        }
+    }
+}

@@ -15,11 +15,16 @@
 
 ## [0.6.2] - 2026-11-06
 
-Two fixes for Windows (a deadlock, and a backlog cut to 200), and one for the
-reactor running every short connection on one worker. No API change.
+Fixes for Windows (a deadlock, a backlog cut to 200, and reset closes held for
+the whole linger), for the reactor running every short connection on one
+worker, and for a drain that could cut a request short on Linux. No API change.
 
 ### Fixed
 
+- The Windows reactor held a graceful close to the full linger (2 s) when the
+  peer reset after reading its reply, as a TLS client that skips `close_notify`
+  does, so connections, buffers, and cap slots piled up under short
+  connections. A reset now ends the linger.
 - On the Linux pool a drain could close a handler in the middle of an exchange:
   it shut the read side of a connection whose next request had already arrived,
   and the rest of that request read as end of stream. A drain now leaves such a
