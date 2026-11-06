@@ -2779,62 +2779,74 @@ mod layout {
 
     /// Edge case 81: more descriptors than net-io takes from one message
     /// ([`MAX_FDS`]) is refused like `MSG_CTRUNC`: every descriptor that arrived
-    /// is closed, none leak. (The receive buffer holds more than Linux sends in
-    /// one message, so the kernel never cuts it; a cut record is covered by
-    /// `test_cut_record_closes_the_descriptors_it_holds`.)
-    #[cfg(all(feature = "local", target_os = "linux"))]
+    /// is closed, none leak. The message carries the most descriptors this kernel
+    /// sends in one (Linux 253; macOS and FreeBSD by their control-data limit), so
+    /// the run also shows the receive buffer holds a whole one: had the kernel cut
+    /// it, the descriptors past the cut would stay open and `y` would not see end
+    /// of stream (register R-41).
+    #[cfg(feature = "local")]
     #[test]
     fn test_truncated_control_message_closes_every_descriptor() {
         use std::os::unix::net::UnixStream;
         let (a, b) = UnixStream::pair().unwrap();
         let (x, mut y) = UnixStream::pair().unwrap();
-        let count = MAX_FDS + 6;
-        let fds = vec![x.as_raw_fd(); count];
-        let data_len = 4 * count;
-        // SAFETY: CMSG_SPACE and CMSG_LEN are arithmetic on their argument.
-        let (space, len) = unsafe {
-            (
-                libc::CMSG_SPACE(data_len as u32),
-                libc::CMSG_LEN(data_len as u32),
-            )
-        };
-        let mut control = vec![0u64; (space as usize).div_ceil(8)];
+        // Before any close: macOS refuses `setsockopt` once the peer is gone.
+        y.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         let body = [7u8; 3];
-        let mut iov = libc::iovec {
-            iov_base: body.as_ptr() as *mut c_void,
-            iov_len: body.len(),
-        };
-        // SAFETY: a zeroed msghdr is valid; every pointer set below points at a
-        // live local of the stated length, and the cmsg macros stay inside `control`.
-        unsafe {
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_iov = &raw mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = control.as_mut_ptr().cast::<c_void>();
-            msg.msg_controllen = space as usize;
-            let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
-            (*cmsg).cmsg_level = libc::SOL_SOCKET;
-            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = len as usize;
-            std::ptr::copy_nonoverlapping(
-                fds.as_ptr().cast::<u8>(),
-                libc::CMSG_DATA(cmsg),
-                data_len,
-            );
-            assert_eq!(libc::sendmsg(a.as_raw_fd(), &raw const msg, 0), 3);
+        let mut sent = 0;
+        for count in (MAX_FDS + 1..=512).rev() {
+            let fds = vec![x.as_raw_fd(); count];
+            let data_len = 4 * count;
+            // SAFETY: CMSG_SPACE and CMSG_LEN are arithmetic on their argument.
+            let (space, len) = unsafe {
+                (
+                    libc::CMSG_SPACE(data_len as u32),
+                    libc::CMSG_LEN(data_len as u32),
+                )
+            };
+            let mut control = vec![0u64; (space as usize).div_ceil(8)];
+            let mut iov = libc::iovec {
+                iov_base: body.as_ptr() as *mut c_void,
+                iov_len: body.len(),
+            };
+            // SAFETY: a zeroed msghdr is valid; every pointer set below points at a
+            // live local of the stated length, and the cmsg macros stay inside
+            // `control`.
+            let ret = unsafe {
+                let mut msg: libc::msghdr = std::mem::zeroed();
+                msg.msg_iov = &raw mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control.as_mut_ptr().cast::<c_void>();
+                msg.msg_controllen = space as _;
+                let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = len as _;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr().cast::<u8>(),
+                    libc::CMSG_DATA(cmsg),
+                    data_len,
+                );
+                libc::sendmsg(a.as_raw_fd(), &raw const msg, 0)
+            };
+            if ret == 3 {
+                sent = count;
+                break;
+            }
         }
+        assert!(sent > MAX_FDS, "no message over {MAX_FDS} descriptors was sent");
         // The message holds the only other copies of `x`.
         drop(x);
         let b = super::super::Stream::Unix(b);
         let mut slots: [Option<OwnedFd>; MAX_FDS] = [const { None }; MAX_FDS];
         let mut out = [0u8; 8];
         let got = recv_with_fds(&b, &mut out, &mut slots).unwrap();
-        assert!(got.truncated);
+        assert!(got.truncated, "{sent} descriptors");
         assert_eq!((got.bytes, got.fds), (3, 0));
         assert!(slots.iter().all(Option::is_none));
         // `y` reads end of stream only once every copy of `x` is closed.
-        y.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
+        eprintln!("{sent} descriptors in one message");
         let mut one = [0u8; 1];
         assert_eq!(
             std::io::Read::read(&mut y, &mut one).unwrap(),
@@ -2852,6 +2864,8 @@ mod layout {
         use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
         let (x, mut y) = UnixStream::pair().unwrap();
+        // Before any close: macOS refuses `setsockopt` once the peer is gone.
+        y.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let hdr = cmsg_align(size_of::<CmsgHdr>());
         let level_at = size_of::<CmsgHdr>() - 2 * size_of::<c_int>();
         let mut control = CmsgBuf([0; cmsg_space(4 * MAX_FDS)]);
@@ -2874,7 +2888,6 @@ mod layout {
         assert_eq!((count, cut), (0, true));
         assert!(slots.iter().all(Option::is_none));
         drop(x);
-        y.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut one = [0u8; 1];
         assert_eq!(
             std::io::Read::read(&mut y, &mut one).unwrap(),
