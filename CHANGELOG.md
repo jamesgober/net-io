@@ -17,6 +17,11 @@ soak, and a database consumer's transport needs.
 
 ### Security
 
+- A session that wrote more than one 16 KiB output buffer per flush spent the
+  shared buffer budget within seconds, after which other connections stalled and
+  the session spun its worker; any client asking for a large reply could cause it.
+  Outputs reuse their pool's buffers now, and a push the spent budget refuses
+  closes the connection with `Limit(BufferBudget)` (also in 0.6.1).
 - On the reactor, bytes read with a PROXY header on a TLS listener reached the
   session as plaintext after the handshake. They go to the TLS engine now
   (also in 0.6.1).
@@ -58,6 +63,7 @@ soak, and a database consumer's transport needs.
 - `UdpOptions::verification_lifetime`, `UdpOptions::verified_table`,
   `UdpSocket::forget_verified`, `UdpContext::forget_verified`.
 - `SharedSocket`, the socket type `Driver::register` takes.
+- `descriptor_limit()`: the soft descriptor limit, for placing a cap under it.
 - Fuzz targets `wheel` and `rate`, a nightly fuzz workflow, and `tests/soak.rs`.
 
 ### Changed
@@ -90,6 +96,57 @@ soak, and a database consumer's transport needs.
   coalesced tail waited for the next refusal; a persistent accept error spun the
   accept thread; an invalid lane reservation could be hidden by a later one; a
   pipe listener whose name was taken paused instead of failing.
+- Everything fixed in 0.6.1: posts reach connections waiting for input, an idle
+  trim releases buffers with a receive out, a stop ends lingers, and a drain
+  answers a request that already arrived.
+
+---
+
+## [0.6.1] - 2026-11-04
+
+A patch for serve-net's requests 4 and 7 and three defects found by the 0.7
+review. No API change.
+
+### Security
+
+- A session that wrote more than one 16 KiB output buffer per flush (a large
+  reply, a stream, a WebSocket echo) charged the shared buffer budget anew on every
+  flush: the output's spare buffers went to the worker's pool and were never taken
+  back. With the default budget (512 MiB on the reactor) it ran out within seconds,
+  after which other connections could get no buffer and stalled, and a session whose
+  push then took nothing was called back at once for ever, spinning the worker. Any
+  client that asks for a large reply could cause it. An output now reuses the pool's
+  buffers before charging the budget, and a flush with nothing queued because the
+  budget refused it closes that connection with `Limit(BufferBudget)`. Affects 0.6.0
+  on both drivers (found by ws-net's soak).
+- On the reactor, bytes that arrived with a PROXY header on a TLS listener reached
+  the session as if they had been decrypted, once the handshake finished: a client
+  (or anyone between it and a proxy in TCP mode) could put bytes in front of the
+  real ClientHello and have them read as the TLS peer's. They now go to the TLS
+  engine, which refuses them. A ClientHello sent in the same segment as the header
+  no longer stalls the handshake. Affects 0.5.0 and 0.6.0 with sessions on the
+  reactor behind PROXY with TLS; the blocking pool was not affected.
+- A session that survived a read timeout while part of a message waited in its
+  buffer could make a reactor worker panic, closing every connection on that worker
+  without its closed event. The input now knows when a receive holds its buffer.
+
+### Fixed
+
+- A `Completer::post` now reaches a connection that waits for input, not only a
+  parked one, on both drivers, so a WebSocket can be written to from another thread
+  (serve-net request 7). A post that arrives while the session is busy is delivered
+  at its next wait. On the blocking driver on Linux, a connection whose session took
+  a completer waits with one `poll` before each receive so the post can wake it.
+- A session step that ends in `Step::Read` while a receive is already out (a
+  survived idle timeout, a wake) gives back its idle buffers, as a fresh wait does:
+  a trimmed idle connection holds about 1.8 KB, not 4.9 KB (serve-net request 4).
+- With an injected clock on the reactor, `Server::shutdown` waited for ever on a
+  connection that had closed gracefully and was lingering: a stop or a deadline
+  kill now ends a linger, as a single kill already did.
+- An accept batch checks the door, a drain, a stop, and the control line before each
+  accept, so no connection is admitted after the door closed (serve-net's drain race).
+- A drain no longer closes a connection whose next request has already arrived: it
+  is answered first, then closed (the drain race's second window).
 
 ---
 

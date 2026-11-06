@@ -215,6 +215,12 @@ impl BufferPool {
         Some(Buffer::new(class))
     }
 
+    /// A buffer of `class` this pool already holds; never allocates or charges the
+    /// budget.
+    pub(crate) fn take_cached(&mut self, class: SizeClass) -> Option<Buffer> {
+        self.list(class).pop()
+    }
+
     /// Returns a buffer; its used part is wiped first unless wiping is off.
     ///
     /// A buffer from another worker's pool is accepted (it is just memory).

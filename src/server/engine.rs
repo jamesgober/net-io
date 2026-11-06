@@ -3118,7 +3118,17 @@ fn drive<G: Gate, S: Session>(
                         Some(next) => step = next,
                         None => return CloseReason::SessionPanicked,
                     },
-                    Ok(Got::Woken) => {}
+                    // The wake channel fired: a post for this connection (serve-net
+                    // request 7) reaches the session now; a drain, a kill, or the
+                    // control line is seen at the top of the loop.
+                    Ok(Got::Woken) => {
+                        if let Some((token, value)) = take_post(w, link) {
+                            match call(w, link, s, |s, cx| s.on_wake(cx, token, value)).0 {
+                                Some(next) => step = next,
+                                None => return CloseReason::SessionPanicked,
+                            }
+                        }
+                    }
                     Err(NetError::TimedOut { kind }) => match timeout(w, link, s, kind) {
                         Ok(next) => step = next,
                         Err(reason) => return reason,
@@ -3208,6 +3218,13 @@ fn flush<G: Gate, S: Session>(
     link: &mut Link,
     s: &mut S,
 ) -> Result<(), CloseReason> {
+    // Read and cleared on every flush: only a step that queued nothing because the
+    // budget refused it closes here.
+    if w.output.take_refused() && w.output.is_empty() {
+        // Nothing to send because the buffer budget is spent: calling the session
+        // back now would spin the worker.
+        return Err(CloseReason::Limit(crate::error::LimitKind::BufferBudget));
+    }
     while !w.output.is_empty() {
         link.response_started = if w.output.response_open {
             w.output.bytes_since_begin > 0
@@ -3274,22 +3291,33 @@ enum Parked {
 }
 
 /// No reads, no idle timer: waits for a completion, a kill, a stop, or the deadline.
+/// The next post for this connection; posts for an earlier connection of the
+/// worker are counted stale and dropped.
+fn take_post<G: Gate>(w: &Worker<G>, link: &Link) -> Option<(u32, u64)> {
+    let shared = &w.shared;
+    let ws = &shared.workers[w.idx];
+    // A swap, so a producer that saw the flag set cannot push after the ring was
+    // found empty and leave its post unannounced.
+    ws.completer.wake_pending.swap(false, Ordering::AcqRel);
+    while let Some(p) = ws.completer.ring.pop() {
+        if p.connection == link.info.id {
+            return Some((p.token, p.value));
+        }
+        ws.stats.begin_write();
+        ws.stats.stale_completions.fetch_add(1, Ordering::Relaxed);
+        ws.stats.end_write();
+        shared.event(Event::StaleCompletion {
+            worker: WorkerId(w.idx as u16),
+        });
+    }
+    None
+}
+
 fn park<G: Gate>(w: &mut Worker<G>, link: &mut Link, until: Option<Instant>) -> Parked {
     let deadline = until.unwrap_or_else(|| link.now() + link.limits.park_timeout);
-    let shared = w.shared.clone();
-    let ws = &shared.workers[w.idx];
     loop {
-        ws.completer.wake_pending.store(false, Ordering::Release);
-        while let Some(p) = ws.completer.ring.pop() {
-            if p.connection == link.info.id {
-                return Parked::Wake(p.token, p.value);
-            }
-            ws.stats.begin_write();
-            ws.stats.stale_completions.fetch_add(1, Ordering::Relaxed);
-            ws.stats.end_write();
-            shared.event(Event::StaleCompletion {
-                worker: WorkerId(w.idx as u16),
-            });
+        if let Some((token, value)) = take_post(w, link) {
+            return Parked::Wake(token, value);
         }
         if let Some(k) = link.killed() {
             return Parked::Closed(CloseReason::Killed(k));

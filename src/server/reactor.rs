@@ -940,7 +940,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             }
         }
         let Some(c) = self.conn(index) else { return };
-        if c.output.as_ref().is_some_and(|o| o.is_empty()) {
+        // A send in flight holds the output's chunks, so it looks empty: leave it.
+        if c.sending == Sending::None && c.output.as_ref().is_some_and(|o| o.is_empty()) {
             if let Some(mut output) = c.output.take() {
                 output.reset();
                 self.outputs.push(output);
@@ -957,6 +958,16 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             let Some(c) = self.conn(index) else { return };
             if c.closing.is_some() {
                 return;
+            }
+            if step == Step::Read {
+                if let Some((token, value)) = c.posted.take() {
+                    // A post that arrived while the session was busy.
+                    match self.call(index, |s, cx| s.on_wake(cx, token, value)) {
+                        Some(next) => step = next,
+                        None => return self.close(index, CloseReason::SessionPanicked),
+                    }
+                    continue;
+                }
             }
             match step {
                 Step::Read if c.input.as_ref().is_some_and(Input::lent) => {
@@ -1087,6 +1098,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             return self.tls_turn(index);
         }
         if c.recv != Recv::None || c.paused {
+            // A receive is already out (a session step that ended in `Read` while
+            // idle: a timeout, a wake): give back what the connection does not need
+            // while it waits, as a new wait would (serve-net request 4).
+            self.release_idle(index);
             return self.arm_timer(index);
         }
         let token = c.token;
@@ -1182,7 +1197,16 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             self.arm_timer(index);
             return Flushed::Waiting;
         }
+        // Read and cleared on every flush: only a step that queued nothing because the
+        // budget refused it closes here.
+        let refused = output.take_refused();
         if output.is_empty() {
+            if refused {
+                // Nothing to send because the buffer budget is spent: calling the
+                // session back now would spin the worker. It closes instead.
+                self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
+                return Flushed::Waiting;
+            }
             c.link.output_done();
             return Flushed::Done;
         }
@@ -1823,9 +1847,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
     }
 
+    /// A post reaches the session at once when it is parked or waiting for input
+    /// (serve-net request 7: a WebSocket waits for input and is written to from
+    /// other threads); otherwise it waits until the connection's next wait.
     fn posted(&mut self, index: u32, token: u32, value: u64) {
         let Some(c) = self.conn(index) else { return };
-        if matches!(c.wait, Wait::Park(_)) {
+        if c.closing.is_none() && matches!(c.wait, Wait::Park(_) | Wait::Read) {
             match self.call(index, |s, cx| s.on_wake(cx, token, value)) {
                 Some(step) => self.run(index, step),
                 None => self.close(index, CloseReason::SessionPanicked),
@@ -1915,10 +1942,19 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
     }
 
+    /// Closes every connection; one already lingering after a graceful close stops
+    /// lingering, as a kill would make it (a linger on an injected clock that does not
+    /// move would otherwise hold a stop for ever: serve-net 0.5 item 2).
     fn close_all(&mut self, reason: CloseReason) {
         for i in 0..self.slots.len() as u32 {
-            if self.conn(i).is_some_and(|c| c.closing.is_none()) {
+            let (open, lingering) = match self.conn(i) {
+                Some(c) => (c.closing.is_none(), matches!(c.wait, Wait::Linger(_))),
+                None => continue,
+            };
+            if open {
                 self.close(i, reason);
+            } else if lingering {
+                self.finish_closing(i);
             }
         }
     }
