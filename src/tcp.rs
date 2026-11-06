@@ -53,7 +53,8 @@ pub(crate) fn effective_backlog(requested: u32) -> Option<u32> {
             .and_then(|s| s.trim().parse::<u32>().ok());
         Some(cap.map_or(requested, |c| requested.min(c)))
     } else if cfg!(windows) {
-        Some(requested)
+        // Asked for as `SOMAXCONN_HINT` past 200, which Windows holds to 65,535.
+        Some(requested.min(65_535))
     } else {
         None
     }

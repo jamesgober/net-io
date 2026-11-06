@@ -104,6 +104,9 @@ soak, and a database consumer's transport needs.
   now goes to a list of spares for the next thread instead (also in 0.6.2).
 - The reactor gave every short connection to its first worker: with all loads at
   0, the least-loaded choice always took worker 0. Ties now go round the workers.
+- Windows: a backlog past 200 was silently cut to 200 pending connections, so a
+  server whose accept thread fell behind dropped SYNs and clients waited about
+  21 s to fail. It is asked for as `SOMAXCONN_HINT` now (also in 0.6.2).
 - Everything fixed in 0.6.1: posts reach connections waiting for input, an idle
   trim releases buffers with a receive out, a stop ends lingers, and a drain
   answers a request that already arrived.
