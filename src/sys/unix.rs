@@ -2835,7 +2835,10 @@ mod layout {
                 break;
             }
         }
-        assert!(sent > MAX_FDS, "no message over {MAX_FDS} descriptors was sent");
+        assert!(
+            sent > MAX_FDS,
+            "no message over {MAX_FDS} descriptors was sent"
+        );
         // The message holds the only other copies of `x`.
         drop(x);
         let b = super::super::Stream::Unix(b);
