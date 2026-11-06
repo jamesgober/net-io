@@ -56,6 +56,16 @@ pub(crate) fn classify_accept(e: &io::Error) -> super::AcceptFailure {
 }
 
 /// Maps a bind or connect error to its own variant.
+/// A connect that failed for want of a local port (every ephemeral port in use or
+/// in TIME_WAIT): it passes once ports come free, so a reconnect may wait for it.
+pub(crate) fn out_of_ports(e: &io::Error) -> bool {
+    use errno::*;
+    matches!(
+        e.raw_os_error(),
+        Some(WSAEADDRINUSE | WSAENOBUFS | WSAEADDRNOTAVAIL)
+    )
+}
+
 pub(crate) fn classify_addr_error(e: &io::Error) -> super::AddrFailure {
     use super::AddrFailure as F;
     use errno::*;
