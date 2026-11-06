@@ -1243,3 +1243,44 @@ fn test_spent_budget_closes_instead_of_spinning() {
     let _ = c.read(&mut b);
     drop(held);
 }
+
+/// Short connections one after another spread over the reactor's workers: with
+/// every load at 0, the hand-over took the first worker each time, and one core
+/// served everything (found by tls-net's handshake benchmark).
+#[cfg(feature = "reactor")]
+#[test]
+fn test_short_connections_spread_over_reactor_workers() {
+    struct Mark(Arc<Mutex<std::collections::HashSet<String>>>);
+    impl Session for Mark {
+        fn on_open(&mut self, cx: &mut SessionContext<'_>) -> Step {
+            if let Ok(mut seen) = self.0.lock() {
+                seen.insert(format!("{:?}", cx.worker()));
+            }
+            Step::Read
+        }
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            Step::Close
+        }
+    }
+    let seen = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let marks = seen.clone();
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(DriverKind::Reactor)
+        .workers(4)
+        .sessions(move |_: &ConnectionInfo| Mark(marks.clone()))
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    for i in 0..40u64 {
+        let mut c = client(addr(&server));
+        assert_eq!(round_trip(&mut c, b"x"), b"x");
+        drop(c);
+        assert!(eventually(WAIT, || server.stats().closed > i));
+    }
+    let used = seen.lock().expect("lock").len();
+    assert_eq!(used, 4, "connections used {used} of 4 workers");
+}

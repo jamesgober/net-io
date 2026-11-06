@@ -787,3 +787,56 @@ fn test_handshake_flight_is_bounded_by_the_handshake_deadline() {
         drop(c);
     }
 }
+
+/// A session that answers and closes, with a client that reads the answer and
+/// closes at once (FIN, or with `close_notify` unread, which resets): the server's
+/// close ends when the client's does, not at the linger's deadline, on both
+/// drivers (tls-net's handshake benchmark held about 9,000 connections open).
+#[test]
+fn test_close_after_reply_ends_with_the_clients_close() {
+    struct Reply;
+    impl Session for Reply {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            let _ = cx.output().push(&[b'r'; 70]);
+            Step::Close
+        }
+    }
+    for &driver in common::DRIVERS {
+        for read_notify in [true, false] {
+            let server = ServerBuilder::new()
+                .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+                .driver(driver)
+                .workers(2)
+                .tls(Toy)
+                .sessions(|_: &ConnectionInfo| Reply)
+                .gate(AllowAll)
+                .build()
+                .expect("build");
+            server.open_door().expect("open");
+            let mut worst = Duration::ZERO;
+            for i in 0..200u64 {
+                let mut c = ToyClient::connect(&server);
+                c.send(b"GET");
+                assert_eq!(c.recv_exact(70), vec![b'r'; 70]);
+                if read_notify {
+                    assert_eq!(c.recv(), None, "close_notify");
+                }
+                drop(c);
+                let t = std::time::Instant::now();
+                assert!(
+                    eventually(WAIT, || server.stats().closed > i),
+                    "{driver:?} {read_notify}: {:?}",
+                    server.stats()
+                );
+                worst = worst.max(t.elapsed());
+            }
+            eprintln!("{driver:?} read close_notify {read_notify}: worst {worst:?}");
+            assert!(
+                worst < Duration::from_millis(500),
+                "{driver:?} {read_notify}: a close waited {worst:?}"
+            );
+        }
+    }
+}

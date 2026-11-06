@@ -101,7 +101,9 @@ soak, and a database consumer's transport needs.
 - Windows: a process whose threads ended after using a `TcpConnection` could
   freeze entirely, every thread start and exit waiting: the thread's wake socket
   was closed by a thread-local destructor, under the loader lock. A thread's wake
-  now goes to a list of spares for the next thread instead.
+  now goes to a list of spares for the next thread instead (also in 0.6.2).
+- The reactor gave every short connection to its first worker: with all loads at
+  0, the least-loaded choice always took worker 0. Ties now go round the workers.
 - Everything fixed in 0.6.1: posts reach connections waiting for input, an idle
   trim releases buffers with a receive out, a stop ends lingers, and a drain
   answers a request that already arrived.
