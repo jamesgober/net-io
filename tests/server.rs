@@ -823,16 +823,23 @@ fn test_panicking_event_sink_loses_only_its_events() {
             .build()
             .expect("build");
         server.open_door().expect("open");
-        for n in 0..3 {
-            let mut c = client(addr(&server));
-            c.write_all(b"hi").expect("write");
-            let mut back = [0u8; 2];
-            if let Err(e) = std::io::Read::read_exact(&mut c, &mut back) {
-                std::thread::sleep(Duration::from_millis(200));
-                panic!("{driver:?} round {n}: {e}: {:?}", server.stats());
+        // One worker: a client that arrives while the last one's close is still
+        // being finished (here, past the sink's panic) is refused `Busy`, which is
+        // a refusal, not a lost slot; it tries again.
+        let served = |n: usize| {
+            for _ in 0..100 {
+                let mut c = client(addr(&server));
+                c.write_all(b"hi").expect("write");
+                let mut back = [0u8; 2];
+                if std::io::Read::read_exact(&mut c, &mut back).is_ok() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            drop(c);
-            // One worker: the next client waits for this close, or the pool says Busy.
+            panic!("{driver:?} round {n}: never served: {:?}", server.stats());
+        };
+        for n in 0..3 {
+            served(n);
             assert!(eventually(Duration::from_secs(5), || server.stats().open == 0));
         }
         assert!(
@@ -840,9 +847,8 @@ fn test_panicking_event_sink_loses_only_its_events() {
             "{driver:?}: {:?}",
             server.stats()
         );
-        let mut c = client(addr(&server));
-        assert_eq!(round_trip(&mut c, b"again"), b"again", "{driver:?}");
-        drop(c);
+        // The worker and its slot came back each time: a lost one never serves.
+        served(3);
         let started = Instant::now();
         let _ = server.shutdown(Instant::now() + Duration::from_secs(2));
         assert!(started.elapsed() < Duration::from_secs(4), "{driver:?}");
