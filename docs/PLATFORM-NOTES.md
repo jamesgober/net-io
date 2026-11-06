@@ -19,8 +19,8 @@ What differs between operating systems, what net-io does about it, and what an o
 - **Backlog.** The kernel silently caps `listen`'s backlog at `net.core.somaxconn` (4,096 since 5.4, 128 before). net-io reads `/proc/sys/net/core/somaxconn` and reports the effective value in `ListenerInfo::backlog`. Raise the sysctl for large accept bursts.
 - **SYN floods** are the kernel's job (SYN cookies, `net.ipv4.tcp_syncookies`); net-io sees only completed handshakes.
 - **No SIGPIPE.** Sends use `MSG_NOSIGNAL`, so a peer that disappears mid-write is `PeerReset`, never a signal.
-- **Two system calls per exchange.** A keep-alive round trip is one blocking `recv` (its timeout set with `SO_RCVTIMEO` only when the deadline moves by more than one tick) and one `send` with `MSG_DONTWAIT`.
-- **Kill and drain** shut the read side of the connection (`shutdown(SHUT_RD)`), which wakes a blocked `recv` at once; a reply already being written still goes out. net-io never calls `shutdown` on a listening socket: on Linux that disables the listener for good (decision D-057).
+- **Three system calls per exchange on the blocking pool.** A keep-alive round trip is one `poll` on the socket and the worker's wake channel before the exchange's first receive, one `recv`, and one `send` with `MSG_DONTWAIT`; receives inside an exchange block under `SO_RCVTIMEO` (set only when the deadline moves by more than one tick). Before 0.6.2 the first receive blocked too (two calls), and a drain had to shut the read side to reach it, which could cut short a request that arrived as the drain looked (D-178).
+- **Kill** shuts the read side of the connection (`shutdown(SHUT_RD)`), which wakes a blocked `recv` at once; a reply already being written still goes out. A **drain** reaches the worker through its wake channel, and the worker closes the connection at its wait, or first answers a request that already arrived. net-io never calls `shutdown` on a listening socket: on Linux that disables the listener for good (decision D-057).
 - **Port reuse.** `SO_REUSEADDR` is on by default for listeners (restart without waiting for `TIME_WAIT`); `SO_REUSEPORT` is opt-in.
 - **Many short client connections** from one host can exhaust the ephemeral port range with `TIME_WAIT` entries on the side that closes first; this is the kernel's design, not a leak.
 
@@ -57,6 +57,7 @@ What differs between operating systems, what net-io does about it, and what an o
 ## Windows
 
 - **The reactor** runs on an I/O completion port per worker. A receive that finds no bytes pends, and an idle connection waits with a zero-byte receive, so it pins no memory. That adds one system call per exchange: wait, receive, send, zero-byte receive. A call that finishes at once completes without a trip through the port (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, unless a layered provider without real handles is installed).
+- **Backlog.** A plain `listen` backlog is capped at 200 pending connections; net-io asks for one past 200 as `SOMAXCONN_HINT`, which Windows holds to 65,535, and reports that value in `ListenerInfo::backlog`. Before 0.6.2 a server whose accept thread fell behind on a loaded host dropped SYNs past the 200th, and those clients waited about 21 s for a timeout.
 - **UDP packet info** is `Unsupported`; it needs `WSARecvMsg`, and no consumer has asked.
 - **`user_timeout`** is `TCP_MAXRT`, in whole seconds.
 - **Pending sends** pin the output's pages in the kernel until the peer takes them. The output budget bounds this per connection, and the write deadline cancels it.

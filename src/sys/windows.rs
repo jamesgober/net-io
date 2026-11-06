@@ -644,7 +644,7 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
     }
     bind_to(s.as_socket(), addr)?;
     // SAFETY: `s` is an open, bound stream socket.
-    cvt(unsafe { listen(raw(s.as_socket()), clamp_int(p.backlog)) })?;
+    cvt(unsafe { listen(raw(s.as_socket()), backlog_arg(p.backlog)) })?;
     if p.fast_open.is_some() {
         set_int(s.as_socket(), c::IPPROTO_TCP, c::TCP_FASTOPEN, 1)?;
     }
@@ -911,7 +911,7 @@ pub(crate) fn unix_bind(sock: Sock<'_>, path: &[u8], backlog: u32) -> io::Result
     // SAFETY: `addr` holds a valid SOCKADDR_UN of `len` bytes and lives for the call.
     cvt(unsafe { bind(raw(sock), addr.as_ptr().cast(), len) })?;
     // SAFETY: `sock` is an open, bound stream socket.
-    cvt(unsafe { listen(raw(sock), clamp_int(backlog)) })?;
+    cvt(unsafe { listen(raw(sock), backlog_arg(backlog)) })?;
     Ok(())
 }
 
@@ -1129,6 +1129,19 @@ pub(crate) unsafe fn shutdown_read_raw(raw: RawSock) {
 
 fn clamp_int(n: u32) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// The `listen` backlog for `n` pending connections. Windows takes a plain number
+/// as at most 200; a backlog past that is asked for as `SOMAXCONN_HINT(n)` (the
+/// negative of `n`), which Windows holds to 200 to 65,535 (D-175).
+fn backlog_arg(n: u32) -> i32 {
+    const PLAIN_MAX: u32 = 200;
+    const HINT_MAX: u32 = 65_535;
+    if n <= PLAIN_MAX {
+        clamp_int(n)
+    } else {
+        -clamp_int(n.min(HINT_MAX))
+    }
 }
 
 /// Linger: `None` = off, `Some(0)` = abortive, `Some(d)` = wait up to `d` seconds.
@@ -1478,6 +1491,23 @@ mod layout {
             .unwrap(),
             Ready::TimedOut
         );
+    }
+
+    /// A backlog past 200 holds that many pending connections: a plain number is
+    /// capped at 200 on Windows, and the 201st connect waited 21 s for a SYN-ACK
+    /// (D-175, found by ws-net under load).
+    #[test]
+    fn test_backlog_past_two_hundred_is_kept() {
+        let l =
+            crate::TcpListener::bind_with("127.0.0.1:0", crate::ListenOptions::new().backlog(1024))
+                .unwrap();
+        let at = l.local_addr().unwrap();
+        let mut held = Vec::new();
+        for _ in 0..300 {
+            let s = std::net::TcpStream::connect_timeout(&at, Duration::from_secs(2));
+            held.push(s.expect("queued without an accept"));
+        }
+        assert_eq!(held.len(), 300);
     }
 
     #[test]

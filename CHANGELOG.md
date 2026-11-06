@@ -13,6 +13,48 @@
 
 ---
 
+## [0.6.2] - 2026-11-06
+
+Fixes for Windows (a deadlock, a backlog cut to 200, and reset closes held for
+the whole linger), for the reactor running every short connection on one
+worker, and for a drain that could cut a request short on Linux. No API change.
+
+### Fixed
+
+- The Windows reactor held a graceful close to the full linger (2 s) when the
+  peer reset after reading its reply, as a TLS client that skips `close_notify`
+  does, so connections, buffers, and cap slots piled up under short
+  connections. A reset now ends the linger.
+- A drain could close a connection in the middle of an exchange: it shut the
+  read side of a connection whose next request had already arrived (or arrived
+  as the drain looked), and the rest of that request read as end of stream. The
+  connection's own thread now decides, through its wake channel, on every
+  system; the Linux pool waits before an idle-phase receive for this.
+- A connection an accept thread was admitting as a drain began could be closed
+  unread by the stop that followed (a reset after 0 bytes, seen in a Windows
+  hand-off between two processes). A drain now waits for admissions in
+  progress.
+- Windows: a backlog past 200 was silently cut to 200 pending connections (the
+  default 1,024 included), so a server whose accept thread fell behind on a busy
+  host dropped SYNs and those clients waited about 21 s to fail (found by
+  ws-net). It is asked for as `SOMAXCONN_HINT` now, up to 65,535, and
+  `ListenerInfo::backlog` reports what Windows applies.
+
+- The reactor gave every short connection to its first worker: with all loads at
+  0, the least-loaded choice always took worker 0, so one core served a whole
+  handshake or request-per-connection load (found by tls-net, at about half of
+  the throughput the other workers could add). Ties now go round the workers.
+
+- Windows: a process whose threads ended after using a `TcpConnection` could
+  freeze entirely, every thread start and exit waiting. A thread's wake socket
+  was closed by its thread-local destructor, which runs under the loader lock,
+  and that deadlocked against a thread loading a Winsock extension (the IOCP
+  driver and `TransmitFile` do). A thread's wake now goes to a list of spares
+  for the next thread instead. Affects 0.3.0 to 0.6.1 on Windows; seen as the
+  library tests hanging in about 1 run in 14.
+
+---
+
 ## [0.6.1] - 2026-11-04
 
 A patch for serve-net's requests 4 and 7 and three defects found by the 0.7

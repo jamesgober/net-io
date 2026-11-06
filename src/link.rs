@@ -68,11 +68,44 @@ pub(crate) enum WakeSource {
 }
 
 thread_local! {
-    static THREAD_WAKE: std::cell::OnceCell<Option<Arc<Wake>>> = const { std::cell::OnceCell::new() };
+    static THREAD_WAKE: std::cell::OnceCell<ThreadWake> = const { std::cell::OnceCell::new() };
+}
+
+/// Wakes of threads that ended, for the next thread that needs one (Windows). A
+/// thread-local destructor runs under the Windows loader lock, where closing a
+/// socket can deadlock the whole process against a thread that is loading a
+/// Winsock extension (D-173), so there a thread's wake is never closed when it
+/// ends. Elsewhere it closes with its thread, which returns its descriptors.
+static SPARE_WAKES: std::sync::Mutex<Vec<Arc<Wake>>> = std::sync::Mutex::new(Vec::new());
+
+/// A thread's wake channel; on Windows given back to `SPARE_WAKES` when the thread
+/// ends.
+struct ThreadWake(Option<Arc<Wake>>);
+
+impl Drop for ThreadWake {
+    fn drop(&mut self) {
+        if !cfg!(windows) {
+            return;
+        }
+        if let Some(w) = self.0.take() {
+            match SPARE_WAKES.lock() {
+                Ok(mut spare) => spare.push(w),
+                // Never close it here, even if that leaks it.
+                Err(_) => std::mem::forget(w),
+            }
+        }
+    }
 }
 
 fn thread_wake() -> Option<Arc<Wake>> {
-    THREAD_WAKE.with(|cell| cell.get_or_init(|| Wake::new().ok().map(Arc::new)).clone())
+    THREAD_WAKE.with(|cell| {
+        cell.get_or_init(|| {
+            let spare = SPARE_WAKES.lock().ok().and_then(|mut s| s.pop());
+            ThreadWake(spare.or_else(|| Wake::new().ok().map(Arc::new)))
+        })
+        .0
+        .clone()
+    })
 }
 
 /// What a read produced.
@@ -904,8 +937,12 @@ impl Link {
     where
         R: FnMut(&sys::Stream, &mut [u8]) -> io::Result<usize>,
     {
-        if sys::WAIT_BEFORE_RECV || self.wakeable.get() {
-            if !self.likely_more {
+        // Between exchanges Linux waits first too, so a drain reaches the owner
+        // through its wake channel and the owner decides; a drain that shut the read
+        // side could cut short a request whose first bytes it saw too late (D-178).
+        let linux_idle = !sys::WAIT_BEFORE_RECV && self.phase == Phase::Idle;
+        if sys::WAIT_BEFORE_RECV || self.wakeable.get() || linux_idle {
+            if !self.likely_more || linux_idle {
                 match self.wait(Interest::Read, timeout) {
                     Ok(Ready::TimedOut) => return None,
                     Ok(Ready::Woken) => {
@@ -918,9 +955,16 @@ impl Link {
                         if !self.slot.drained() {
                             return Some(Ok(Got::Woken));
                         }
+                        if self.phase != Phase::Idle {
+                            // Marked while it was leaving its wait: a later pass marks
+                            // it again at its next one.
+                            self.slot.undrain();
+                            return Some(Ok(Got::Woken));
+                        }
                         if !self.input_waiting() {
                             return Some(Err(self.fail(CloseReason::Drained, NetError::Closed)));
                         }
+                        self.slot.undrain();
                     }
                     Ok(Ready::Socket) => {}
                     Err(e) => return Some(Err(self.os_error("wait", e))),
@@ -1900,5 +1944,20 @@ impl Link {
             }
         }
         self.killed().is_some()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// On Windows a thread's wake outlives the thread: it goes back to the spares
+    /// instead of being closed by a thread-local destructor (D-173).
+    #[test]
+    fn test_thread_wake_is_kept_when_its_thread_ends() {
+        let weak = std::thread::spawn(|| Arc::downgrade(&thread_wake().expect("wake")))
+            .join()
+            .expect("thread");
+        assert!(weak.upgrade().is_some(), "closed when its thread ended");
     }
 }
