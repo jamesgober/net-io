@@ -216,7 +216,7 @@ The plan for each item:
 | Fuzzing | every parser has a target (PROXY, CIDR, trusted lists, manifest, systemd environment) plus new stateful targets for the timing wheel, the rate counter, and the UDP source table against models; a scheduled CI workflow runs each target for longer than the per-push 30 s and keeps the corpus between runs |
 | Threat tests | every row of `docs/SECURITY.md` names a passing test, or a later version with a reason |
 | Shim coverage | a list of every `sys` call site, each with an injected error test, checked by a test that fails when a new site has none |
-| Soak | `tests/soak.rs`, driven by `NET_IO_SOAK_SECS`: normal clients, slowloris and slow readers, floods at the cap, kills, and client reconnects through a test pool, sampling memory, descriptors or handles, and open connections; 24 hours on the build host's Windows and Linux. macOS runs on GitHub's hosted runner, whose jobs stop at 6 hours, so it runs 5.5 hours there (recorded with the result) |
+| Soak | `tests/soak.rs`, driven by `NET_IO_SOAK_SECS`: normal clients, big writers whose replies take several output buffers a flush (the 0.6.0 budget leak, D-169), slowloris and slow readers, floods at the cap, kills, and client reconnects through a test pool, sampling memory, descriptors or handles, and open connections; 24 hours on the build host's Windows and Linux. macOS runs on GitHub's hosted runner, whose jobs stop at 6 hours, so it runs 5.5 hours there (recorded with the result) |
 | Review | six independent reviews of the crate (link and sessions, reactor and drivers, engine and admission, Unix `sys`, Windows `sys`, parsers and UDP); every finding fixed test-first or recorded with a reason |
 
 Done:

@@ -1,12 +1,14 @@
 //! The soak (NFR-17): normal clients, a pooled client that reconnects through
-//! kills, and hostile peers (slowloris, slow readers, idle hoarders, floods at the
+//! kills, big writers whose replies take several output buffers a flush, and
+//! hostile peers (slowloris, slow readers, idle hoarders, floods at the
 //! cap) against one server, while memory, descriptors or handles, and open
 //! connections are sampled.
 //!
 //! `NET_IO_SOAK_SECS` sets the length (default 15; the release soak is 86,400),
 //! `NET_IO_SOAK_SAMPLE_SECS` the sampling interval (default 5), and
 //! `NET_IO_SOAK_DRIVER` `blocking` or `reactor` (default: the server's choice).
-//! It passes when no normal or pooled exchange got stuck, every hostile peer was
+//! It passes when no normal, pooled, or big exchange got stuck, no connection was
+//! closed for want of buffer budget, every hostile peer was
 //! closed by its limit, memory in the last quarter is within 10% (plus 8 MiB) of
 //! the second quarter, and once the clients stop, every connection closes and the
 //! descriptor or handle count returns to where it was before the server started.
@@ -22,20 +24,35 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use net_io::{
-    AllowAll, Backoff, ConnectOptions, ConnectionId, ConnectionInfo, DriverKind, Event, EventSink,
-    Health, Input, KillReason, Limits, ListenerSpec, MinRate, PrefixPolicy, ServerBuilder, Session,
-    SessionContext, Step, TcpConnection,
+    AllowAll, Backoff, CloseReason, ConnectOptions, ConnectionId, ConnectionInfo, DriverKind,
+    Event, EventSink, Health, Input, KillReason, LimitKind, Limits, ListenerSpec, MinRate,
+    PrefixPolicy, ServerBuilder, Session, SessionContext, Step, TcpConnection,
 };
 
 /// One megabyte, sent sixteen times to `B` requests: what a slow reader is asked to take.
 static BIG: [u8; 1 << 20] = [b'b'; 1 << 20];
 
-/// `B` asks for 16 MiB, more than socket buffers hold; complete lines are echoed,
-/// so a peer that never finishes one is a slowloris to the server.
-struct Soak;
+/// What `W` asks for: copied out three output buffers a flush, the shape that
+/// spent 0.6.0's buffer budget within seconds (D-169).
+const STREAM: usize = 4 << 20;
+static BLOCK: [u8; 48 << 10] = [b'w'; 48 << 10];
+
+/// `B` asks for 16 MiB, more than socket buffers hold; `W` for `STREAM` bytes;
+/// complete lines are echoed, so a peer that never finishes one is a slowloris to
+/// the server.
+#[derive(Default)]
+struct Soak {
+    left: usize,
+}
 
 impl Session for Soak {
     fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+        if input.bytes().first() == Some(&b'W') {
+            let n = input.bytes().len();
+            input.consume(n);
+            self.left = STREAM;
+            return self.on_writable(cx);
+        }
         if input.bytes().first() == Some(&b'B') {
             let n = input.bytes().len();
             input.consume(n);
@@ -49,6 +66,23 @@ impl Session for Soak {
         };
         let taken = cx.output().push_partial(&input.bytes()[..=end]);
         input.consume(taken);
+        Step::Write
+    }
+
+    fn on_writable(&mut self, cx: &mut SessionContext<'_>) -> Step {
+        if self.left == 0 {
+            return Step::Read;
+        }
+        let want = self.left.min(BLOCK.len());
+        let mut at = 0;
+        while at < want {
+            let n = cx.output().push_partial(&BLOCK[at..want]);
+            if n == 0 {
+                break;
+            }
+            at += n;
+        }
+        self.left -= at;
         Step::Write
     }
 }
@@ -73,6 +107,7 @@ impl EventSink for Recent {
 #[derive(Default)]
 struct Counts {
     exchanges: AtomicU64,
+    big: AtomicU64,
     stuck: AtomicU64,
     pool_reconnects: AtomicU64,
     hostile_closed: AtomicU64,
@@ -238,6 +273,35 @@ fn normal(at: SocketAddr, stop: &AtomicBool, counts: &Counts, seed: u64) {
         } else {
             c.abort();
         }
+    }
+}
+
+/// Asks for `STREAM` bytes and reads them at full speed, again and again.
+fn big_writer(at: SocketAddr, stop: &AtomicBool, counts: &Counts) {
+    let mut buf = vec![0u8; 256 << 10];
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(20));
+        let Ok(mut c) = TcpConnection::connect_with(at, client_options()) else {
+            continue;
+        };
+        let mut left = STREAM;
+        let mut result = c.send_all(b"W");
+        while result.is_ok() && left > 0 {
+            let n = left.min(buf.len());
+            result = c.recv_exact(&mut buf[..n]);
+            left -= n;
+        }
+        match result {
+            Ok(()) => {
+                counts.big.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                if stuck(&e) {
+                    counts.stuck.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        c.abort();
     }
 }
 
@@ -437,6 +501,9 @@ fn clients(
         spawn(Box::new(move |s, c| pooled(at, s, c, 0x51ed + i)));
     }
     for _ in 0..4 {
+        spawn(Box::new(move |s, c| big_writer(at, s, c)));
+    }
+    for _ in 0..4 {
         spawn(Box::new(move |s, c| slowloris(at, s, c, limit)));
     }
     for _ in 0..2 {
@@ -452,7 +519,7 @@ fn warm_up(driver: DriverKind, workers: u16) {
         .listener(ListenerSpec::tcp("127.0.0.1:0"))
         .driver(driver)
         .workers(workers)
-        .sessions(|_: &ConnectionInfo| Soak)
+        .sessions(|_: &ConnectionInfo| Soak::default())
         .gate(AllowAll)
         .build()
         .expect("build");
@@ -517,7 +584,7 @@ fn test_soak_with_normal_and_hostile_peers() {
         .driver(driver)
         .workers(workers)
         .limits(limits)
-        .sessions(|_: &ConnectionInfo| Soak)
+        .sessions(|_: &ConnectionInfo| Soak::default())
         .gate(AllowAll)
         .events(recent.clone())
         .build()
@@ -557,12 +624,13 @@ fn test_soak_with_normal_and_hostile_peers() {
         let open = server.stats().open;
         let t = started.elapsed();
         println!(
-            "soak {:>7.0}s rss {:>6} KiB handles {:>5} open {:>5} exchanges {} stuck {} reconnects {} hostile closed {} held {} kills {}",
+            "soak {:>7.0}s rss {:>6} KiB handles {:>5} open {:>5} exchanges {} big {} stuck {} reconnects {} hostile closed {} held {} kills {}",
             t.as_secs_f64(),
             rss / 1024,
             fds,
             open,
             counts.exchanges.load(Ordering::Relaxed),
+            counts.big.load(Ordering::Relaxed),
             counts.stuck.load(Ordering::Relaxed),
             counts.pool_reconnects.load(Ordering::Relaxed),
             counts.hostile_closed.load(Ordering::Relaxed),
@@ -591,6 +659,15 @@ fn test_soak_with_normal_and_hostile_peers() {
         "a hostile peer outlived its limits"
     );
     assert!(counts.exchanges.load(Ordering::Relaxed) > 0);
+    assert!(
+        counts.big.load(Ordering::Relaxed) > 0,
+        "no big reply finished"
+    );
+    assert_eq!(
+        stats.closed_for(CloseReason::Limit(LimitKind::BufferBudget)),
+        0,
+        "closed for want of buffer budget"
+    );
     assert!(counts.hostile_closed.load(Ordering::Relaxed) > 0);
     assert!(
         common::eventually(Duration::from_secs(15), || server.stats().open == 0),
