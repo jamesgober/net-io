@@ -471,6 +471,17 @@ unsafe extern "C" {
     ) -> c_int;
     #[cfg(target_os = "linux")]
     fn sendfile(out: c_int, file: c_int, offset: *mut i64, count: usize) -> isize;
+    #[cfg(target_os = "linux")]
+    fn splice(
+        fd_in: c_int,
+        off_in: *mut i64,
+        fd_out: c_int,
+        off_out: *mut i64,
+        len: usize,
+        flags: u32,
+    ) -> isize;
+    #[cfg(target_os = "linux")]
+    fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
     #[cfg(target_os = "macos")]
     fn sendfile(
         file: c_int,
@@ -1128,6 +1139,117 @@ pub(crate) fn send_file_refused(e: &io::Error) -> bool {
 /// Bytes of `file` at `offset`, leaving its position alone.
 pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+/// Writes all of `buf` to `file` at `offset`, leaving its position alone.
+pub(crate) fn write_file_at(file: &std::fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
+}
+
+/// The pipe a socket's bytes pass through on their way into a file (`splice` moves
+/// pages between a pipe and anything else, never between two other descriptors).
+#[cfg(target_os = "linux")]
+pub(crate) struct SplicePipe {
+    read: std::fs::File,
+    write: OwnedFd,
+}
+
+/// `pipe2` with close-on-exec. The pipe stays blocking: it is empty before each
+/// receive and holds at most one receive's bytes, so no call on it waits.
+#[cfg(target_os = "linux")]
+const O_CLOEXEC: c_int = 0o2_000_000;
+#[cfg(target_os = "linux")]
+const SPLICE_F_MOVE: u32 = 1;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn splice_pipe() -> io::Result<SplicePipe> {
+    let mut fds = [-1 as c_int; 2];
+    // SAFETY: `fds` is a live array of two ints, which pipe2(2) fills on success.
+    cvt(unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) })?;
+    // SAFETY: pipe2 succeeded, so both are new descriptors that nothing else owns.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    Ok(SplicePipe {
+        read: std::fs::File::from(read),
+        write,
+    })
+}
+
+/// One receive of at most `len` bytes (at most the pipe's 64 KiB) from `sock` into
+/// `file` at `offset`, through `pipe`, without copying through user space: blocks
+/// like `recv` (under `SO_RCVTIMEO`), and 0 is the peer's FIN. Bytes that reached the
+/// pipe always reach the file: if the file turns `splice` down after them, they are
+/// read out of the pipe and written instead. `send_file_refused` errors before any
+/// byte moved mean the socket cannot be spliced, and the caller receives by copying.
+#[cfg(target_os = "linux")]
+pub(crate) fn splice_to_file(
+    sock: Sock<'_>,
+    pipe: &SplicePipe,
+    file: &std::fs::File,
+    offset: u64,
+    len: usize,
+) -> io::Result<usize> {
+    let start = i64::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let len = len.min(64 << 10);
+    let n = retry_interrupted(|| {
+        #[cfg(any(test, net_io_shim))]
+        let len = match super::shim::io(super::shim::Op::Recv, len)? {
+            Some(n) => n,
+            None => len,
+        };
+        // SAFETY: both descriptors are open for the call; no offsets (a socket and a
+        // pipe have none).
+        let n = unsafe {
+            splice(
+                sock.as_raw_fd(),
+                std::ptr::null_mut(),
+                pipe.write.as_raw_fd(),
+                std::ptr::null_mut(),
+                len,
+                SPLICE_F_MOVE,
+            )
+        };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n.unsigned_abs())
+        }
+    })?;
+    let mut moved = 0usize;
+    while moved < n {
+        let mut at = start + moved as i64;
+        // SAFETY: both descriptors are open for the call, and `at` is a live local
+        // the call reads and advances.
+        let m = unsafe {
+            splice(
+                pipe.read.as_raw_fd(),
+                std::ptr::null_mut(),
+                file.as_raw_fd(),
+                &raw mut at,
+                n - moved,
+                SPLICE_F_MOVE,
+            )
+        };
+        if m > 0 {
+            moved += m.unsigned_abs();
+            continue;
+        }
+        let e = io::Error::last_os_error();
+        if m < 0 && e.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        // The file turned it down (or wrote nothing): copy what the pipe holds.
+        let mut rest = [0u8; 4096];
+        while moved < n {
+            let want = (n - moved).min(rest.len());
+            let got = retry_interrupted(|| io::Read::read(&mut &pipe.read, &mut rest[..want]))?;
+            if got == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            write_file_at(file, &rest[..got], offset + moved as u64)?;
+            moved += got;
+        }
+    }
+    Ok(n)
 }
 
 /// Whether this OS can pin a thread.
@@ -3068,5 +3190,38 @@ mod layout {
             listener_kind(a.as_fd()).unwrap(),
             listener_kind(b.as_fd()).unwrap()
         );
+    }
+
+    /// `splice` moves a socket's bytes into a regular file itself (no refusal, so
+    /// no copy), at the offset asked, and the file's position stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_splice_to_file_moves_bytes_without_a_copy() {
+        use std::io::{Seek, Write};
+        assert_eq!(O_CLOEXEC, libc::O_CLOEXEC);
+        assert_eq!(SPLICE_F_MOVE, libc::SPLICE_F_MOVE);
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut tx = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (rx, _) = l.accept().unwrap();
+        tx.write_all(&[7u8; 5000]).unwrap();
+        let path = std::env::temp_dir().join(format!("nio-splice-{}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let pipe = splice_pipe().unwrap();
+        let mut got = 0;
+        while got < 5000 {
+            let n = splice_to_file(rx.as_fd(), &pipe, &file, 100 + got as u64, 5000 - got);
+            got += n.expect("spliced, not refused");
+        }
+        assert_eq!(file.stream_position().unwrap(), 0);
+        let body = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(body.len(), 5100);
+        assert!(body[100..].iter().all(|&b| b == 7));
     }
 }

@@ -59,12 +59,14 @@ soak, and a database consumer's transport needs.
 - `Backoff`, `TcpConnection::connect_retry`, `probe` (`Health`), and `drain`
   (`Drained`): reconnecting with backoff and jitter, a health check that consumes
   nothing, and a client-side drain.
+- `TcpConnection::recv_file`: receives into a file at an offset, by `splice` on
+  Linux and by copying elsewhere, under the usual read limits.
 - `PipeConnection::server_pid` and `server_owner_sid`.
 - `UdpOptions::verification_lifetime`, `UdpOptions::verified_table`,
   `UdpSocket::forget_verified`, `UdpContext::forget_verified`.
 - `SharedSocket`, the socket type `Driver::register` takes.
 - `descriptor_limit()`: the soft descriptor limit, for placing a cap under it.
-- Fuzz targets `wheel` and `rate`, a nightly fuzz workflow, and `tests/soak.rs`.
+- Fuzz targets `wheel`, `rate`, and `udp`, a nightly fuzz workflow, and `tests/soak.rs`.
 
 ### Changed
 

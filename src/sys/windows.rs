@@ -668,6 +668,26 @@ pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) ->
     std::os::windows::fs::FileExt::seek_read(file, buf, offset)
 }
 
+/// Writes all of `buf` to `file` at `offset`. Windows moves the file's position.
+pub(crate) fn write_file_at(
+    file: &std::fs::File,
+    mut buf: &[u8],
+    mut offset: u64,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        match std::os::windows::fs::FileExt::seek_write(file, buf, offset) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Whether this OS can pin a thread.
 pub(crate) const CAN_PIN: bool = true;
 

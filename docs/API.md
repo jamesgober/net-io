@@ -1101,6 +1101,7 @@ impl TcpConnection {
     pub fn send_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize, NetError>;
     pub fn send_all_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> Result<(), NetError>;
     pub fn send_file(&mut self, file: &File, offset: u64, len: u64) -> Result<u64, NetError>;
+    pub fn recv_file(&mut self, file: &File, offset: u64, len: u64) -> Result<u64, NetError>;
 
     pub fn shutdown(&mut self, how: Shutdown) -> Result<(), NetError>;
     pub fn close(self) -> Result<(), NetError>;                                  // graceful
@@ -1141,6 +1142,7 @@ A connected TCP socket that carries its own limits: every read honours the curre
 | `send_all` | loops from the exact offset until done, the deadline passes, or the gate denies; the gate check runs before each write (a retry after the socket was full is not checked again, D-074) | as `send` | 1 system call per chunk | P0 | 1 | `0.3.0` |
 | `send_vectored`, `send_all_vectored` | up to 64 slices per system call; `send_all_vectored` advances the slices in place (no copy) | as `send` | 1 system call per 64 slices | P1 | 2 | `0.3.0` |
 | `send_file` | `sendfile` (Linux, macOS, FreeBSD) in 1 MiB chunks (256 KiB on the reactor, at most 256 KiB of file per worker between two looks at the OS), a gate check before each; `TransmitFile` for `push_file` on the Windows reactor; falls back to read-and-write internally where zero copy is unavailable (TLS, pipes, Unix sockets off Linux, a held connection on Windows) | as `send`; `FileTruncated { sent }` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
+| `recv_file` | receives up to `len` bytes into `file` at `offset`, short only at the peer's FIN; on Linux by `splice` (socket to pipe to file, no copy through user space), with TLS, bytes read ahead, other systems, or a file `splice` turns down by a 64 KiB copy; the read deadlines, the minimum rate, kills, and drains apply as for `recv` | as `recv`; `Os` when the file cannot be written | one pipe (two descriptors) for the call; two `splice` calls per receive on Linux | P2 | 2 | `0.7.0` |
 | `shutdown` | half-close: `Write` sends FIN and keeps reading; `Read` stops reading; repeated calls are no-ops | `Closed`, `Os` | 1 system call | P0 | 1 | `0.3.0` |
 | `close` | graceful: FIN, then reads and discards up to 64 KiB for up to 2 s so unread input does not cause an RST that destroys the last response, then close | `TimedOut`, `Os` | flush plus linger | P0 | 1 | `0.3.0` |
 | `drain` | client-side drain: FIN, then reads and discards until the peer's FIN or `within`, then closes; closing after the peer's FIN leaves nothing unread, so neither side sees a reset. [`Drained`](#health-drained) says whether the peer finished and how much was discarded | none surfaced | 1 `shutdown`, one wait and read per arrival | P1 | 2 | `0.7.0` |

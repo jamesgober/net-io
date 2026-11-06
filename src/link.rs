@@ -1409,6 +1409,75 @@ impl Link {
         Ok(sent)
     }
 
+    /// Receives up to `len` bytes into `file` at `offset`, under the same deadlines,
+    /// minimum rate, kill, and drain as `read`; returns the count, short of `len` only
+    /// when the peer closed. Linux splices socket to pipe to file (no copy through
+    /// user space) unless TLS is on or bytes were read ahead; elsewhere, and when the
+    /// socket or the file turns `splice` down, it copies through a 64 KiB buffer.
+    pub(crate) fn recv_file(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        offset.checked_add(len).ok_or_else(|| {
+            NetError::from_os("recv", io::Error::from(io::ErrorKind::InvalidInput))
+        })?;
+        #[cfg(target_os = "linux")]
+        let pipe = if self.tls.is_none() {
+            Some(sys::splice_pipe().map_err(|e| self.os_error("pipe", e))?)
+        } else {
+            None
+        };
+        // Off for good once the socket or the file turns `splice` down.
+        #[cfg(target_os = "linux")]
+        let refused = std::cell::Cell::new(pipe.is_none());
+        let mut buf = vec![0u8; FILE_COPY.min(usize::try_from(len).unwrap_or(usize::MAX))];
+        let mut got = 0u64;
+        while got < len {
+            let take = usize::try_from(len - got).map_or(buf.len(), |n| n.min(buf.len()));
+            let at = offset + got;
+            // Set when the bytes went straight into the file, not into `buf`.
+            let spliced = std::cell::Cell::new(false);
+            #[cfg(target_os = "linux")]
+            let result = match &pipe {
+                Some(pipe) if !refused.get() => {
+                    self.read_raw_with(&mut buf[..take], |stream, b| {
+                        if !refused.get() {
+                            match sys::splice_to_file(stream.sock(), pipe, file, at, b.len()) {
+                                Ok(n) => {
+                                    spliced.set(true);
+                                    return Ok(n);
+                                }
+                                Err(e) if sys::send_file_refused(&e) => refused.set(true),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        sys::recv(stream, b)
+                    })
+                }
+                _ => self.read(&mut buf[..take]),
+            };
+            #[cfg(not(target_os = "linux"))]
+            let result = self.read(&mut buf[..take]);
+            match result? {
+                Got::Data(n) => {
+                    if !spliced.get() {
+                        sys::write_file_at(file, &buf[..n], at)
+                            .map_err(|e| self.os_error("write", e))?;
+                    }
+                    got += n as u64;
+                }
+                Got::Eof => break,
+                Got::Woken => {}
+            }
+        }
+        Ok(got)
+    }
+
     fn file_truncated(&mut self, sent: u64) -> NetError {
         self.fail(
             CloseReason::Io(OsErrorClass::FileTruncated),

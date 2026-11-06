@@ -873,6 +873,36 @@ impl TcpConnection {
         self.link()?.send_file(file, offset, len)
     }
 
+    /// Receives up to `len` bytes into `file` at `offset`, for snapshot and log
+    /// shipping; returns the count, which is short of `len` only when the peer
+    /// closed. On Linux the bytes go socket to pipe to file by `splice`, without a
+    /// copy through user space; with TLS, on other systems, and for a file `splice`
+    /// turns down, they are copied through a 64 KiB buffer. The read deadlines, the
+    /// minimum rate, kills, and drains apply as for [`TcpConnection::recv`]. The
+    /// file's position does not matter, and on Unix it does not move; a file opened
+    /// for appending is written at its end whatever `offset` says.
+    ///
+    /// ```no_run
+    /// let mut conn = net_io::connect("127.0.0.1:7000")?;
+    /// let file = std::fs::File::create("snapshot.bin")?;
+    /// let got = conn.recv_file(&file, 0, 1 << 30)?;
+    /// println!("received {got} bytes");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`TcpConnection::recv`]; `Os` when the file cannot be written, and the
+    /// connection is then closed.
+    pub fn recv_file(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, NetError> {
+        self.link()?.recv_file(file, offset, len)
+    }
+
     /// Sends every slice, advancing them in place (no copy).
     ///
     /// # Errors

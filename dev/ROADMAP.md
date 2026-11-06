@@ -222,10 +222,11 @@ The plan for each item:
 Done:
 - [x] Six independent reviews of the crate: 1 critical, 2 high, 24 medium, 33 low. Every critical, high, and medium finding fixed with a test that failed before it, or shown not to be a defect (D-143 to D-161); the lows fixed or entered in the register (R-34 to R-41).
 - [x] Attack tests for every threat in `docs/SECURITY.md`, now final (T-1 to T-52).
-- [x] Fuzzing: stateful targets `wheel` and `rate` (the second found D-153 at once); every target runs 30 s per push and 10 minutes nightly with the corpus kept.
+- [x] Fuzzing: stateful targets `wheel`, `rate`, and `udp` (the UDP guard against a model, D-171; `rate` found D-153 at once); every target runs 30 s per push and 10 minutes nightly with the corpus kept.
 - [x] Shim: the reactor's wait failing, a file stream giving way, the descriptor routine's reset.
-- [x] A database consumer's needs: bulk files give way every 256 KiB (D-141); `Backoff`, `connect_retry`, `probe`, `drain` (D-142); tail latency through the executor adapter scheduled with it in 0.8 (D-140).
-- [x] `tests/soak.rs`: normal, pooled, and hostile peers with memory, handle, and connection sampling.
+- [x] A database consumer's needs: bulk files give way every 256 KiB (D-141); receiving into a file, by `splice` on Linux (D-170); `Backoff`, `connect_retry`, `probe`, `drain` (D-142); tail latency through the executor adapter scheduled with it in 0.8 (D-140).
+- [x] `tests/soak.rs`: normal, pooled, big-writer, and hostile peers with memory, handle, and connection sampling.
+- [x] 0.6.1 merged in: the output-buffer leak fix (D-169) and serve-net's requests 4 and 7.
 
 ## v0.8.0 - Alpha
 Exit: two consumers in daily use for two weeks without a net-io defect of severity medium or above.
