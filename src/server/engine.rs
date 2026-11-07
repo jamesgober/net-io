@@ -1041,7 +1041,7 @@ impl Shared {
                 && !w.slot.drained()
             {
                 w.idle_cause.store(IDLE_SHED, Ordering::Release);
-                if !w.slot.drain_idle(generation) {
+                if !w.slot.shed_idle(generation) {
                     w.idle_cause.store(IDLE_DRAIN, Ordering::Release);
                 }
             }
@@ -3246,8 +3246,14 @@ fn drive<G: Gate, S: Session>(
                 link.set_deadline_scale(w.shared.deadline_scale());
                 link.set_rescales();
                 let idle = link.phase() == Phase::Idle && input.bytes().is_empty();
-                // A request that already arrived is answered before the drain closes.
-                if w.draining() && idle && !link.drain_kept() && !link.input_waiting() {
+                // A request that already arrived is answered before the drain closes,
+                // and a fresh connection may still bring its first one.
+                if w.draining()
+                    && idle
+                    && !link.drain_kept()
+                    && !link.input_waiting()
+                    && !link.awaits_first_request()
+                {
                     match drain_reached(w, link, s) {
                         Ok(next) => step = next,
                         Err(reason) => return reason,

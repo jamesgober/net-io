@@ -985,8 +985,10 @@ impl Server {
         self.shared.door()
     }
 
-    /// Closes the door, tells sessions to finish, closes idle connections at once,
-    /// waits for the rest until `deadline`, then kills them with `DrainDeadline`.
+    /// Closes the door, tells sessions to finish, closes idle connections at once
+    /// (one that has received nothing yet once `Limits::first_request_grace` from its
+    /// accept has passed), waits for the rest until `deadline`, then kills them with
+    /// `DrainDeadline`.
     pub fn drain(&self, deadline: Instant) -> DrainReport {
         self.shared.drain(deadline)
     }

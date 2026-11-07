@@ -31,6 +31,9 @@ const DRAINED: u64 = 32;
 /// Reads end, queued output still goes out until the bound, then a graceful close.
 /// A hard kill clears it.
 const SOFT: u64 = 64;
+/// With `DRAINED`: the mark is a shed (`ControlState::Shed`), not a drain, so a
+/// connection that has not brought its first request yet closes too.
+const SHED: u64 = 128;
 const REASON_SHIFT: u32 = 16;
 const GEN_SHIFT: u32 = 32;
 
@@ -279,6 +282,15 @@ impl KillSlot {
     /// writes are untouched. Returns `false` when the
     /// connection is not idle, already drained, killed, or closing.
     pub(crate) fn drain_idle(&self, generation: u32) -> bool {
+        self.mark_idle(generation, DRAINED)
+    }
+
+    /// As `drain_idle`, for a shed: the owner closes it even before its first request.
+    pub(crate) fn shed_idle(&self, generation: u32) -> bool {
+        self.mark_idle(generation, DRAINED | SHED)
+    }
+
+    fn mark_idle(&self, generation: u32, mark: u64) -> bool {
         let mut s = self.state.load(Ordering::Acquire);
         loop {
             if gen_of(s) != generation
@@ -289,7 +301,7 @@ impl KillSlot {
             }
             match self.state.compare_exchange_weak(
                 s,
-                s | DRAINED | KILLING,
+                s | mark | KILLING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -318,7 +330,7 @@ impl KillSlot {
             // SAFETY: the KILLING bit is set, so `raw` is open for this call (as below).
             if unsafe { super::input_waiting_raw(raw) } {
                 self.state
-                    .fetch_and(!(DRAINED | KILLING), Ordering::Release);
+                    .fetch_and(!(DRAINED | SHED | KILLING), Ordering::Release);
                 return false;
             }
             // SAFETY: the KILLING bit is set; the owner's `begin_close` waits for it to
@@ -336,7 +348,13 @@ impl KillSlot {
     /// arrived): a later pass may mark it again.
     #[inline]
     pub(crate) fn undrain(&self) {
-        self.state.fetch_and(!DRAINED, Ordering::AcqRel);
+        self.state.fetch_and(!(DRAINED | SHED), Ordering::AcqRel);
+    }
+
+    /// Whether the mark is a shed's.
+    #[inline]
+    pub(crate) fn shed(&self) -> bool {
+        self.state.load(Ordering::Acquire) & SHED != 0
     }
 
     /// Whether a drain marked this connection.

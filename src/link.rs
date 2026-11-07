@@ -1211,6 +1211,11 @@ impl Link {
                             self.slot.undrain();
                             return Some(Ok(Got::Woken));
                         }
+                        if !self.slot.shed() && self.awaits_first_request() {
+                            // Fresh: a later pass of the drain marks it again.
+                            self.slot.undrain();
+                            return Some(Ok(Got::Woken));
+                        }
                         if !self.input_waiting() {
                             if self.drains & DRAIN_HOOK != 0 {
                                 // The session hears it (`on_drain`) and decides.
@@ -1883,6 +1888,19 @@ impl Link {
 
     /// Whether bytes wait in the socket now: one zero-timeout wait. A drain leaves a
     /// connection whose next request already arrived to answer it first.
+    /// A connection that has received nothing yet, within `first_request_grace` of
+    /// its accept: a drain lets it bring its first request instead of closing it as
+    /// idle, since a client that connected just before the drain is still writing it.
+    pub(crate) fn awaits_first_request(&self) -> bool {
+        self.bytes_in == 0
+            && self.pending.is_none()
+            && self
+                .info
+                .accepted_at
+                .checked_add(self.limits.first_request_grace)
+                .is_some_and(|until| self.now() < until)
+    }
+
     pub(crate) fn input_waiting(&self) -> bool {
         self.pending.is_some()
             || matches!(

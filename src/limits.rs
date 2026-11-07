@@ -183,6 +183,7 @@ pub struct Limits {
     completion_queue: Option<u32>,
     buffer_budget: Option<u64>,
     drain_timeout: Option<Duration>,
+    first_request_grace: Option<Duration>,
     graceful_linger: Option<(Duration, u32)>,
     denial_linger: Option<Duration>,
     denial_linger_max: Option<u32>,
@@ -214,6 +215,9 @@ pub(crate) struct Effective {
     pub completion_queue: u32,
     pub buffer_budget: u64,
     pub drain_timeout: Duration,
+    /// How long a drain lets a connection that has sent nothing yet bring its first
+    /// request before it counts as idle.
+    pub first_request_grace: Duration,
     pub graceful_linger: Duration,
     pub graceful_linger_bytes: u32,
     pub denial_linger: Duration,
@@ -264,6 +268,7 @@ impl Effective {
             completion_queue: if blocking { 1 } else { 1024 },
             buffer_budget: if blocking { 64 << 20 } else { 512 << 20 },
             drain_timeout: Duration::from_secs(30),
+            first_request_grace: Duration::from_secs(1),
             graceful_linger: Duration::from_secs(2),
             graceful_linger_bytes: 64 * 1024,
             denial_linger: Duration::from_millis(100),
@@ -415,6 +420,7 @@ impl Limits {
             completion_queue: self.completion_queue.unwrap_or(d.completion_queue),
             buffer_budget: self.buffer_budget.unwrap_or(d.buffer_budget),
             drain_timeout: self.drain_timeout.unwrap_or(d.drain_timeout),
+            first_request_grace: self.first_request_grace.unwrap_or(d.first_request_grace),
             graceful_linger,
             graceful_linger_bytes,
             denial_linger: self.denial_linger.unwrap_or(d.denial_linger),
@@ -455,6 +461,7 @@ impl Limits {
             completion_queue,
             buffer_budget,
             drain_timeout,
+            first_request_grace,
             graceful_linger,
             denial_linger,
             denial_linger_max,
@@ -483,6 +490,7 @@ impl Limits {
             completion_queue: Some(e.completion_queue),
             buffer_budget: Some(e.buffer_budget),
             drain_timeout: Some(e.drain_timeout),
+            first_request_grace: Some(e.first_request_grace),
             graceful_linger: Some((e.graceful_linger, e.graceful_linger_bytes)),
             denial_linger: Some(e.denial_linger),
             denial_linger_max: Some(e.denial_linger_max),
@@ -580,6 +588,12 @@ impl Limits {
     #[must_use]
     pub fn drain_timeout(&self) -> Option<Duration> {
         self.drain_timeout
+    }
+    /// How long a drain waits for the first request of a connection that has sent
+    /// nothing yet.
+    #[must_use]
+    pub fn first_request_grace(&self) -> Option<Duration> {
+        self.first_request_grace
     }
     /// The graceful-close linger: time and bytes read and discarded.
     #[must_use]
@@ -719,6 +733,17 @@ impl LimitsBuilder {
         self
     }
 
+    /// How long a drain waits, from a connection's accept, for the first request of
+    /// a connection that has sent nothing yet before it counts the connection idle
+    /// and closes it. A client that connected just before the drain and writes its
+    /// request right after is answered instead of finding the connection closed.
+    /// Default 1 s; the drain's deadline still bounds it; zero closes such a
+    /// connection at once, as before 0.8.
+    pub fn first_request_grace(mut self, time: Duration) -> Self {
+        self.limits.first_request_grace = Some(time);
+        self
+    }
+
     /// The graceful-close linger: time and bytes read and discarded.
     pub fn graceful_linger(mut self, time: Duration, bytes: u32) -> Self {
         self.limits.graceful_linger = Some((time, bytes));
@@ -833,6 +858,9 @@ impl LimitsBuilder {
         }
         if l.graceful_linger.is_some_and(|(d, _)| long(d)) {
             return Err(invalid("graceful_linger", TOO_LONG));
+        }
+        if l.first_request_grace.is_some_and(long) {
+            return Err(invalid("first_request_grace", TOO_LONG));
         }
         if l.denial_linger.is_some_and(long) {
             return Err(invalid("denial_linger", TOO_LONG));

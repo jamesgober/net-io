@@ -1041,7 +1041,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     // A request the socket already reported is answered first.
                     let readable = c.readable;
                     let kept = c.drain_kept;
-                    if idle && self.shared.is_draining() && !readable && !kept {
+                    let fresh = c.link.awaits_first_request();
+                    if idle && self.shared.is_draining() && !readable && !kept && !fresh {
                         return self.drain_reached(index, CloseReason::Drained);
                     }
                     if idle && self.shed(lane) {
@@ -2049,6 +2050,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     && !c.drain_kept
                     && !c.readable
                     && c.link.phase() == Phase::Idle
+                    && (reason != CloseReason::Drained || !c.link.awaits_first_request())
                     && c.input
                         .as_ref()
                         .is_none_or(|n| !n.lent() && n.bytes().is_empty())

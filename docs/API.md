@@ -884,6 +884,7 @@ impl Limits {
     pub fn completion_queue(&self) -> Option<u32>;
     pub fn buffer_budget(&self) -> Option<u64>;
     pub fn drain_timeout(&self) -> Option<Duration>;
+    pub fn first_request_grace(&self) -> Option<Duration>;        // 0.8.0
     pub fn graceful_linger(&self) -> Option<(Duration, u32)>;
     pub fn denial_linger(&self) -> Option<Duration>;              // 0.8.0
     pub fn denial_linger_max(&self) -> Option<u32>;               // 0.8.0
@@ -922,6 +923,7 @@ impl LimitsBuilder {
     pub fn completion_queue(self, n: u32) -> Self;             // rounded up to a power of two
     pub fn buffer_budget(self, bytes: u64) -> Self;
     pub fn drain_timeout(self, d: Duration) -> Self;
+    pub fn first_request_grace(self, d: Duration) -> Self;      // 0.8.0; zero: a drain closes it at once
     pub fn graceful_linger(self, d: Duration, bytes: u32) -> Self;
     pub fn denial_linger(self, d: Duration) -> Self;            // 0.8.0; zero: reset at once
     pub fn denial_linger_max(self, n: u32) -> Self;             // 0.8.0; server-wide soft closes at once
@@ -992,6 +994,7 @@ assert!(Limits::builder().max_connections(100).build().is_ok()); // max_per_sour
 | `completion_queue` | 1,024 per worker | 1 per worker | offload floods | a blocking worker serves one connection |
 | `buffer_budget` | 512 MiB | 64 MiB | total memory | at least `workers x 64 KiB x 2` (checked) |
 | `drain_timeout` | 30 s | 30 s | hung shutdowns | matches common orchestrator grace periods |
+| `first_request_grace` | 1 s | same | a drain closing a connection whose first request is still on its way, so the client finds it closed unanswered | from its accept, how long a drain lets a connection that has received nothing bring its first request before it counts as idle; the drain deadline still bounds it, and a shed does not wait (D-189, `0.8.0`) |
 | `graceful_linger` | 2 s, 64 KiB | same | RST on unread data at close | enough for the peer to see the last response |
 | `denial_linger` | 100 ms | same | a reset that destroys a denial before the peer reads it (Windows discards unsent data on an abortive close) | the linger after a denial went out: FIN, then reads discarded until the peer closes or this passes (D-182, `0.8.0`); its bytes cap is `graceful_linger`'s |
 | `denial_linger_max` | `max_connections` / 16 (at least 1) | same | a denial storm holding slots and pool workers through lingers | soft closes at once, server-wide; past it a denial resets at once and `close_after_flush` acts as `kill` (`0.8.0`) |
