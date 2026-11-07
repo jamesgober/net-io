@@ -12,6 +12,9 @@ on:
       seconds:
         description: Soak length in seconds per driver
         default: "19800"
+      icmplim:
+        description: "net.inet.icmp.icmplim for the run (the closed-port reset limit; 0 is none; empty keeps the runner's, D-193)"
+        default: ""
 
 permissions:
   contents: read
@@ -28,6 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - name: Reset limit
+        if: ${{ inputs.icmplim != '' }}
+        run: sudo sysctl -w net.inet.icmp.icmplim=${{ inputs.icmplim }}
       - name: Soak
         run: cargo test --release --all-features --test soak -- --nocapture
         env:
