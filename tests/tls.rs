@@ -900,3 +900,67 @@ fn test_idle_tls_connections_hold_no_buffers() {
     );
     assert_eq!(server.stats().open, 101, "{:?}", server.stats());
 }
+
+/// tls-net's report: on the pool, the first connection after a handshake timeout
+/// was closed at once as a second `HandshakeTimeout`. A stalled hello times out,
+/// then a fresh client must complete its handshake, again and again.
+#[test]
+fn test_a_connection_after_a_handshake_timeout_gets_its_own_deadline() {
+    // A handler runs on the pool only.
+    {
+        let driver = net_io::DriverKind::Blocking;
+        let rec = Recorder::default();
+        let limits = Limits::blocking_defaults()
+            .to_builder()
+            .handshake_timeout(Duration::from_millis(300))
+            .build()
+            .expect("limits");
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+            .driver(driver)
+            .workers(4)
+            .limits(limits)
+            .tls(Toy)
+            .handler(echo)
+            .gate(AllowAll)
+            .events(rec.clone())
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        for round in 0..30 {
+            let before = rec.0.lock().expect("lock").len();
+            let mut stalled = client(addr(&server));
+            stalled.write_all(b"H").expect("one byte");
+            assert!(
+                eventually(WAIT, || rec.0.lock().expect("lock").len() > before),
+                "{driver:?} round {round}: no close"
+            );
+            assert_eq!(
+                rec.0.lock().expect("lock")[before],
+                CloseReason::HandshakeTimeout,
+                "{driver:?} round {round}"
+            );
+            let mut fresh = ToyClient::connect(&server);
+            let greeting = b"sni=Some(\"example.test\");";
+            assert_eq!(
+                fresh.recv_exact(greeting.len()),
+                greeting,
+                "{driver:?} round {round}"
+            );
+            fresh.send(b"ping");
+            assert_eq!(fresh.recv_exact(4), b"ping", "{driver:?} round {round}");
+            drop(fresh);
+            drop(stalled);
+            assert!(
+                eventually(WAIT, || rec.0.lock().expect("lock").len() == before + 2),
+                "{driver:?} round {round}"
+            );
+            let closes = rec.0.lock().expect("lock").clone();
+            assert_ne!(
+                closes[before + 1],
+                CloseReason::HandshakeTimeout,
+                "{driver:?} round {round}: {closes:?}"
+            );
+        }
+    }
+}

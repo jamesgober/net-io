@@ -123,6 +123,11 @@ const DRAIN_REACHED: u8 = 2;
 const DRAIN_KEPT: u8 = 4;
 /// Not a drain bit: net-io still picks the phase (the owner never set one).
 const AUTO_PHASE: u8 = 8;
+/// Not a drain bit: the session's last bytes went out while the connection was
+/// idle (a reply at open, a push). The peer may be sending its own request, so a
+/// close lingers instead of taking the idle shortcut; otherwise that request draws
+/// a reset and the peer's stack can discard the reply it already holds (D-192).
+const SPOKE_IDLE: u8 = 16;
 
 /// Soft closes in progress across a server, against `Limits::denial_linger_max`.
 #[derive(Debug)]
@@ -217,7 +222,8 @@ pub(crate) struct Link {
     /// `DRAIN_HOOK`: the owner hears a drain at its idle wait (`Session::on_drain`)
     /// instead of the read closing with `Drained`; `DRAIN_REACHED`: that news;
     /// `DRAIN_KEPT`: the session kept the connection through the drain; and
-    /// `AUTO_PHASE`: net-io picks the phase (the owner never set one). One byte.
+    /// `AUTO_PHASE`: net-io picks the phase (the owner never set one); `SPOKE_IDLE`:
+    /// the last send went out while idle. One byte.
     drains: u8,
     /// The soft close (after a denial, or `close_after_flush`), once there is one.
     /// Boxed: one pointer on every connection, the rest only where it happens.
@@ -594,10 +600,11 @@ impl Link {
                     // Records the engine wrote on its own are not the session's reply:
                     // they must not end an exchange, and they go out under the
                     // outbound rate like any send.
-                    let replied = self.replied;
+                    let (replied, spoke) = (self.replied, self.drains & SPOKE_IDLE);
                     self.rate_out.activate(self.now());
                     let r = self.send_raw_all(t.cout.as_slice());
                     self.replied = replied;
+                    self.drains = self.drains & !SPOKE_IDLE | spoke;
                     r?;
                 }
                 TlsNext::NeedInput => {
@@ -1357,6 +1364,11 @@ impl Link {
         let now = self.now();
         self.bytes_out += n as u64;
         self.replied = true;
+        if self.phase == Phase::Idle {
+            self.drains |= SPOKE_IDLE;
+        } else {
+            self.drains &= !SPOKE_IDLE;
+        }
         self.progress_at = now;
         self.rate_out.record(now, n);
         if n > 0 {
@@ -1988,9 +2000,10 @@ impl Link {
     /// session's reply, so the exchange does not end on them.
     #[cfg(feature = "reactor")]
     pub(crate) fn note_engine_sent(&mut self, n: usize) -> Result<(), NetError> {
-        let replied = self.replied;
+        let (replied, spoke) = (self.replied, self.drains & SPOKE_IDLE);
         let r = self.note_sent(n);
         self.replied = replied;
+        self.drains = self.drains & !SPOKE_IDLE | spoke;
         r
     }
 
@@ -2249,7 +2262,9 @@ impl Link {
     pub(crate) fn begin_graceful_close(&mut self, readable: bool) -> bool {
         self.tls_close_notify();
         let _ = self.stream.shutdown(Shutdown::Write);
-        self.stream.half_closes() && !self.peer_closed && (self.phase != Phase::Idle || readable)
+        self.stream.half_closes()
+            && !self.peer_closed
+            && (self.phase != Phase::Idle || readable || self.drains & SPOKE_IDLE != 0)
     }
 
     /// Closes the socket after the driver let go of it.
@@ -2404,8 +2419,10 @@ impl Link {
         }
         // Between exchanges with nothing unread there is nothing to protect from a
         // reset: close at once (one zero-timeout poll), so a drain of idle
-        // connections does not wait out the linger.
+        // connections does not wait out the linger. Not after the session spoke
+        // while idle: the peer's answer may be on its way (D-192).
         if self.phase == Phase::Idle
+            && self.drains & SPOKE_IDLE == 0
             && !matches!(self.wait(Interest::Read, Duration::ZERO), Ok(Ready::Socket))
         {
             return false;
