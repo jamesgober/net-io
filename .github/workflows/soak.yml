@@ -12,8 +12,8 @@ on:
       seconds:
         description: Soak length in seconds per driver
         default: "19800"
-      icmplim:
-        description: "net.inet.icmp.icmplim for the run (the closed-port reset limit; 0 is none; empty keeps the runner's, D-193)"
+      sysctl:
+        description: "A sysctl to set for the run, as name=value (for D-193, the closed-port reset limit); empty sets nothing"
         default: ""
 
 permissions:
@@ -31,9 +31,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - name: Reset limit
-        if: ${{ inputs.icmplim != '' }}
-        run: sudo sysctl -w net.inet.icmp.icmplim=${{ inputs.icmplim }}
+      - name: Reset limits
+        run: sysctl -a | grep -iE "icmplim|rst|blackhole|bandlim|ratelimit" || true
+      - name: Set sysctl
+        if: ${{ inputs.sysctl != '' }}
+        run: sudo sysctl -w "$SETTING"
+        env:
+          SETTING: ${{ inputs.sysctl }}
       - name: Soak
         run: cargo test --release --all-features --test soak -- --nocapture
         env:
