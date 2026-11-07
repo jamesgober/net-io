@@ -173,6 +173,34 @@ struct Trace(Mutex<Ports>);
 
 static TRACE: OnceLock<Trace> = OnceLock::new();
 
+/// When the run began, so the lines a client prints can be laid against the samples
+/// and against a stall.
+static START: OnceLock<Instant> = OnceLock::new();
+
+/// Prints a line with the second of the run it happened in; nothing during the
+/// warm-up, whose counts are not checked.
+fn note(line: std::fmt::Arguments<'_>) {
+    if let Some(t) = START.get() {
+        eprintln!("{line} at {}s", t.elapsed().as_secs());
+    }
+}
+
+/// Sleeps 50 ms again and again and reports each overrun of a second or more, and
+/// the worst, in milliseconds: a stall of the whole process (a loaded host, a paused
+/// VM) holds every peer at once, which no server limit can close in time.
+fn watch_stalls(stop: &AtomicBool, worst: &AtomicU64) {
+    let nap = Duration::from_millis(50);
+    while !stop.load(Ordering::Relaxed) {
+        let t = Instant::now();
+        std::thread::sleep(nap);
+        let late = u64::try_from(t.elapsed().saturating_sub(nap).as_millis()).unwrap_or(u64::MAX);
+        worst.fetch_max(late, Ordering::Relaxed);
+        if late >= 1_000 {
+            note(format_args!("stall: {late} ms"));
+        }
+    }
+}
+
 /// The server's and the client's view of a connection whose exchange timed out:
 /// whether the server ever had it, whether it was killed or closed and when, and
 /// whether a byte sent now draws a reset (the server's socket is gone).
@@ -220,6 +248,7 @@ struct Counts {
     held_slow_reader: AtomicU64,
     held_hoarder: AtomicU64,
     kills: AtomicU64,
+    stall_ms: AtomicU64,
 }
 
 fn env_secs(name: &str, default: u64) -> Duration {
@@ -334,7 +363,10 @@ fn client_options() -> ConnectOptions {
 fn stuck(e: &net_io::NetError, c: &mut TcpConnection, client: &str, started: Instant) -> bool {
     let timed_out = matches!(e, net_io::NetError::TimedOut { .. });
     if timed_out {
-        eprintln!("stuck: {client} {e:?}: {}", explain(c, started));
+        note(format_args!(
+            "stuck: {client} {e:?}: {}",
+            explain(c, started)
+        ));
     }
     timed_out
 }
@@ -494,6 +526,7 @@ fn slowloris(at: SocketAddr, stop: &AtomicBool, counts: &Counts, limit: Duration
                 return;
             }
             if started.elapsed() > limit {
+                note(format_args!("held: slowloris"));
                 counts.hostile_held.fetch_add(1, Ordering::Relaxed);
                 counts.held_slowloris.fetch_add(1, Ordering::Relaxed);
                 break;
@@ -543,6 +576,7 @@ fn slow_reader(at: SocketAddr, stop: &AtomicBool, counts: &Counts, limit: Durati
                 // reader is left with the kernel's copy (see `tests/server.rs`,
                 // `test_reader_slower_than_the_rate_is_closed_while_it_reads`).
                 if cfg!(target_os = "linux") {
+                    note(format_args!("held: slow reader"));
                     counts.hostile_held.fetch_add(1, Ordering::Relaxed);
                 }
                 counts.held_slow_reader.fetch_add(1, Ordering::Relaxed);
@@ -566,6 +600,7 @@ fn hoarder(at: SocketAddr, stop: &AtomicBool, counts: &Counts, limit: Duration) 
             let _ = c.set_read_timeout(Some(left));
             match c.read(&mut b) {
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    note(format_args!("held: hoarder"));
                     counts.hostile_held.fetch_add(1, Ordering::Relaxed);
                     counts.held_hoarder.fetch_add(1, Ordering::Relaxed);
                 }
@@ -711,6 +746,12 @@ fn test_soak_with_normal_and_hostile_peers() {
 
     let mut threads = clients(at, &stop, &counts, hostile_limit);
     {
+        let (stop, counts) = (stop.clone(), counts.clone());
+        threads.push(std::thread::spawn(move || {
+            watch_stalls(&stop, &counts.stall_ms);
+        }));
+    }
+    {
         // Kills a recent connection every 200 ms, as an operator or a gate would.
         let (stop, counts, recent) = (stop.clone(), counts.clone(), recent.clone());
         let handle = server.handle();
@@ -732,6 +773,7 @@ fn test_soak_with_normal_and_hostile_peers() {
     }
 
     let started = Instant::now();
+    let _ = START.set(started);
     let mut samples: Vec<(Duration, u64, u64, u64)> = Vec::new();
     while started.elapsed() < length {
         std::thread::sleep(every.min(length.saturating_sub(started.elapsed())));
@@ -739,7 +781,7 @@ fn test_soak_with_normal_and_hostile_peers() {
         let open = server.stats().open;
         let t = started.elapsed();
         println!(
-            "soak {:>7.0}s rss {:>6} KiB handles {:>5} open {:>5} exchanges {} big {} stuck {} reconnects {} hostile closed {} held {} kills {}",
+            "soak {:>7.0}s rss {:>6} KiB handles {:>5} open {:>5} exchanges {} big {} stuck {} reconnects {} hostile closed {} held {} kills {} stall {} ms",
             t.as_secs_f64(),
             rss / 1024,
             fds,
@@ -751,6 +793,7 @@ fn test_soak_with_normal_and_hostile_peers() {
             counts.hostile_closed.load(Ordering::Relaxed),
             counts.hostile_held.load(Ordering::Relaxed),
             counts.kills.load(Ordering::Relaxed),
+            counts.stall_ms.load(Ordering::Relaxed),
         );
         samples.push((t, rss, fds, open));
     }
