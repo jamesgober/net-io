@@ -16,11 +16,11 @@
 
 mod common;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use net_io::{
@@ -87,7 +87,8 @@ impl Session for Soak {
     }
 }
 
-/// Keeps the ids of recent connections, for the thread that kills some of them.
+/// Keeps the ids of recent connections, for the thread that kills some of them,
+/// and what the server reported about each client port, for a stuck exchange.
 #[derive(Clone, Default)]
 struct Recent(Arc<Mutex<VecDeque<ConnectionId>>>);
 
@@ -101,7 +102,110 @@ impl EventSink for Recent {
                 q.push_back(*id);
             }
         }
+        if let Ok(mut t) = TRACE.get_or_init(Trace::default).0.lock() {
+            t.event(e);
+        }
     }
+}
+
+/// What the server reported about one connection.
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    id: ConnectionId,
+    accepted: Instant,
+    killed: Option<Instant>,
+    closed: Option<(Instant, CloseReason, u64, u64)>,
+}
+
+/// The last connection the server saw from each client port (at most 65,536), and
+/// the port of each open one.
+#[derive(Default)]
+struct Ports {
+    by_port: HashMap<u16, Seen>,
+    port_of: HashMap<ConnectionId, u16>,
+}
+
+impl Ports {
+    fn event(&mut self, e: &Event) {
+        let now = Instant::now();
+        match *e {
+            Event::Accepted {
+                id, peer: Some(p), ..
+            } => {
+                let seen = Seen {
+                    id,
+                    accepted: now,
+                    killed: None,
+                    closed: None,
+                };
+                self.by_port.insert(p.port(), seen);
+                self.port_of.insert(id, p.port());
+            }
+            Event::Killed { id, .. } => {
+                if let Some(s) = self.seen(id) {
+                    s.killed = Some(now);
+                }
+            }
+            Event::Closed {
+                id,
+                reason,
+                bytes_in,
+                bytes_out,
+                ..
+            } => {
+                if let Some(s) = self.seen(id) {
+                    s.closed = Some((now, reason, bytes_in, bytes_out));
+                }
+                self.port_of.remove(&id);
+            }
+            _ => {}
+        }
+    }
+
+    fn seen(&mut self, id: ConnectionId) -> Option<&mut Seen> {
+        let port = self.port_of.get(&id)?;
+        self.by_port.get_mut(port).filter(|s| s.id == id)
+    }
+}
+
+#[derive(Default)]
+struct Trace(Mutex<Ports>);
+
+static TRACE: OnceLock<Trace> = OnceLock::new();
+
+/// The server's and the client's view of a connection whose exchange timed out:
+/// whether the server ever had it, whether it was killed or closed and when, and
+/// whether a byte sent now draws a reset (the server's socket is gone).
+fn explain(c: &mut TcpConnection, started: Instant) -> String {
+    let port = c.local_addr().port();
+    let now = Instant::now();
+    let ago = |t: Instant| now.saturating_duration_since(t).as_millis();
+    let server = TRACE
+        .get()
+        .and_then(|t| t.0.lock().ok().and_then(|p| p.by_port.get(&port).copied()));
+    // The last connection the server accepted from this port: a different one if
+    // it was accepted before this connection began.
+    let server = server.map_or_else(
+        || "never accepted this port".to_string(),
+        |s| {
+            format!(
+                "{:?} accepted {} ms ago, killed {:?}, closed {:?}",
+                s.id,
+                ago(s.accepted),
+                s.killed.map(ago),
+                s.closed.map(|(t, r, i, o)| (ago(t), r, i, o)),
+            )
+        },
+    );
+    let before = (c.take_error().ok().flatten(), c.probe());
+    let sent = c.send_all(b"x");
+    std::thread::sleep(Duration::from_millis(500));
+    let after = (c.take_error().ok().flatten(), c.probe());
+    format!(
+        "port {port}, began {} ms ago; server: {server}; client before {before:?}, \
+         one byte {sent:?}, after {after:?}",
+        ago(started)
+    )
 }
 
 #[derive(Default)]
@@ -227,10 +331,10 @@ fn client_options() -> ConnectOptions {
 
 /// Whether a client error means the server stopped answering (not a kill or a
 /// refusal, which the run causes on purpose).
-fn stuck(e: &net_io::NetError) -> bool {
+fn stuck(e: &net_io::NetError, c: &mut TcpConnection, client: &str, started: Instant) -> bool {
     let timed_out = matches!(e, net_io::NetError::TimedOut { .. });
     if timed_out {
-        eprintln!("stuck: {e:?}");
+        eprintln!("stuck: {client} {e:?}: {}", explain(c, started));
     }
     timed_out
 }
@@ -243,6 +347,7 @@ fn normal(at: SocketAddr, stop: &AtomicBool, counts: &Counts, seed: u64) {
     let mut buf = vec![0u8; 16 << 10];
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
         let Ok(mut c) = TcpConnection::connect_with(at, client_options()) else {
             // Refused at the cap by the flood: try again shortly.
             continue;
@@ -260,7 +365,7 @@ fn normal(at: SocketAddr, stop: &AtomicBool, counts: &Counts, seed: u64) {
                     counts.exchanges.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    if stuck(&e) {
+                    if stuck(&e, &mut c, "normal", started) {
                         counts.stuck.fetch_add(1, Ordering::Relaxed);
                     }
                     alive = false;
@@ -281,6 +386,7 @@ fn big_writer(at: SocketAddr, stop: &AtomicBool, counts: &Counts) {
     let mut buf = vec![0u8; 256 << 10];
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
         let Ok(mut c) = TcpConnection::connect_with(at, client_options()) else {
             continue;
         };
@@ -296,7 +402,7 @@ fn big_writer(at: SocketAddr, stop: &AtomicBool, counts: &Counts) {
                 counts.big.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
-                if stuck(&e) {
+                if stuck(&e, &mut c, "big", started) {
                     counts.stuck.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -318,6 +424,7 @@ fn pooled(at: SocketAddr, stop: &AtomicBool, counts: &Counts, seed: u64) {
         let reuse = pool
             .pop()
             .and_then(|mut c| matches!(c.probe(), Ok(Health::Open)).then_some(c));
+        let started = Instant::now();
         let mut conn = match reuse {
             Some(c) => c,
             None => {
@@ -342,8 +449,11 @@ fn pooled(at: SocketAddr, stop: &AtomicBool, counts: &Counts, seed: u64) {
             .send_all(&msg)
             .and_then(|()| conn.recv_exact(&mut back))
         {
-            Err(e) if stuck(&e) => {
-                counts.stuck.fetch_add(1, Ordering::Relaxed);
+            // Killed while in the pool or mid-exchange: the next turn reconnects.
+            Err(e) => {
+                if stuck(&e, &mut conn, "pooled", started) {
+                    counts.stuck.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Ok(()) => {
                 counts.exchanges.fetch_add(1, Ordering::Relaxed);
@@ -353,8 +463,6 @@ fn pooled(at: SocketAddr, stop: &AtomicBool, counts: &Counts, seed: u64) {
                     let _ = conn.drain(Duration::from_millis(500));
                 }
             }
-            // Killed while in the pool or mid-exchange: the next turn reconnects.
-            Err(_) => {}
         }
         // Shrink now and then: a drain closes from the client's side, and each such
         // close keeps a port in TIME_WAIT (two minutes on Windows, 16,384 ports).

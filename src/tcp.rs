@@ -101,7 +101,12 @@ fn connect_error(addr: SocketAddr, after: Duration, e: io::Error) -> NetError {
 
 /// Whether a connect error is one a restarting or failing-over server produces, or
 /// a shortage of local ports that passes (the backoff bounds the wait either way).
-fn reconnectable(e: &NetError) -> bool {
+/// A `local` address the host does not have is a configuration error: its bind
+/// fails with the same `AddrNotAvailable`, but names the local address.
+fn reconnectable(e: &NetError, local: Option<SocketAddr>) -> bool {
+    if matches!(e, NetError::AddrNotAvailable { addr } if Some(*addr) == local) {
+        return false;
+    }
     e.is_retryable()
         || matches!(
             e,
@@ -634,7 +639,7 @@ impl TcpConnection {
                 Ok(conn) => return Ok(conn),
                 Err(e) => e,
             };
-            if !reconnectable(&err) {
+            if !reconnectable(&err, options.local_addr) {
                 return Err(err);
             }
             match backoff.next_delay() {
@@ -1408,21 +1413,29 @@ mod tests {
             io::Error::from(io::ErrorKind::ConnectionReset),
         );
         assert!(matches!(reset, NetError::ConnectionReset));
-        assert!(reconnectable(&reset));
+        assert!(reconnectable(&reset, None));
         #[cfg(windows)]
         let shortages = [10055, 10048, 10049];
         #[cfg(unix)]
         let shortages = [sys::errno::EADDRNOTAVAIL, sys::errno::EADDRINUSE];
         for code in shortages {
             let short = connect_error(addr, Duration::ZERO, io::Error::from_raw_os_error(code));
-            assert!(reconnectable(&short), "{code}: {short:?}");
+            assert!(reconnectable(&short, None), "{code}: {short:?}");
         }
         let denied = connect_error(
             addr,
             Duration::ZERO,
             io::Error::from(io::ErrorKind::PermissionDenied),
         );
-        assert!(!reconnectable(&denied), "{denied:?}");
+        assert!(!reconnectable(&denied, None), "{denied:?}");
+        // A bind to a local address this host does not have names that address.
+        let local: SocketAddr = "192.0.2.1:0".parse().unwrap();
+        #[cfg(unix)]
+        let not_available = sys::errno::EADDRNOTAVAIL;
+        #[cfg(windows)]
+        let not_available = sys::errno::WSAEADDRNOTAVAIL;
+        let missing = bind_error(local, io::Error::from_raw_os_error(not_available));
+        assert!(!reconnectable(&missing, Some(local)), "{missing:?}");
     }
 
     #[test]
