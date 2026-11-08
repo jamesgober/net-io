@@ -213,6 +213,15 @@ impl EventSink for Recorder {
 }
 
 impl Recorder {
+    fn wait_close_within(&self, limit: Duration) -> Option<CloseReason> {
+        if !eventually(limit, || {
+            self.0.lock().map(|v| !v.is_empty()).unwrap_or(false)
+        }) {
+            return None;
+        }
+        self.0.lock().ok().map(|v| v[0])
+    }
+
     fn wait_close(&self) -> CloseReason {
         assert!(
             eventually(WAIT, || self
@@ -517,4 +526,377 @@ fn test_tls_listener_needs_an_engine() {
             reason: ConfigReason::Missing
         })
     ));
+}
+
+/// An engine that panics on `BOOM` in place of a hello.
+struct Panicky;
+
+impl TlsAcceptor for Panicky {
+    type Session = PanickySession;
+    fn session(&self, _info: &ConnectionInfo) -> Result<PanickySession, TlsError> {
+        Ok(PanickySession(ToySession::default()))
+    }
+}
+
+struct PanickySession(ToySession);
+
+impl TlsSession for PanickySession {
+    fn step<'i>(
+        &mut self,
+        input: &'i mut [u8],
+        output: &mut [u8],
+    ) -> Result<TlsProgress<'i>, TlsError> {
+        assert!(!input.starts_with(b"BOOM"), "engine bug");
+        self.0.step(input, output)
+    }
+    fn encrypt(&mut self, plaintext: &[u8], output: &mut [u8]) -> Result<usize, TlsError> {
+        self.0.encrypt(plaintext, output)
+    }
+    fn close(&mut self, output: &mut [u8]) -> Result<usize, TlsError> {
+        self.0.close(output)
+    }
+    fn on_transport_closed(&mut self) -> TlsCloseKind {
+        self.0.on_transport_closed()
+    }
+    fn info(&self) -> Option<TlsInfo> {
+        self.0.info()
+    }
+    fn input_capacity_required(&self) -> usize {
+        self.0.input_capacity_required()
+    }
+}
+
+/// A panic inside the TLS engine closes only that connection, `TlsFailed`, on both
+/// drivers: the worker, its caps, and drain survive (review finding).
+#[test]
+fn test_engine_panic_closes_only_that_connection() {
+    struct Echo;
+    impl Session for Echo {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            Step::Write
+        }
+    }
+    for &driver in common::DRIVERS {
+        let rec = Recorder::default();
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+            .driver(driver)
+            .workers(1)
+            .tls(Panicky)
+            .sessions(|_: &ConnectionInfo| Echo)
+            .gate(AllowAll)
+            .events(rec.clone())
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        for _ in 0..3 {
+            let mut s = client(addr(&server));
+            s.write_all(b"BOOM!").expect("write");
+            let mut rest = Vec::new();
+            let _ = s.read_to_end(&mut rest);
+            // One worker: the next client waits for this close, or the pool says Busy.
+            assert!(eventually(WAIT, || server.stats().open == 0));
+        }
+        assert!(
+            eventually(WAIT, || server.stats().closed == 3
+                && server.stats().open == 0),
+            "{driver:?}: {:?}",
+            server.stats()
+        );
+        assert!(
+            rec.0
+                .lock()
+                .expect("lock")
+                .iter()
+                .all(|r| *r == CloseReason::TlsFailed),
+            "{driver:?}: {:?}",
+            rec.0.lock().expect("lock")
+        );
+        // The one worker still serves.
+        let mut c = ToyClient::connect(&server);
+        c.send(b"still here");
+        assert_eq!(c.recv_exact(10), b"still here", "{driver:?}");
+        drop(c);
+        let report = server.shutdown(std::time::Instant::now() + Duration::from_secs(2));
+        assert_eq!(report.killed, 0, "{driver:?}: {report:?}");
+    }
+}
+
+/// A gate denial on a TLS connection goes out as a record, never as plaintext on the
+/// socket, on both drivers (review finding).
+#[test]
+fn test_denial_under_tls_is_encrypted() {
+    struct DenyAfterHandshake;
+    impl Gate for DenyAfterHandshake {
+        type Ticket = ();
+        fn admit(&self, _: &ConnectionInfo, _: AdmitStage) -> Result<Admitted<()>, Refusal> {
+            Ok(Admitted {
+                lane: Lane(0),
+                ticket: (),
+                tag: GateTag(0),
+            })
+        }
+        fn readmit(&self, _: &mut (), _: &ConnectionInfo) -> Result<(), Refusal> {
+            Ok(())
+        }
+        fn check(&self, _: &mut (), _: &WriteCheck) -> Result<(), Denial> {
+            Err(Denial { code: 3 })
+        }
+    }
+    struct Reply;
+    impl Session for Reply {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            cx.output().begin_response();
+            cx.output().push(b"the real reply").expect("push");
+            Step::Write
+        }
+        fn on_denied(&mut self, _code: u16, output: &mut net_io::Output) {
+            let _ = output.push(b"DENIED-IN-THE-CLEAR");
+        }
+    }
+    for &driver in common::DRIVERS {
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+            .driver(driver)
+            .workers(2)
+            .tls(Toy)
+            .sessions(|_: &ConnectionInfo| Reply)
+            .gate(DenyAfterHandshake)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = ToyClient::connect(&server);
+        c.send(b"go");
+        let mut wire = Vec::new();
+        let _ = c.0.read_to_end(&mut wire);
+        let clear = b"DENIED-IN-THE-CLEAR";
+        assert!(
+            !wire.windows(clear.len()).any(|w| w == clear),
+            "{driver:?}: the denial crossed the wire unencrypted"
+        );
+        assert!(
+            !wire.windows(14).any(|w| w == b"the real reply"),
+            "{driver:?}"
+        );
+    }
+}
+
+/// An engine whose handshake flight is 60 KiB: more than the socket buffers hold.
+struct BigFlight;
+
+impl TlsAcceptor for BigFlight {
+    type Session = BigSession;
+    fn session(&self, _info: &ConnectionInfo) -> Result<BigSession, TlsError> {
+        Ok(BigSession(false))
+    }
+}
+
+struct BigSession(bool);
+
+impl TlsSession for BigSession {
+    fn step<'i>(
+        &mut self,
+        input: &'i mut [u8],
+        output: &mut [u8],
+    ) -> Result<TlsProgress<'i>, TlsError> {
+        if self.0 || input.len() < 5 {
+            return Ok(TlsProgress {
+                consumed: 0,
+                written: 0,
+                event: TlsEvent::NeedInput,
+            });
+        }
+        self.0 = true;
+        let n = output.len().min(60 << 10);
+        output[..n].fill(0xEE);
+        Ok(TlsProgress {
+            consumed: 5,
+            written: n,
+            event: TlsEvent::Transmit,
+        })
+    }
+    fn encrypt(&mut self, _: &[u8], _: &mut [u8]) -> Result<usize, TlsError> {
+        Err(TlsError::new(TlsFailure::State, 0, None))
+    }
+    fn close(&mut self, _: &mut [u8]) -> Result<usize, TlsError> {
+        Ok(0)
+    }
+    fn on_transport_closed(&mut self) -> TlsCloseKind {
+        TlsCloseKind::Unclean
+    }
+    fn info(&self) -> Option<TlsInfo> {
+        None
+    }
+    fn input_capacity_required(&self) -> usize {
+        0
+    }
+}
+
+/// A peer that takes the handshake flight a byte at a time (here: not at all) is
+/// closed at the handshake deadline, not after a write timeout each byte restarts,
+/// on both drivers (review finding: the pool waited on the write timeout).
+#[test]
+fn test_handshake_flight_is_bounded_by_the_handshake_deadline() {
+    struct Nothing;
+    impl Session for Nothing {
+        fn on_data(&mut self, _: &mut SessionContext<'_>, _: &mut Input) -> Step {
+            Step::Close
+        }
+    }
+    for &driver in common::DRIVERS {
+        let rec = Recorder::default();
+        let limits = Limits::builder()
+            .handshake_timeout(Duration::from_millis(800))
+            .write_timeout(Duration::from_secs(60))
+            .build()
+            .expect("limits");
+        let server = ServerBuilder::new()
+            .listener(
+                ListenerSpec::tcp_with(
+                    "127.0.0.1:0",
+                    net_io::ListenOptions::new().send_buffer(4096),
+                )
+                .tls(true)
+                .limits(limits),
+            )
+            .driver(driver)
+            .workers(2)
+            .tls(BigFlight)
+            .sessions(|_: &ConnectionInfo| Nothing)
+            .gate(AllowAll)
+            .events(rec.clone())
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let options = net_io::ConnectOptions::new()
+            .tcp_options(net_io::TcpOptions::new().receive_buffer(4096));
+        let mut c = TcpConnection::connect_with(addr(&server), options).expect("connect");
+        c.send_all(b"HELLO").expect("hello");
+        let started = std::time::Instant::now();
+        let reason = rec.wait_close_within(Duration::from_secs(10));
+        assert_eq!(reason, Some(CloseReason::HandshakeTimeout), "{driver:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{driver:?}: {:?}",
+            started.elapsed()
+        );
+        drop(c);
+    }
+}
+
+/// A session that answers and closes, with a client that reads the answer and
+/// closes at once (FIN, or with `close_notify` unread, which resets): the server's
+/// close ends when the client's does, not at the linger's deadline, on both
+/// drivers (tls-net's handshake benchmark held about 9,000 connections open).
+#[test]
+fn test_close_after_reply_ends_with_the_clients_close() {
+    struct Reply;
+    impl Session for Reply {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            let _ = cx.output().push(&[b'r'; 70]);
+            Step::Close
+        }
+    }
+    for &driver in common::DRIVERS {
+        for read_notify in [true, false] {
+            let server = ServerBuilder::new()
+                .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+                .driver(driver)
+                .workers(2)
+                .tls(Toy)
+                .sessions(|_: &ConnectionInfo| Reply)
+                .gate(AllowAll)
+                .build()
+                .expect("build");
+            server.open_door().expect("open");
+            let mut worst = Duration::ZERO;
+            for i in 0..200u64 {
+                let mut c = ToyClient::connect(&server);
+                c.send(b"GET");
+                assert_eq!(c.recv_exact(70), vec![b'r'; 70]);
+                if read_notify {
+                    assert_eq!(c.recv(), None, "close_notify");
+                }
+                drop(c);
+                let t = std::time::Instant::now();
+                assert!(
+                    eventually(WAIT, || server.stats().closed > i),
+                    "{driver:?} {read_notify}: {:?}",
+                    server.stats()
+                );
+                worst = worst.max(t.elapsed());
+            }
+            eprintln!("{driver:?} read close_notify {read_notify}: worst {worst:?}");
+            assert!(
+                worst < Duration::from_millis(500),
+                "{driver:?} {read_notify}: a close waited {worst:?}"
+            );
+        }
+    }
+}
+
+/// Idle TLS connections hold no buffers on the reactor: with a budget for about 32
+/// connections' pairs of 64 KiB buffers, 100 connections that each finish an
+/// exchange and wait all stay open and are served again, and a new one is served
+/// too (D-181; tls-net found the reactor capped at budget / 128 KiB connections).
+#[cfg(feature = "reactor")]
+#[test]
+fn test_idle_tls_connections_hold_no_buffers() {
+    struct Echo;
+    impl Session for Echo {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            Step::Write
+        }
+    }
+    let limits = Limits::builder()
+        .buffer_budget(4 << 20)
+        .max_connections(256)
+        .max_per_source(256, net_io::PrefixPolicy::DEFAULT)
+        .build()
+        .expect("limits");
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+        .driver(net_io::DriverKind::Reactor)
+        .workers(2)
+        .limits(limits)
+        .tls(Toy)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let mut held = Vec::new();
+    for i in 0..100u32 {
+        let mut c = ToyClient::connect(&server);
+        c.send(format!("hello {i}").as_bytes());
+        assert_eq!(
+            c.recv_exact(format!("hello {i}").len()),
+            format!("hello {i}").as_bytes()
+        );
+        held.push(c);
+    }
+    for (i, c) in held.iter_mut().enumerate() {
+        c.send(b"again");
+        assert_eq!(c.recv_exact(5), b"again", "connection {i}");
+    }
+    let mut last = ToyClient::connect(&server);
+    last.send(b"new");
+    assert_eq!(last.recv_exact(3), b"new");
+    assert_eq!(
+        server
+            .stats()
+            .closed_for(CloseReason::Limit(net_io::LimitKind::BufferBudget)),
+        0,
+        "{:?}",
+        server.stats()
+    );
+    assert_eq!(server.stats().open, 101, "{:?}", server.stats());
 }

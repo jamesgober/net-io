@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use super::Sessions;
 use super::engine::{
     CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP, CMD_PRESSURE,
-    CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, count_drained,
-    record_close,
+    CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, announce,
+    count_drained, record_close,
 };
 use crate::addr::PrefixKey;
 use crate::buf::{Buffer, BufferPool};
@@ -54,8 +54,14 @@ pub(crate) type Backend = crate::driver::ready::ReadyDriver;
 #[cfg(windows)]
 pub(crate) type Backend = crate::driver::iocp::IocpDriver;
 
-/// How much of a file one operation, and one gate check, covers.
-const FILE_CHUNK: u64 = 1 << 20;
+/// How much of a file one operation, and one gate check, covers: one
+/// [`BULK_TURN`], so a worker never copies more than that between looks at the OS.
+const FILE_CHUNK: u64 = BULK_TURN as u64;
+
+/// How many file bytes a worker sends between two looks at the OS. A `sendfile`
+/// copies in the calling thread, so a fast reader would otherwise hold the worker
+/// for as long as its stream lasts (D-141).
+const BULK_TURN: usize = 256 << 10;
 
 /// How many rounds of finished-at-once completions run between looks at the OS.
 const LOCAL_ROUNDS: usize = 16;
@@ -200,6 +206,10 @@ struct Reactor<'a, F: SessionFactory, G: Gate> {
     completer: Completer,
     /// Connections waiting for a buffer, oldest first.
     starved: VecDeque<(u32, Token)>,
+    /// File bytes sent since the last look at the OS.
+    bulk_sent: usize,
+    /// Connections whose next file piece waits for the next look at the OS.
+    yielded: VecDeque<(u32, Token)>,
     view: ControlView,
     clock: ClockRef,
     notes: Arc<KillNotes>,
@@ -234,6 +244,8 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         pool: BufferPool::new(engine.budget.clone(), engine.wipe),
         outputs: Vec::new(),
         starved: VecDeque::new(),
+        bulk_sent: 0,
+        yielded: VecDeque::new(),
         completer: Completer {
             shared: ws.completer.clone(),
         },
@@ -248,7 +260,11 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         facts_pool: Vec::new(),
         done: Some(Completions::new()),
     };
-    r.main();
+    if guarded(|| r.main()).is_none() {
+        // A panic got past every inner boundary: nothing on this worker can be
+        // trusted to finish, so each connection closes now and gives back what it held.
+        r.abandon_all(CloseReason::SessionPanicked);
+    }
 }
 
 impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
@@ -272,25 +288,38 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 return;
             };
             if self.driver.wait(&mut done, timeout).is_err() {
-                // The wait itself failed: nothing more can happen on this worker.
-                self.close_all(CloseReason::Shutdown);
+                // The wait itself failed: no completion will be read again, so a close
+                // that waits for one would never finish. Each connection closes now.
+                self.abandon_all(CloseReason::Shutdown);
                 return;
             }
             begin_turn();
+            self.bulk_sent = 0;
+            self.resume_yielded();
             for c in done.drain() {
                 self.on_completion(c);
             }
             // What those finished at once needs no trip through the OS or the checks
             // above; bounded, so a chatty connection cannot hold them off.
-            for _ in 0..LOCAL_ROUNDS {
+            let mut rounds = 0;
+            while rounds < LOCAL_ROUNDS {
                 if self.driver.take_local(&mut done) == 0 {
                     break;
                 }
                 for c in done.drain() {
                     self.on_completion(c);
                 }
+                rounds += 1;
+            }
+            if rounds == LOCAL_ROUNDS {
+                // The rounds ran out with work still local: look at the OS next, so
+                // the bound is these rounds, not these rounds times the driver's own.
+                self.driver.poll_next();
             }
             self.done = Some(done);
+            if !self.yielded.is_empty() {
+                self.driver.poll_next();
+            }
         }
     }
 
@@ -302,6 +331,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             .wheel
             .next_expiry()
             .map(|t| self.ticks.until(t, now).max(Duration::from_micros(100)));
+        if !self.yielded.is_empty() {
+            return Some(Duration::ZERO);
+        }
         // Buffers free on any worker, and nothing wakes this one for them.
         let starved = !self.starved.is_empty();
         match self.clock {
@@ -317,12 +349,56 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
     }
 
+    /// File sends that gave way at the last look at the OS go on, oldest first.
+    fn resume_yielded(&mut self) {
+        for _ in 0..self.yielded.len() {
+            let Some((index, token)) = self.yielded.pop_front() else {
+                return;
+            };
+            let wait = match self.conn(index) {
+                Some(c)
+                    if c.token == token && c.sending == Sending::None && c.closing.is_none() =>
+                {
+                    c.wait
+                }
+                _ => continue,
+            };
+            self.flush_and_continue(index, wait);
+        }
+    }
+
     /// Reading resumes, oldest connection first, as buffers free up.
     fn resume_starved(&mut self) {
         while let Some(&(index, token)) = self.starved.front() {
+            if self
+                .conn(index)
+                .is_some_and(|c| c.token == token && c.paused && c.link.tls_released())
+            {
+                if !self.tls_retake(index) {
+                    return;
+                }
+                self.starved.pop_front();
+                if let Some(c) = self.conn(index) {
+                    c.paused = false;
+                }
+                self.read(index);
+                continue;
+            }
             let class = match self.conn(index) {
-                Some(c) if c.token == token && c.paused && c.wait == Wait::Read => {
+                Some(c)
+                    if c.token == token
+                        && c.paused
+                        && c.wait == Wait::Read
+                        && c.input.is_none() =>
+                {
                     c.link.limits.read_class
+                }
+                Some(c) if c.token == token => {
+                    // Its wait moved on (a timeout the session survived), or it found
+                    // a buffer another way: it asks again at its next read.
+                    c.paused = false;
+                    self.starved.pop_front();
+                    continue;
                 }
                 _ => {
                     self.starved.pop_front();
@@ -364,6 +440,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let (stream, mut info, ticket, listener, source) = job.into_parts();
         let shared = self.shared;
         info.worker = WorkerId(self.idx as u16);
+        announce(shared, &info, &listener);
         let index = match self.free.pop() {
             Some(i) => i,
             None => {
@@ -628,7 +705,17 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             }
             Ok(Some((facts, real, consumed))) => {
                 c.proxy = None;
-                c.link.end_handshake(Some((buffer, consumed)));
+                if let Some(b) = c.link.end_handshake(Some((buffer, consumed))) {
+                    self.pool.put(b);
+                }
+                // The slot directly, so the facts pool stays borrowable.
+                let Some(c) = self
+                    .slots
+                    .get_mut(index as usize)
+                    .and_then(|s| s.conn.as_mut())
+                else {
+                    return;
+                };
                 let result = super::engine::proxy_resolved(
                     shared,
                     &mut c.link,
@@ -652,6 +739,33 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     }
 
     // ---- the TLS machine ----------------------------------------------------------
+
+    /// Takes the TLS buffers back for a connection that released them while idle
+    /// (D-181); `false`, with nothing taken, when the budget is spent.
+    fn tls_retake(&mut self, index: u32) -> bool {
+        let Some(c) = self.conn(index) else {
+            return false;
+        };
+        if !c.link.tls_released() {
+            return true;
+        }
+        let class = c.link.limits.read_class_max;
+        let Some(cin) = self.pool.take(class) else {
+            return false;
+        };
+        let Some(cout) = self.pool.take(SizeClass::LARGE) else {
+            self.pool.put(cin);
+            return false;
+        };
+        match self.conn(index) {
+            Some(c) => c.link.tls_restore(cin, cout),
+            None => {
+                self.pool.put(cin);
+                self.pool.put(cout);
+            }
+        }
+        true
+    }
 
     /// Turns the machine until it waits for something. Plaintext goes to the
     /// session's input; the handshake's end starts the session.
@@ -692,12 +806,13 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                         }
                     };
                     c.recv = Recv::Cipher;
+                    c.readable = false;
                     self.submit_receive(index, token, cin);
                     self.arm_timer(index);
                     return;
                 }
                 TlsNext::Handshaken => {
-                    c.link.end_handshake(None);
+                    let _ = c.link.end_handshake(None);
                     if !c.opened {
                         return self.open_session(index);
                     }
@@ -834,6 +949,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             Some(b) => {
                 if let Some(c) = self.conn(index) {
                     c.input = Some(Input::new(b));
+                    // Its place on the starved list, if any, lapses.
+                    c.paused = false;
                 }
                 true
             }
@@ -841,9 +958,11 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 // Reading pauses (edge case 11): the peer's bytes wait in the kernel,
                 // TCP pushes back, and the connection's read deadline keeps running.
                 if let Some(c) = self.conn(index) {
-                    c.paused = true;
-                    let token = c.token;
-                    self.starved.push_back((index, token));
+                    if !c.paused {
+                        c.paused = true;
+                        let token = c.token;
+                        self.starved.push_back((index, token));
+                    }
                 }
                 self.arm_timer(index);
                 false
@@ -1009,9 +1128,55 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             };
             let n = c.link.take_read_ahead(input.spare_for_read());
             input.filled(n);
+            if !c.link.has_read_ahead() {
+                if let Some(b) = c.link.take_pending() {
+                    self.pool.put(b);
+                }
+            }
             return self.input_arrived(index);
         }
         if c.link.has_tls() {
+            if c.recv != Recv::None || c.paused {
+                return self.arm_timer(index);
+            }
+            if c.link.phase() == Phase::Idle && !c.readable {
+                // Between exchanges with nothing held: the buffers go back to the
+                // pool and the wait takes none, as a plaintext connection's does, so
+                // idle TLS connections do not hold the budget (D-181).
+                if let Some((cin, cout)) = c.link.tls_release() {
+                    self.pool.put(cin);
+                    self.pool.put(cout);
+                }
+            }
+            let Some(c) = self.conn(index) else { return };
+            if c.link.tls_released() {
+                if !c.readable {
+                    let token = c.token;
+                    c.recv = Recv::Zero;
+                    if self
+                        .driver
+                        .submit(Operation::ReceiveZero { token })
+                        .is_err()
+                    {
+                        if let Some(c) = self.conn(index) {
+                            c.recv = Recv::None;
+                        }
+                        return self.close(index, CloseReason::Io(OsErrorClass::Other(0)));
+                    }
+                    return self.arm_timer(index);
+                }
+                if !self.tls_retake(index) {
+                    // Reading pauses until a buffer comes back (edge case 11).
+                    if let Some(c) = self.conn(index) {
+                        if !c.paused {
+                            c.paused = true;
+                            let token = c.token;
+                            self.starved.push_back((index, token));
+                        }
+                    }
+                    return self.arm_timer(index);
+                }
+            }
             self.arm_timer(index);
             return self.tls_turn(index);
         }
@@ -1047,6 +1212,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 .submit(Operation::ReceiveZero { token })
                 .is_err()
             {
+                if let Some(c) = self.conn(index) {
+                    c.recv = Recv::None;
+                }
                 return self.close(index, CloseReason::Io(OsErrorClass::Other(0)));
             }
         }
@@ -1099,6 +1267,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
 
     /// Starts sending what is queued: the gate first, one operation at a time.
     fn flush(&mut self, index: u32, after: Wait) -> Flushed {
+        let bulk_room = self.bulk_sent < BULK_TURN;
         let Some(c) = self.conn(index) else {
             return Flushed::Waiting;
         };
@@ -1107,6 +1276,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         };
         if c.sending != Sending::None {
             c.wait = after;
+            // The timer `fire_timers` just cleared must run again for this wait.
+            self.arm_timer(index);
             return Flushed::Waiting;
         }
         // Read and cleared on every flush: only a step that queued nothing because the
@@ -1138,6 +1309,11 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         if let Some((file, offset, left)) = output.front_file() {
             let len = left.min(FILE_CHUNK) as usize;
             let token = c.token;
+            if !bulk_room {
+                c.wait = after;
+                self.yielded.push_back((index, token));
+                return Flushed::Waiting;
+            }
             return match c.link.check_send(len) {
                 Ok(()) => {
                     c.sending = Sending::File { total: len };
@@ -1148,6 +1324,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                         offset,
                         len: len as u32,
                     };
+                    self.bulk_sent += len;
                     if self.driver.submit(op).is_err() {
                         if let Some(c) = self.conn(index) {
                             c.sending = Sending::None;
@@ -1171,6 +1348,15 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
         let total = output.pending_in_send();
         let tls = c.link.has_tls();
+        if tls && c.link.tls_released() {
+            // Records need the output buffer back first; with the budget spent the
+            // connection closes, as an output with nothing queued does (D-169).
+            if !self.tls_retake(index) {
+                self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
+                return Flushed::Waiting;
+            }
+            return self.flush(index, after);
+        }
         let token = c.token;
         let checked = if tls {
             let take = total.min(c.link.tls_write_budget());
@@ -1521,7 +1707,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 let Some(mut chunks) = chunks else { return };
                 match done.result {
                     Ok(n) => {
-                        if c.link.note_sent(n).is_err() && !closing {
+                        if c.link.note_engine_sent(n).is_err() && !closing {
                             if let Some(cout) = chunks.into_buffer() {
                                 c.link.tls_put_cout(cout);
                             }
@@ -1552,6 +1738,16 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 }
                 if !closing {
                     self.tls_turn(index);
+                    // A step that wanted a flush while the engine's records were out.
+                    let pending = self.conn(index).and_then(|c| {
+                        (c.sending == Sending::None
+                            && c.closing.is_none()
+                            && matches!(c.wait, Wait::Flush | Wait::FlushClose))
+                        .then_some(c.wait)
+                    });
+                    if let Some(wait) = pending {
+                        self.flush_and_continue(index, wait);
+                    }
                     return;
                 }
             }
@@ -1570,6 +1766,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         if closing {
             return self.settle(index);
         }
+        self.flush_and_continue(index, wait);
+    }
+
+    /// Sends the next piece and, when the output is empty, does what the wait was
+    /// for.
+    fn flush_and_continue(&mut self, index: u32, wait: Wait) {
         match wait {
             Wait::Flush => match self.flush(index, Wait::Flush) {
                 Flushed::Done => match self.call(index, |s, cx| s.on_writable(cx)) {
@@ -1725,8 +1927,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let shared = self.shared;
         let ws = &shared.workers[self.idx];
         // Read first: this runs on every turn, and a write would own the line.
+        // A swap, not a store: a producer that saw the flag still set must not be able
+        // to push after the ring was found empty (store-buffer reordering).
         if ws.completer.wake_pending.load(Ordering::Acquire) {
-            ws.completer.wake_pending.store(false, Ordering::Release);
+            ws.completer.wake_pending.swap(false, Ordering::AcqRel);
         }
         while let Some(p) = ws.completer.ring.pop() {
             match shared.conn_index(p.connection, self.idx as u32) {
@@ -1866,6 +2070,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let reason = c.link.killed().map_or(reason, CloseReason::Killed);
         c.closing = Some(reason);
         if !reason.is_abortive() {
+            if c.link.tls_released() {
+                // `close_notify` needs the output buffer; without one the close is a
+                // plain FIN.
+                let _ = self.tls_retake(index);
+            }
+            let Some(c) = self.conn(index) else { return };
             let linger = c.link.begin_graceful_close(c.readable);
             if linger && c.sending == Sending::None {
                 let until = c.link.now() + c.link.limits.graceful_linger;
@@ -1912,6 +2122,11 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     /// Finishes the close once nothing is in flight.
     fn settle(&mut self, index: u32) {
         let Some(c) = self.conn(index) else { return };
+        if matches!(c.wait, Wait::Linger(_)) && c.recv == Recv::None && c.sending == Sending::None {
+            // The receive that was out when the linger began is back: the linger's
+            // own read starts now, so it sees the peer's FIN and drains what is unread.
+            return self.linger_read(index);
+        }
         if c.wait == Wait::Closing && c.recv == Recv::None && c.sending == Sending::None {
             // A kill also ends the linger's read: it may arrive here first.
             let reason = match c.link.killed() {
@@ -1990,6 +2205,38 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 self.facts_pool.push(facts);
             }
         }
+        shared.notify_progress();
+    }
+}
+
+impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
+    /// After a panic in the loop, or a wait that failed: every connection is reset,
+    /// its gate ticket and caps returned, and its close counted, so `stats`, drains,
+    /// and admission stay right.
+    fn abandon_all(&mut self, reason: CloseReason) {
+        let shared = self.shared;
+        let ws = &shared.workers[self.idx];
+        for i in 0..self.slots.len() {
+            let Some(c) = self.slots[i].conn.take() else {
+                continue;
+            };
+            let _ = self.driver.deregister(c.token);
+            let mut link = c.link;
+            let info = link.info.clone();
+            let (bytes_in, bytes_out) = (link.bytes_in, link.bytes_out);
+            let lifetime = self.clock.now().saturating_duration_since(info.accepted_at);
+            let erased = link.gate.take();
+            let reason = link.finish_reactor(reason);
+            if let Some(mut g) = erased {
+                g.close(&info, reason);
+            }
+            shared.unregister_conn(info.id);
+            ws.load.fetch_sub(1, Ordering::Relaxed);
+            count_drained(shared, reason);
+            shared.release(&c.listener, c.source);
+            record_close(shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
+        }
+        self.open = 0;
         shared.notify_progress();
     }
 }

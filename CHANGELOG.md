@@ -11,6 +11,136 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-08
+
+Hardening: an adversarial review of the whole crate with every finding of medium
+severity or above fixed, attack tests for every threat, continuous fuzzing, a
+soak, and a database consumer's transport needs.
+
+### Security
+
+- A session that wrote more than one 16 KiB output buffer per flush spent the
+  shared buffer budget within seconds, after which other connections stalled and
+  the session spun its worker; any client asking for a large reply could cause it.
+  Outputs reuse their pool's buffers now, and a push the spent budget refuses
+  closes the connection with `Limit(BufferBudget)` (also in 0.6.1).
+- On the reactor, bytes read with a PROXY header on a TLS listener reached the
+  session as plaintext after the handshake. They go to the TLS engine now
+  (also in 0.6.1).
+- A gate denial on a TLS connection was written in the clear between records. It
+  is an encrypted record now, sent once.
+- A panic in a TLS engine or an event sink cost a worker its connections, their
+  cap slots, and every later drain. Both run behind panic boundaries, and each
+  worker has a last boundary that closes and accounts for what a panic left.
+- Released buffers were wiped only up to their current length, so a consumed
+  request or decrypted TLS plaintext could reach the next owner. The wipe covers
+  everything the buffer held since its last wipe.
+- TLS records with no plaintext, or records the engine sends on its own, could
+  keep a connection past its idle deadline or its minimum rate, and a handshake
+  flight drained a byte at a time held a pool worker past the handshake deadline.
+- A listener's own `max_connections` replaced the server's cap; it is refused at
+  build now (use `max_per_listener`).
+- Windows: a pipe listener with no open instance claims its name again instead of
+  joining a pipe another user created under it; clients can check who serves a
+  pipe (`PipeConnection::server_pid`, `server_owner_sid`); hand-off refuses a
+  socket the process already owns, closes every socket of a failed message, and
+  makes received sockets non-inheritable; binding an AF_UNIX path no longer
+  deletes a reparse point that is not a socket file.
+- Unix: a cut `SCM_RIGHTS` message closes every descriptor it carried; FreeBSD
+  sets close-on-exec atomically; systemd and FastCGI descriptors with
+  close-on-exec set are not taken (an in-place re-exec).
+- UDP: verification is per address and port and expires (`verification_lifetime`,
+  60 s), in its own bounded table; a dropped datagram no longer keeps its source
+  in the table.
+- The public `Driver` holds each registered socket until `deregister`, so a
+  dropped socket's number cannot be reused by a connection that then gets another
+  connection's bytes.
+
+### Added
+
+- `Backoff`, `TcpConnection::connect_retry`, `probe` (`Health`), and `drain`
+  (`Drained`): reconnecting with backoff and jitter, a health check that consumes
+  nothing, and a client-side drain.
+- `TcpConnection::recv_file`: receives into a file at an offset, by `splice` on
+  Linux and by copying elsewhere, under the usual read limits.
+- `PipeConnection::server_pid` and `server_owner_sid`.
+- `UdpOptions::verification_lifetime`, `UdpOptions::verified_table`,
+  `UdpSocket::forget_verified`, `UdpContext::forget_verified`.
+- `SharedSocket`, the socket type `Driver::register` takes.
+- `descriptor_limit()`: the soft descriptor limit, for placing a cap under it.
+- `TlsInfo::with_peer_spki_sha256` and `peer_spki_sha256`: the SHA-256 of a
+  verified client certificate's public key, which a TLS engine sets so a session
+  can map a mutual-TLS peer to a principal.
+- Fuzz targets `wheel`, `rate`, and `udp`, a nightly fuzz workflow, and `tests/soak.rs`.
+
+### Changed
+
+- The reactor sends at most 256 KiB of file between two looks at the OS, in
+  256 KiB pieces, so a stream to a fast reader cannot hold off the worker's other
+  connections.
+- `Driver::register` takes a `SharedSocket`; `BorrowedSocket` is no longer public.
+- Timeouts over a year and `max_connections` over 2^20 are refused at build;
+  durations at call sites are held to a year.
+- `Accepted` and `Admitted` come from the worker that takes the connection, so
+  they always precede its `Closed`; one drain emits one `DrainFinished`.
+- UDP verification expires and is per port: protocols call `mark_verified` on each
+  proof. `amplification_window` is at most an hour.
+- A sub-second `Linger::Timeout` rounds up to one second on every OS.
+
+### Fixed
+
+- `TcpConnection::connect_retry` gave up at once on two errors that pass: a
+  reset during the connect (a server refusing at its cap) and, on Windows, every
+  ephemeral port in use or in TIME_WAIT (10048, 10055); both are retried under
+  the backoff now, and a reset during the connect reads as `ConnectionReset`.
+  A `local_addr` this host does not have still ends it at once. Found by the 0.7
+  soak's pooled client.
+- A session that survived a timeout with part of a message held could panic a
+  reactor worker (also in 0.6.1).
+- The accept batch admitted connections after the door closed; a stop during a
+  drain waited for the drain's deadline.
+- On the reactor: a paused reader whose wait moved on never resumed; a failed OS
+  wait abandoned every connection; a post could lose its wake; a flush behind the
+  TLS engine's records lost its timer; a linger that began with a receive out
+  never read; idle PROXY connections kept their handshake buffer.
+- The minimum rate required nothing at low rates or with a window under twice its
+  check interval (found by the new `rate` fuzz target).
+- Smaller fixes: drains and sheds could hit a worker's next connection; a flood's
+  coalesced tail waited for the next refusal; a persistent accept error spun the
+  accept thread; an invalid lane reservation could be hidden by a later one; a
+  pipe listener whose name was taken paused instead of failing.
+- Windows: a process whose threads ended after using a `TcpConnection` could
+  freeze entirely, every thread start and exit waiting: the thread's wake socket
+  was closed by a thread-local destructor, under the loader lock. A thread's wake
+  now goes to a list of spares for the next thread instead (also in 0.6.2).
+- The reactor gave every short connection to its first worker: with all loads at
+  0, the least-loaded choice always took worker 0. Ties now go round the workers.
+- Windows: a backlog past 200 was silently cut to 200 pending connections, so a
+  server whose accept thread fell behind dropped SYNs and clients waited about
+  21 s to fail. It is asked for as `SOMAXCONN_HINT` now (also in 0.6.2).
+- On the Linux pool a drain could close a handler in the middle of an exchange:
+  it shut the read side of a connection whose next request had already arrived,
+  and the rest of that request read as end of stream. A drain now leaves such a
+  connection to answer first (also in 0.6.2).
+- The Windows reactor held a graceful close to the full linger (2 s) when the
+  peer reset after reading its reply, as a TLS client that skips `close_notify`
+  does, so connections, buffers, and cap slots piled up under short connections.
+  A reset now ends the linger (also in 0.6.2).
+- A drain could still close a connection in the middle of an exchange when it
+  landed just as the connection's request arrived: it is now the connection's
+  own thread that decides, through its wake channel, on every system (the Linux
+  pool waits before an idle-phase receive for this).
+- A connection an accept thread was admitting as a drain began could be closed
+  unread by the stop that followed (a reset after 0 bytes, seen in the Windows
+  hand-off test). A drain now waits for admissions in progress.
+- Idle TLS connections on the reactor kept two 64 KiB buffers each until they
+  closed, so the default budget capped a server at about 4,096 TLS connections,
+  and idle TLS peers could spend the budget every connection draws from. They
+  give the buffers back while they wait, as plaintext connections do.
+- Everything fixed in 0.6.1: posts reach connections waiting for input, an idle
+  trim releases buffers with a receive out, a stop ends lingers, and a drain
+  answers a request that already arrived.
+
 ---
 
 ## [0.6.2] - 2026-11-06
@@ -405,7 +535,12 @@ The scaffold and the plan. No functional code yet.
   dependencies, testing, open decisions, and the decision log.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/net-io/compare/v0.6.2...v0.7.0
+[0.6.2]: https://github.com/jamesgober/net-io/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/jamesgober/net-io/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/jamesgober/net-io/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/jamesgober/net-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/net-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/net-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/net-io/compare/v0.1.0...v0.2.0

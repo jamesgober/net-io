@@ -279,7 +279,8 @@ pub(crate) enum Ready {
 pub(crate) enum SockKind {
     /// A TCP listener bound to this address.
     Tcp(std::net::SocketAddr),
-    /// A Unix stream listener bound to this path (empty when unnamed or abstract).
+    /// A Unix stream listener bound to this path: empty when unnamed; a Linux
+    /// abstract name keeps its leading NUL.
     #[cfg(unix)]
     Unix(Vec<u8>),
 }

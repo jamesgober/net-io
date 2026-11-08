@@ -182,6 +182,10 @@ impl Wheel {
     /// The next expired timer at time `now`, in deadline order, or `None` when
     /// nothing has expired. Call it in a loop with a bound per iteration.
     pub(crate) fn pop_expired(&mut self, now: u64) -> Option<Fired> {
+        // A clock that went back (a user `Clock` that broke its contract) is held at
+        // the wheel's own time: placing an entry due between the two would otherwise
+        // put it straight back on the due list, for ever.
+        let now = now.max(self.elapsed);
         loop {
             if self.due_head != NONE {
                 let index = self.due_head;
@@ -468,6 +472,19 @@ mod tests {
         assert_eq!(drain(&mut w, 50), vec![7]);
     }
 
+    /// A clock that goes back cannot hang the wheel: an entry due between the two
+    /// times fires instead of circling the due list (review finding).
+    #[test]
+    fn test_clock_going_back_does_not_spin() {
+        let mut w = Wheel::with_capacity(8);
+        assert!(drain(&mut w, 1_000).is_empty());
+        w.insert(990, 7);
+        assert_eq!(drain(&mut w, 980), vec![7]);
+        w.insert(1_500, 8);
+        assert!(drain(&mut w, 900).is_empty());
+        assert_eq!(drain(&mut w, 1_500), vec![8]);
+    }
+
     /// Edge case 54: a deadline in the past fires at the next look.
     #[test]
     fn test_deadline_in_the_past() {
@@ -728,5 +745,55 @@ mod tests {
             per(extend),
             per(cancel)
         );
+    }
+}
+
+/// The fuzz target `wheel`: operations decoded from `data` run against a plain
+/// map of deadlines; every entry fires exactly once, never before its tick, and
+/// cancelled or rescheduled ones follow the model.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_wheel(data: &[u8]) {
+    use std::collections::BTreeMap;
+    let mut w = Wheel::with_capacity(16);
+    let mut model: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut ids: Vec<(TimerId, u64)> = Vec::new();
+    let mut now = 0u64;
+    let mut next = 0u64;
+    for op in data.chunks(4) {
+        let arg = op.get(1..).map_or(0u64, |b| {
+            b.iter().fold(0u64, |a, &x| (a << 8) | u64::from(x))
+        });
+        match op[0] % 4 {
+            0 => {
+                // Deadlines up to past the wheel's top level, some already due.
+                let deadline = now.saturating_sub(4).saturating_add(arg << (op[0] >> 5));
+                let id = w.insert(deadline, next);
+                model.insert(next, deadline);
+                ids.push((id, next));
+                next += 1;
+            }
+            1 if !ids.is_empty() => {
+                let (id, p) = ids.swap_remove(arg as usize % ids.len());
+                assert_eq!(w.cancel(id), model.remove(&p).is_some());
+            }
+            2 if !ids.is_empty() => {
+                let (id, p) = ids[arg as usize % ids.len()];
+                let deadline = now.saturating_add(arg & 0xffff);
+                let live = model.contains_key(&p);
+                assert_eq!(w.reschedule(id, deadline), live);
+                if live {
+                    model.insert(p, deadline);
+                }
+            }
+            _ => {
+                now = now.saturating_add(arg & 0x3ffff);
+                while let Some(f) = w.pop_expired(now) {
+                    let deadline = model.remove(&f.payload).expect("fired once");
+                    assert!(deadline <= now, "fired early: {deadline} > {now}");
+                }
+                assert!(model.values().all(|&d| d > now), "missed a deadline");
+            }
+        }
+        assert_eq!(w.len(), model.len());
     }
 }

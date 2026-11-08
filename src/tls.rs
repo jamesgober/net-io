@@ -182,6 +182,9 @@ impl std::error::Error for TlsError {}
 /// let info = net_io::TlsInfo::new(Some("example.com"), Some(b"h2"), 0x0304, 0x1301).unwrap();
 /// assert_eq!(info.sni(), Some("example.com"));
 /// assert!(net_io::TlsInfo::new(Some(&"a".repeat(256)), None, 0, 0).is_none());
+/// assert_eq!(info.peer_spki_sha256(), None);
+/// let mutual = info.with_peer_spki_sha256([7; 32]);
+/// assert_eq!(mutual.peer_spki_sha256(), Some(&[7; 32]));
 /// ```
 #[non_exhaustive]
 #[derive(Clone, Copy)]
@@ -192,6 +195,7 @@ pub struct TlsInfo {
     alpn_len: u8,
     version: u16,
     cipher_suite: u16,
+    peer_spki: Option<[u8; 32]>,
 }
 
 impl TlsInfo {
@@ -215,6 +219,7 @@ impl TlsInfo {
             alpn_len: u8::try_from(alpn.len()).ok()?,
             version,
             cipher_suite,
+            peer_spki: None,
         };
         info.sni[..sni.len()].copy_from_slice(sni);
         info.alpn[..alpn.len()].copy_from_slice(alpn);
@@ -247,6 +252,23 @@ impl TlsInfo {
     pub fn cipher_suite(&self) -> u16 {
         self.cipher_suite
     }
+
+    /// The facts with the SHA-256 of the client certificate's public key
+    /// (its DER `SubjectPublicKeyInfo`). The engine sets it only for a client
+    /// certificate it verified (the chain, or a pin), never from unverified bytes.
+    #[must_use]
+    pub fn with_peer_spki_sha256(mut self, hash: [u8; 32]) -> TlsInfo {
+        self.peer_spki = Some(hash);
+        self
+    }
+
+    /// The SHA-256 of the verified client certificate's public key, for mapping a
+    /// mutual-TLS peer to a principal; `None` without a client certificate. It
+    /// stays the same when the certificate is reissued with the same key.
+    #[must_use]
+    pub fn peer_spki_sha256(&self) -> Option<&[u8; 32]> {
+        self.peer_spki.as_ref()
+    }
 }
 
 impl fmt::Debug for TlsInfo {
@@ -256,7 +278,17 @@ impl fmt::Debug for TlsInfo {
             .field("alpn", &self.alpn().map(String::from_utf8_lossy))
             .field("version", &format_args!("{:#06x}", self.version))
             .field("cipher_suite", &format_args!("{:#06x}", self.cipher_suite))
+            .field("peer_spki_sha256", &self.peer_spki.map(Hex))
             .finish()
+    }
+}
+
+/// Bytes printed as lowercase hex.
+struct Hex([u8; 32]);
+
+impl fmt::Debug for Hex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
     }
 }
 
@@ -278,8 +310,93 @@ pub(crate) trait ErasedAcceptor: Send + Sync {
 
 impl<A: TlsAcceptor> ErasedAcceptor for A {
     fn session_boxed(&self, info: &ConnectionInfo) -> Result<Box<dyn TlsSession>, TlsError> {
-        self.session(info)
-            .map(|s| Box::new(s) as Box<dyn TlsSession>)
+        match crate::gate::guarded(|| self.session(info)) {
+            Some(Ok(s)) => Ok(Box::new(Guarded {
+                inner: Box::new(s),
+                poisoned: false,
+            })),
+            Some(Err(e)) => Err(e),
+            None => Err(PANICKED),
+        }
+    }
+}
+
+/// The error a panicking engine call becomes.
+const PANICKED: TlsError = TlsError::new(TlsFailure::State, u16::MAX, None);
+
+/// An engine behind a panic boundary: a panic in any call becomes [`PANICKED`] and
+/// every later call fails the same way, so the connection closes `TlsFailed` through
+/// the normal close path and its worker, slots, and ticket survive. The engine parses
+/// the most hostile bytes a connection carries; this keeps one engine bug from
+/// taking a worker with it. No cost unless a panic unwinds.
+struct Guarded {
+    inner: Box<dyn TlsSession>,
+    poisoned: bool,
+}
+
+impl Guarded {
+    fn call<R>(
+        &mut self,
+        f: impl FnOnce(&mut dyn TlsSession) -> Result<R, TlsError>,
+    ) -> Result<R, TlsError> {
+        if self.poisoned {
+            return Err(PANICKED);
+        }
+        let inner = &mut *self.inner;
+        match crate::gate::guarded(|| f(inner)) {
+            Some(r) => r,
+            None => {
+                self.poisoned = true;
+                Err(PANICKED)
+            }
+        }
+    }
+}
+
+impl TlsSession for Guarded {
+    fn step<'i>(
+        &mut self,
+        input: &'i mut [u8],
+        output: &mut [u8],
+    ) -> Result<TlsProgress<'i>, TlsError> {
+        if self.poisoned {
+            return Err(PANICKED);
+        }
+        let inner = &mut *self.inner;
+        match crate::gate::guarded(move || inner.step(input, output)) {
+            Some(r) => r,
+            None => {
+                self.poisoned = true;
+                Err(PANICKED)
+            }
+        }
+    }
+
+    fn encrypt(&mut self, plaintext: &[u8], output: &mut [u8]) -> Result<usize, TlsError> {
+        self.call(|s| s.encrypt(plaintext, output))
+    }
+
+    fn close(&mut self, output: &mut [u8]) -> Result<usize, TlsError> {
+        self.call(|s| s.close(output))
+    }
+
+    fn on_transport_closed(&mut self) -> TlsCloseKind {
+        self.call(|s| Ok(s.on_transport_closed()))
+            .unwrap_or(TlsCloseKind::Unclean)
+    }
+
+    fn info(&self) -> Option<TlsInfo> {
+        if self.poisoned {
+            return None;
+        }
+        crate::gate::guarded(|| self.inner.info()).flatten()
+    }
+
+    fn input_capacity_required(&self) -> usize {
+        if self.poisoned {
+            return 0;
+        }
+        crate::gate::guarded(|| self.inner.input_capacity_required()).unwrap_or(0)
     }
 }
 

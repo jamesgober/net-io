@@ -256,7 +256,7 @@ impl Coalescer {
         }
         self.in_window = self.in_window.saturating_add(1);
         if self.in_window <= COALESCE_ABOVE {
-            sink.event(&event);
+            let _ = crate::gate::guarded(|| sink.event(&event));
             return;
         }
         if let Some(entry) = self.folded[..self.folded_len]
@@ -276,9 +276,11 @@ impl Coalescer {
 
     pub(crate) fn flush(&mut self, sink: &dyn EventSink) {
         for (kind, count) in &self.folded[..self.folded_len] {
-            sink.event(&Event::Coalesced {
-                kind: *kind,
-                count: *count,
+            let _ = crate::gate::guarded(|| {
+                sink.event(&Event::Coalesced {
+                    kind: *kind,
+                    count: *count,
+                });
             });
         }
         self.folded_len = 0;

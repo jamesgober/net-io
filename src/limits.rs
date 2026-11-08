@@ -310,6 +310,7 @@ impl Limits {
     pub fn to_builder(&self) -> LimitsBuilder {
         LimitsBuilder {
             limits: self.clone(),
+            bad_lane: false,
         }
     }
 
@@ -345,6 +346,7 @@ impl Limits {
         // Rules that need only the values themselves.
         LimitsBuilder {
             limits: self.clone(),
+            bad_lane: false,
         }
         .check()?;
         let e = self.effective(DriverKind::Blocking);
@@ -611,6 +613,8 @@ fn invalid(field: &'static str, reason: ConfigReason) -> NetError {
 #[derive(Clone, Debug, Default)]
 pub struct LimitsBuilder {
     limits: Limits,
+    /// A `lane_reserve` for a lane that does not exist, refused by `build`.
+    bad_lane: bool,
 }
 
 macro_rules! setter {
@@ -622,6 +626,9 @@ macro_rules! setter {
         }
     };
 }
+
+/// The most connections one server holds: the source tables are sized from it.
+pub(crate) const MAX_CONNECTIONS: u32 = 1 << 20;
 
 impl LimitsBuilder {
     setter!(/// The global connection cap.
@@ -692,7 +699,7 @@ impl LimitsBuilder {
         match self.limits.lane_reserve.get_mut(usize::from(lane.0)) {
             Some(slot) => *slot = Some(slots),
             // Rejected by `build` (field "lane_reserve").
-            None => self.limits.lane_reserve[RESERVED_LANES - 1] = Some(u32::MAX),
+            None => self.bad_lane = true,
         }
         self
     }
@@ -713,6 +720,11 @@ impl LimitsBuilder {
     }
 
     fn check(&self) -> Result<(), NetError> {
+        /// A timeout over a year is refused (in seconds): `Instant + Duration` panics
+        /// on overflow, and "no limit" is not a limit a peer should be able to hold.
+        const TOO_LONG: ConfigReason = ConfigReason::TooLarge {
+            max: crate::time::LONGEST.as_secs(),
+        };
         let l = &self.limits;
         // Zero where zero is meaningless.
         let zeros: [(&'static str, bool); 6] = [
@@ -757,6 +769,26 @@ impl LimitsBuilder {
             if value.is_some_and(|d| d < tick) {
                 return Err(invalid(field, ConfigReason::BelowTick));
             }
+            if value.is_some_and(|d| d > crate::time::LONGEST) {
+                return Err(invalid(field, TOO_LONG));
+            }
+        }
+        let long = |d: Duration| d > crate::time::LONGEST;
+        if l.min_rate
+            .is_some_and(|r| long(r.grace) || long(r.window) || long(r.check))
+        {
+            return Err(invalid("min_rate", TOO_LONG));
+        }
+        if l.graceful_linger.is_some_and(|(d, _)| long(d)) {
+            return Err(invalid("graceful_linger", TOO_LONG));
+        }
+        if l.max_connections.is_some_and(|n| n > MAX_CONNECTIONS) {
+            return Err(invalid(
+                "max_connections",
+                ConfigReason::TooLarge {
+                    max: u64::from(MAX_CONNECTIONS),
+                },
+            ));
         }
         if let Some(rate) = l.min_rate {
             if !rate.is_off() {
@@ -802,7 +834,7 @@ impl LimitsBuilder {
                 return Err(invalid("pressure", ConfigReason::Inconsistent));
             }
         }
-        if l.lane_reserve[RESERVED_LANES - 1] == Some(u32::MAX) {
+        if self.bad_lane {
             return Err(invalid("lane_reserve", ConfigReason::TooLarge { max: 7 }));
         }
         let reserved: u64 = l.lane_reserve.iter().flatten().map(|n| u64::from(*n)).sum();
@@ -813,6 +845,20 @@ impl LimitsBuilder {
         }
         Ok(())
     }
+}
+
+/// The process's open-descriptor limit (`RLIMIT_NOFILE`, soft) on Unix: what
+/// `ServerBuilder::build` checks a global cap against. `None` where it is unlimited,
+/// and on Windows, where socket handles do not come from a small table. Use it to
+/// place a soft cap of your own under the one net-io would pick.
+///
+/// ```
+/// let cap = net_io::descriptor_limit().map_or(10_000, |n| n.saturating_sub(64));
+/// assert!(cap > 0);
+/// ```
+#[must_use]
+pub fn descriptor_limit() -> Option<u64> {
+    crate::sys::descriptor_limit()
 }
 
 #[cfg(test)]
@@ -876,6 +922,42 @@ mod tests {
         ));
     }
 
+    /// "No limit" spelled `Duration::MAX` is refused at build instead of panicking
+    /// on the first deadline (review finding).
+    #[test]
+    fn test_timeouts_over_a_year_and_huge_caps_rejected() {
+        for field in ["idle_timeout", "read_timeout", "drain_timeout"] {
+            let b = Limits::builder();
+            let b = match field {
+                "idle_timeout" => b.idle_timeout(Duration::MAX),
+                "read_timeout" => b.read_timeout(Duration::from_secs(400 * 86_400)),
+                _ => b.drain_timeout(Duration::MAX),
+            };
+            let err = b.build().unwrap_err();
+            assert!(
+                matches!(err, NetError::InvalidConfig { field: f, reason: ConfigReason::TooLarge { .. } } if f == field),
+                "{err:?}"
+            );
+        }
+        assert!(
+            Limits::builder()
+                .idle_timeout(Duration::from_secs(365 * 86_400))
+                .build()
+                .is_ok()
+        );
+        let err = Limits::builder()
+            .max_connections(u32::MAX)
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NetError::InvalidConfig {
+                field: "max_connections",
+                reason: ConfigReason::TooLarge { .. }
+            }
+        ));
+    }
+
     #[test]
     fn test_min_rate_window_below_check_rejected() {
         let rate = MinRate {
@@ -922,6 +1004,14 @@ mod tests {
         };
         assert!(Limits::builder().pressure(bad).build().is_err());
         assert!(Limits::builder().lane_reserve(Lane(8), 1).build().is_err());
+        // A later valid lane 7 does not hide the invalid one (review finding).
+        assert!(
+            Limits::builder()
+                .lane_reserve(Lane(8), 1)
+                .lane_reserve(Lane(7), 1)
+                .build()
+                .is_err()
+        );
         assert!(
             Limits::builder()
                 .max_connections(10)

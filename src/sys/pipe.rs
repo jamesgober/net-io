@@ -17,9 +17,9 @@
 
 use std::ffi::c_void;
 use std::io::{self, IoSlice};
+use std::mem::ManuallyDrop;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::windows::{CancelIoEx, Overlapped, Wake};
@@ -43,6 +43,11 @@ const SECURITY_IDENTIFICATION: u32 = 1 << 16;
 const SDDL_REVISION_1: u32 = 1;
 const TOKEN_QUERY: u32 = 8;
 const TOKEN_USER_CLASS: i32 = 1;
+#[cfg(test)]
+const TOKEN_OWNER_CLASS: i32 = 4;
+/// `SE_KERNEL_OBJECT`: a handle to any kernel object, a pipe included.
+const SE_KERNEL_OBJECT: i32 = 6;
+const OWNER_SECURITY_INFORMATION: u32 = 1;
 const WAIT_TIMEOUT: u32 = 258;
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 const INFINITE: u32 = 0xFFFF_FFFF;
@@ -139,6 +144,16 @@ unsafe extern "system" {
         returned: *mut u32,
     ) -> i32;
     fn ConvertSidToStringSidW(sid: *mut c_void, text: *mut *mut u16) -> i32;
+    fn GetSecurityInfo(
+        handle: Handle,
+        object: i32,
+        info: u32,
+        owner: *mut *mut c_void,
+        group: *mut *mut c_void,
+        dacl: *mut *mut c_void,
+        sacl: *mut *mut c_void,
+        descriptor: *mut *mut c_void,
+    ) -> u32;
     fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
         text: *const u16,
         revision: u32,
@@ -226,13 +241,54 @@ impl Side {
 struct Sides {
     read: Side,
     write: Side,
+    /// The close drops what is unsent. Only a stream with IO under way has
+    /// anything to drop, so the flag lives here, not in every stream.
+    abortive: bool,
+}
+
+/// The instances of one pipe name this process holds: the spare and every server
+/// end in use. A pipe exists while one of its instances is open, so while `live` is
+/// above zero the name is ours. At zero another process may have created the name
+/// since, and a new instance made without `FILE_FLAG_FIRST_PIPE_INSTANCE` would join
+/// that pipe, with its security descriptor. Instances are made and closed under
+/// this lock, so `live` never counts one that is already closed.
+#[derive(Default)]
+struct Instances {
+    spare: Option<OwnedHandle>,
+    live: usize,
+}
+
+type Held = Arc<Mutex<Instances>>;
+
+fn hold(held: &Held) -> MutexGuard<'_, Instances> {
+    held.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Instances {
+    /// Closes an instance this process made.
+    fn close(&mut self, handle: OwnedHandle) {
+        drop(handle);
+        self.live = self.live.saturating_sub(1);
+    }
+
+    /// Keeps `handle` as the spare, or closes it when there is one already.
+    fn keep(&mut self, handle: OwnedHandle) {
+        if self.spare.is_none() {
+            self.spare = Some(handle);
+        } else {
+            self.close(handle);
+        }
+    }
 }
 
 /// A connected pipe, either end.
 pub(crate) struct PipeStream {
-    handle: OwnedHandle,
+    /// Closed in `Drop`, after the IO has ended, under the server's lock for a
+    /// server end.
+    handle: ManuallyDrop<OwnedHandle>,
+    /// The server's instance count, for a server end.
+    instances: Option<Held>,
     sides: Mutex<Option<Box<Sides>>>,
-    abortive: AtomicBool,
 }
 
 impl std::fmt::Debug for PipeStream {
@@ -244,11 +300,21 @@ impl std::fmt::Debug for PipeStream {
 }
 
 impl PipeStream {
+    /// A client end.
     pub(crate) fn new(handle: OwnedHandle) -> PipeStream {
         PipeStream {
-            handle,
+            handle: ManuallyDrop::new(handle),
+            instances: None,
             sides: Mutex::new(None),
-            abortive: AtomicBool::new(false),
+        }
+    }
+
+    /// A server end, counted among `instances` until it closes.
+    fn server_end(handle: OwnedHandle, instances: Held) -> PipeStream {
+        PipeStream {
+            handle: ManuallyDrop::new(handle),
+            instances: Some(instances),
+            sides: Mutex::new(None),
         }
     }
 
@@ -270,6 +336,7 @@ impl PipeStream {
             *guard = Some(Box::new(Sides {
                 read: Side::new()?,
                 write: Side::new()?,
+                abortive: false,
             }));
         }
         match guard.as_mut() {
@@ -433,7 +500,10 @@ impl PipeStream {
 
     /// Unread bytes are dropped at close, and nothing waits for a flush.
     pub(crate) fn set_abortive(&self) {
-        self.abortive.store(true, Ordering::Relaxed);
+        let mut guard = self.sides.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(sides) = guard.as_mut() {
+            sides.abortive = true;
+        }
     }
 
     /// The process that created the pipe's server end.
@@ -444,6 +514,41 @@ impl PipeStream {
             return Err(io::Error::last_os_error());
         }
         Ok(pid)
+    }
+
+    /// The owner of the pipe's security descriptor, as a string SID: the account
+    /// (or, for an elevated administrator, the group) that created its first
+    /// instance. Read from the handle, so it describes the pipe this end is
+    /// connected to.
+    pub(crate) fn owner_sid(&self) -> io::Result<String> {
+        let mut owner: *mut c_void = std::ptr::null_mut();
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        // SAFETY: the handle is open; `owner` and `descriptor` are written during the
+        // call, and `owner` points into `descriptor`, which is freed below.
+        let status = unsafe {
+            GetSecurityInfo(
+                self.raw(),
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &raw mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let text = if owner.is_null() {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        } else {
+            // SAFETY: `owner` points to a SID inside `descriptor`, still allocated.
+            unsafe { sid_string(owner) }
+        };
+        // SAFETY: the call says to free the descriptor so.
+        let _ = unsafe { LocalFree(descriptor) };
+        text
     }
 
     /// The process that opened the pipe's client end.
@@ -459,6 +564,19 @@ impl PipeStream {
 
 impl Drop for PipeStream {
     fn drop(&mut self) {
+        self.settle();
+        // SAFETY: the handle is taken once, here, and nothing uses it after.
+        let handle = unsafe { ManuallyDrop::take(&mut self.handle) };
+        match &self.instances {
+            Some(held) => hold(held).close(handle),
+            None => drop(handle),
+        }
+    }
+}
+
+impl PipeStream {
+    /// Ends the IO still under way, so the box can go.
+    fn settle(&mut self) {
         let sides = self
             .sides
             .get_mut()
@@ -468,7 +586,7 @@ impl Drop for PipeStream {
         let raw = self.handle.as_raw_handle();
         // Closing a pipe keeps what is already in it readable, so only a write the
         // kernel has not taken yet needs a moment.
-        if sides.write.pending && !self.abortive.load(Ordering::Relaxed) {
+        if sides.write.pending && !sides.abortive {
             // SAFETY: the event is open; the wait is bounded.
             let _ =
                 unsafe { WaitForSingleObject(sides.write.event.as_raw_handle(), CLOSE_FLUSH_MS) };
@@ -543,8 +661,33 @@ impl Drop for Descriptor {
     }
 }
 
-/// The SDDL that lets only the current user in (and the system, when asked).
-pub(crate) fn owner_sddl(system: bool) -> io::Result<String> {
+/// A SID as text (`S-1-5-18`).
+///
+/// # Safety
+///
+/// `sid` points to a valid SID for the call.
+unsafe fn sid_string(sid: *mut c_void) -> io::Result<String> {
+    let mut text: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `sid` is valid by this function's contract; `text` is written.
+    if unsafe { ConvertSidToStringSidW(sid, &raw mut text) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut len = 0;
+    // SAFETY: the string is terminated, per the conversion's contract.
+    let out = unsafe {
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
+    };
+    // SAFETY: the conversion says to free it so.
+    let _ = unsafe { LocalFree(text.cast()) };
+    Ok(out)
+}
+
+/// A SID from this process's token: `TokenUser` or `TokenOwner`, whose structures
+/// both start with the SID pointer.
+fn token_sid(class: i32) -> io::Result<String> {
     let mut token: Handle = std::ptr::null_mut();
     // SAFETY: the current-process pseudo handle needs no closing; `token` is written.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
@@ -552,14 +695,14 @@ pub(crate) fn owner_sddl(system: bool) -> io::Result<String> {
     }
     // SAFETY: `token` was just returned, is open, and has no other owner.
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    // A TOKEN_USER and its SID, aligned for the pointer it starts with.
+    // The structure and its SID, aligned for the pointer it starts with.
     let mut info = [0usize; 32];
     let mut returned = 0u32;
     // SAFETY: `info` has room for the stated length; it is written during the call.
     let ok = unsafe {
         GetTokenInformation(
             token.as_raw_handle(),
-            TOKEN_USER_CLASS,
+            class,
             info.as_mut_ptr().cast(),
             size_of_val(&info) as u32,
             &raw mut returned,
@@ -568,22 +711,19 @@ pub(crate) fn owner_sddl(system: bool) -> io::Result<String> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    let sid = info[0] as *mut c_void;
-    let mut text: *mut u16 = std::ptr::null_mut();
-    // SAFETY: `sid` points into `info`, as the call above filled it.
-    if unsafe { ConvertSidToStringSidW(sid, &raw mut text) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut len = 0;
-    // SAFETY: the string is terminated, per the conversion's contract.
-    let user = unsafe {
-        while *text.add(len) != 0 {
-            len += 1;
-        }
-        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
-    };
-    // SAFETY: the conversion says to free it so.
-    let _ = unsafe { LocalFree(text.cast()) };
+    // SAFETY: the first word points to the SID, inside `info`, as the call filled it.
+    unsafe { sid_string(info[0] as *mut c_void) }
+}
+
+/// This process's default owner for new objects, which a pipe it creates gets.
+#[cfg(test)]
+pub(crate) fn token_owner_sid() -> io::Result<String> {
+    token_sid(TOKEN_OWNER_CLASS)
+}
+
+/// The SDDL that lets only the current user in (and the system, when asked).
+pub(crate) fn owner_sddl(system: bool) -> io::Result<String> {
+    let user = token_sid(TOKEN_USER_CLASS)?;
     let mut sddl = format!("D:P(A;;GA;;;{user})");
     if system {
         sddl.push_str("(A;;GA;;;SY)");
@@ -603,7 +743,7 @@ pub(crate) struct PipeServer {
     path: Vec<u16>,
     descriptor: Descriptor,
     params: PipeParams,
-    next: Mutex<Option<OwnedHandle>>,
+    instances: Held,
 }
 
 impl std::fmt::Debug for PipeServer {
@@ -612,9 +752,23 @@ impl std::fmt::Debug for PipeServer {
     }
 }
 
+impl Drop for PipeServer {
+    fn drop(&mut self) {
+        let mut held = hold(&self.instances);
+        if let Some(spare) = held.spare.take() {
+            held.close(spare);
+        }
+    }
+}
+
+/// The error for a name another process holds.
+fn name_taken(e: io::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::AddrInUse, e)
+}
+
 impl PipeServer {
     /// Creates the first instance, which fails if the name is taken: another process
-    /// that made it first owns it. `ERROR_ACCESS_DENIED` and `ERROR_PIPE_BUSY` say so.
+    /// that made it first owns it.
     pub(crate) fn create(
         name: &str,
         params: PipeParams,
@@ -624,19 +778,26 @@ impl PipeServer {
             path: pipe_path(name),
             descriptor,
             params,
-            next: Mutex::new(None),
+            instances: Held::default(),
         };
-        let first = server.instance(true)?;
-        *server.next.lock().unwrap_or_else(PoisonError::into_inner) = Some(first);
+        {
+            let mut held = hold(&server.instances);
+            let first = server.instance(&mut held)?;
+            held.spare = Some(first);
+        }
         Ok(server)
     }
 
-    fn instance(&self, first: bool) -> io::Result<OwnedHandle> {
+    /// A new instance, made under the lock. With no instance held it claims the name
+    /// (`FILE_FLAG_FIRST_PIPE_INSTANCE`), and `ERROR_ACCESS_DENIED` or
+    /// `ERROR_PIPE_BUSY` then mean another process owns it: `AddrInUse`.
+    fn instance(&self, held: &mut Instances) -> io::Result<OwnedHandle> {
         let attributes = SecurityAttributes {
             length: size_of::<SecurityAttributes>() as u32,
             descriptor: self.descriptor.0 as *mut c_void,
             inherit: 0,
         };
+        let first = held.live == 0;
         let open_mode = PIPE_ACCESS_DUPLEX
             | FILE_FLAG_OVERLAPPED
             | if first {
@@ -658,43 +819,69 @@ impl PipeServer {
             )
         };
         if is_invalid(raw) {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            return Err(match e.raw_os_error() {
+                Some(ERROR_ACCESS_DENIED | ERROR_PIPE_BUSY) if first => name_taken(e),
+                _ => e,
+            });
         }
+        held.live += 1;
         // SAFETY: `raw` was just returned, is open, and has no other owner.
         Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
     }
 
     /// Waits for a client; `None` when `wake` fired first. The next instance exists
-    /// before this returns, so a client never finds none.
+    /// before this returns, so a client never finds none, unless the instance cap is
+    /// reached (with `max_instances(1)`, always): the name is then free once the
+    /// connections close, and the next accept claims it again.
     pub(crate) fn accept(&self, wake: Option<&Wake>) -> io::Result<Option<PipeStream>> {
         loop {
-            let taken = self
-                .next
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            let handle = match taken {
-                Some(h) => h,
-                None => self.instance(false)?,
+            let handle = {
+                let mut held = hold(&self.instances);
+                match held.spare.take() {
+                    Some(h) => h,
+                    None => self.instance(&mut held)?,
+                }
             };
             match self.connect(&handle, wake) {
                 Ok(true) => {
-                    if let Ok(next) = self.instance(false) {
-                        *self.next.lock().unwrap_or_else(PoisonError::into_inner) = Some(next);
+                    let mut held = hold(&self.instances);
+                    // `handle` is open, so this joins our own pipe.
+                    if held.spare.is_none() {
+                        if let Ok(next) = self.instance(&mut held) {
+                            held.spare = Some(next);
+                        }
                     }
-                    return Ok(Some(PipeStream::new(handle)));
+                    drop(held);
+                    return Ok(Some(PipeStream::server_end(handle, self.instances.clone())));
                 }
                 Ok(false) => {
-                    *self.next.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
+                    hold(&self.instances).keep(handle);
                     return Ok(None);
                 }
                 // The client came and went before the call: this instance is spent.
                 Err(e) if e.raw_os_error() == Some(ERROR_NO_DATA) => {
                     // SAFETY: the handle is open.
                     let _ = unsafe { DisconnectNamedPipe(handle.as_raw_handle()) };
-                    *self.next.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
+                    hold(&self.instances).keep(handle);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Keep the name: a fresh instance replaces this one while it is
+                    // still open, and when none can be made this one stays.
+                    let mut held = hold(&self.instances);
+                    match self.instance(&mut held) {
+                        Ok(next) => {
+                            held.close(handle);
+                            held.keep(next);
+                        }
+                        Err(_) => {
+                            // SAFETY: the handle is open.
+                            let _ = unsafe { DisconnectNamedPipe(handle.as_raw_handle()) };
+                            held.keep(handle);
+                        }
+                    }
+                    return Err(e);
+                }
             }
         }
     }
@@ -787,12 +974,10 @@ pub(crate) fn is_no_pipe(e: &io::Error) -> bool {
     e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND)
 }
 
-/// Whether `e` from creating a pipe's first instance says another owns the name.
+/// Whether `e` from creating or accepting on a pipe says another process owns the
+/// name.
 pub(crate) fn is_name_taken(e: &io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(ERROR_ACCESS_DENIED | ERROR_PIPE_BUSY)
-    )
+    e.kind() == io::ErrorKind::AddrInUse
 }
 
 #[cfg(test)]
@@ -825,6 +1010,8 @@ mod tests {
         assert_eq!(SECURITY_IDENTIFICATION, fs::SECURITY_IDENTIFICATION);
         assert_eq!(TOKEN_QUERY, sec::TOKEN_QUERY);
         assert_eq!(TOKEN_USER_CLASS, sec::TokenUser);
+        assert_eq!(TOKEN_OWNER_CLASS, sec::TokenOwner);
+        assert_eq!(OWNER_SECURITY_INFORMATION, sec::OWNER_SECURITY_INFORMATION);
         assert_eq!(WAIT_TIMEOUT, wf::WAIT_TIMEOUT);
         assert_eq!(WAIT_FAILED, wf::WAIT_FAILED);
         assert_eq!(ERROR_FILE_NOT_FOUND as u32, wf::ERROR_FILE_NOT_FOUND);
@@ -841,6 +1028,64 @@ mod tests {
             size_of::<SecurityAttributes>(),
             size_of::<sec::SECURITY_ATTRIBUTES>()
         );
+    }
+
+    /// The owner a client reads is the creator's default owner for new objects.
+    #[test]
+    fn test_owner_sid_is_the_creators_default_owner() {
+        let name = format!("net-io-sys-owner-{}", std::process::id());
+        let params = PipeParams {
+            max_instances: 1,
+            inbound: 4096,
+            outbound: 4096,
+        };
+        let sddl = owner_sddl(false).unwrap();
+        let server =
+            PipeServer::create(&name, params, Descriptor::from_sddl(&sddl).unwrap()).unwrap();
+        let client = pipe_connect(&name, Duration::from_secs(1)).unwrap();
+        let expected = token_owner_sid().unwrap();
+        assert_eq!(client.owner_sid().unwrap(), expected);
+        let accepted = server.accept(None).unwrap().unwrap();
+        assert_eq!(accepted.owner_sid().unwrap(), expected);
+    }
+
+    /// A drain closes an idle connection, but a reply its owner already handed over
+    /// (a write still under way) goes out whole.
+    #[test]
+    fn test_drain_leaves_a_pending_write_alone() {
+        let name = format!("net-io-sys-drain-{}", std::process::id());
+        let params = PipeParams {
+            max_instances: 1,
+            inbound: 1024,
+            outbound: 1024,
+        };
+        let sddl = owner_sddl(false).unwrap();
+        let server =
+            PipeServer::create(&name, params, Descriptor::from_sddl(&sddl).unwrap()).unwrap();
+        let client = pipe_connect(&name, Duration::from_secs(1)).unwrap();
+        let stream = server.accept(None).unwrap().unwrap();
+        // More than the pipe holds: the write stays in the kernel until read.
+        assert_eq!(stream.write(&[5u8; BUFFER]).unwrap(), BUFFER);
+        let slot = crate::sys::KillSlot::new();
+        let generation = slot.install(stream.as_sock());
+        slot.set_wake(Some(Arc::new(Wake::new().unwrap())));
+        slot.set_idle(true);
+        assert!(slot.drain_idle(generation));
+        let (mut got, mut buf) = (0, [0u8; 4096]);
+        let until = Instant::now() + Duration::from_secs(2);
+        while got < BUFFER && Instant::now() < until {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    client
+                        .wait(Interest::Read, None, Some(Duration::from_millis(100)))
+                        .unwrap();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(got, BUFFER, "the drain cut the reply short");
     }
 
     #[test]

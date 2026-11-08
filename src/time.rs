@@ -27,6 +27,15 @@ pub trait Clock: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MonotonicClock;
 
+/// A year: the longest timeout net-io takes. `Instant + Duration` panics on
+/// overflow, and `Duration::MAX` is a common way to say "no limit".
+pub(crate) const LONGEST: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// `d`, held to [`LONGEST`].
+pub(crate) fn bounded(d: Duration) -> Duration {
+    d.min(LONGEST)
+}
+
 /// The raw monotonic clock in microseconds: `CLOCK_MONOTONIC` on Linux and
 /// macOS, the performance counter on Windows. This is the value systemd's
 /// `MONOTONIC_USEC` expects (`sd_notify` reload and watchdog messages); it is

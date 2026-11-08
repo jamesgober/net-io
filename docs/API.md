@@ -1,7 +1,7 @@
 # net-io - API Reference
 
 > Reference for every public item in `net-io`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.6.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; items marked with a later version than the current release are specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.7.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; items marked with a later version than the current release are specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -47,6 +47,8 @@
 - [TCP](#tcp)
   - [`TcpListener`](#tcplistener)
   - [`TcpConnection`](#tcpconnection)
+  - [`Health`, `Drained`](#health-drained)
+  - [`Backoff`](#backoff)
   - [`ConnectOptions`](#connectoptions)
 - [Socket options](#socket-options)
   - [`ListenOptions`](#listenoptions)
@@ -892,7 +894,7 @@ impl Limits {
 
 Every bound net-io enforces, in one value. A `Limits` records only what was set; everything left unset takes the defaults of the driver that runs the connection (table below), so `Limits::builder().max_connections(100).build()` means "my cap, the driver's defaults for the rest" whichever driver the server picks. `Limits::default()` is the same as an empty builder. A server takes one `Limits` and each listener may override values of it (`ListenerSpec::limits`); a client `TcpConnection` takes one through `set_limits`. Limits are checked before the resource is committed: a connection over a cap is refused before any byte is read, a header over its size before buffering, a buffer before allocation. P0, Tier 2, `0.3.0`.
 
-`resolve` returns the effective values for a driver (every getter then returns `Some`); `validate` is what `ServerBuilder::build` runs on the resolved values (Tier 3 for code that checks limits ahead of time). `descriptor_limit` is the process's open-descriptor limit (`RLIMIT_NOFILE` soft limit on Unix, `None` on Windows, where socket handles do not come from a small table).
+`descriptor_limit()` (crate root, P1, Tier 2, `0.7.0`) returns the same descriptor limit `build` checks against, so a consumer can place a soft cap of its own under it (serve-net's request). `resolve` returns the effective values for a driver (every getter then returns `Some`); `validate` is what `ServerBuilder::build` runs on the resolved values (Tier 3 for code that checks limits ahead of time). `descriptor_limit` is the process's open-descriptor limit (`RLIMIT_NOFILE` soft limit on Unix, `None` on Windows, where socket handles do not come from a small table).
 
 ### `LimitsBuilder`
 
@@ -1088,6 +1090,7 @@ impl TcpConnection {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<TcpConnection, NetError>;
     pub fn connect_with<A: ToSocketAddrs>(addr: A, options: ConnectOptions) -> Result<TcpConnection, NetError>;
     pub fn connect_host(host: &str, port: u16, options: ConnectOptions) -> Result<TcpConnection, NetError>;
+    pub fn connect_retry<A: ToSocketAddrs>(addr: A, options: ConnectOptions, backoff: &mut Backoff) -> Result<TcpConnection, NetError>;
 
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, NetError>;           // 0 = the peer closed its side
     pub fn recv_exact(&mut self, buf: &mut [u8]) -> Result<(), NetError>;
@@ -1098,9 +1101,12 @@ impl TcpConnection {
     pub fn send_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize, NetError>;
     pub fn send_all_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> Result<(), NetError>;
     pub fn send_file(&mut self, file: &File, offset: u64, len: u64) -> Result<u64, NetError>;
+    pub fn recv_file(&mut self, file: &File, offset: u64, len: u64) -> Result<u64, NetError>;
 
     pub fn shutdown(&mut self, how: Shutdown) -> Result<(), NetError>;
     pub fn close(self) -> Result<(), NetError>;                                  // graceful
+    pub fn drain(self, within: Duration) -> Drained;                             // FIN, wait for the peer's FIN
+    pub fn probe(&mut self) -> Result<Health, NetError>;                         // no wait, nothing consumed
     pub fn abort(self);                                                          // RST
 
     pub fn info(&self) -> &ConnectionInfo;
@@ -1128,15 +1134,19 @@ A connected TCP socket that carries its own limits: every read honours the curre
 | `connect` | as [`connect`](#connect) | as `connect` | | P0 | 1 | `0.3.0` |
 | `connect_with` | uses [`ConnectOptions`](#connectoptions) | as `connect` | | P0 | 2 | `0.3.0` |
 | `connect_host` | resolves through `std::net::ToSocketAddrs`, tries addresses in order, per-attempt deadline = remaining total / remaining addresses (at least 1 s); Happy Eyeballs when `ConnectOptions::happy_eyeballs(true)` | `NoAddresses`, connect errors (the last one) | resolution plus one round trip | P1 (Happy Eyeballs P2) | 2 | `0.3.0` (Happy Eyeballs `0.5.0`) |
+| `connect_retry` | connects; after an error a restarting or failing-over server produces (refused, timed out, unreachable, reset, no addresses, resolution failed) or a shortage of local ports sleeps [`Backoff::next_delay`](#backoff) and tries again, resolving `addr` again each time; any other error returns at once | the last connect error once the backoff is spent | one connect per attempt, plus the delays | P1 | 2 | `0.7.0` |
 | `recv`, `recv_vectored` | retries `EINTR` with the remaining deadline; a zero-length `buf` returns `Ok(0)` without a system call (this is not end of stream; check `buf.len()`) | `TimedOut { kind }`, `SlowPeer { In }`, `ConnectionReset`, `Killed`, `Closed` | 1 system call; 2 when the deadline target moved by more than a tick | P0 (vectored P1) | 1 | `0.3.0` |
 | `recv_exact` | loops until `buf` is full | as `recv`, plus `Closed` when the peer closes early | | P1 | 1 | `0.3.0` |
 | `peek` | `MSG_PEEK` | as `recv` | 1 system call | P2 | 2 | `0.3.0` |
 | `send` | gate check, then one system call; may write less than `buf` | `TimedOut`, `SlowPeer { Out }`, `BrokenPipe`, `ConnectionReset`, `EgressDenied`, `Killed` | gate check + 1 system call | P0 | 1 | `0.3.0` |
 | `send_all` | loops from the exact offset until done, the deadline passes, or the gate denies; the gate check runs before each write (a retry after the socket was full is not checked again, D-074) | as `send` | 1 system call per chunk | P0 | 1 | `0.3.0` |
 | `send_vectored`, `send_all_vectored` | up to 64 slices per system call; `send_all_vectored` advances the slices in place (no copy) | as `send` | 1 system call per 64 slices | P1 | 2 | `0.3.0` |
-| `send_file` | `sendfile` (Linux, macOS, FreeBSD) in 1 MiB chunks, a gate check before each; `TransmitFile` for `push_file` on the Windows reactor; falls back to read-and-write internally where zero copy is unavailable (TLS, pipes, Unix sockets off Linux, a held connection on Windows) | as `send`; `FileTruncated { sent }` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
+| `send_file` | `sendfile` (Linux, macOS, FreeBSD) in 1 MiB chunks (256 KiB on the reactor, at most 256 KiB of file per worker between two looks at the OS), a gate check before each; `TransmitFile` for `push_file` on the Windows reactor; falls back to read-and-write internally where zero copy is unavailable (TLS, pipes, Unix sockets off Linux, a held connection on Windows) | as `send`; `FileTruncated { sent }` when the file shrinks | zero copy where possible | P2 | 2 | `0.6.0` |
+| `recv_file` | receives up to `len` bytes into `file` at `offset`, short only at the peer's FIN; on Linux by `splice` (socket to pipe to file, no copy through user space), with TLS, bytes read ahead, other systems, or a file `splice` turns down by a 64 KiB copy; the read deadlines, the minimum rate, kills, and drains apply as for `recv` | as `recv`; `Os` when the file cannot be written | one pipe (two descriptors) for the call; two `splice` calls per receive on Linux | P2 | 2 | `0.7.0` |
 | `shutdown` | half-close: `Write` sends FIN and keeps reading; `Read` stops reading; repeated calls are no-ops | `Closed`, `Os` | 1 system call | P0 | 1 | `0.3.0` |
 | `close` | graceful: FIN, then reads and discards up to 64 KiB for up to 2 s so unread input does not cause an RST that destroys the last response, then close | `TimedOut`, `Os` | flush plus linger | P0 | 1 | `0.3.0` |
+| `drain` | client-side drain: FIN, then reads and discards until the peer's FIN or `within`, then closes; closing after the peer's FIN leaves nothing unread, so neither side sees a reset. [`Drained`](#health-drained) says whether the peer finished and how much was discarded | none surfaced | 1 `shutdown`, one wait and read per arrival | P1 | 2 | `0.7.0` |
+| `probe` | what the next read would find, without waiting or consuming: one zero-timeout wait and, when readable, a one-byte `MSG_PEEK` (TCP); [`Health`](#health-drained) `Open`, `Readable`, or `PeerClosed`. For checking an idle pooled connection before reuse | `ConnectionReset`, `Killed`, `Closed`, `Os` | 1 or 2 system calls | P1 | 2 | `0.7.0` |
 | `abort` | `SO_LINGER {on, 0}` and close: RST, kernel resources freed at once | none surfaced | 2 system calls | P0 | 1 | `0.3.0` |
 | `info`, `id`, `peer_addr`, `local_addr` | | | none | P0 | 1 | `0.3.0` |
 | `kill_handle` | a handle other threads can use to abort this connection | | one `Arc` clone | P0 | 2 | `0.3.0` |
@@ -1173,6 +1183,44 @@ let mut buf = [0u8; 16];
 assert!(matches!(conn.recv(&mut buf), Err(net_io::NetError::Killed { .. })));
 # Ok::<(), net_io::NetError>(())
 ```
+
+### `Health`, `Drained`
+
+```rust
+#[non_exhaustive]
+pub enum Health { Open, Readable, PeerClosed }
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Drained {
+    pub peer_closed: bool,   // the peer's FIN arrived in time
+    pub discarded: u64,      // bytes read and dropped while waiting
+}
+```
+
+P1, Tier 2, `0.7.0`. `Readable` on a TLS connection can mean records with no plaintext; on a stream other than TCP it can mean the end of the stream (only TCP can peek). A pool in front of these is the pooling crates' job (`pool-mod`, `fetch-net`); net-io supplies the connection, its health, and its drain (D-140).
+
+### `Backoff`
+
+```rust
+#[must_use]
+#[derive(Clone, Debug)]
+pub struct Backoff { /* ... */ }
+impl Backoff {
+    pub fn new() -> Self;                                  // 100 ms doubling to 30 s, jitter on, no limits
+    pub fn first(self, d: Duration) -> Self;               // at least 1 ms
+    pub fn max(self, d: Duration) -> Self;                 // at least `first`
+    pub fn jitter(self, on: bool) -> Self;
+    pub fn attempts(self, n: u32) -> Self;
+    pub fn give_up_after(self, total: Duration) -> Self;
+    pub fn next_delay(&mut self) -> Option<Duration>;
+    pub fn attempt(&self) -> u32;
+    pub fn reset(&mut self);
+}
+impl Default for Backoff;
+```
+
+P1, Tier 2, `0.7.0`. Delay `n` is `first * 2^n`, capped at `max`; with jitter each is drawn from the upper half of its step, so a fleet of clients that lost the same server spreads out but none retries faster than half the step (D-142). `next_delay` returns `None` once `attempts` delays were handed out, or when waiting the next one would end later than `give_up_after` from the first call. `reset` after a success. No allocation; the jitter source is a xorshift seeded from the standard library's per-process random hash key.
 
 ### `ConnectOptions`
 
@@ -1271,7 +1319,7 @@ impl Keepalive { pub const DEFAULT: Keepalive; }      // 60 s, 10 s, 6
 pub enum Linger { Off, Abortive, Timeout(Duration) }
 ```
 
-`None` leaves the OS default. P0, Tier 2, `0.3.0`.
+`None` leaves the OS default. `SO_LINGER` counts whole seconds, so `Linger::Timeout` rounds up: under a second it lingers one second (from `0.7.0`; before, it truncated to 0, which resets). P0, Tier 2, `0.3.0`.
 
 ### `SocketOptions`
 
@@ -2169,7 +2217,7 @@ The driver interface itself becomes public (Tier 3) at `0.5.0` so an executor ad
 ```rust
 pub trait Driver: Send {
     fn kind(&self) -> DriverKind;
-    fn register(&mut self, socket: BorrowedSocket<'_>, token: Token) -> Result<(), NetError>;
+    fn register(&mut self, socket: SharedSocket, token: Token) -> Result<(), NetError>;   // the driver holds the socket until deregister
     fn submit(&mut self, operation: Operation) -> Result<(), Rejected>;   // Rejected gives the operation and its buffers back
     fn wait(&mut self, out: &mut Completions, timeout: Option<Duration>) -> Result<usize, NetError>;
     fn cancel(&mut self, token: Token, which: OperationKind) -> Result<(), NetError>;  // always followed by exactly one completion
@@ -2194,15 +2242,15 @@ pub struct SendChunks { /* up to 64 chunks: pool buffers, &'static slices; taken
 pub struct Rejected { pub operation: Operation }
 #[derive(Clone)] pub struct DriverWaker { /* eventfd, EVFILT_USER, IOCP port, or parker */ }
 impl DriverWaker { pub fn wake(&self); }
-#[cfg(unix)] pub type BorrowedSocket<'a> = BorrowedFd<'a>;
-#[cfg(windows)] pub type BorrowedSocket<'a> = std::os::windows::io::BorrowedSocket<'a>;
+#[cfg(unix)] pub type SharedSocket = Arc<dyn AsFd + Send + Sync>;
+#[cfg(windows)] pub type SharedSocket = Arc<dyn std::os::windows::io::AsSocket + Send + Sync>;
 ```
 
 ```rust
 #[cfg(feature = "reactor")] pub fn new_reactor_driver(capacity: usize) -> Result<Box<dyn Driver>, NetError>;
 ```
 
-Completion-shaped (decision D-005): operations own their buffers until the completion returns them, which is what IOCP and io_uring need; epoll and kqueue adapt by doing the non-blocking call when readiness arrives. Cancellation always ends in exactly one completion. A token's low 32 bits index a table the driver keeps, so keep them small and dense, and put a generation in the high 32 bits to catch a completion for a slot that moved on. On Windows a listener cannot be registered (D-016) and `Accept` is refused. P2, Tier 3, `0.5.0`.
+Completion-shaped (decision D-005): operations own their buffers until the completion returns them, which is what IOCP and io_uring need; epoll and kqueue adapt by doing the non-blocking call when readiness arrives. Cancellation always ends in exactly one completion. The driver does I/O on a registered socket's descriptor by number, so it holds the socket (a `SharedSocket`, any `Arc` of a socket type) from `register` until `deregister`: a socket the caller dropped early stays open, and its number cannot go to another connection whose bytes a stale operation would then read or write. `deregister` drops the driver's clone, which closes the socket when it was the last one. Keep a clone to accept from a registered listener. The descriptor `as_fd` (`as_socket`) returns at registration is the one used throughout, as every `std` socket type keeps it. Cost: one `Arc` per registered socket, made by the caller (one allocation if the socket was not shared already) and 16 bytes in the driver's table; nothing per operation. Before `0.7.0`, `register` took a `BorrowedSocket<'_>` and only the documentation asked the caller to keep the socket open, which safe code could break. A token's low 32 bits index a table the driver keeps, so keep them small and dense, and put a generation in the high 32 bits to catch a completion for a slot that moved on. On Windows a listener cannot be registered (D-016) and `Accept` is refused. P2, Tier 3, `0.5.0`.
 
 ---
 
@@ -2221,6 +2269,7 @@ impl UdpSocket {
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<Datagram, NetError>;
     pub fn send(&mut self, buf: &[u8]) -> Result<usize, NetError>;
     pub fn mark_verified(&mut self, peer: SocketAddr);
+    pub fn forget_verified(&mut self, peer: SocketAddr);
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), NetError>;
     pub fn local_addr(&self) -> Result<SocketAddr, NetError>;
     pub fn stats(&self) -> UdpStats;
@@ -2243,10 +2292,12 @@ pub struct UdpOptions { /* ... */ }
 impl UdpOptions {
     pub fn new() -> Self;
     pub fn amplification_factor(self, factor: u8) -> Self;     // 1 by default, at most 3
-    pub fn amplification_window(self, window: Duration) -> Self; // 10 s by default, at least 1 s
+    pub fn amplification_window(self, window: Duration) -> Self; // 10 s by default, at least 1 s, at most 1 hour
     pub fn source_budget(self, budget: UdpBudget) -> Self;
     pub fn global_budget(self, budget: UdpBudget) -> Self;
     pub fn source_table(self, entries: u32) -> Self;            // 65,536 by default
+    pub fn verification_lifetime(self, lifetime: Duration) -> Self; // 60 s by default, at least 1 s, at most 1 day
+    pub fn verified_table(self, entries: u32) -> Self;          // 65,536 by default
     pub fn packet_info(self, on: bool) -> Self;                 // P2, 0.6.0
     pub fn ipv6_only(self, on: bool) -> Self;
 }
@@ -2265,10 +2316,11 @@ pub enum MulticastInterface { Any, V4(Ipv4Addr), V6Index(u32) }
 pub trait UdpSession: Send + 'static {
     fn on_datagram(&mut self, cx: &mut UdpContext<'_>, from: SocketAddr, bytes: &[u8]);
 }
-pub struct UdpContext<'a> { /* send_to (guarded), mark_verified, now, worker */ }
+pub struct UdpContext<'a> { /* send_to (guarded), mark_verified, forget_verified, now */ }
 impl UdpContext<'_> {
     pub fn send_to(&mut self, bytes: &[u8], to: SocketAddr) -> Result<usize, NetError>;
     pub fn mark_verified(&mut self, peer: SocketAddr);
+    pub fn forget_verified(&mut self, peer: SocketAddr);
     pub fn now(&self) -> Instant;
 }
 pub trait UdpSessionFactory: Send + Sync + 'static { fn open(&self, listener: &ListenerInfo) -> Box<dyn UdpSession>; }  // any Fn(&ListenerInfo) -> impl UdpSession
@@ -2279,13 +2331,14 @@ UDP source addresses are trivially spoofed, so the socket protects others and it
 
 | Item | Behaviour | Errors | Cost | Grade | Tier | Version |
 |---|---|---|---|---|---|---|
-| `bind`, `bind_with` | close-on-exec; no `SO_REUSEADDR` (and `SO_EXCLUSIVEADDRUSE` on Windows), so no other socket shares the port; `IPV6_V6ONLY` on by default; on Windows `SIO_UDP_CONNRESET` is switched off; peers normalized; options checked (`factor` 1 to 3, window at least 1 s, non-zero budgets and table) | bind errors, `InvalidConfig` | one-time | P1 | 1 / 2 | `0.4.0` |
-| `recv_from`, `recv` | a datagram larger than `buf` is reported with `truncated: true` and its real length where the OS gives it (`MSG_TRUNC` on Linux, `WSAEMSGSIZE` on Windows), never as a silently cut datagram; a zero-length datagram is valid; datagrams from sources over their budget are read, dropped, and counted before returning; ICMP "port unreachable" reports (`ECONNREFUSED`, Windows `WSAECONNRESET`) never end the socket | `TimedOut`, `Os` | 1 system call plus the budget check [est. under 30 ns] | P1 | 1 | `0.4.0` |
-| `send_to`, `send` | **no amplification**: to a peer not marked verified, the bytes sent never exceed `factor x` the bytes received from it within the window (the current and the previous window, so a reply just after the boundary passes); a peer never heard from gets nothing; otherwise `Limit { which: Amplification }` and nothing is sent. Peers are keyed by IP address, not port, since the victim of amplification is an address (decision D-096). An IPv4 destination on a dual-stack socket goes out IPv4-mapped | `Limit`, `Closed` (`send` unconnected), `Os` | 1 system call plus the guard (one hash lookup [est. under 30 ns]) | P1 | 1 | `0.4.0` |
+| `bind`, `bind_with` | close-on-exec; no `SO_REUSEADDR` (and `SO_EXCLUSIVEADDRUSE` on Windows), so no other socket shares the port; `IPV6_V6ONLY` on by default; on Windows `SIO_UDP_CONNRESET` is switched off; peers normalized; options checked (`factor` 1 to 3, window 1 s to 1 hour, verification lifetime 1 s to 1 day, non-zero budgets and tables) | bind errors, `InvalidConfig` | one-time | P1 | 1 / 2 | `0.4.0` |
+| `recv_from`, `recv` | a datagram larger than `buf` is reported with `truncated: true` and its real length where the OS gives it (`MSG_TRUNC` on Linux, `WSAEMSGSIZE` on Windows), never as a silently cut datagram; a zero-length datagram is valid; datagrams from sources over their budget are read, dropped, and counted before returning; ICMP "port unreachable" reports (`ECONNREFUSED`, Windows `WSAECONNRESET`) never end the socket; a read timeout too long for the clock (`Duration::MAX`) waits without a deadline | `TimedOut`, `Os` | 1 system call plus the budget check [est. under 30 ns] | P1 | 1 | `0.4.0` |
+| `send_to`, `send` | **no amplification**: to an address and port not marked verified, the bytes sent never exceed `factor x` the bytes received from its IP within the window (the current and the previous window, so a reply just after the boundary passes); a peer never heard from gets nothing; otherwise `Limit { which: Amplification }` and nothing is sent. The allowance is pooled per IP address, not port, since the victim of amplification is an address (decision D-096); sends to a verified peer are not charged to it. The bytes are charged before the send. An IPv4 destination on a dual-stack socket goes out IPv4-mapped | `Limit`, `Closed` (`send` unconnected), `Os` | 1 system call plus the guard (two hash lookups for an unverified peer, one for a verified one [est. under 60 ns]) | P1 | 1 | `0.4.0` |
 | `stats` | counters: returned, sent, dropped over budget, refused by the guard, truncated, ICMP reports ignored, overflow datagrams, sources tracked | | none | P1 | 2 | `0.4.0` |
 | `connect` | fixes the peer; the kernel filters other sources | `Os` | one-time | P1 | 2 | `0.4.0` |
-| `mark_verified` | the protocol proved the peer can receive (a cookie, a handshake); lifts the guard for it | | O(1) | P1 | 2 | `0.4.0` |
-| source table | bounded (default 65,536 entries, about 130 bytes each [est.], 8.5 MiB full) with CLOCK eviction of unverified entries (one insertion looks at most 64 entries); when nothing can be evicted, unknown sources share one overflow budget the size of a source budget and get no send allowance (strangers lose first, verified peers keep their entries) | | O(1) | P1 | 2 | `0.4.0` |
+| `mark_verified` | the protocol proved the peer can receive at this address and port (a cookie, a handshake, an authenticated datagram); lifts the guard for that address and port, not for other ports of the IP (a new port is a new path, as in RFC 9000 section 9), for the verification lifetime (60 s by default) from the latest call. Call it again each time the protocol proves the peer again; raw datagrams never extend it, since anyone can forge one. The verified table is bounded (default 65,536 entries, about 100 bytes each [est.]); a full one gives the place of a lapsed peer, then of one not recently verified, and the peer that loses its place is limited again until it is verified again | | one hash lookup, O(1) [est. under 30 ns] | P1 | 2 | `0.4.0` (port and lifetime: `0.7.0`) |
+| `forget_verified` | the protocol is done with the peer: its verification ends now | | one hash lookup | P1 | 2 | `0.7.0` |
+| source table | bounded (default 65,536 entries, about 130 bytes each [est.], 8.5 MiB full) with CLOCK eviction (one insertion looks at most 64 entries). Only an admitted datagram marks its entry recently used; one dropped over a budget does not. While the table is full, every datagram from a source already in it moves the hand two entries, so the sources' own traffic ages the table and a spoofer cannot hold every slot by touching each once per revolution. Verified peers live in their own table and never pin a slot here. When nothing can be evicted, unknown sources share one overflow budget the size of a source budget and get no send allowance | | O(1); a full table adds two flag writes per datagram [est. under 5 ns] | P1 | 2 | `0.4.0` |
 | `recv_batch`, `send_batch` | `recvmmsg` / `sendmmsg` on Linux, a loop elsewhere | | 1 system call per batch on Linux | P2 | 3 | `0.6.0` |
 | packet info (`destination`) | `IP_PKTINFO`, `IPV6_RECVPKTINFO` (`IP_RECVDSTADDR` on FreeBSD); not reported by `recv_batch` | `Unsupported` on Windows | ancillary data parse | P2 | 3 | `0.6.0` |
 | `join_multicast` | IPv4 and IPv6 groups | `Os` | | P2 | 2 | `0.6.0` |
@@ -2410,6 +2463,8 @@ conn.send_all(b"ready\n")?;
     // recv, recv_exact, send, send_all, close, abort, info, id, kill_handle, set_limits, set_phase,
     // set_exchange_deadline: the same signatures as UnixConnection; Read, Write, Drop as TcpConnection
     pub fn client_pid(&self) -> Result<u32, NetError>;
+    pub fn server_pid(&self) -> Result<u32, NetError>;
+    pub fn server_owner_sid(&self) -> Result<String, NetError>;                     // "S-1-5-18"
 }
 #[cfg(windows)] #[must_use] #[derive(Clone, Debug)] pub struct PipeOptions { /* ... */ }
 #[cfg(windows)] impl PipeOptions {
@@ -2426,8 +2481,11 @@ pub enum PipeSecurity { OwnerOnly, OwnerAndSystem, Sddl(String) }
 |---|---|---|---|---|---|
 | `create`, `create_with` | the first instance uses `FILE_FLAG_FIRST_PIPE_INSTANCE`, so if another process already owns the name the call fails instead of sharing it; `PIPE_REJECT_REMOTE_CLIENTS` always (not configurable); an owner-only security descriptor by default; a backslash in the name part is refused before any system call | `PipeNameInUse`, `PermissionDenied`, `InvalidConfig`, `Os` | P1 | 1 / 2 | `0.5.0` |
 | `accept` | waits for a client (overlapped on the reactor), creates the next instance before returning so a client never finds none; a client that connected before the wait (`ERROR_PIPE_CONNECTED`) is a success | `Os` | P1 | 1 | `0.5.0` |
+| `accept`: the name between instances | a pipe exists while one of its instances is open. When every instance is connected (always with `max_instances(1)`) there is no spare, so after those connections close the name is free and a client gets `NotFound` until the next accept. The listener counts its open instances, spare and connections together; when it holds none, the next instance claims the name again with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so it never joins a pipe another process created in the gap (which would carry that process's security descriptor). A failed `ConnectNamedPipe` keeps an instance open. Cost: one mutex per accept and per server-end close [est. under 1 µs] | `PipeNameInUse` (another process took the name in the gap), `Os` | P1 | 1 | `0.7.0` |
 | `PipeConnection::connect` | `CreateFileW` with `SECURITY_SQOS_PRESENT \| SECURITY_IDENTIFICATION`, so the server can identify the client but not impersonate it beyond that; on `ERROR_PIPE_BUSY` waits with `WaitNamedPipeW` within `timeout` | `ConnectTimeout`, `NotFound`, `PermissionDenied` | P1 | 1 | `0.5.0` |
 | `client_pid` | `GetNamedPipeClientProcessId` | `Os` | P1 | 2 | `0.5.0` |
+| `server_pid` | `GetNamedPipeServerProcessId`: the process that created the server end. Any local user may create a pipe name nobody holds, so a client that knows its server's process (one it started, say) checks this before it sends anything that matters. Process ids are reused after exit; `server_owner_sid` checks an account instead. Cost: one system call | `Closed`, `Os` | P1 | 2 | `0.7.0` |
+| `server_owner_sid` | `GetSecurityInfo(OWNER_SECURITY_INFORMATION)` on the connection's own handle, as a canonical string SID: the account that created the pipe, or `S-1-5-32-544` when an elevated administrator did. A user who squats a name cannot make a pipe owned by another account, so comparing this with the account the server runs as (`S-1-5-18` for a service as local system) tells the real server from a squatter, with no race: the handle is the pipe that was reached. Cost: one system call and one string [est. under 10 µs] | `Closed`, `Os` | P1 | 2 | `0.7.0` |
 
 ### `LocalListener`, `LocalConnection`
 
@@ -2760,7 +2818,7 @@ pub enum HandoffError {
 |---|---|---|---|---|
 | `ListenerHandle` | owned, move-only; dropping it closes the socket | P0 | 3 | `0.4.0` |
 | `send_listeners`, `recv_listeners` | one message carrying up to 64 descriptors (`SCM_RIGHTS`, attached to its first byte) and a manifest: magic `NIOH`, version 1, count, total length, per listener its kind, name (at most 64 bytes, cut at a character boundary), and local address, then a CRC32C of everything before it. The receiver checks the sender's credentials against `expect` (default: same uid) before reading, reads under `deadline`, receives close-on-exec, fails on a truncated control message or a sender that closes mid-message, refuses descriptors on any later read, checks magic, version, checksum, and count, and verifies every descriptor (`SO_TYPE`, `SO_ACCEPTCONN`, `getsockname` equals the manifest address). Any failure closes every received descriptor and returns the error: all or nothing (decision D-099) | P0 | 3 | `0.4.0` |
-| `share_listeners`, `receive_shared` | Windows: `WSADuplicateSocketW` per socket for one target pid (each blob works once, in that process only), sent with a random nonce over a named pipe with an owner-only security descriptor; the receiver checks the process at the far end of the pipe against `expect.pid`, refuses a nonce it already accepted, creates each socket with `WSASocketW(FROM_PROTOCOL_INFO, WSA_FLAG_OVERLAPPED)`, and verifies it | P0 | 3 | `0.5.0` |
+| `share_listeners`, `receive_shared` | Windows: `WSADuplicateSocketW` per socket for one target pid (each blob works once, in that process only), sent with a random nonce over a named pipe with an owner-only security descriptor; the receiver checks the process at the far end of the pipe against `expect.pid`, refuses a nonce it already accepted, creates each socket with `WSASocketW(FROM_PROTOCOL_INFO, WSA_FLAG_OVERLAPPED)` and makes it non-inheritable, claims every socket of the message before verifying any (a failure closes them all), refuses a socket this process already owns, and verifies each against the manifest. A damaged message cannot be claimed safely, so its sockets stay open until the process exits; the pipe's access list bounds who can send one | P0 | 3 | `0.5.0` (claim-all, refuse-owned, non-inheritable `0.7.0`) |
 | `HandoffPeer`, `HandoffError` | | P0 | 3 | `0.4.0` |
 
 Keep the channel's socket in a private directory (`0700`). Cost: under 1 ms per hand-off [est.].

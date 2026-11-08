@@ -377,6 +377,8 @@ impl Port {
     /// Puts a connected or connecting socket on this port. A listener is refused
     /// (D-016).
     pub(crate) fn associate(&self, sock: Sock<'_>) -> io::Result<Associated> {
+        #[cfg(any(test, net_io_shim))]
+        super::shim::check(super::shim::Op::Register)?;
         if super::is_listening_stream(sock)? {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
@@ -706,6 +708,9 @@ impl Port {
                 0,
             )
         };
+        // A success sent all `len` bytes: asking past the end of the file (one that
+        // shrank) fails with `WSAEINVAL` instead of sending less
+        // (`test_send_file_past_the_end_fails`).
         // SAFETY: the return value is mapped as in `connect`, right after the call.
         Ok(unsafe { self.started(on, raw, win_ret(ok), len) })
     }
@@ -916,6 +921,43 @@ mod tests {
     use std::mem::{align_of, offset_of};
     use windows_sys::Win32::Networking::WinSock as ws;
     use windows_sys::Win32::System::IO as wio;
+
+    /// `TransmitFile` sends all it was asked for or fails: asking past the end of
+    /// the file is `WSAEINVAL`, never a short count, so a success reports the
+    /// length asked for.
+    #[test]
+    fn test_send_file_past_the_end_fails() {
+        use std::io::{Read, Write};
+        use std::os::windows::io::AsSocket;
+        let path = std::env::temp_dir().join(format!("net-io-iocp-{}", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&[3u8; 100])
+            .unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let mut port = Port::with_skip(true).unwrap();
+        let on = port.associate(stream.as_socket()).unwrap();
+        let mut send = |len| match port.send_file(on, 7, file.clone(), 0, len).unwrap() {
+            Started::Done(f) => f.result,
+            Started::Pending(_) => {
+                let mut got = None;
+                while got.is_none() {
+                    port.wait(Some(Duration::from_secs(5)), |f| got = Some(f))
+                        .unwrap();
+                }
+                got.unwrap().result
+            }
+        };
+        assert_eq!(send(100).unwrap(), 100);
+        assert_eq!(send(101).unwrap_err().raw_os_error(), Some(WSAEINVAL));
+        let mut back = [0u8; 100];
+        peer.read_exact(&mut back).unwrap();
+        drop((stream, port));
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn test_layout_matches_windows_sys() {
