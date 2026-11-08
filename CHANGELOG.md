@@ -47,6 +47,13 @@
   socket in its own event loop, with no accept thread and no wake between threads
   for each connection. The gate's `admit` for these listeners runs on the worker.
   `remove_listener` still returns only once the group's sockets are closed.
+- A graceful close on the reactor that needs no linger no longer calls `shutdown`
+  before `close`: the close sends the FIN itself, one system call fewer (D-198).
+
+### Fixed
+
+- A refusal now shows in `Stats` by the time the client sees it; it was counted
+  just after the socket closed (D-199).
 
 ## [0.7.0] - 2026-11-08
 

@@ -2384,6 +2384,10 @@ impl<W, G: Gate> Engine<W, G> {
         co: &mut Coalescer,
     ) {
         let shared = &self.shared;
+        // Counted before the peer can see the refusal, so `stats` already shows it
+        // to a client that saw the reset or the FIN.
+        shared.refused.fetch_add(1, Ordering::Relaxed);
+        shared.refused_by[cause.index()].fetch_add(1, Ordering::Relaxed);
         let mut sent = false;
         if let Some(b) = bytes {
             let max = usize::from(self.limits.refusal_bytes_max);
@@ -2400,8 +2404,6 @@ impl<W, G: Gate> Engine<W, G> {
             let _ = sys::set_linger(stream.sock(), Some(Duration::ZERO));
         }
         drop(stream);
-        shared.refused.fetch_add(1, Ordering::Relaxed);
-        shared.refused_by[cause.index()].fetch_add(1, Ordering::Relaxed);
         if let Some(sink) = &shared.sink {
             co.emit(
                 sink.as_ref(),

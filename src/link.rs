@@ -2316,15 +2316,22 @@ impl Link {
         self.gate_check(bytes)
     }
 
-    /// A graceful close on the reactor: FIN now. `true` when unread input may
-    /// still arrive, so the socket must linger to protect the last response.
+    /// A graceful close on the reactor. `true` when unread input may still arrive,
+    /// so the socket must linger to protect the last response: FIN now, by
+    /// `shutdown`. Otherwise the close that follows sends the FIN itself, behind
+    /// whatever is still queued, and a `shutdown` first would change nothing on the
+    /// wire: once the socket is closed, input that arrives is answered with a reset
+    /// either way (D-198).
     #[cfg(feature = "reactor")]
     pub(crate) fn begin_graceful_close(&mut self, readable: bool) -> bool {
         self.tls_close_notify();
-        let _ = self.stream.shutdown(Shutdown::Write);
-        self.stream.half_closes()
+        let linger = self.stream.half_closes()
             && !self.peer_closed
-            && (self.phase != Phase::Idle || readable || self.drains & SPOKE_IDLE != 0)
+            && (self.phase != Phase::Idle || readable || self.drains & SPOKE_IDLE != 0);
+        if linger {
+            let _ = self.stream.shutdown(Shutdown::Write);
+        }
+        linger
     }
 
     /// Closes the socket after the driver let go of it.
