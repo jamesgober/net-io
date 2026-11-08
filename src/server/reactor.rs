@@ -1,7 +1,9 @@
 //! The reactor: one event loop per worker, thousands of connections each.
 //!
 //! The accept threads and admission are the blocking driver's: a socket reaches
-//! a worker through its bounded inbox, already admitted. From there each
+//! a worker through its bounded inbox, already admitted. A per-worker group is the
+//! exception: each worker accepts on its own socket in its own loop, admits there,
+//! and takes the connection from its own inbox in the same turn (D-197). From there each
 //! connection is a state machine driven by driver completions, a timing wheel,
 //! and a few commands. The rules are the blocking driver's (`engine::drive`), in
 //! resumable form: whatever a blocking worker would wait for here is an operation
@@ -26,9 +28,9 @@ use std::time::{Duration, Instant};
 
 use super::Sessions;
 use super::engine::{
-    CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP, CMD_PRESSURE,
-    CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, announce,
-    count_drained, record_close,
+    AcceptState, CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP,
+    CMD_PRESSURE, CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, ListenerRuntime, RegisteredConn,
+    Shared, WorkerAccept, announce, count_drained, record_close,
 };
 use crate::addr::PrefixKey;
 use crate::buf::{Buffer, BufferPool};
@@ -188,6 +190,33 @@ struct Slot<S> {
     conn: Option<Conn<S>>,
 }
 
+/// A listener this worker accepts on itself (D-197). It holds a slot index, with no
+/// connection in it, for its token.
+struct OwnListener {
+    conf: Arc<ListenerConf>,
+    runtime: Arc<ListenerRuntime>,
+    index: u32,
+    token: Token,
+    state: Accepting,
+    st: AcceptState,
+}
+
+/// Where a worker's own listener stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Accepting {
+    /// `Operation::Accept` is in flight: the next connection completes it.
+    Armed,
+    /// A `Nop` is in flight: the next batch runs after this turn's other work.
+    Kicked,
+    /// The door is closed or a drain runs; looked at each turn.
+    Parked,
+    /// Out of descriptors until then.
+    Paused(Instant),
+    /// Failed, or the server stops: deregistered, kept so a rescan does not add it
+    /// again.
+    Gone,
+}
+
 /// One worker.
 // Borrowed, not `Arc`: every worker would write the same reference count on every
 // clone, and that line would cross the cores with each event.
@@ -219,6 +248,9 @@ struct Reactor<'a, F: SessionFactory, G: Gate> {
     cells: Vec<Box<GateCell<G>>>,
     facts_pool: Vec<Arc<ProxyFacts>>,
     done: Option<Completions>,
+    /// The listeners this worker accepts on (D-197), and the epoch they match.
+    listeners: Vec<OwnListener>,
+    listener_epoch: u64,
 }
 
 /// Runs one worker until the server stops.
@@ -261,6 +293,9 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         cells: Vec::new(),
         facts_pool: Vec::new(),
         done: Some(Completions::new()),
+        listeners: Vec::new(),
+        // Not an epoch the server has had: the first turn scans.
+        listener_epoch: u64::MAX,
     };
     if guarded(|| r.main()).is_none() {
         // A panic got past every inner boundary: nothing on this worker can be
@@ -274,6 +309,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         loop {
             begin_turn();
             self.take_inbox();
+            self.poll_listeners();
             self.run_commands();
             self.take_kills();
             self.take_posted();
@@ -333,6 +369,18 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             .wheel
             .next_expiry()
             .map(|t| self.ticks.until(t, now).max(Duration::from_micros(100)));
+        let paused = self
+            .listeners
+            .iter()
+            .filter_map(|l| match l.state {
+                Accepting::Paused(until) => Some(until.saturating_duration_since(now)),
+                _ => None,
+            })
+            .min();
+        let timer = match (timer, paused) {
+            (Some(t), Some(p)) => Some(t.min(p)),
+            (t, p) => t.or(p),
+        };
         if !self.yielded.is_empty() {
             return Some(Duration::ZERO);
         }
@@ -435,6 +483,145 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
     fn take_inbox(&mut self) {
         while let Some(job) = self.engine.next_inbox(self.idx) {
             self.start(job);
+        }
+    }
+
+    // ---- listeners this worker accepts on (D-197) ---------------------------------
+
+    /// Rescans when the server's listeners changed, and wakes listeners whose door
+    /// opened or whose pause ended. A few loads a turn for each listener.
+    fn poll_listeners(&mut self) {
+        let epoch = self.shared.listener_epoch.load(Ordering::Acquire);
+        if epoch != self.listener_epoch {
+            self.listener_epoch = epoch;
+            self.rescan_listeners();
+        }
+        let now = self.clock.now();
+        for i in 0..self.listeners.len() {
+            let l = &self.listeners[i];
+            let kick = match l.state {
+                Accepting::Parked => self.engine.accepting(&l.conf) || self.shared.is_stopping(),
+                Accepting::Paused(until) => now >= until,
+                _ => false,
+            };
+            if kick {
+                self.kick(i);
+            }
+        }
+    }
+
+    /// Takes up the listeners the server added for this worker and lets go of those
+    /// it removed: their sockets close once every worker has dropped them.
+    fn rescan_listeners(&mut self) {
+        let fresh = self.shared.worker_listeners(self.idx);
+        let mut i = 0;
+        while i < self.listeners.len() {
+            if fresh
+                .iter()
+                .any(|(c, _)| Arc::ptr_eq(c, &self.listeners[i].conf))
+            {
+                i += 1;
+                continue;
+            }
+            let l = self.listeners.swap_remove(i);
+            if l.state != Accepting::Gone {
+                let _ = self.driver.deregister(l.token);
+            }
+            self.free.push(l.index);
+        }
+        for (conf, runtime) in fresh {
+            if self.listeners.iter().any(|l| Arc::ptr_eq(&l.conf, &conf)) {
+                continue;
+            }
+            let index = match self.free.pop() {
+                Some(i) => i,
+                None => {
+                    self.slots.push(Slot {
+                        generation: 0,
+                        conn: None,
+                    });
+                    (self.slots.len() - 1) as u32
+                }
+            };
+            self.slots[index as usize].generation =
+                self.slots[index as usize].generation.wrapping_add(1);
+            let token = self.token_of(index);
+            let registered = match runtime.tcp_sock() {
+                Some(sock) => self
+                    .driver
+                    .register(sock, token)
+                    .map_err(std::io::Error::from),
+                None => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+            };
+            let failed = registered.is_err();
+            if let Err(e) = registered {
+                self.shared.event(Event::ListenerFailed {
+                    listener: conf.id,
+                    class: OsErrorClass::from_io(&e),
+                });
+            }
+            self.listeners.push(OwnListener {
+                conf,
+                runtime,
+                index,
+                token,
+                state: if failed {
+                    Accepting::Gone
+                } else {
+                    Accepting::Parked
+                },
+                st: AcceptState::new(),
+            });
+            if !failed {
+                // Connections may already wait: the first batch runs this turn.
+                self.kick(self.listeners.len() - 1);
+            }
+        }
+    }
+
+    /// The next batch runs after this turn's other completions.
+    fn kick(&mut self, i: usize) {
+        let token = self.listeners[i].token;
+        self.listeners[i].state = Accepting::Kicked;
+        let _ = self.driver.submit(Operation::Nop { token });
+    }
+
+    /// A connection waits on one of this worker's listeners, or a kick came back.
+    fn on_accept(&mut self, i: usize) {
+        let engine = self.engine;
+        let idx = self.idx;
+        let l = &mut self.listeners[i];
+        if !matches!(l.state, Accepting::Armed | Accepting::Kicked) {
+            return;
+        }
+        let next = engine.worker_accept(&l.conf, &l.runtime, idx, &mut l.st);
+        // What the batch admitted starts now, in this turn.
+        self.take_inbox();
+        match next {
+            WorkerAccept::Armed => {
+                let token = self.listeners[i].token;
+                self.listeners[i].state = Accepting::Armed;
+                if self
+                    .driver
+                    .submit(Operation::Accept { listener: token })
+                    .is_err()
+                {
+                    self.listener_gone(i);
+                }
+            }
+            WorkerAccept::Kick => self.kick(i),
+            WorkerAccept::Park => self.listeners[i].state = Accepting::Parked,
+            WorkerAccept::Paused(until) => self.listeners[i].state = Accepting::Paused(until),
+            WorkerAccept::Gone => self.listener_gone(i),
+        }
+    }
+
+    fn listener_gone(&mut self, i: usize) {
+        let l = &mut self.listeners[i];
+        if l.state != Accepting::Gone {
+            l.state = Accepting::Gone;
+            let token = l.token;
+            let _ = self.driver.deregister(token);
         }
     }
 
@@ -1464,6 +1651,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             .get(index as usize)
             .is_some_and(|s| u64::from(s.generation) == done.token.0 >> 32 && s.conn.is_some());
         if !current {
+            if let Some(i) = self.listeners.iter().position(|l| l.token == done.token) {
+                return self.on_accept(i);
+            }
             if let Some(b) = done.buffer {
                 self.pool.put(b);
             }

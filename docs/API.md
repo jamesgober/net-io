@@ -1377,7 +1377,7 @@ Errors: `Unsupported { feature, platform }` (never silent, except options marked
 | `defer_accept` | `TCP_DEFER_ACCEPT` | `Unsupported` | accept filter (P3) | `Unsupported` | off | P2 | `0.6.0` |
 | `fast_open` (server) | `TCP_FASTOPEN` | `TCP_FASTOPEN` | `TCP_FASTOPEN` | `TCP_FASTOPEN` (1607+) | off | P2 | `0.6.0` |
 | `incoming_cpu` | `SO_INCOMING_CPU` (set 4.4+) | `Unsupported` | `Unsupported` | `Unsupported` | off | P2 | `0.6.0` |
-| `per_worker` | a `SO_REUSEPORT` group, one socket and accept thread per reactor worker; not with the hand-off | `Unsupported` | `Unsupported` | `Unsupported` | off | P2 | `0.6.0` |
+| `per_worker` | a `SO_REUSEPORT` group, one socket per reactor worker; each worker accepts and admits on its own socket in its own loop, with no accept thread (from `0.8.0`, D-197); not with the hand-off | `Unsupported` | `Unsupported` | `Unsupported` | off | P2 | `0.6.0` |
 | `user_timeout` | `TCP_USER_TIMEOUT` | `Unsupported` | `Unsupported` | `TCP_MAXRT` (seconds) | off | P2 | `0.6.0` |
 | `ttl` | `IP_TTL` / `IPV6_UNICAST_HOPS` | yes | yes | yes | OS default | P2 | `0.3.0` |
 | `notsent_lowat` | `TCP_NOTSENT_LOWAT` | yes | `Unsupported` | `Unsupported` | off | P3 | after `1.0.0` |
@@ -1712,7 +1712,7 @@ impl Drop for Server;   // shutdown with the drain timeout as the deadline
 | `drain` | closes the door, tells every session to finish (`SessionContext::draining()`), closes idle connections at once, waits for the rest until `deadline`, then kills them with `DrainDeadline`; returns the counts | none (report) | 10,000 idle connections under 100 ms [est.] | P0 | 2 | `0.3.0` |
 | `shutdown` | `drain`, then closes the listening sockets (except released ones) and joins every worker; afterwards no net-io thread runs and every descriptor net-io opened is closed | none (report) | | P0 | 2 | `0.3.0` |
 | `wait_for_stop` | blocks the calling thread until a stop is requested (`ServerHandle::request_stop`, or the control line moves to `Draining` or `Stopping`), then shuts down with the drain deadline (the drain timeout or the control line's) | none (report) | zero CPU while waiting | P0 | 1 | `0.3.0` |
-| `add_listener` | binds one more listener on a running server with the same checks as `build` (features, TLS engine, trusted proxies, unique name, limits) and starts its accept thread; its door stays closed until the next `open_door`, which opens every listener's door; ids are never reused; at most 64 listeners at a time (decision D-097) | as `build`, `ShuttingDown`, `ForkedChild` | one bind and one thread | P1 | 2 | `0.4.0` |
+| `add_listener` | binds one more listener on a running server with the same checks as `build` (features, TLS engine, trusted proxies, unique name, limits) and starts its accept thread (a per-worker group: its workers take it up at their next turn); its door stays closed until the next `open_door`, which opens every listener's door; ids are never reused; at most 64 listeners at a time (decision D-097) | as `build`, `ShuttingDown`, `ForkedChild` | one bind and one thread | P1 | 2 | `0.4.0` |
 | `remove_listener` | closes that listener's socket at once (a Unix socket file it created is removed) and emits `ListenerClosed`, then drains only its connections: idle ones close now (`Drained`), queued ones close unread, the rest may finish until `deadline` and are then killed (`DrainDeadline`); other listeners are not touched | `InvalidConfig { field: "listener", reason: Missing }`, `ForkedChild` | as `drain`, for one listener | P1 | 2 | `0.4.0` |
 | `release_listeners` | owned duplicates of every listening socket, for [hand-off](#listener-hand-off); works while the door is open, so the new process can start accepting before this one stops (decision D-042); a later `shutdown` does not close the released sockets | `Os` | 1 system call per listener | P0 | 3 | `0.4.0` |
 | `adopt` | registers a dialed connection exactly like an accepted one: new id, `Gate::admit` with `AdmitStage::Adopt`, the named listener's limits, sessions, kill handle, events | `Refused`, `Limit`, `ShuttingDown` | as accept | P1 | 3 | `0.4.0` |
@@ -1841,7 +1841,7 @@ Rules:
 - **`readmit` has no default.** A gate that does not care about proxies writes `Ok(())` on purpose; a silent default would admit every real client behind a trusted proxy on the proxy's own verdict (decision D-060).
 - **Fail closed.** A gate method that panics (unwind builds) counts as a refusal or a denial. Refusals and denials are abortive.
 - **Static dispatch.** Each worker loop is compiled for the server's gate type, so the hooks are direct calls.
-- **Where the checks run.** `admit` on the accepting worker (blocking driver: the accept thread) before the socket is registered for reading; `check` on the worker that writes; `closed` on the worker that closed the connection. A gate must be `Sync`.
+- **Where the checks run.** `admit` on the accept thread before the socket is registered for reading (a per-worker group on the reactor: on the worker that accepted, D-197); `check` on the worker that writes; `closed` on the worker that closed the connection. A gate must be `Sync`.
 - **Denial text belongs to the session**, which knows the protocol and its framing state (an HTTP response boundary, a WebSocket frame, a database frame). The gate gives only a code.
 - **Ejecting idle connections** from a gate's own maintenance thread uses [`ServerHandle::kill`](#serverhandle) with the `ConnectionId` in `ConnectionInfo`.
 
@@ -1981,7 +1981,7 @@ A process-wide signal that every worker reads with one atomic load at the top of
 | `Normal` | none; undoes the reactions below |
 | `Shed { from_lane }` | refuses new connections in `from_lane` and every less important lane (numbers at or above it; `RefusalCause::Shed`); closes idle connections in those lanes at once and busy ones at their next idle point (`CloseReason::Shed`); `SessionContext::pressure()` reports 1.0 so protocols stop keep-alive |
 | `Lockdown` | refuses new connections on listeners not marked `lockdown_allowed`; existing connections are not touched |
-| `Draining` | `close_door`, then `drain` with the line's deadline (or the drain timeout); the accept thread runs the drain, so it happens whether or not the program waits in `wait_for_stop` (D-075) |
+| `Draining` | `close_door`, then `drain` with the line's deadline (or the drain timeout); the accept thread runs the drain (for a per-worker group, a thread the worker starts once, D-197), so it happens whether or not the program waits in `wait_for_stop` (D-075) |
 | `Stopping` | kills every remaining connection with `Shutdown` |
 
 `ServerHandle::wake_all` makes workers that sleep in the kernel see a change at once. Reactions are idempotent and epoch-gated: a line that moves `Normal`, `Shed`, `Normal` within one loop iteration is seen only in its final state.

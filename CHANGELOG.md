@@ -43,6 +43,10 @@
   `Step::Close` carries `close_notify` in the same send. A full exchange with a
   closing reply goes from 4 sends to 2. Held records go out at once whenever a
   turn ends without a reply.
+- Per-worker listeners on the reactor (D-197): each worker accepts on its own
+  socket in its own event loop, with no accept thread and no wake between threads
+  for each connection. The gate's `admit` for these listeners runs on the worker.
+  `remove_listener` still returns only once the group's sockets are closed.
 
 ## [0.7.0] - 2026-11-08
 
