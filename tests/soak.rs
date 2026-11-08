@@ -204,13 +204,14 @@ fn watch_stalls(stop: &AtomicBool, worst: &AtomicU64) {
 /// The server's and the client's view of a connection whose exchange timed out:
 /// whether the server ever had it, whether it was killed or closed and when, and
 /// whether a byte sent now draws a reset (the server's socket is gone).
-fn explain(c: &mut TcpConnection, started: Instant) -> String {
+fn explain(c: &mut TcpConnection, started: Instant) -> (String, Option<Seen>) {
     let port = c.local_addr().port();
     let now = Instant::now();
     let ago = |t: Instant| now.saturating_duration_since(t).as_millis();
-    let server = TRACE
+    let seen = TRACE
         .get()
         .and_then(|t| t.0.lock().ok().and_then(|p| p.by_port.get(&port).copied()));
+    let server = seen;
     // The last connection the server accepted from this port: a different one if
     // it was accepted before this connection began.
     let server = server.map_or_else(
@@ -229,12 +230,27 @@ fn explain(c: &mut TcpConnection, started: Instant) -> String {
     let sent = c.send_all(b"x");
     std::thread::sleep(Duration::from_millis(500));
     let after = (c.take_error().ok().flatten(), c.probe());
-    format!(
+    let line = format!(
         "port {port}, began {} ms ago; server: {server}; client before {before:?}, \
          one byte {sent:?}, after {after:?}",
         ago(started)
+    );
+    (line, seen)
+}
+
+/// Whether the server killed this connection during the client's wait: the server
+/// reset it, and the client's stack dropped the reset. macOS's does when the reset
+/// arrives with the client's receive window full (a big reply, a kill mid-stream),
+/// and the reset its window update then draws can fall to the closed-port reset
+/// limit (D-193). The client learns of it only from its own read timeout.
+fn reset_lost(seen: Option<Seen>, began: Instant) -> bool {
+    seen.is_some_and(
+        |s| matches!(s.closed, Some((at, CloseReason::Killed(_), _, _)) if at >= began),
     )
 }
+
+/// The stacks that drop a reset outside a zero receive window (D-193).
+const RESETS_MAY_BE_LOST: bool = cfg!(any(target_os = "macos", target_os = "freebsd"));
 
 #[derive(Default)]
 struct Counts {
@@ -249,6 +265,7 @@ struct Counts {
     held_hoarder: AtomicU64,
     kills: AtomicU64,
     stall_ms: AtomicU64,
+    resets_lost: AtomicU64,
 }
 
 fn env_secs(name: &str, default: u64) -> Duration {
@@ -359,16 +376,26 @@ fn client_options() -> ConnectOptions {
 }
 
 /// Whether a client error means the server stopped answering (not a kill or a
-/// refusal, which the run causes on purpose).
-fn stuck(e: &net_io::NetError, c: &mut TcpConnection, client: &str, started: Instant) -> bool {
-    let timed_out = matches!(e, net_io::NetError::TimedOut { .. });
-    if timed_out {
-        note(format_args!(
-            "stuck: {client} {e:?}: {}",
-            explain(c, started)
-        ));
+/// refusal, which the run causes on purpose). A timeout on a connection the server
+/// killed during the wait counts as a lost reset instead (D-193).
+fn stuck(
+    e: &net_io::NetError,
+    c: &mut TcpConnection,
+    client: &str,
+    started: Instant,
+    counts: &Counts,
+) -> bool {
+    if !matches!(e, net_io::NetError::TimedOut { .. }) {
+        return false;
     }
-    timed_out
+    let (line, seen) = explain(c, started);
+    if reset_lost(seen, started) {
+        note(format_args!("reset lost: {client} {e:?}: {line}"));
+        counts.resets_lost.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    note(format_args!("stuck: {client} {e:?}: {line}"));
+    true
 }
 
 /// Connect, a few echoes of mixed sizes, then a reset (one in fifty closes
@@ -397,7 +424,7 @@ fn normal(at: SocketAddr, stop: &AtomicBool, counts: &Counts, seed: u64) {
                     counts.exchanges.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    if stuck(&e, &mut c, "normal", started) {
+                    if stuck(&e, &mut c, "normal", started, counts) {
                         counts.stuck.fetch_add(1, Ordering::Relaxed);
                     }
                     alive = false;
@@ -434,7 +461,7 @@ fn big_writer(at: SocketAddr, stop: &AtomicBool, counts: &Counts) {
                 counts.big.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
-                if stuck(&e, &mut c, "big", started) {
+                if stuck(&e, &mut c, "big", started, counts) {
                     counts.stuck.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -483,7 +510,7 @@ fn pooled(at: SocketAddr, stop: &AtomicBool, counts: &Counts, seed: u64) {
         {
             // Killed while in the pool or mid-exchange: the next turn reconnects.
             Err(e) => {
-                if stuck(&e, &mut conn, "pooled", started) {
+                if stuck(&e, &mut conn, "pooled", started, counts) {
                     counts.stuck.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -781,7 +808,7 @@ fn test_soak_with_normal_and_hostile_peers() {
         let open = server.stats().open;
         let t = started.elapsed();
         println!(
-            "soak {:>7.0}s rss {:>6} KiB handles {:>5} open {:>5} exchanges {} big {} stuck {} reconnects {} hostile closed {} held {} kills {} stall {} ms",
+            "soak {:>7.0}s rss {:>6} KiB handles {:>5} open {:>5} exchanges {} big {} stuck {} reconnects {} hostile closed {} held {} kills {} stall {} ms resets lost {}",
             t.as_secs_f64(),
             rss / 1024,
             fds,
@@ -794,6 +821,7 @@ fn test_soak_with_normal_and_hostile_peers() {
             counts.hostile_held.load(Ordering::Relaxed),
             counts.kills.load(Ordering::Relaxed),
             counts.stall_ms.load(Ordering::Relaxed),
+            counts.resets_lost.load(Ordering::Relaxed),
         );
         samples.push((t, rss, fds, open));
     }
@@ -811,6 +839,13 @@ fn test_soak_with_normal_and_hostile_peers() {
         counts.held_hoarder.load(Ordering::Relaxed)
     );
     assert_eq!(counts.stuck.load(Ordering::Relaxed), 0, "stuck exchanges");
+    if !RESETS_MAY_BE_LOST {
+        assert_eq!(
+            counts.resets_lost.load(Ordering::Relaxed),
+            0,
+            "a peer missed the server's reset"
+        );
+    }
     assert_eq!(
         counts.hostile_held.load(Ordering::Relaxed),
         0,

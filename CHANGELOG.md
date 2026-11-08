@@ -11,6 +11,8 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-08
+
 Hardening: an adversarial review of the whole crate with every finding of medium
 severity or above fixed, attack tests for every threat, continuous fuzzing, a
 soak, and a database consumer's transport needs.
@@ -66,6 +68,9 @@ soak, and a database consumer's transport needs.
   `UdpSocket::forget_verified`, `UdpContext::forget_verified`.
 - `SharedSocket`, the socket type `Driver::register` takes.
 - `descriptor_limit()`: the soft descriptor limit, for placing a cap under it.
+- `TlsInfo::with_peer_spki_sha256` and `peer_spki_sha256`: the SHA-256 of a
+  verified client certificate's public key, which a TLS engine sets so a session
+  can map a mutual-TLS peer to a principal.
 - Fuzz targets `wheel`, `rate`, and `udp`, a nightly fuzz workflow, and `tests/soak.rs`.
 
 ### Changed
@@ -530,7 +535,12 @@ The scaffold and the plan. No functional code yet.
   dependencies, testing, open decisions, and the decision log.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/net-io/compare/v0.6.2...v0.7.0
+[0.6.2]: https://github.com/jamesgober/net-io/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/jamesgober/net-io/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/jamesgober/net-io/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/jamesgober/net-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/net-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/net-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/net-io/compare/v0.1.0...v0.2.0
