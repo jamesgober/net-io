@@ -11,6 +11,39 @@
 
 ## [Unreleased]
 
+### Added
+
+- Flush-then-close (D-182): after a denial whose bytes went out, the connection
+  stops reading, sends what is queued, sends FIN, and discards input until the
+  peer's EOF or `Limits::denial_linger` (default 100 ms; zero keeps the immediate
+  reset). `Limits::denial_linger_max` caps how many connections linger at once
+  (default a sixteenth of `max_connections`); past it a denial resets as before.
+  On Windows this stops the formatted denial being lost to an abortive close.
+- `ServerHandle::close_after_flush(id, reason, within)`: a soft kill. The session's
+  queued output goes out within the bound, then the connection closes the same
+  way. A later `kill` upgrades it to a reset.
+- `Session::on_drain(cx) -> Step` (D-183): called once when a drain reaches a
+  connection between exchanges. The default, `Close`, keeps the old behaviour; any
+  other step keeps the connection until the session closes it or the drain
+  deadline passes.
+- `ListenerSpec::workers(n)` (D-186): on the reactor a listener gets workers of its
+  own, so an admin listener keeps answering while the shared workers are busy.
+- `Limits::first_request_grace` (D-189, default 1 s): a drain does not close a
+  connection that was just accepted and has sent nothing yet, so a client that
+  connected as the drain began still gets its first request answered.
+
+### Changed
+
+- A connection whose session wrote while it was idle (a reply in `on_open`, a push
+  between exchanges) now lingers on a graceful close instead of closing at once,
+  so a request already crossing the reply no longer turns the close into a reset
+  that discards the reply (D-192).
+- TLS on the reactor (D-194): the records a TLS engine writes as its handshake ends
+  (session tickets) leave with the session's first reply, and a reply before
+  `Step::Close` carries `close_notify` in the same send. A full exchange with a
+  closing reply goes from 4 sends to 2. Held records go out at once whenever a
+  turn ends without a reply.
+
 ## [0.7.0] - 2026-11-08
 
 Hardening: an adversarial review of the whole crate with every finding of medium
