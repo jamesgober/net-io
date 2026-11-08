@@ -11,6 +11,18 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-08
+
+### Fixed
+
+- On the reactor, an idle TLS connection kept its session's output, with up to
+  four spare 16 KiB buffers from its last reply, charged to the shared buffer
+  budget. Enough warm idle TLS connections spent the budget, and other
+  connections' pushes then failed (`OutputFull`, `Limit(BufferBudget)`). The
+  output and the session's input now go back as a plaintext connection's do
+  (D-200; found by tls-net). Affects 0.7.0; on 0.6 such a connection held its
+  128 KiB of TLS buffers as well.
+
 ## [0.7.0] - 2026-11-08
 
 Hardening: an adversarial review of the whole crate with every finding of medium
@@ -535,7 +547,8 @@ The scaffold and the plan. No functional code yet.
   dependencies, testing, open decisions, and the decision log.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/jamesgober/net-io/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/net-io/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/jamesgober/net-io/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/jamesgober/net-io/compare/v0.6.0...v0.6.1
