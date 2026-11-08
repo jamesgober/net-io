@@ -1333,6 +1333,11 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             return self.input_arrived(index);
         }
         if c.link.has_tls() {
+            // The session's own input and output go back as a plaintext connection's
+            // do, in any phase: an output keeps up to four spare buffers after a
+            // large reply, 64 KiB an idle connection held (tls-net, D-200).
+            self.release_idle(index);
+            let Some(c) = self.conn(index) else { return };
             if c.recv != Recv::None || c.paused {
                 return self.arm_timer(index);
             }

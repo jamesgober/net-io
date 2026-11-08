@@ -901,6 +901,65 @@ fn test_idle_tls_connections_hold_no_buffers() {
     assert_eq!(server.stats().open, 101, "{:?}", server.stats());
 }
 
+/// The same after a large reply (tls-net, on 0.7.0): each connection fetches a
+/// 32 KiB page, which the session writes and then reads again from `on_writable`,
+/// and goes idle. Its buffers go back too, the output's spares among them: 100
+/// such connections fit a budget of 20 KiB each (D-200).
+#[cfg(feature = "reactor")]
+#[test]
+fn test_idle_tls_connections_after_a_large_reply_hold_no_buffers() {
+    const PAGE: usize = 32 << 10;
+    struct Page;
+    impl Session for Page {
+        fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+            let n = input.bytes().len();
+            input.consume(n);
+            cx.output().push(&[b'p'; PAGE]).expect("push");
+            Step::Write
+        }
+        fn on_writable(&mut self, _: &mut SessionContext<'_>) -> Step {
+            Step::Read
+        }
+    }
+    let limits = Limits::builder()
+        .buffer_budget(2 << 20)
+        .max_connections(256)
+        .max_per_source(256, net_io::PrefixPolicy::DEFAULT)
+        .build()
+        .expect("limits");
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+        .driver(net_io::DriverKind::Reactor)
+        .workers(2)
+        .limits(limits)
+        .tls(Toy)
+        .sessions(|_: &ConnectionInfo| Page)
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let mut held = Vec::new();
+    for i in 0..100u32 {
+        let mut c = ToyClient::connect(&server);
+        c.send(b"GET");
+        assert_eq!(c.recv_exact(PAGE).len(), PAGE, "connection {i}");
+        held.push(c);
+    }
+    for (i, c) in held.iter_mut().enumerate() {
+        c.send(b"GET");
+        assert_eq!(c.recv_exact(PAGE).len(), PAGE, "connection {i}, again");
+    }
+    assert_eq!(
+        server
+            .stats()
+            .closed_for(CloseReason::Limit(net_io::LimitKind::BufferBudget)),
+        0,
+        "{:?}",
+        server.stats()
+    );
+    assert_eq!(server.stats().open, 100, "{:?}", server.stats());
+}
+
 /// tls-net's report: on the pool, the first connection after a handshake timeout
 /// was closed at once as a second `HandshakeTimeout`. A stalled hello times out,
 /// then a fresh client must complete its handshake, again and again.
