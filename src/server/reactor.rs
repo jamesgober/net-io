@@ -788,6 +788,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             };
             match next {
                 TlsNext::Transmit => {
+                    if c.link.tls_hold() {
+                        // The tickets wait for the reply to the request already read.
+                        continue;
+                    }
                     let token = c.token;
                     let Some(cout) = c.link.tls_take_cout() else {
                         return self.close(index, CloseReason::TlsFailed);
@@ -1379,6 +1383,14 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 };
                 match sealed {
                     Ok(taken) => {
+                        let last = after == Wait::FlushClose
+                            && taken == total
+                            && output.chunks.len() <= sys::MAX_SLICES
+                            && !output.chunks.iter().any(|ch| ch.is_file());
+                        if last {
+                            // The reply's last records and `close_notify` leave together.
+                            c.link.tls_seal_close_notify();
+                        }
                         let Some(cout) = c.link.tls_take_cout() else {
                             self.close(index, CloseReason::TlsFailed);
                             return Flushed::Waiting;

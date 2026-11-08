@@ -256,8 +256,16 @@ pub(crate) struct TlsLayer {
     /// Decrypted plaintext not yet delivered: `[plain_at, plain_end)` inside `cin`.
     plain_at: usize,
     plain_end: usize,
-    /// Ciphertext out: scratch, flushed within each call.
+    /// Ciphertext out: scratch, flushed within each call, except `[0, held)`.
     cout: Buffer,
+    /// Records the engine wrote as the handshake ended, kept at the front of `cout`
+    /// to leave with the session's first reply in one send (the reactor, D-180).
+    /// They are already encrypted in sequence, so whatever is sent next goes after
+    /// them, never without them.
+    held: usize,
+    /// `close_notify` is in `cout` (sealed with the last reply, D-180): a close
+    /// sends no second one.
+    notified: bool,
     done: bool,
     eof: bool,
     /// What the engine reported last, not acted on yet.
@@ -472,6 +480,8 @@ impl Link {
             plain_at: 0,
             plain_end: 0,
             cout,
+            held: 0,
+            notified: false,
             done: false,
             eof: false,
             event: None,
@@ -500,7 +510,8 @@ impl Link {
             && t.start >= t.cin.len()
             && t.plain_at >= t.plain_end
             && t.cin.capacity() > 0
-            && t.cout.capacity() > 0;
+            && t.cout.capacity() > 0
+            && t.held == 0;
         if !idle {
             return None;
         }
@@ -655,10 +666,11 @@ impl Link {
             let start = t.start;
             let end = t.cin.len();
             let base = t.cin.as_slice().as_ptr() as usize;
+            let held = t.held;
             let TlsLayer {
                 session, cin, cout, ..
             } = &mut *t;
-            cout.set_len(0);
+            cout.set_len(held);
             let stepped = session
                 .step(&mut cin.as_mut_slice()[start..end], cout.spare())
                 .map(|p| {
@@ -688,7 +700,7 @@ impl Link {
             }
             t.event = Some(ev);
             if written > 0 {
-                t.cout.set_len(written.min(t.cout.capacity()));
+                t.cout.set_len((held + written).min(t.cout.capacity()));
                 return Ok(TlsNext::Transmit);
             }
         }
@@ -740,7 +752,8 @@ impl Link {
     /// output buffer.
     fn tls_budget(&self) -> usize {
         self.tls.as_ref().map_or(0, |t| {
-            (t.cout.capacity() / (TLS_RECORD + TLS_OVERHEAD)).max(1) * TLS_RECORD
+            let room = t.cout.capacity().saturating_sub(t.held);
+            (room / (TLS_RECORD + TLS_OVERHEAD)).max(1) * TLS_RECORD
         })
     }
 
@@ -781,7 +794,7 @@ impl Link {
         bufs: &[IoSlice<'_>],
         take: usize,
     ) -> Result<usize, NetError> {
-        t.cout.set_len(0);
+        t.cout.set_len(t.held);
         let mut taken = 0;
         let mut failed = None;
         'slices: for b in bufs.iter().take(sys::MAX_SLICES) {
@@ -814,14 +827,16 @@ impl Link {
         let Some(mut t) = self.tls.take() else {
             return;
         };
-        if t.done && !t.eof {
-            t.cout.set_len(0);
+        if t.done && !t.eof && !t.notified {
+            t.cout.set_len(t.held);
             if let Ok(n) = t.session.close(t.cout.spare()) {
-                t.cout.set_len(n.min(t.cout.capacity()));
+                t.cout.set_len((t.held + n).min(t.cout.capacity()));
                 if let Ok(sent) = sys::send(&self.stream, t.cout.as_slice()) {
                     self.bytes_out += sent as u64;
                 }
             }
+            t.held = 0;
+            t.notified = true;
         }
         self.tls = Some(t);
     }
@@ -2160,15 +2175,44 @@ impl Link {
         let Some(mut t) = self.tls.take() else {
             return Ok(TlsNext::Eof);
         };
-        let r = self.tls_advance(&mut t);
+        let mut r = self.tls_advance(&mut t);
+        if t.held > 0 && matches!(r, Ok(TlsNext::NeedInput)) {
+            // Nothing more to answer in this turn: the held records go out now, and
+            // the machine asks for input again after them.
+            t.event = Some(Ev::NeedInput);
+            t.cout.set_len(t.held);
+            r = Ok(TlsNext::Transmit);
+        }
         self.tls = Some(t);
         r
+    }
+
+    /// Keeps the records in `cout` for the session's first reply instead of sending
+    /// them now (D-180): `true` when they are the handshake's last records
+    /// (the tickets, with the completion still to report) and the client's request
+    /// is already in the input, so the client waits for nothing these records carry
+    /// and the reply follows within this turn. Anything else sends them at once.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_hold(&mut self) -> bool {
+        let Some(t) = self.tls.as_mut() else {
+            return false;
+        };
+        let hold = t.held == 0
+            && !t.done
+            && matches!(t.event, Some(Ev::Handshaken))
+            && t.start < t.cin.len()
+            && !t.cout.is_empty();
+        if hold {
+            t.held = t.cout.len();
+        }
+        hold
     }
 
     /// The records to send; give the buffer back with [`Link::tls_put_cout`].
     #[cfg(feature = "reactor")]
     pub(crate) fn tls_take_cout(&mut self) -> Option<Buffer> {
         let t = self.tls.as_mut()?;
+        t.held = 0;
         Some(std::mem::replace(&mut t.cout, Buffer::placeholder()))
     }
 
@@ -2239,6 +2283,22 @@ impl Link {
         let r = self.tls_encrypt(&mut t, bufs, take);
         self.tls = Some(t);
         r
+    }
+
+    /// After a seal that took the last of the output before a graceful close:
+    /// `close_notify` joins the records in `cout`, so they leave in one send and
+    /// the close sends no second one (D-180). Nothing happens when it does not fit.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_seal_close_notify(&mut self) {
+        let Some(t) = self.tls.as_mut() else { return };
+        if !t.done || t.eof || t.notified || t.cout.spare().len() < TLS_OVERHEAD {
+            return;
+        }
+        let used = t.cout.len();
+        if let Ok(n) = t.session.close(t.cout.spare()) {
+            t.cout.set_len((used + n).min(t.cout.capacity()));
+            t.notified = true;
+        }
     }
 
     /// The plaintext one sealed write may take.
@@ -2387,10 +2447,13 @@ impl Link {
     pub(crate) fn send_denial_once(&mut self, buf: &[u8]) {
         let sent = match self.tls.as_mut() {
             Some(t) => {
-                t.cout.set_len(0);
+                // Held records go first: the denial's record follows them in sequence.
+                let held = t.held;
+                t.cout.set_len(held);
+                t.held = 0;
                 match t.session.encrypt(buf, t.cout.spare()) {
                     Ok(n) if n > 0 => {
-                        t.cout.set_len(n);
+                        t.cout.set_len(held + n);
                         let r = sys::send(&self.stream, t.cout.as_slice());
                         t.cout.set_len(0);
                         r.ok()
