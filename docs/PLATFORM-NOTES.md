@@ -1,10 +1,10 @@
 # net-io - Platform notes
 
-What differs between operating systems, what net-io does about it, and what an operator should know. Covers 0.6.0.
+What differs between operating systems, what net-io does about it, and what an operator should know. Covers 0.8.0.
 
 ## Every platform
 
-- **Two drivers.** Sessions run on the reactor by default: one thread per CPU, each with its own epoll, kqueue, or completion port, and a default cap of 10,000 connections (or what the descriptor limit allows). A `BlockingHandler` always runs on the pool. Accepts stay on one thread per listener on both drivers, and a new connection goes to the least-loaded worker, or is refused as `Busy` when that worker's inbox of 4,096 is full.
+- **Two drivers.** Sessions run on the reactor by default: one thread per CPU, each with its own epoll, kqueue, or completion port, and a default cap of 10,000 connections (or what the descriptor limit allows). A `BlockingHandler` always runs on the pool. Accepts stay on one thread per listener on both drivers (a per-worker group on the Linux reactor accepts in the workers' own loops instead), and a new connection goes to the least-loaded worker, or is refused as `Busy` when that worker's inbox of 4,096 is full.
 - **One worker per open connection.** The blocking driver serves each connection on a pool thread (128 by default, 256 KiB stacks). An idle keep-alive connection holds its worker, which is why the default idle timeout is 5 s. `max_connections` defaults to the worker count; the reactor (0.5) lifts this.
 - **Busy means busy.** When every worker has a connection or one waiting for it, a new connection is refused with RST (`RefusalCause::Busy`) instead of queueing without bound.
 - **Descriptors.** At build, net-io checks that `max_connections + 2 x workers + 32` descriptors fit under the process limit (`RLIMIT_NOFILE` on Unix) and refuses the configuration otherwise, naming what it has and needs.
@@ -12,7 +12,8 @@ What differs between operating systems, what net-io does about it, and what an o
 - **PROXY behind a proxy.** A listener with `ProxyMode::Required` closes a peer outside its trusted proxies before reading a byte. On a Unix listener every peer that can open the socket file is trusted, so the file's mode is the boundary. HAProxy (v1 and v2) and nginx (v1) are tested in CI over TCP and Unix sockets; Apache's `mod_proxy` does not send the PROXY protocol (`mod_remoteip` only receives it).
 - **UDP.** Every datagram is charged to its source address's budget before `recv_from` returns it, and replies to a source that has not been marked verified never exceed what it sent (factor 1 by default). Sources are keyed by IP address, not port. A full source table (65,536 by default, about 130 bytes each) evicts unverified entries; strangers that still find no room share one overflow budget and get no send allowance.
 - **Files.** `send_file` and `push_file` use `sendfile` on Unix and `TransmitFile` on the Windows reactor. TLS, named pipes, and Unix sockets off Linux read a piece at a time on the worker, as does a held `TcpConnection` on Windows, so a slow disk holds that worker. A file must not shrink while in flight: the connection is reset with `Io(FileTruncated)`.
-- **Closing.** A graceful close sends FIN and, if the peer may still have unread request bytes in flight, reads and discards up to 64 KiB for up to 2 s so the reply is not destroyed by a reset. An idle connection with nothing unread closes at once. Kills, timeouts in the middle of an exchange, and refusals close with RST (linger 0).
+- **Closing.** A graceful close sends FIN and, if the peer may still have unread request bytes in flight, reads and discards up to 64 KiB for up to 2 s so the reply is not destroyed by a reset. A connection idle after an exchange with nothing unread closes at once; one whose session wrote while idle (a reply in `on_open`, a push between exchanges) lingers, since the client's request may be on its way (D-192). A denial whose bytes went out, and `close_after_flush`, close with FIN and a short linger (`Limits::denial_linger`, 100 ms). Kills, timeouts in the middle of an exchange, and refusals without bytes close with RST (linger 0). A peer that resets during a linger ends it at once.
+- **Input after the close.** Once the socket is closed, input that arrives is answered with a reset on every system, and the reset can destroy a reply the peer has received but not read (Windows discards it; Linux leaves it readable first). The linger is what keeps that from happening when input may still come; a client that sends after the server's reply and close sees a reset.
 
 ## Linux
 
@@ -29,7 +30,7 @@ What differs between operating systems, what net-io does about it, and what an o
 - **Descriptor passing** receives with `MSG_CMSG_CLOEXEC`, so a passed descriptor is close-on-exec from the moment it arrives.
 
 - **Fast open** needs `net.ipv4.tcp_fastopen` to include the server bit (2). A client's first data can be replayed by the network: turn it on only for requests that are safe to run twice.
-- **`per_worker`** builds a `SO_REUSEPORT` group, so the kernel's hash decides the balance, and with `ServerBuilder::placement` each socket takes what its worker's CPU received. Closing one socket of a group resets the connections queued on it, so such a listener cannot be handed off.
+- **`per_worker`** builds a `SO_REUSEPORT` group, so the kernel's hash decides the balance, and with `ServerBuilder::placement` each socket takes what its worker's CPU received. Reactor only (`InvalidConfig` on the blocking driver). Each worker accepts on its own socket in its own loop, so a connection never crosses threads, and a slow gate `admit` delays that worker's other connections. Closing one socket of a group resets the connections queued on it, so such a listener cannot be handed off, and `remove_listener` returns once every worker has closed its socket.
 - **Batches.** `recv_batch` and `send_batch` are `recvmmsg` and `sendmmsg`; elsewhere they are a loop that flips the socket non-blocking and back.
 
 ## macOS
@@ -42,6 +43,7 @@ What differs between operating systems, what net-io does about it, and what an o
 - **Write wake-ups.** kqueue's write filter fires now and then after an ACK, an empty wake about once in twenty exchanges.
 - **`TcpListener::from_std`** cannot ask macOS whether a socket listens (`SO_ACCEPTCONN` is not answered), so it accepts a stream socket that is bound and has no peer; a socket that was bound but never listened then fails at its first `accept`.
 - **`shutdown(SHUT_RD)`** discards data already received and any that arrives later; a drain or kill therefore never delivers more input to the session (Linux delivers what was already queued).
+- **Lost resets.** A reset sent while the client's receive window is full can carry a sequence number past the zero window, and the BSD stacks drop it (RFC 5961); the client's next window update then reaches a closed port, whose reset macOS rate-limits (`net.inet.tcp.rst_rlc_enable`, on by default). Under a churn of kills a peer of a killed connection can wait for its own read timeout instead of seeing the reset (D-193). net-io's own clients time out (30 s by default). A deployment that kills many connections can turn the limiter off; the soak keeps the default, and with it off 2 hours of soak on each driver lost none.
 
 - **Unix sockets.** Paths are limited to 103 bytes. Peer credentials come from `getpeereid` (uid, gid) and `LOCAL_PEERPID` (pid).
 - **Close-on-exec window.** macOS has no atomic close-on-exec for accepted, received (descriptor passing), or inherited descriptors: net-io sets `FD_CLOEXEC` right after the call, so a `fork` plus `exec` on another thread in between can inherit one.
@@ -62,6 +64,8 @@ What differs between operating systems, what net-io does about it, and what an o
 - **`user_timeout`** is `TCP_MAXRT`, in whole seconds.
 - **Pending sends** pin the output's pages in the kernel until the peer takes them. The output budget bounds this per connection, and the write deadline cancels it.
 - **Waits.** Microsoft documents a socket whose blocking receive or send timed out as being in an indeterminate state, so net-io never relies on `SO_RCVTIMEO`: every socket in the blocking driver is non-blocking and every wait is `WSAPoll` on the socket and the worker's wake channel (decision D-052). A keep-alive round trip is therefore three system calls (`WSAPoll`, `recv`, `send`).
+- **TIME_WAIT and SYNs.** Windows drops a SYN whose four-tuple matches one of its own `TIME_WAIT` entries (120 s), before the listen queue sees it, so on a host with many short loopback connections a client can sit in `SYN_SENT` and fail with `WSAETIMEDOUT` while the listener is idle (register R-44). Clients on such a host also run out of ephemeral ports (`WSAEADDRINUSE` on connect); `connect_retry` retries a port shortage under its backoff (D-184).
+- **Thread wake channels.** A thread outside the workers that waits on a `TcpConnection` gets a wake channel; when the thread ends the channel goes to a process-wide list of spares instead of closing, since closing a socket in a thread-local destructor runs under the loader lock and can deadlock the process (D-173). The list holds at most as many channels as threads ever waited at once.
 - **Wake channels.** Each worker's wake channel is a loopback UDP socket connected to itself, which holds one ephemeral port. With 128 workers that is 128 ports per server; many servers in one process (a test suite starting dozens of default servers at once) can run out of buffer space (`WSAENOBUFS`). Size `workers` to the load.
 - **Exclusive binding.** Listeners use `SO_EXCLUSIVEADDRUSE` by default, so another process cannot bind the same port over net-io's listener. `SO_REUSEPORT` does not exist; asking for it is `Unsupported`.
 - **Slow readers and send buffers.** Windows autotunes socket send buffers. On loopback a peer that never read absorbed 32 MiB before a send stalled, so the write timeout and the outbound rate check never fired. Internet-facing listeners on Windows should set `ListenOptions::send_buffer` (for example 256 KiB): then a peer that stops reading is detected within the write timeout, and the kernel memory one slow reader can pin is bounded.
@@ -76,4 +80,4 @@ What differs between operating systems, what net-io does about it, and what an o
 
 ## Targets
 
-0.5 builds on Linux, macOS, FreeBSD, and Windows for x86_64 and aarch64, with net-io's own declarations of the OS calls it needs (`dev/SYS-SURFACE.md` lists them). Other targets stop at a compile error that says so.
+net-io builds on Linux, macOS, FreeBSD, and Windows for x86_64 and aarch64, with net-io's own declarations of the OS calls it needs (`dev/SYS-SURFACE.md` lists them). Other targets stop at a compile error that says so.
