@@ -412,6 +412,7 @@ fn test_kill_ends_a_close_after_flush() {
         });
         std::thread::sleep(Duration::from_millis(50));
         let handle = server.handle();
+        let soft_at = Instant::now();
         assert!(handle.close_after_flush(id, KillReason(2), Duration::from_secs(20)));
         assert!(
             !handle.close_after_flush(id, KillReason(3), Duration::from_secs(20)),
@@ -431,7 +432,16 @@ fn test_kill_ends_a_close_after_flush() {
             );
             assert!(!handle.kill(id, KillReason(8)), "{driver:?}: closed");
         } else {
-            assert_eq!(server.stats().open, 1, "{driver:?}: still lingering");
+            // Once on the Linux reactor in a full suite run at load 110 on 32 cores the
+            // connection was gone here, not reproduced in 70 runs; this says how.
+            let stats = server.stats();
+            assert_eq!(
+                stats.open,
+                1,
+                "{driver:?}: still lingering {:?} after the soft kill, closes {:?}",
+                soft_at.elapsed(),
+                stats.closes().collect::<Vec<_>>()
+            );
             let start = Instant::now();
             assert!(
                 handle.kill(id, KillReason(8)),
