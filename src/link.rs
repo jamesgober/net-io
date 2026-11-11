@@ -128,6 +128,10 @@ const AUTO_PHASE: u8 = 8;
 /// close lingers instead of taking the idle shortcut; otherwise that request draws
 /// a reset and the peer's stack can discard the reply it already holds (D-192).
 const SPOKE_IDLE: u8 = 16;
+/// Not a drain bit: the session was given input in this exchange, so what it sends
+/// while idle is its answer, not news the peer did not ask for. Cleared when the
+/// exchange ends (`settle_phase` with nothing left over and the phase `Idle`).
+const HEARD: u8 = 32;
 
 /// Soft closes in progress across a server, against `Limits::denial_linger_max`.
 #[derive(Debug)]
@@ -223,7 +227,8 @@ pub(crate) struct Link {
     /// instead of the read closing with `Drained`; `DRAIN_REACHED`: that news;
     /// `DRAIN_KEPT`: the session kept the connection through the drain; and
     /// `AUTO_PHASE`: net-io picks the phase (the owner never set one); `SPOKE_IDLE`:
-    /// the last send went out while idle. One byte.
+    /// the last send went out while idle and unasked; `HEARD`: the session was given
+    /// input in this exchange. One byte.
     drains: u8,
     /// The soft close (after a denial, or `close_after_flush`), once there is one.
     /// Boxed: one pointer on every connection, the rest only where it happens.
@@ -426,7 +431,19 @@ impl Link {
             self.progress_at = now;
             self.rate_in.deactivate();
         }
+        // The exchange is over: what goes out from here until the next input is the
+        // session's own news (D-192).
+        if done && self.phase == Phase::Idle {
+            self.drains &= !HEARD;
+        }
         self.replied = false;
+    }
+
+    /// The session is about to see input: what it sends until the exchange ends
+    /// answers the peer.
+    #[inline]
+    pub(crate) fn note_heard(&mut self) {
+        self.drains |= HEARD;
     }
 
     pub(crate) fn set_exchange_deadline(&mut self, at: Option<Instant>) {
@@ -1108,13 +1125,18 @@ impl Link {
         if buf.is_empty() {
             return Ok(Got::Data(0));
         }
-        if let Some(mut t) = self.tls.take() {
+        let r = if let Some(mut t) = self.tls.take() {
             self.settle_phase(true);
             let r = self.read_tls(&mut t, buf);
             self.tls = Some(t);
-            return r;
+            r
+        } else {
+            self.read_raw(buf)
+        };
+        if matches!(r, Ok(Got::Data(n)) if n > 0) {
+            self.note_heard();
         }
-        self.read_raw(buf)
+        r
     }
 
     /// One read from the socket (or from the bytes left after a handshake),
@@ -1379,7 +1401,9 @@ impl Link {
         let now = self.now();
         self.bytes_out += n as u64;
         self.replied = true;
-        if self.phase == Phase::Idle {
+        // A reply the session wrote after it set `Idle` for the exchange it answered
+        // is not unasked: only bytes sent while idle with no input heard are (D-201).
+        if self.phase == Phase::Idle && self.drains & HEARD == 0 {
             self.drains |= SPOKE_IDLE;
         } else {
             self.drains &= !SPOKE_IDLE;
@@ -2368,7 +2392,19 @@ impl Link {
         Some(stream)
     }
 
-    pub(crate) fn finish(mut self, reason: CloseReason) -> CloseReason {
+    pub(crate) fn finish(self, reason: CloseReason) -> CloseReason {
+        self.finish_with(reason, |_| false)
+    }
+
+    /// As `finish`; `own(k)` says a kill with reason `k` was net-io's own (a drain's
+    /// deadline, a stop). Such a kill during the linger ends the linger and keeps the
+    /// graceful close's reason, as on the reactor; a user's kill still makes it
+    /// `Killed` and a reset (D-201).
+    pub(crate) fn finish_with(
+        mut self,
+        reason: CloseReason,
+        own: impl Fn(KillReason) -> bool,
+    ) -> CloseReason {
         let mut reason = reason;
         // After a denial or during a soft kill, an abortive reason still closes
         // gracefully, with the shorter linger: the peer reads what was sent.
@@ -2381,9 +2417,9 @@ impl Link {
         if graceful {
             self.tls_close_notify();
             let within = soft.unwrap_or(self.limits.graceful_linger);
-            if self.linger_gracefully(within) {
+            if self.linger_gracefully(within, soft.is_some()) {
                 // A kill arrived during the linger: close abortively at once.
-                if let Some(k) = self.killed() {
+                if let Some(k) = self.killed().filter(|&k| !own(k)) {
                     reason = CloseReason::Killed(k);
                 }
             }
@@ -2481,8 +2517,9 @@ impl Link {
 
     /// FIN, then read and discard up to the linger budget so unread input does not
     /// turn into an RST that destroys the last response, for at most `within`.
-    /// Returns `true` if killed meanwhile (a soft kill does not count).
-    fn linger_gracefully(&mut self, within: Duration) -> bool {
+    /// Returns `true` if killed meanwhile (a soft kill does not count). `always`: a
+    /// flush then close (a denial, `close_after_flush`), which lingers in any phase.
+    fn linger_gracefully(&mut self, within: Duration, always: bool) -> bool {
         let _ = self.stream.shutdown(Shutdown::Write);
         if self.peer_closed || !self.stream.half_closes() {
             return false;
@@ -2490,8 +2527,11 @@ impl Link {
         // Between exchanges with nothing unread there is nothing to protect from a
         // reset: close at once (one zero-timeout poll), so a drain of idle
         // connections does not wait out the linger. Not after the session spoke
-        // while idle: the peer's answer may be on its way (D-192).
-        if self.phase == Phase::Idle
+        // while idle: the peer's answer may be on its way (D-192). Not for a flush
+        // then close either: it ends the connection on the server's terms, and the
+        // peer's request may be crossing it whatever the phase (D-182, D-202).
+        if !always
+            && self.phase == Phase::Idle
             && self.drains & SPOKE_IDLE == 0
             && !matches!(self.wait(Interest::Read, Duration::ZERO), Ok(Ready::Socket))
         {

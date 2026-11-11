@@ -391,6 +391,51 @@ fn test_close_after_flush_is_bounded_for_a_peer_that_never_reads() {
     }
 }
 
+/// A flush-then-close lingers whatever the phase: before the session has seen any
+/// input the peer's request may be on its way, and closing at once would answer it
+/// with a reset (D-182). Register R-47: under load the Linux reactor got the soft
+/// kill before the first `on_data`, and the close took the idle shortcut.
+#[test]
+fn test_a_close_after_flush_lingers_before_any_input() {
+    for driver in DRIVERS {
+        let (server, ids) = reporting(driver, || Sink);
+        let mut c = client(addr(&server));
+        let id = ids.recv_timeout(WAIT).expect("id");
+        std::thread::sleep(Duration::from_millis(50));
+        let handle = server.handle();
+        let soft_at = Instant::now();
+        assert!(handle.close_after_flush(id, KillReason(2), Duration::from_secs(2)));
+        std::thread::sleep(Duration::from_millis(300));
+        let stats = server.stats();
+        assert_eq!(
+            stats.open,
+            1,
+            "{driver:?}: closed {:?} after the soft kill without its linger, closes {:?}",
+            soft_at.elapsed(),
+            stats.closes().collect::<Vec<_>>()
+        );
+        // The linger sends FIN first; the peer sees the end of the stream, not a reset.
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            c.read(&mut buf).map_err(|e| e.kind()),
+            Ok(0),
+            "{driver:?}: FIN"
+        );
+        assert!(
+            eventually(WAIT, || server
+                .stats()
+                .closed_for(CloseReason::Killed(KillReason(2)))
+                == 1),
+            "{driver:?}: closed by the soft kill"
+        );
+        assert!(
+            soft_at.elapsed() >= Duration::from_millis(1900),
+            "{driver:?}: closed {:?} after the soft kill, before its bound",
+            soft_at.elapsed()
+        );
+    }
+}
+
 #[test]
 fn test_kill_ends_a_close_after_flush() {
     for driver in DRIVERS {
@@ -432,8 +477,8 @@ fn test_kill_ends_a_close_after_flush() {
             );
             assert!(!handle.kill(id, KillReason(8)), "{driver:?}: closed");
         } else {
-            // Once on the Linux reactor in a full suite run at load 110 on 32 cores the
-            // connection was gone here, not reproduced in 70 runs; this says how.
+            // Register R-47: under load the soft kill came before the first `on_data`
+            // and the close skipped its linger (D-202); this says how, should it recur.
             let stats = server.stats();
             assert_eq!(
                 stats.open,

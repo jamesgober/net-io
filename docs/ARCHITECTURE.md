@@ -25,7 +25,7 @@ A close takes one of three shapes:
 
 | Shape | When | On the wire |
 |---|---|---|
-| Graceful | `Step::Close`, a drain, an idle timeout between exchanges | queued bytes, `close_notify` on TLS, FIN; then a linger that reads and discards input for up to 2 s and 64 KiB, only when input may still arrive (mid-exchange, the socket readable, or the session wrote while idle, D-192). Without a linger the reactor closes at once and the kernel sends the FIN behind what is queued (D-198) |
+| Graceful | `Step::Close`, a drain, an idle timeout between exchanges | queued bytes, `close_notify` on TLS, FIN; then a linger that reads and discards input for up to 2 s and 64 KiB, only when input may still arrive (mid-exchange, the socket readable, or the session wrote while idle with no request to answer, D-192, D-201). Without a linger the reactor closes at once and the kernel sends the FIN behind what is queued (D-198) |
 | Flush then close | a denial whose bytes went out, `ServerHandle::close_after_flush` | no more input, queued bytes, FIN, reads discarded until the peer's EOF or `Limits::denial_linger` (D-182) |
 | Abortive | a kill, a timeout mid-exchange, a refusal without bytes | RST (linger 0) |
 

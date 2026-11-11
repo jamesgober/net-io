@@ -1080,6 +1080,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let session = c.session.as_mut()?;
         let output = c.output.as_mut()?;
         let input = c.input.as_mut()?;
+        c.link.note_heard();
         let mut cx = SessionContext {
             link: &mut c.link,
             output,
@@ -2339,7 +2340,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 let _ = self.tls_retake(index);
             }
             let Some(c) = self.conn(index) else { return };
-            let linger = c.link.begin_graceful_close(c.readable);
+            // A flush then close lingers in any phase: the peer's request may be
+            // crossing it, seen or not (D-182, D-202).
+            let linger = c.link.begin_graceful_close(c.readable || soft.is_some());
             if linger && c.sending == Sending::None {
                 let until = c.link.now() + soft.unwrap_or(c.link.limits.graceful_linger);
                 c.linger_left = c.link.limits.graceful_linger_bytes;

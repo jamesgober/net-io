@@ -3139,7 +3139,11 @@ impl<G: Gate> Worker<G> {
             self.pool.put(cin);
             self.pool.put(cout);
         }
-        let reason = link.finish(reason);
+        // net-io's own kill (the drain's deadline, a stop) during the linger ends the
+        // linger and leaves the reason as it was, as on the reactor (D-201).
+        let own =
+            |k: KillReason| k == DRAIN_KILL && ws.kill_cause.load(Ordering::Acquire) != CAUSE_USER;
+        let reason = link.finish_with(reason, own);
         // Give the gate its ticket back with the reason; keep the cell for the next connection.
         match erased {
             Some(mut g) => {
@@ -3632,6 +3636,7 @@ fn on_data<G: Gate, S: Session>(
     s: &mut S,
     input: &mut Input,
 ) -> Option<Step> {
+    link.note_heard();
     let (step, grow) = call(w, link, s, |s, cx| s.on_data(cx, input));
     if let Some(class) = grow {
         if class > input.buf.class() {

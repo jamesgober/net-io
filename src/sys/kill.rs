@@ -531,11 +531,11 @@ mod loom_tests {
     #[test]
     fn loom_kill_never_acts_after_close() {
         loom::model(|| {
+            // The rest from `new`, so a field added later cannot break this build.
             let slot = loom::sync::Arc::new(KillSlot {
                 state: AtomicU64::new((1 << GEN_SHIFT) | ACTIVE),
                 raw: AtomicU64::new(3),
-                wake: Mutex::new(None),
-                sink: Mutex::new(None),
+                ..KillSlot::new()
             });
             let closed = loom::sync::Arc::new(AtomicBool::new(false));
             let (s2, c2) = (slot.clone(), closed.clone());

@@ -16,7 +16,7 @@
 - Flush-then-close (D-182): after a denial whose bytes went out, the connection
   stops reading, sends what is queued, sends FIN, and discards input until the
   peer's EOF or `Limits::denial_linger` (default 100 ms; zero keeps the immediate
-  reset). `Limits::denial_linger_max` caps how many connections linger at once
+  reset), in any phase, including before the session has seen input (D-202). `Limits::denial_linger_max` caps how many connections linger at once
   (default a sixteenth of `max_connections`); past it a denial resets as before.
   On Windows this stops the formatted denial being lost to an abortive close.
 - `ServerHandle::close_after_flush(id, reason, within)`: a soft kill. The session's
@@ -37,7 +37,9 @@
 - A connection whose session wrote while it was idle (a reply in `on_open`, a push
   between exchanges) now lingers on a graceful close instead of closing at once,
   so a request already crossing the reply no longer turns the close into a reset
-  that discards the reply (D-192).
+  that discards the reply (D-192). A reply to a request is not counted, even when
+  the session set `Idle` before writing it: a connection that answered its
+  exchange still closes at once (D-201).
 - TLS on the reactor (D-194): the records a TLS engine writes as its handshake ends
   (session tickets) leave with the session's first reply, and a reply before
   `Step::Close` carries `close_notify` in the same send. A full exchange with a
@@ -54,6 +56,9 @@
 
 - A refusal now shows in `Stats` by the time the client sees it; it was counted
   just after the socket closed (D-199).
+- On the blocking driver, a drain whose deadline ended a graceful close's linger
+  reported the close as `Killed(KillReason(0))`; it now keeps the close's own
+  reason, as the reactor does, and the drain report counts it graceful (D-201).
 
 ## [0.7.1] - 2026-11-08
 
