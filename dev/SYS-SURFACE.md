@@ -114,7 +114,7 @@ Declared per target; values from the target's system headers, cross-checked in C
 | kqueue | `EVFILT_READ`, `EVFILT_WRITE`, `EVFILT_USER`, `EV_ADD`, `EV_DELETE`, `EV_ENABLE`, `EV_DISABLE`, `EV_DISPATCH`, `EV_CLEAR`, `EV_EOF`, `EV_ERROR`, `NOTE_TRIGGER` | macOS, FreeBSD |
 | CPU sets | `CPU_LEVEL_WHICH`, `CPU_WHICH_TID` | FreeBSD |
 | clocks | `CLOCK_MONOTONIC` | all, values per OS |
-| error numbers | `EINTR`, `EAGAIN`, `EWOULDBLOCK`, `EINPROGRESS`, `EALREADY`, `EISCONN`, `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`, `EPROTO`, `EPERM`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET` (Linux), `EHOSTUNREACH`, `ENETUNREACH`, `EOPNOTSUPP`, `EBADF`, `EINVAL`, `ENOTSOCK`, `ENOTCONN`, `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `ETIMEDOUT`, `EADDRINUSE`, `EADDRNOTAVAIL`, `EACCES`, `ENOENT`, `ENAMETOOLONG`, `ENOSYS` | all, values per OS (read back through `io::Error::raw_os_error`) |
+| error numbers | `EINTR`, `EAGAIN`, `EWOULDBLOCK`, `EINPROGRESS`, `EALREADY`, `EISCONN`, `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`, `EPROTO`, `EMSGSIZE` (a UDP receive after an ICMP "fragmentation needed", 0.8), `EPERM`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET` (Linux), `EHOSTUNREACH`, `ENETUNREACH`, `EOPNOTSUPP`, `EBADF`, `EINVAL`, `ENOTSOCK`, `ENOTCONN`, `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `ETIMEDOUT`, `EADDRINUSE`, `EADDRNOTAVAIL`, `EACCES`, `ENOENT`, `ENAMETOOLONG`, `ENOSYS` | all, values per OS (read back through `io::Error::raw_os_error`) |
 | random | `GRND_NONBLOCK` is not used (blocking until seeded is correct at start-up) | |
 
 ## 3. Unix structs

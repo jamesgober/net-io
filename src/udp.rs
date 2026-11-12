@@ -1348,10 +1348,12 @@ fn icmp_report(e: &io::Error) -> bool {
     }
     #[cfg(unix)]
     {
-        use sys::errno::{EHOSTDOWN, ENONET, ENOPROTOOPT, EPROTO};
+        // EMSGSIZE: an ICMP "fragmentation needed" on a connected socket. A receive
+        // reports a datagram too large for its buffer as truncated, never so.
+        use sys::errno::{EHOSTDOWN, EMSGSIZE, ENONET, ENOPROTOOPT, EPROTO};
         matches!(
             e.raw_os_error(),
-            Some(EHOSTDOWN | ENONET | ENOPROTOOPT | EPROTO)
+            Some(EHOSTDOWN | EMSGSIZE | ENONET | ENOPROTOOPT | EPROTO)
         )
     }
     #[cfg(windows)]
@@ -2201,6 +2203,7 @@ mod tests {
             Fault::Os(sys::errno::EHOSTDOWN),
             Fault::Os(sys::errno::ENOPROTOOPT),
             Fault::Os(sys::errno::EPROTO),
+            Fault::Os(sys::errno::EMSGSIZE),
         ]);
         // WSAENETRESET: a "time exceeded" report.
         #[cfg(windows)]
