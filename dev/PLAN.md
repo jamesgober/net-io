@@ -42,13 +42,13 @@ net-io is the entrance and the exit. Every byte that reaches one of our services
 6. **Graceful drain and zero-downtime restarts:** a door that opens last and closes first, drain with a deadline, systemd socket activation, FastCGI descriptor-0 inheritance, and listener hand-off between processes by descriptor passing.
 7. **The real client address behind a proxy:** PROXY protocol v1 and v2 parsed sans-IO, honoured only from configured trusted proxies.
 
-It is written once and used by everything that listens on a port or dials one: the web stack, HiveDB's wire protocol, raft-io's transport, rpc-io over TCP, admin consoles, back-channel clients.
+It is written once and used by everything that listens on a port or dials one: the web stack, a database wire protocol, raft-io's transport, rpc-io over TCP, admin consoles, back-channel clients.
 
 What it is not:
 
 | Not | Why | Where it lives |
 |---|---|---|
-| an HTTP server or any protocol parser | protocol-free rule (2.2) | `http-net`, `ws-net`, `fcgi-net`, `wire-codec`, HiveDB wire |
+| an HTTP server or any protocol parser | protocol-free rule (2.2) | `http-net`, `ws-net`, `fcgi-net`, `wire-codec`, a database wire protocol |
 | a TLS implementation | TLS is never written in-house (D-003, D-012) | `tls-net` (adapter over rustls) |
 | a policy engine (bans, scores, rates per prefix) | policy belongs to the gate | `bouncer-io`, `sentinel-sec` |
 | an async runtime or task scheduler | no rented runtime (D-004) | an executor crate, through a driver seam |
@@ -81,7 +81,7 @@ Each stage rejects as early and as cheaply as it can. An IP ban costs nanosecond
   │ TLS (tls-net adapter) │  handshake, fingerprint     │ handlers / services   │  bouncer checkpoints
   ├───────────────────────┤                             │                       │  between stages
   │ protocol engine       │  http-net / ws-net /        └───────────────────────┘
-  │ (Session)             │  fcgi-net / HiveDB wire                 ▲
+  │ (Session)             │  fcgi-net / a DB wire                   ▲
   ├───────────────────────┤                                         │
   │ customs-sec: head     │  declared size, type, route             │
   ├───────────────────────┤                                         │
@@ -110,7 +110,7 @@ A crate is **protocol-free** when it does its job without knowing the format of 
 | `bouncer-io` | implements `Gate`; uses `ServerHandle::kill`, `ConnectionInfo`, `ConnectionId`, `Cidr`, `PrefixKey`, `normalize` |
 | `tls-net` | implements `TlsAcceptor` and `TlsSession` |
 | `fetch-net`, `proxy-net`, `smtp-net`, back-channel clients | outbound connect with timeouts, socket options, the same limits, `set_gate` |
-| HiveDB's network layer, `raft-io`, `rpc-io` | TCP listener and client, drain, limits, hand-off |
+| A database's network layer, `raft-io`, `rpc-io` | TCP listener and client, drain, limits, hand-off |
 | `quic-net` (later) | UDP socket, batch IO, GSO/GRO, packet info |
 | an executor crate | net-io implements its driver trait so workers park inside the reactor (feature `executor`, D-030) |
 
@@ -838,7 +838,7 @@ Ideas worth keeping that are not scheduled. Each moves into the roadmap with a r
 | D-005 | 2026-10-13 | Internal driver interface is completion-shaped | IOCP and io_uring are completion-based; readiness backends adapt cheaply, the reverse does not |
 | D-006 | 2026-10-13 | net-io defines gate, TLS, and event traits; implementers depend on net-io, never the reverse | one-way dependencies; protocol-free rule |
 | D-007 | 2026-10-13 | Mandatory gate check before every socket write, with wipe-and-replace and abortive close | no byte leaves a revoked connection even if a handler skips its checkpoints |
-| D-008 | 2026-10-13 | Template aligned with http-net: edition 2024, MSRV 1.85, `Apache-2.0 OR MIT`, `dev/` committed and `.dev/` private | portfolio consistency |
+| D-008 | 2026-10-13 | Template aligned with http-net: edition 2024, MSRV 1.85, `Apache-2.0 OR MIT`, `dev/` committed | portfolio consistency |
 | D-009 | 2026-10-13 | Naming: `gate-net` for authentication and sessions, `gate-sec` for authorization, `bouncer-io` for the door, `customs-sec` for contract inspection | James's naming |
 | D-010 | 2026-10-13 | `shield-sec` and `sentinel-sec` (`sentinel` is taken) | public crate names in the `-sec` family |
 | D-011 | 2026-10-13 | "Protocol parser" in the request path is a role, not a crate | each protocol keeps its own engine above the protocol-free layers |
