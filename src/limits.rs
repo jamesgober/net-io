@@ -347,8 +347,10 @@ impl Limits {
         out
     }
 
-    /// Checks the resolved values against each other, the worker count, and the
-    /// process's descriptor limit.
+    /// Checks the values, with unset ones taken from the blocking driver's
+    /// defaults, against each other, the worker count, and the process's
+    /// descriptor limit. `ServerBuilder::build` runs the same checks with the
+    /// defaults of the driver it resolved.
     ///
     /// # Errors
     ///
@@ -360,13 +362,24 @@ impl Limits {
     /// # Ok::<(), net_io::NetError>(())
     /// ```
     pub fn validate(&self, workers: u16, descriptor_limit: Option<u64>) -> Result<(), NetError> {
+        self.validate_for(DriverKind::Blocking, workers, descriptor_limit)
+    }
+
+    /// As `validate`, with unset values from `driver`'s defaults: a reactor's
+    /// buffer budget is not the blocking pool's.
+    pub(crate) fn validate_for(
+        &self,
+        driver: DriverKind,
+        workers: u16,
+        descriptor_limit: Option<u64>,
+    ) -> Result<(), NetError> {
         // Rules that need only the values themselves.
         LimitsBuilder {
             limits: self.clone(),
             bad_lane: false,
         }
         .check()?;
-        let e = self.effective(DriverKind::Blocking);
+        let e = self.effective(driver);
         let need_budget = u64::from(workers)
             .saturating_mul(u64::from(e.read_class_max.bytes()))
             .saturating_mul(2);

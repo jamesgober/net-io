@@ -248,7 +248,7 @@ impl std::os::windows::io::AsSocket for Stream {
 }
 #[cfg(feature = "reactor")]
 pub(crate) use kill::KillSink;
-pub(crate) use kill::KillSlot;
+pub(crate) use kill::{KillSlot, SlotLease};
 
 #[cfg(any(test, net_io_shim))]
 pub(crate) mod shim;

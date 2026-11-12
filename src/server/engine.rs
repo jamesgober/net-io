@@ -99,6 +99,20 @@ const NO_LISTENER: u32 = u32::MAX;
 /// How often a drain looks again for connections that became idle.
 const DRAIN_PASS: Duration = Duration::from_millis(10);
 
+/// How long a drain waits, after it killed what was left (at its deadline, or at a
+/// stop), for those connections to close before it returns anyway, and how long a
+/// stop then waits for its worker threads. A killed connection closes in
+/// microseconds once its owner sees the kill; an owner that does not (a blocking
+/// handler that computes, sleeps, or waits on a lock and never touches the socket,
+/// or a session callback that does not return) is left running, detached, and
+/// counted in `Stats::workers_detached`. Cost: a stop returns at most this long after
+/// its deadline, plus the join below; nothing on a normal drain, which ends when
+/// the last connection closes.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a stop waits for its worker threads after a drain gave up on some.
+const JOIN_SLACK: Duration = Duration::from_millis(100);
+
 /// Accept errors in a row, none of them a connection, before the accept loop pauses.
 const SKIPS_BEFORE_PAUSE: u32 = 64;
 
@@ -245,6 +259,11 @@ pub(crate) struct WorkerShared {
     /// Wakes this worker's loop, reactor only.
     #[cfg(feature = "reactor")]
     pub(crate) waker: OnceLock<DriverWaker>,
+    /// The worker's loop ended on a panic or a failed wait, reactor only: it takes
+    /// no more connections, and what waited in its inbox was closed. Set under the
+    /// inbox lock, so a hand-over either sees it or leaves a job the worker closes.
+    #[cfg(feature = "reactor")]
+    pub(crate) dead: AtomicBool,
 }
 
 /// A worker's inbox, on cache lines of its own: its owner locks it on every turn.
@@ -382,6 +401,13 @@ pub(crate) struct Shared {
     descriptor_pressure: AtomicU64,
     drained_graceful: AtomicU32,
     drained_killed: AtomicU32,
+    /// Reactor workers whose loop ended on a panic or a failed wait.
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    workers_lost: AtomicU32,
+    /// Worker threads a stop left running past its bound (`DRAIN_GRACE`).
+    workers_detached: AtomicU32,
+    /// Worker threads still running, for a stop's bounded join.
+    running: AtomicUsize,
     pub(crate) drain_timeout: Duration,
     /// The TLS engine, when any listener serves TLS.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
@@ -742,6 +768,10 @@ impl Shared {
                 killed_at_deadline = true;
                 self.command(CMD_LISTENER_KILL);
             }
+            // What is left ignored the kill (a callback that does not return).
+            if killed_at_deadline && now >= deadline + DRAIN_GRACE {
+                break;
+            }
             let wait = if killed_at_deadline {
                 Duration::from_millis(50)
             } else {
@@ -813,6 +843,10 @@ impl Shared {
                     }
                 }
             }
+            // What is left ignored the kill (a handler that does not return).
+            if killed_at_deadline && now >= deadline + DRAIN_GRACE {
+                break;
+            }
             let wait = if killed_at_deadline {
                 Duration::from_millis(50)
             } else {
@@ -866,6 +900,11 @@ impl Shared {
         self.workers.len()
     }
 
+    /// The driver this server runs, which its limits resolve for.
+    pub(crate) fn driver(&self) -> DriverKind {
+        self.driver
+    }
+
     /// Wakes every worker (not the accept threads).
     fn wake_workers(&self) {
         for i in 0..self.workers.len() {
@@ -888,23 +927,55 @@ impl Shared {
     }
 
     /// The listeners worker `idx` accepts on itself (D-197): for each listener of a
-    /// per-worker group, the socket of that worker's place in the group.
+    /// per-worker group, the socket of that worker's place in the group, and the
+    /// socket of each dead worker it is heir to (the first live worker after it), so
+    /// that the connections the kernel puts on a dead worker's socket are accepted.
     #[cfg(feature = "reactor")]
     pub(crate) fn worker_listeners(
         &self,
         idx: usize,
     ) -> Vec<(Arc<ListenerConf>, Arc<ListenerRuntime>)> {
-        self.lock_listeners()
+        let dead = |i: usize| {
+            self.workers
+                .get(i)
+                .is_none_or(|w| w.dead.load(Ordering::Acquire))
+        };
+        let mut out = Vec::new();
+        if dead(idx) {
+            return out;
+        }
+        for e in self
+            .lock_listeners()
             .iter()
             .filter(|e| e.conf.on_workers && !e.conf.removed.load(Ordering::Acquire))
-            .filter_map(|e| {
-                let rt = match idx {
+        {
+            let places = e.siblings.len() + 1;
+            for place in 0..places {
+                let heir = (0..places)
+                    .map(|k| (place + k) % places)
+                    .find(|&i| !dead(i));
+                if heir != Some(idx) {
+                    continue;
+                }
+                let rt = match place {
                     0 => &e.runtime,
-                    i => &e.siblings.get(i - 1)?.runtime,
+                    i => &e.siblings[i - 1].runtime,
                 };
-                Some((e.conf.clone(), rt.clone()))
-            })
-            .collect()
+                out.push((e.conf.clone(), rt.clone()));
+            }
+        }
+        out
+    }
+
+    /// A reactor worker died (`Engine::retire` marked it): the others look again at
+    /// the listeners they accept on, so an heir takes its sockets, and a drain
+    /// waiting for its connections looks again.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn worker_lost(&self) {
+        self.workers_lost.fetch_add(1, Ordering::Relaxed);
+        self.listener_epoch.fetch_add(1, Ordering::AcqRel);
+        self.wake_workers();
+        self.notify_progress();
     }
 
     pub(crate) fn wake_all(&self) {
@@ -970,6 +1041,8 @@ impl Shared {
             accepted: self.accepted.load(Ordering::Relaxed),
             refused: self.refused.load(Ordering::Relaxed),
             descriptor_pressure: self.descriptor_pressure.load(Ordering::Relaxed),
+            workers_lost: u64::from(self.workers_lost.load(Ordering::Relaxed)),
+            workers_detached: u64::from(self.workers_detached.load(Ordering::Relaxed)),
             ..Stats::default()
         };
         let mut closed_by = [0u64; CloseReason::COUNT];
@@ -1014,7 +1087,8 @@ impl Shared {
             });
         }
         let mut guard = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut killed_at_deadline = false;
+        // When the drain first killed what was left.
+        let mut killed_at: Option<Instant> = None;
         while !self.idle() {
             // Close every connection that waits for its next exchange; repeated each
             // pass for connections that finish an exchange during the drain.
@@ -1026,12 +1100,19 @@ impl Shared {
                 || self.control.state() == ControlState::Stopping;
             if stop {
                 self.kill_all(CAUSE_STOP);
-                killed_at_deadline = true;
+                let _ = killed_at.get_or_insert(now);
             } else if now >= deadline {
                 // Every pass, not once: a connection admitted late is killed too.
-                killed_at_deadline = true;
+                let _ = killed_at.get_or_insert(now);
                 self.kill_all(CAUSE_DRAIN);
             }
+            // What is left ignored the kill: an owner that never looks at its socket
+            // or a callback that does not return. The drain ends anyway, and
+            // `stats().open` still counts them.
+            if killed_at.is_some_and(|at| now >= at + DRAIN_GRACE) {
+                break;
+            }
+            let killed_at_deadline = killed_at.is_some();
             let wait = if killed_at_deadline {
                 Duration::from_millis(50)
             } else {
@@ -1121,6 +1202,37 @@ impl Shared {
                     w.idle_cause.store(IDLE_DRAIN, Ordering::Release);
                 }
             }
+        }
+    }
+
+    /// Joins the worker threads of a stopping server, waiting at most `DRAIN_GRACE`
+    /// (`JOIN_SLACK` when the drain already gave up on some connections); a thread
+    /// still running then is left detached and counted: it ends, and frees what it
+    /// holds, when its handler returns.
+    pub(crate) fn join_workers(&self, threads: Vec<JoinHandle<()>>) {
+        let bound = Instant::now() + if self.idle() { DRAIN_GRACE } else { JOIN_SLACK };
+        let mut guard = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        while self.running.load(Ordering::Acquire) > 0 {
+            let now = Instant::now();
+            if now >= bound {
+                break;
+            }
+            guard = self
+                .progress_cv
+                .wait_timeout(guard, bound - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        drop(guard);
+        let left = self.running.load(Ordering::Acquire);
+        for t in threads {
+            if left == 0 || t.is_finished() {
+                let _ = t.join();
+            }
+        }
+        if left > 0 {
+            let left = u32::try_from(left).unwrap_or(u32::MAX);
+            self.workers_detached.fetch_add(left, Ordering::Relaxed);
         }
     }
 
@@ -1262,6 +1374,17 @@ thread_local! {
     /// reactor worker's own accepts, that worker, with `true`: it takes its inbox
     /// after the batch, so no wake is sent (D-197).
     static FEEDS: std::cell::Cell<Option<(usize, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// A worker thread, counted in `Shared::running` until it ends (or its spawn fails
+/// and the closure holding this is dropped), however it ends.
+struct Running(Arc<Shared>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::AcqRel);
+        self.0.notify_progress();
+    }
 }
 
 /// One accept thread inside an admission, for the drain (see `Shared::admitting`).
@@ -1663,6 +1786,18 @@ impl<W, G: Gate> Engine<W, G> {
             .pop_front()
     }
 
+    /// Worker `idx`'s loop ended for good: it is marked dead under its inbox lock,
+    /// so no hand-over adds to the inbox after this, and gets what waited there, to
+    /// close.
+    pub(crate) fn retire(&self, idx: usize) -> VecDeque<Job<G::Ticket>> {
+        let mut inbox = self.inboxes[idx]
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.shared.workers[idx].dead.store(true, Ordering::Release);
+        std::mem::take(&mut *inbox)
+    }
+
     pub(crate) fn inbox_empty(&self, idx: usize) -> bool {
         self.inboxes[idx]
             .0
@@ -1679,7 +1814,10 @@ impl<W, G: Gate> Engine<W, G> {
     fn hand_to_worker(&self, job: Job<G::Ticket>) -> Result<(), Job<G::Ticket>> {
         let shared = &self.shared;
         let (base, len) = job.listener.workers.unwrap_or((0, shared.shared_workers));
-        let feed = FEEDS.with(std::cell::Cell::get);
+        // An accept thread whose worker died hands to the others.
+        let feed = FEEDS
+            .with(std::cell::Cell::get)
+            .filter(|&(i, _)| !shared.workers[i].dead.load(Ordering::Relaxed));
         let idx = feed.map_or_else(
             || base + least_loaded(&shared.workers[base..base + len], &shared.next_worker),
             |(i, _)| i,
@@ -1689,7 +1827,9 @@ impl<W, G: Gate> Engine<W, G> {
                 .0
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if inbox.len() >= INBOX_MAX {
+            // Read under the lock the dying worker sets it under: no job is left in
+            // an inbox nobody takes.
+            if inbox.len() >= INBOX_MAX || shared.workers[idx].dead.load(Ordering::Acquire) {
                 return Err(job);
             }
             // Counted now, so a burst spreads over the workers.
@@ -1706,7 +1846,8 @@ impl<W, G: Gate> Engine<W, G> {
 /// The worker with the fewest open connections, looking from a start that moves on
 /// by one each call: with short connections every load is usually 0, and taking the
 /// first minimum gave every connection to worker 0 (found by tls-net, D-174). Stops
-/// at the first idle worker.
+/// at the first idle worker. A dead worker is never chosen while another lives (its
+/// load would read 0 for ever); when all are dead, the hand-over refuses.
 #[cfg(feature = "reactor")]
 fn least_loaded(workers: &[WorkerShared], next: &AtomicUsize) -> usize {
     let n = workers.len();
@@ -1718,6 +1859,9 @@ fn least_loaded(workers: &[WorkerShared], next: &AtomicUsize) -> usize {
     let mut least = u32::MAX;
     for k in 0..n {
         let i = (start + k) % n;
+        if workers[i].dead.load(Ordering::Relaxed) {
+            continue;
+        }
         let load = workers[i].load.load(Ordering::Relaxed);
         if load < least {
             least = load;
@@ -1840,6 +1984,8 @@ where
                 load: AtomicU32::new(0),
                 #[cfg(feature = "reactor")]
                 waker: OnceLock::new(),
+                #[cfg(feature = "reactor")]
+                dead: AtomicBool::new(false),
             })
             .collect(),
         #[cfg(feature = "reactor")]
@@ -1877,6 +2023,9 @@ where
         descriptor_pressure: AtomicU64::new(0),
         drained_graceful: AtomicU32::new(0),
         drained_killed: AtomicU32::new(0),
+        workers_lost: AtomicU32::new(0),
+        workers_detached: AtomicU32::new(0),
+        running: AtomicUsize::new(0),
         drain_timeout: limits.drain_timeout,
         tls: cfg.tls,
     });
@@ -1903,7 +2052,8 @@ where
         #[cfg(feature = "reactor")]
         drivers: Mutex::new(backends),
         work: cfg.work,
-        gated: TypeId::of::<G>() != TypeId::of::<AllowAll>(),
+        gated: TypeId::of::<G>() != TypeId::of::<AllowAll>()
+            && TypeId::of::<G>() != TypeId::of::<super::NoGate>(),
         gate: Arc::new(cfg.gate),
         queue: Mutex::new(VecDeque::with_capacity(total)),
         queue_cv: Condvar::new(),
@@ -1946,10 +2096,13 @@ where
     for i in 0..total {
         let e = engine.clone();
         let cpu = layout.cpu_of(i);
+        shared.running.fetch_add(1, Ordering::AcqRel);
+        let running = Running(shared.clone());
         match std::thread::Builder::new()
             .name(format!("net-io-worker-{i}"))
             .stack_size(WORKER_STACK)
             .spawn(move || {
+                let _running = running;
                 if let Some(cpu) = cpu {
                     // Placement is a tuning hint: a CPU this process may not use leaves
                     // the worker where it is, working.

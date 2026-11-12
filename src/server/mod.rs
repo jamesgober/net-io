@@ -98,6 +98,14 @@ pub struct Stats {
     pub stale_completions: u64,
     /// Sessions that panicked.
     pub session_panics: u64,
+    /// Reactor workers whose loop ended on a panic or a failed wait. Such a worker
+    /// takes no more connections (the others take them, and its own listening
+    /// sockets, instead); its connections were closed when it ended.
+    pub workers_lost: u64,
+    /// Worker threads a stop left running: their connection was killed at the
+    /// drain's deadline, but its owner did not return within the grace after it (a
+    /// blocking handler that never touches its socket). Each ends on its own.
+    pub workers_detached: u64,
     refused_by: [u64; RefusalCause::COUNT],
     closed_by: [u64; CloseReason::COUNT],
 }
@@ -398,9 +406,49 @@ pub struct NoWork;
 #[derive(Debug)]
 pub struct UdpOnly;
 
-/// The unset gate (no `build` exists for it): name `AllowAll` to run without a gate.
+/// The builder's gate until `ServerBuilder::gate` names one: every connection is
+/// admitted, in the most important lane, as with [`AllowAll`](crate::AllowAll), and
+/// no gate check runs on the write path.
+///
+/// ```
+/// use net_io::{AdmitStage, ConnectionInfo, Gate, NoGate};
+/// let info = ConnectionInfo::for_testing("127.0.0.1:9".parse().unwrap());
+/// assert!(NoGate.admit(&info, AdmitStage::Accept).is_ok());
+/// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoGate;
+
+impl Gate for NoGate {
+    type Ticket = ();
+    #[inline(always)]
+    fn admit(
+        &self,
+        _info: &crate::info::ConnectionInfo,
+        _stage: crate::gate::AdmitStage,
+    ) -> Result<crate::gate::Admitted<()>, crate::gate::Refusal> {
+        Ok(crate::gate::Admitted {
+            lane: crate::info::Lane::MOST_IMPORTANT,
+            ticket: (),
+            tag: crate::info::GateTag(0),
+        })
+    }
+    #[inline(always)]
+    fn readmit(
+        &self,
+        _ticket: &mut (),
+        _info: &crate::info::ConnectionInfo,
+    ) -> Result<(), crate::gate::Refusal> {
+        Ok(())
+    }
+    #[inline(always)]
+    fn check(
+        &self,
+        _ticket: &mut (),
+        _write: &crate::gate::WriteCheck,
+    ) -> Result<(), crate::gate::Denial> {
+        Ok(())
+    }
+}
 
 /// Where workers run.
 ///
@@ -468,8 +516,9 @@ impl<H> Workload for BlockingHandler<H> where
 {
 }
 
-/// Builds a [`Server`]. A builder without a gate or without `sessions`/`handler`
-/// has no `build` method: forgetting either is a compile error.
+/// Builds a [`Server`]. A builder without `sessions`/`handler` has no `build`
+/// method: forgetting it is a compile error. Without `gate` every connection is
+/// admitted ([`NoGate`], as [`AllowAll`](crate::AllowAll)).
 ///
 /// # Examples
 ///
@@ -638,7 +687,7 @@ impl<W, G, S, T> ServerBuilder<W, G, S, T> {
         self.map(|w, g, s, _| (w, g, s, acceptor))
     }
 
-    /// The connection gate (required; `AllowAll` for none).
+    /// The connection gate (default: none, every connection admitted).
     pub fn gate<G2: Gate>(self, gate: G2) -> ServerBuilder<W, G2, S, T> {
         self.map(|w, _, s, t| (w, gate, s, t))
     }
@@ -802,10 +851,12 @@ where
         } else {
             self.limits.clone()
         };
-        limits.validate(workers, crate::sys::descriptor_limit())?;
+        limits.validate_for(driver, workers, crate::sys::descriptor_limit())?;
         for spec in &listeners {
             spec.check_listener_limits()?;
-            limits.overlay(&spec.limits).validate(workers, None)?;
+            limits
+                .overlay(&spec.limits)
+                .validate_for(driver, workers, None)?;
         }
         if self.placement != Placement::Off && !crate::sys::CAN_PIN {
             return Err(NetError::Unsupported {
@@ -989,11 +1040,20 @@ impl Server {
     /// (one that has received nothing yet once `Limits::first_request_grace` from its
     /// accept has passed), waits for the rest until `deadline`, then kills them with
     /// `DrainDeadline`.
+    ///
+    /// Returns once every connection closed, or 2 s after the kill at the latest: a
+    /// kill shuts the socket and wakes its owner, but a thread cannot be stopped from
+    /// outside, so a blocking handler that computes, sleeps, or waits on a lock
+    /// without touching its connection keeps running (and its connection open,
+    /// still counted in `stats().open`) until it returns.
     pub fn drain(&self, deadline: Instant) -> DrainReport {
         self.shared.drain(deadline)
     }
 
-    /// Drains, then closes the listening sockets and joins every thread.
+    /// Drains, then closes the listening sockets and joins every thread. Bounded as
+    /// [`Server::drain`] is: a worker thread still held by a connection the drain
+    /// gave up on is left detached, counted in `Stats::workers_detached` (read it
+    /// through a [`ServerHandle`]), and ends when its handler returns.
     pub fn shutdown(mut self, deadline: Instant) -> DrainReport {
         self.stop(deadline)
     }
@@ -1016,9 +1076,7 @@ impl Server {
         self.stopped = true;
         let report = self.shared.drain(deadline);
         self.shared.stop_threads();
-        for t in self.threads.drain(..) {
-            let _ = t.join();
-        }
+        self.shared.join_workers(std::mem::take(&mut self.threads));
         self.shared.join_listeners();
         report
     }
@@ -1119,10 +1177,11 @@ impl Server {
         )?;
         let workers = u16::try_from(self.shared.worker_count()).unwrap_or(u16::MAX);
         spec.check_listener_limits()?;
-        self.shared
-            .base_limits
-            .overlay(&spec.limits)
-            .validate(workers, None)?;
+        self.shared.base_limits.overlay(&spec.limits).validate_for(
+            self.shared.driver(),
+            workers,
+            None,
+        )?;
         let info = self.shared.add_listener(spec)?;
         let id = info.id;
         self.listeners.push(info);
@@ -1132,7 +1191,7 @@ impl Server {
     /// Closes one listener's socket at once (its connections keep running),
     /// then drains them: idle ones close now, the rest may finish until
     /// `deadline` and are then killed (`DrainDeadline`). Other listeners and
-    /// their connections are not touched.
+    /// their connections are not touched. Bounded as [`Server::drain`] is.
     ///
     /// # Errors
     ///
