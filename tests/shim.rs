@@ -710,6 +710,8 @@ fn test_a_dead_workers_own_listening_socket_goes_to_an_heir() {
     drop(held);
     let report = server.shutdown(std::time::Instant::now() + Duration::from_millis(500));
     assert!(report.took < Duration::from_secs(3), "{report:?}");
+}
+
 /// Linux: a file error after bytes left the socket for the pipe fails the
 /// receive. Those bytes cannot be received again, so going on with plain receives
 /// would put the next bytes at the wrong offset, with a gap before them.

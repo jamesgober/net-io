@@ -44,6 +44,7 @@ pub(crate) mod errno {
     pub const EPROTO: i32 = 71;
     pub const ENOTSOCK: i32 = 88;
     /// A UDP receive reports it after an ICMP "fragmentation needed".
+    #[cfg(feature = "udp")]
     pub const EMSGSIZE: i32 = 90;
     pub const ENOPROTOOPT: i32 = 92;
     pub const EOPNOTSUPP: i32 = 95;
@@ -76,6 +77,7 @@ pub(crate) mod errno {
     #[cfg(feature = "local")]
     pub const EALREADY: i32 = 37;
     pub const ENOTSOCK: i32 = 38;
+    #[cfg(feature = "udp")]
     pub const EMSGSIZE: i32 = 40;
     pub const ENOPROTOOPT: i32 = 42;
     pub const ENOTCONN: i32 = 57;
@@ -3075,6 +3077,7 @@ mod layout {
         assert_eq!(EMFILE, libc::EMFILE);
         assert_eq!(EPROTO, libc::EPROTO);
         assert_eq!(ENOTSOCK, libc::ENOTSOCK);
+        #[cfg(feature = "udp")]
         assert_eq!(EMSGSIZE, libc::EMSGSIZE);
         assert_eq!(ENOPROTOOPT, libc::ENOPROTOOPT);
         assert_eq!(EOPNOTSUPP, libc::EOPNOTSUPP);
