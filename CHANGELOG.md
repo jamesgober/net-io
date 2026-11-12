@@ -13,6 +13,44 @@
 
 ---
 
+## [0.6.3] - 2026-11-11
+
+A security release for the 0.6 line, with the fixes of 0.7.2. An independent review
+of 0.7.1 found the defects below, and 0.6.2 has them too. No API change.
+
+### Security
+
+- Windows, reactor driver: a named-pipe connection whose gate denied a write could
+  corrupt the worker's memory and end the process. Pipe IO outside the driver no
+  longer reports to the worker's completion port, and the port ignores any
+  completion it did not start (D-203).
+- Windows listener hand-off (`receive_shared`): a forged message could make the
+  receiving process take over, or close, one of its own sockets. A socket that is
+  not a fresh duplicate is now refused and left alone, received sockets are no
+  longer inheritable, and the sender must run as the same user and have started
+  before the pipe connected (D-204, D-210).
+- Windows named pipes: a name with `/` or `..` could open a file or a network path
+  instead of a pipe. Names with `\` or `/`, the names `.` and `..`, and names over
+  247 characters are refused with `InvalidConfig` (D-205). A name with `/` used to
+  mean a nested pipe name; use another character.
+- Reactor with TLS: connections that sent nothing held 128 KiB each of the shared
+  buffer budget until their handshake deadline, so enough of them stalled every
+  other connection, and the budget did not come back afterwards. A TLS connection
+  now takes its buffers when its first bytes arrive, unfinished handshakes hold at
+  most a quarter of the budget, and buffers a worker no longer needs go back to the
+  budget (D-206).
+- Unix sockets: binding in a directory other users can write to could change the
+  mode or owner of a different file. Mode and owner are now set without going
+  through a path another user can change, and a directory that every user can write
+  to and that is not sticky is refused with
+  `InvalidConfig { reason: ConfigReason::InsecureDirectory }` (D-207).
+
+### Added
+
+- `ConfigReason::InsecureDirectory`, `PoolStats::freed`.
+
+---
+
 ## [0.6.2] - 2026-11-06
 
 Fixes for Windows (a deadlock, a backlog cut to 200, and reset closes held for
