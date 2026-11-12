@@ -77,7 +77,7 @@ reactor = []
 libc = "0.2"
 
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_WindowsProgramming"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 
 [target.'cfg(net_io_loom)'.dev-dependencies]
 loom = "0.7"

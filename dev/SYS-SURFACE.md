@@ -152,12 +152,14 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 | `CancelIoEx` | kernel32 | kill and deadlines on IOCP | ioapiset | 0.5 |
 | `SetFileCompletionNotificationModes` | kernel32 | `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, `FILE_SKIP_SET_EVENT_ON_HANDLE` | winbase | 0.5 |
 | `SetHandleInformation` | kernel32 | clear `HANDLE_FLAG_INHERIT` on handles not created non-inheritable | handleapi | 0.3 |
+| `GetHandleInformation` | kernel32 | a socket made from a hand-off description must still be inheritable (the sender's fresh duplicate) before it is taken; tests: received and accepted sockets are not inheritable | handleapi | 0.6.3 |
 | `CloseHandle` | kernel32 | | handleapi | 0.3 |
 | `GetCurrentProcessId` | kernel32 | fork-equivalent checks, hand-off target | processthreadsapi | 0.3 |
 | `CreateEventW`, `SetEvent`, `WaitForSingleObject` | kernel32 | overlapped pipe connect in the blocking driver | synchapi | 0.5 |
 | `CreateNamedPipeW`, `ConnectNamedPipe`, `DisconnectNamedPipe`, `WaitNamedPipeW`, `GetNamedPipeClientProcessId`, `GetNamedPipeServerProcessId` | kernel32 | named pipes | namedpipeapi, winbase | 0.5 |
 | `GetOverlappedResult`, `WaitForMultipleObjects`, `GetCurrentProcess` | kernel32 | overlapped pipe IO, waits, the token query | ioapiset, synchapi, processthreadsapi | 0.5 |
 | `OpenProcessToken`, `GetTokenInformation`, `ConvertSidToStringSidW` | advapi32 | the current user's SID for an owner-only pipe (D-114) | processthreadsapi, securitybaseapi, sddl | 0.5 |
+| `OpenProcess`, `GetProcessTimes` | kernel32 | a hand-off sender's user and start time, checked before anything is read | processthreadsapi | 0.6.3 |
 | `CreateFileW`, `ReadFile`, `WriteFile`, `FlushFileBuffers` | kernel32 | pipe clients and IO | fileapi | 0.5 |
 | `DeleteFileW`, `GetFileAttributesW` | kernel32 | AF_UNIX socket files | fileapi | 0.5 |
 | `LocalFree` | kernel32 | security descriptor from SDDL | winbase | 0.5 |
@@ -180,6 +182,7 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 | poll | `POLLRDNORM`, `POLLWRNORM`, `POLLERR`, `POLLHUP`, `POLLNVAL` |
 | messages | `MSG_PEEK`, `MSG_TRUNC`, `MSG_PARTIAL` |
 | pipes | `PIPE_ACCESS_DUPLEX`, `FILE_FLAG_OVERLAPPED`, `FILE_FLAG_FIRST_PIPE_INSTANCE`, `PIPE_TYPE_BYTE`, `PIPE_READMODE_BYTE`, `PIPE_WAIT`, `PIPE_REJECT_REMOTE_CLIENTS`, `PIPE_UNLIMITED_INSTANCES`, `NMPWAIT_USE_DEFAULT_WAIT`, `SECURITY_SQOS_PRESENT`, `SECURITY_IDENTIFICATION`, `GENERIC_READ`, `GENERIC_WRITE`, `OPEN_EXISTING`, `SDDL_REVISION_1` |
+| processes | `PROCESS_QUERY_LIMITED_INFORMATION` (0.6.3) |
 | handles, IOCP | `INVALID_HANDLE_VALUE`, `HANDLE_FLAG_INHERIT`, `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, `FILE_SKIP_SET_EVENT_ON_HANDLE`, `INFINITE`, `WAIT_OBJECT_0`, `WAIT_TIMEOUT`, `XP1_IFS_HANDLES` |
 | random | `BCRYPT_USE_SYSTEM_PREFERRED_RNG` |
 | errors | `WSAEINTR`, `WSAEWOULDBLOCK`, `WSAEINPROGRESS`, `WSAEALREADY`, `WSAEMFILE`, `WSAENOBUFS`, `WSAECONNABORTED`, `WSAECONNRESET`, `WSAECONNREFUSED`, `WSAETIMEDOUT`, `WSAEADDRINUSE`, `WSAEADDRNOTAVAIL`, `WSAEACCES`, `WSAENOTCONN`, `WSAENOTSOCK`, `WSAEINVAL`, `WSAEMSGSIZE`, `WSAESHUTDOWN`, `WSAENETUNREACH`, `WSAEHOSTUNREACH`, `WSAEAFNOSUPPORT`, `WSA_IO_PENDING`, `WSA_OPERATION_ABORTED`, `ERROR_PIPE_BUSY`, `ERROR_PIPE_CONNECTED`, `ERROR_NO_DATA`, `ERROR_ACCESS_DENIED`, `ERROR_FILE_NOT_FOUND`, `ERROR_NOT_FOUND`, `ERROR_NETNAME_DELETED`, `ERROR_OPERATION_ABORTED`, `ERROR_IO_PENDING`, `ERROR_SEM_TIMEOUT` |
@@ -196,6 +199,7 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 | `WSAPROTOCOL_INFOW`, `WSAPROTOCOLCHAIN`, `GUID` | hand-off, provider enumeration, extension pointers |
 | `tcp_keepalive` | `SIO_KEEPALIVE_VALS` |
 | `OVERLAPPED`, `OVERLAPPED_ENTRY` | IOCP |
+| `FILETIME` | `GetProcessTimes` (0.6.3) |
 | `SECURITY_ATTRIBUTES` | pipes |
 | `TRANSMIT_FILE_BUFFERS` | `TransmitFile` (not used: null) |
 | `IN_PKTINFO`, `IN6_PKTINFO`, `IP_MREQ`, `IPV6_MREQ` | packet info, multicast |
@@ -218,3 +222,7 @@ Added: epoll (`epoll_create1`, `epoll_ctl`, `epoll_wait`, `eventfd`) on Linux; `
 ## 0.6.0 as built
 
 Added: `sendfile` (three signatures: Linux, macOS, FreeBSD), `recvmmsg`, `sendmmsg`, `sched_setaffinity`, `cpuset_setaffinity`; `TCP_DEFER_ACCEPT` 9, `TCP_USER_TIMEOUT` 18, `TCP_FASTOPEN` 23 (0x105 on macOS, 1025 on FreeBSD), `SO_INCOMING_CPU` 49, `MSG_WAITFORONE` 0x10000, `IP_PKTINFO` and `IPV6_RECVPKTINFO` with their per-OS values, FreeBSD `IP_RECVDSTADDR` 7; on Windows `TransmitFile` (pointer), `GetActiveProcessorGroupCount`, `GetActiveProcessorCount`, `GetCurrentThread`, `SetThreadGroupAffinity`, `TCP_MAXRT` 5, `TCP_FASTOPEN` 15. Each constant has a layout test against `libc` or `windows-sys`, except the per-OS packet-info values on macOS and FreeBSD, which `test_packet_info_reports_the_destination` exercises.
+
+## 0.6.3 as built
+
+Added on Windows: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` 0x1000, `GetProcessTimes` and the struct `FILETIME` (a hand-off sender's user SID, through the existing token calls, and its start time); `GetHandleInformation` outside tests (a socket made from a `WSAPROTOCOL_INFOW` is taken only while it is inheritable). `SetHandleInformation` now also clears `HANDLE_FLAG_INHERIT` on a socket made from a `WSAPROTOCOL_INFOW`: `WSA_FLAG_NO_HANDLE_INHERIT` does not reach such a socket. Every overlapped call on a pipe sets the low bit of `OVERLAPPED.hEvent`, so it queues no completion packet. The constant and the struct have layout tests against `windows-sys`.
