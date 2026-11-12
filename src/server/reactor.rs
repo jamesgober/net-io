@@ -316,15 +316,31 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         handshake_bytes: 0,
         handshake_cap: engine.limits.buffer_budget / 4 / workers,
     };
-    if guarded(|| r.main()).is_none() {
+    let reason = match guarded(|| r.main()) {
+        Some(Ended::Stopped) => return,
+        // The wait itself failed: no completion will be read again, so a close that
+        // waits for one would never finish.
+        Some(Ended::WaitFailed) => CloseReason::Shutdown,
         // A panic got past every inner boundary: nothing on this worker can be
-        // trusted to finish, so each connection closes now and gives back what it held.
-        r.abandon_all(CloseReason::SessionPanicked);
-    }
+        // trusted to finish.
+        None => CloseReason::SessionPanicked,
+    };
+    // Each connection closes now and gives back what it held. A panic in that
+    // leaves some uncounted, and a drain's bound (`DRAIN_GRACE`) still ends it.
+    let _ = guarded(|| r.abandon_all(reason));
+    r.retire(reason);
+}
+
+/// How a worker's loop ended.
+enum Ended {
+    /// The server stopped and this worker's connections are closed.
+    Stopped,
+    /// The driver's wait failed.
+    WaitFailed,
 }
 
 impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
-    fn main(&mut self) {
+    fn main(&mut self) -> Ended {
         loop {
             begin_turn();
             self.take_inbox();
@@ -337,18 +353,15 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             if self.shared.is_stopping() {
                 self.close_all(CloseReason::Shutdown);
                 if self.open == 0 && self.engine.inbox_empty(self.idx) {
-                    return;
+                    return Ended::Stopped;
                 }
             }
             let timeout = self.wait_timeout();
             let Some(mut done) = self.done.take() else {
-                return;
+                return Ended::WaitFailed;
             };
             if self.driver.wait(&mut done, timeout).is_err() {
-                // The wait itself failed: no completion will be read again, so a close
-                // that waits for one would never finish. Each connection closes now.
-                self.abandon_all(CloseReason::Shutdown);
-                return;
+                return Ended::WaitFailed;
             }
             begin_turn();
             self.bulk_sent = 0;
@@ -531,13 +544,15 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
 
     /// Takes up the listeners the server added for this worker and lets go of those
     /// it removed: their sockets close once every worker has dropped them.
+    /// Sockets are told apart by their runtime: an heir to a dead worker holds two
+    /// sockets of one listener (`Shared::worker_listeners`).
     fn rescan_listeners(&mut self) {
         let fresh = self.shared.worker_listeners(self.idx);
         let mut i = 0;
         while i < self.listeners.len() {
             if fresh
                 .iter()
-                .any(|(c, _)| Arc::ptr_eq(c, &self.listeners[i].conf))
+                .any(|(_, rt)| Arc::ptr_eq(rt, &self.listeners[i].runtime))
             {
                 i += 1;
                 continue;
@@ -549,7 +564,11 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             self.free.push(l.index);
         }
         for (conf, runtime) in fresh {
-            if self.listeners.iter().any(|l| Arc::ptr_eq(&l.conf, &conf)) {
+            if self
+                .listeners
+                .iter()
+                .any(|l| Arc::ptr_eq(&l.runtime, &runtime))
+            {
                 continue;
             }
             let index = match self.free.pop() {
@@ -694,7 +713,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             link.info.id,
             RegisteredConn {
                 slot,
-                generation: link.generation,
+                generation: link.generation(),
                 worker: self.idx as u32,
                 index,
             },
@@ -2637,6 +2656,30 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         self.handshake_bytes = 0;
         shared.notify_progress();
     }
+
+    /// After `abandon_all`: this worker takes no more connections. Those already
+    /// handed to it close at once with `reason` (a reset, the gate's ticket and the
+    /// caps given back, the close counted), and its own listening sockets go to an
+    /// heir, so nothing is left waiting for a loop that will not run again and a
+    /// drain can end.
+    fn retire(&mut self, reason: CloseReason) {
+        let shared = self.shared;
+        let ws = &shared.workers[self.idx];
+        for job in self.engine.retire(self.idx) {
+            let (stream, mut info, ticket, listener, source) = job.into_parts();
+            info.worker = WorkerId(self.idx as u16);
+            announce(shared, &info, &listener);
+            let _ = sys::set_linger(stream.sock(), Some(Duration::ZERO));
+            drop(stream);
+            let gate = &self.engine.gate;
+            let _ = guarded(|| gate.closed(ticket, &info, reason));
+            ws.load.fetch_sub(1, Ordering::Relaxed);
+            count_drained(shared, reason);
+            shared.release(&listener, source);
+            record_close(shared, ws, &info, reason, 0, 0, Duration::ZERO);
+        }
+        shared.worker_lost();
+    }
 }
 
 /// Where `flush` left things.
@@ -2659,7 +2702,9 @@ mod tests {
             size_of::<ConnectionInfo>()
         );
         // 512 is the goal (register R-18); this keeps it from growing meanwhile.
-        // 904: D-182's soft close added one pointer (896 before).
-        assert!(size <= 904, "{size} bytes per idle connection");
+        // 904: D-182's soft close added one pointer (896 before). 912: the kill
+        // slot's lease keeps the generation beside the slot, so a link dropped
+        // without its close ends only its own connection's slot.
+        assert!(size <= 912, "{size} bytes per idle connection");
     }
 }

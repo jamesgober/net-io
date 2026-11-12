@@ -16,7 +16,7 @@ use crate::info::{ConnectionInfo, GateTag, Transport};
 use crate::limits::Effective;
 use crate::rate::Rate;
 use crate::session::Phase;
-use crate::sys::{self, AsSock, Interest, KillSlot, Ready, Wake};
+use crate::sys::{self, AsSock, Interest, KillSlot, Ready, SlotLease, Wake};
 use crate::tcp::Health;
 use crate::time::Clock;
 use crate::tls::{TlsError, TlsEvent, TlsFailure, TlsSession};
@@ -196,6 +196,9 @@ impl Drop for SoftPermit {
 }
 
 pub(crate) struct Link {
+    /// First, so that it drops before `stream`: a link dropped without a close
+    /// (unwinding) ends its kill slot before its descriptor closes.
+    pub(crate) slot: SlotLease,
     pub(crate) stream: sys::Stream,
     pub(crate) info: ConnectionInfo,
     pub(crate) limits: Arc<Effective>,
@@ -205,8 +208,6 @@ pub(crate) struct Link {
     exchange_deadline: Option<Instant>,
     rate_in: Rate,
     rate_out: Rate,
-    pub(crate) slot: Arc<KillSlot>,
-    pub(crate) generation: u32,
     wake: WakeSource,
     recv_timeout_set: Option<Duration>,
     pub(crate) gate: Option<Box<dyn ErasedGate>>,
@@ -361,6 +362,11 @@ fn scale(d: Duration, by: f32) -> Duration {
 }
 
 impl Link {
+    /// The generation this connection holds its kill slot with.
+    pub(crate) fn generation(&self) -> u32 {
+        self.slot.generation()
+    }
+
     pub(crate) fn new(
         stream: sys::Stream,
         info: ConnectionInfo,
@@ -379,6 +385,7 @@ impl Link {
         let rate_out = Rate::new(&limits.min_rate, now);
         let idle_timeout = limits.idle_timeout;
         let mut link = Link {
+            slot: SlotLease::new(slot, generation),
             stream,
             info,
             limits,
@@ -388,8 +395,6 @@ impl Link {
             exchange_deadline: None,
             rate_in,
             rate_out,
-            slot,
-            generation,
             wake,
             recv_timeout_set: None,
             gate: None,

@@ -387,6 +387,56 @@ impl KillSlot {
         self.state
             .store(u64::from(gen_of(s)) << GEN_SHIFT, Ordering::Release);
     }
+
+    /// `begin_close` then `uninstall`, when the connection of `generation` still
+    /// holds the slot (its owner's close did not run). Only the owner installs, so
+    /// the slot cannot move to another connection between the check and the close.
+    fn release(&self, generation: u32) {
+        let s = self.state.load(Ordering::Acquire);
+        if gen_of(s) != generation || s & ACTIVE == 0 {
+            return;
+        }
+        let _ = self.begin_close();
+        self.uninstall();
+    }
+}
+
+/// A connection's hold on its kill slot, for as long as the connection holds its
+/// socket. Declared before the socket in its owner, so it drops first: a close that
+/// never ran (a panic unwinding past the owner) still ends the slot before the
+/// descriptor closes, and a kill handle kept elsewhere can no longer act on that
+/// number once the OS gives it to another socket. The owner's own close uninstalls
+/// the slot first, and then this does nothing.
+#[derive(Debug)]
+pub(crate) struct SlotLease {
+    slot: Arc<KillSlot>,
+    generation: u32,
+}
+
+impl SlotLease {
+    /// Holds `slot` for the connection of `generation` (what `install` returned).
+    pub(crate) fn new(slot: Arc<KillSlot>, generation: u32) -> SlotLease {
+        SlotLease { slot, generation }
+    }
+
+    /// The generation the connection holds the slot with, not the slot's current
+    /// one (`KillSlot::generation`).
+    pub(crate) fn generation(&self) -> u32 {
+        self.generation
+    }
+}
+
+impl std::ops::Deref for SlotLease {
+    type Target = Arc<KillSlot>;
+    fn deref(&self) -> &Arc<KillSlot> {
+        &self.slot
+    }
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        self.slot.release(self.generation);
+    }
 }
 
 #[cfg(not(net_io_loom))]
@@ -503,6 +553,33 @@ mod tests {
         assert!(slot.drained());
     }
 
+    /// A lease dropped without its owner's close (a panic unwinding past it) ends
+    /// the slot: a kill for that connection is refused from then on. One dropped
+    /// after the owner's close, or after the next connection took the slot, leaves
+    /// the slot alone.
+    #[test]
+    fn test_lease_dropped_without_a_close_ends_the_slot() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slot = Arc::new(KillSlot::new());
+        let generation = slot.install(super::super::AsSock::sock(&l));
+        drop(SlotLease::new(slot.clone(), generation));
+        assert!(!slot.is_open(generation));
+        assert!(!slot.kill_with(generation, KillReason(1), |_, _| {}));
+
+        let next = slot.install(super::super::AsSock::sock(&l));
+        let stale = SlotLease::new(slot.clone(), generation);
+        drop(stale);
+        assert!(
+            slot.is_open(next),
+            "an old lease does not end the next connection"
+        );
+        let lease = SlotLease::new(slot.clone(), next);
+        assert_eq!(slot.begin_close(), None);
+        slot.uninstall();
+        drop(lease);
+        assert!(!slot.is_open(next));
+    }
+
     #[test]
     fn test_kill_from_many_threads_exactly_one_wins() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -546,6 +623,40 @@ mod loom_tests {
             });
             slot.begin_close();
             closed.store(true, Ordering::SeqCst);
+            let _ = killer.join().unwrap();
+        });
+    }
+
+    /// A connection's lease dropped without its owner's close (a panic unwinding past
+    /// the owner), then its descriptor number closed and given to the next
+    /// connection, which installs in the same slot: a kill for the first connection,
+    /// racing all of it, never acts on the number while the next connection owns it.
+    #[test]
+    fn loom_unwound_lease_keeps_a_stale_kill_off_a_reused_number() {
+        loom::model(|| {
+            let slot = std::sync::Arc::new(KillSlot {
+                state: AtomicU64::new((1 << GEN_SHIFT) | ACTIVE),
+                raw: AtomicU64::new(3),
+                ..KillSlot::new()
+            });
+            // Who owns descriptor number 3: connection 1, nobody (0), or 2.
+            let owner = loom::sync::Arc::new(loom::sync::atomic::AtomicU32::new(1));
+            let (s2, o2) = (slot.clone(), owner.clone());
+            let killer = loom::thread::spawn(move || {
+                s2.kill_with(1, KillReason(1), |raw, _| {
+                    assert_eq!(raw, 3);
+                    assert_eq!(
+                        o2.load(Ordering::SeqCst),
+                        1,
+                        "kill acted on a reused number"
+                    );
+                })
+            });
+            drop(SlotLease::new(slot.clone(), 1));
+            owner.store(0, Ordering::SeqCst);
+            owner.store(2, Ordering::SeqCst);
+            slot.state
+                .store((2 << GEN_SHIFT) | ACTIVE, Ordering::Release);
             let _ = killer.join().unwrap();
         });
     }

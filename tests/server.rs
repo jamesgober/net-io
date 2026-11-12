@@ -1364,3 +1364,104 @@ fn test_close_after_reply_ends_with_a_reset() {
         }
     }
 }
+
+/// A blocking handler that never looks at its connection again (it waits on
+/// something else) cannot be stopped from outside its thread: the drain kills it at
+/// the deadline and returns within its grace anyway, and the shutdown leaves that
+/// worker detached, counted, instead of waiting for it.
+#[test]
+fn test_shutdown_returns_while_a_handler_ignores_the_kill() {
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (r, s) = (release.clone(), started.clone());
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(DriverKind::Blocking)
+        .workers(2)
+        .handler(move |_conn: &mut TcpConnection| {
+            s.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Up to 30 s, never touching the connection.
+            for _ in 0..3000 {
+                if r.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        })
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let mut c = client(addr(&server));
+    c.write_all(b"x").expect("write");
+    assert!(eventually(WAIT, || started.load(std::sync::atomic::Ordering::SeqCst)));
+    let handle = server.handle();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(server.shutdown(Instant::now() + Duration::from_millis(200)));
+    });
+    // The deadline, the 2 s grace, and the join's slack, with room for a slow host.
+    let report = rx.recv_timeout(Duration::from_secs(10));
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    let report = report.expect("the shutdown waited for the handler");
+    assert!(report.took < Duration::from_secs(8), "{report:?}");
+    let stats = handle.stats();
+    assert_eq!(stats.workers_detached, 1, "{stats:?}");
+    assert_eq!(stats.open, 1, "{stats:?}");
+}
+
+/// The buffer budget is checked against the defaults of the driver the server runs:
+/// 64 workers that may each read 1 MiB at a time need more than the blocking pool's
+/// default budget, and less than the reactor's.
+#[cfg(feature = "reactor")]
+#[test]
+fn test_the_budget_is_checked_against_the_drivers_own_default() {
+    let one_mib = net_io::SizeClass::new(1 << 20).expect("class");
+    let limits = Limits::builder()
+        .read_class(net_io::SizeClass::MEDIUM, one_mib)
+        .max_connections(64)
+        .build()
+        .expect("limits");
+    let build = |driver| {
+        ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(64)
+            .limits(limits.clone())
+            .sessions(|_: &ConnectionInfo| Echo)
+            .gate(AllowAll)
+            .build()
+    };
+    assert!(
+        matches!(
+            build(DriverKind::Blocking),
+            Err(NetError::InvalidConfig {
+                field: "buffer_budget",
+                ..
+            })
+        ),
+        "64 MiB < 64 x 2 MiB"
+    );
+    let server = build(DriverKind::Reactor).expect("512 MiB covers 64 x 2 MiB");
+    server.open_door().expect("open");
+    let mut c = client(addr(&server));
+    assert_eq!(round_trip(&mut c, b"ok"), b"ok");
+}
+
+/// A builder that never names a gate builds, and admits every connection.
+#[test]
+fn test_a_server_builds_without_a_gate() {
+    for &driver in DRIVERS {
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0"))
+            .driver(driver)
+            .workers(2)
+            .sessions(|_: &ConnectionInfo| Echo)
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        let mut c = client(addr(&server));
+        assert_eq!(round_trip(&mut c, b"no gate"), b"no gate", "{driver:?}");
+    }
+}

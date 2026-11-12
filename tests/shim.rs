@@ -609,3 +609,105 @@ fn test_receive_timeout_error_closes_the_connection() {
     d.read_exact(&mut back).expect("served after the fault");
     assert_eq!(&back, b"ping");
 }
+
+/// Clients of a reactor server, one at a time: how many got their byte back
+/// within half a second each.
+#[cfg(feature = "reactor")]
+fn served_of(at: std::net::SocketAddr, n: u8) -> (usize, Vec<TcpStream>) {
+    let mut served = 0;
+    let mut held = Vec::new();
+    for i in 0..n {
+        let mut c = client(at);
+        c.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        c.write_all(&[i]).expect("write");
+        let mut b = [0u8; 1];
+        if matches!(c.read(&mut b), Ok(1)) {
+            served += 1;
+        }
+        held.push(c);
+    }
+    (served, held)
+}
+
+/// One reactor worker's wait fails, so its loop ends: no new connection goes to it
+/// (every client is answered by the other), what it held is closed and counted, and
+/// a shutdown ends by its deadline.
+#[cfg(feature = "reactor")]
+#[test]
+fn test_a_reactor_worker_that_dies_takes_no_more_connections() {
+    let _shim = Shim::take();
+    let server = net_io::ServerBuilder::new()
+        .listener(net_io::ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(net_io::DriverKind::Reactor)
+        .workers(2)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let at = addr(&server);
+    // A first client is served; then its worker's next wait fails.
+    let mut first = client(at);
+    assert_eq!(round_trip(&mut first, b"a"), b"a");
+    program(Op::Wait, 0, 1, Fault::Os(9));
+    first.write_all(b"b").expect("write");
+    assert!(eventually(WAIT, || server.stats().workers_lost == 1));
+    clear();
+    assert!(
+        eventually(WAIT, || server.stats().open == 0),
+        "{:?}",
+        server.stats()
+    );
+    drop(first);
+
+    let (served, held) = served_of(at, 8);
+    assert_eq!(served, 8, "{:?}", server.stats());
+    drop(held);
+    let handle = server.handle();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = server.shutdown(std::time::Instant::now() + Duration::from_millis(500));
+        let _ = tx.send(r);
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "the shutdown did not end: {:?}",
+        handle.stats()
+    );
+    assert_eq!(handle.stats().open, 0);
+}
+
+/// A per-worker group on the reactor (Linux): the kernel keeps sending a share of
+/// connections to each worker's socket, so the socket of a worker that died is
+/// taken up by another, and every client is still answered.
+#[cfg(all(target_os = "linux", feature = "reactor"))]
+#[test]
+fn test_a_dead_workers_own_listening_socket_goes_to_an_heir() {
+    let _shim = Shim::take();
+    let server = net_io::ServerBuilder::new()
+        .listener(net_io::ListenerSpec::tcp_with(
+            "127.0.0.1:0",
+            net_io::ListenOptions::new().per_worker(true),
+        ))
+        .driver(net_io::DriverKind::Reactor)
+        .workers(2)
+        .sessions(|_: &ConnectionInfo| Echo)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let at = addr(&server);
+    // Clients until one lands on each worker; then the wait of one of them fails.
+    let mut first = client(at);
+    assert_eq!(round_trip(&mut first, b"a"), b"a");
+    program(Op::Wait, 0, 1, Fault::Os(9));
+    first.write_all(b"b").expect("write");
+    assert!(eventually(WAIT, || server.stats().workers_lost == 1));
+    clear();
+    drop(first);
+    // The kernel spreads these over both sockets by their ports.
+    let (served, held) = served_of(at, 16);
+    assert_eq!(served, 16, "{:?}", server.stats());
+    drop(held);
+    let report = server.shutdown(std::time::Instant::now() + Duration::from_millis(500));
+    assert!(report.took < Duration::from_secs(3), "{report:?}");
+}

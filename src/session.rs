@@ -914,7 +914,7 @@ impl SessionContext<'_> {
     pub fn kill_handle(&self) -> KillHandle {
         KillHandle {
             slot: self.link.slot.clone(),
-            generation: self.link.generation,
+            generation: self.link.generation(),
             id: self.link.info.id,
         }
     }
