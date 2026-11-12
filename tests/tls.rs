@@ -571,7 +571,7 @@ impl TlsSession for PanickySession {
 }
 
 /// A panic inside the TLS engine closes only that connection, `TlsFailed`, on both
-/// drivers: the worker, its caps, and drain survive (review finding).
+/// drivers: the worker, its caps, and drain survive.
 #[test]
 fn test_engine_panic_closes_only_that_connection() {
     struct Echo;
@@ -629,7 +629,7 @@ fn test_engine_panic_closes_only_that_connection() {
 }
 
 /// A gate denial on a TLS connection goes out as a record, never as plaintext on the
-/// socket, on both drivers (review finding).
+/// socket, on both drivers.
 #[test]
 fn test_denial_under_tls_is_encrypted() {
     struct DenyAfterHandshake;
@@ -742,7 +742,7 @@ impl TlsSession for BigSession {
 
 /// A peer that takes the handshake flight a byte at a time (here: not at all) is
 /// closed at the handshake deadline, not after a write timeout each byte restarts,
-/// on both drivers (review finding: the pool waited on the write timeout).
+/// on both drivers (the pool used to wait on the write timeout).
 #[test]
 fn test_handshake_flight_is_bounded_by_the_handshake_deadline() {
     struct Nothing;

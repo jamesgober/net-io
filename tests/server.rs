@@ -756,7 +756,7 @@ impl Session for Lines {
 
 /// A complete line plus the start of the next, then silence past the read timeout:
 /// the session survives the timeout while its partial line is with the receive in
-/// flight, and the line completes later (review finding: the reactor indexed the
+/// flight, and the line completes later (the reactor used to index the
 /// stand-in buffer and the worker panicked).
 #[test]
 fn test_session_survives_a_timeout_with_a_partial_message_held() {
@@ -804,7 +804,7 @@ fn test_session_survives_a_timeout_with_a_partial_message_held() {
 }
 
 /// An event sink that panics on every close loses those events and nothing else:
-/// caps come back and drain finishes, on both drivers (review finding).
+/// caps come back and drain finishes, on both drivers.
 #[test]
 fn test_panicking_event_sink_loses_only_its_events() {
     struct Bad;
@@ -857,7 +857,7 @@ fn test_panicking_event_sink_loses_only_its_events() {
 }
 
 /// A handler that gates its own accepted connection and is refused: the connection
-/// closes, its slots come back, and the worker serves the next one (review finding).
+/// closes, its slots come back, and the worker serves the next one.
 #[test]
 fn test_handler_refused_by_its_own_gate_releases_the_connection() {
     struct No;
@@ -914,7 +914,7 @@ fn test_handler_refused_by_its_own_gate_releases_the_connection() {
 }
 
 /// A listener cannot lift the server's cap: its own `max_connections` is refused at
-/// build, and admission counts against the server's cap (review finding).
+/// build, and admission counts against the server's cap.
 #[test]
 fn test_listener_cannot_set_the_global_cap() {
     let raised = Limits::builder()
@@ -941,7 +941,7 @@ fn test_listener_cannot_set_the_global_cap() {
 }
 
 /// A session that sets "no idle limit" as `Duration::MAX`, and a client connect with
-/// a `Duration::MAX` timeout, work instead of panicking (review finding).
+/// a `Duration::MAX` timeout, work instead of panicking.
 #[test]
 fn test_duration_max_is_held_to_a_year_not_a_panic() {
     struct Forever;

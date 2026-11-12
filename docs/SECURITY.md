@@ -1,6 +1,6 @@
 # net-io security
 
-> Final as of `0.7.0`. The threat table below is the one net-io is built against. Each row names its defence, its cost, and the test that attacks it; a row whose feature ships later says when. `0.7.0` added T-46 to T-50 from the adversarial review of the whole crate (PLAN D-143 to D-160). `0.8.0` widened T-17, T-30, T-32, T-36, and T-38 after an independent review (D-211 to D-228).
+> Final as of `0.7.0`. The threat table below is the one net-io is built against. Each row names its defence, its cost, and the test that attacks it; a row whose feature ships later says when. `0.7.0` added T-46 to T-50. `0.8.0` widened T-17, T-30, T-32, T-36, and T-38.
 
 ## Reporting a vulnerability
 

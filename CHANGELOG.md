@@ -13,59 +13,59 @@
 
 ### Added
 
-- Flush-then-close (D-182): after a denial whose bytes went out, the connection
+- Flush-then-close: after a denial whose bytes went out, the connection
   stops reading, sends what is queued, sends FIN, and discards input until the
   peer's EOF or `Limits::denial_linger` (default 100 ms; zero keeps the immediate
-  reset), in any phase, including before the session has seen input (D-202). `Limits::denial_linger_max` caps how many connections linger at once
+  reset), in any phase, including before the session has seen input. `Limits::denial_linger_max` caps how many connections linger at once
   (default a sixteenth of `max_connections`); past it a denial resets as before.
   On Windows this stops the formatted denial being lost to an abortive close.
 - `ServerHandle::close_after_flush(id, reason, within)`: a soft kill. The session's
   queued output goes out within the bound, then the connection closes the same
   way. A later `kill` upgrades it to a reset.
-- `Session::on_drain(cx) -> Step` (D-183): called once when a drain reaches a
+- `Session::on_drain(cx) -> Step`: called once when a drain reaches a
   connection between exchanges. The default, `Close`, keeps the old behaviour; any
   other step keeps the connection until the session closes it or the drain
   deadline passes.
-- `ListenerSpec::workers(n)` (D-186): on the reactor a listener gets workers of its
+- `ListenerSpec::workers(n)`: on the reactor a listener gets workers of its
   own, so an admin listener keeps answering while the shared workers are busy.
-- `Limits::first_request_grace` (D-189, default 1 s): a drain does not close a
+- `Limits::first_request_grace` (default 1 s): a drain does not close a
   connection that was just accepted and has sent nothing yet, so a client that
   connected as the drain began still gets its first request answered.
-- `UdpOptions::source_prefix(PrefixPolicy)` and `UdpOptions::new_source_burst(n)`
-  (D-221): how UDP sources are grouped for their budgets, and how many datagrams
+- `UdpOptions::source_prefix(PrefixPolicy)` and `UdpOptions::new_source_burst(n)`:
+  how UDP sources are grouped for their budgets, and how many datagrams
   a new source may send at once. `UdpBudget::GLOBAL_DEFAULT` names the default
   socket-wide budget.
-- `Stats::workers_lost` (D-211) and `Stats::workers_detached` (D-213).
-- `NoGate` implements `Gate` (D-215).
+- `Stats::workers_lost` and `Stats::workers_detached`.
+- `NoGate` implements `Gate`.
 
 ### Changed
 
 - A connection whose session wrote while it was idle (a reply in `on_open`, a push
   between exchanges) now lingers on a graceful close instead of closing at once,
   so a request already crossing the reply no longer turns the close into a reset
-  that discards the reply (D-192). A reply to a request is not counted, even when
+  that discards the reply. A reply to a request is not counted, even when
   the session set `Idle` before writing it: a connection that answered its
-  exchange still closes at once (D-201).
-- TLS on the reactor (D-194): the records a TLS engine writes as its handshake ends
+  exchange still closes at once.
+- TLS on the reactor: the records a TLS engine writes as its handshake ends
   (session tickets) leave with the session's first reply, and a reply before
   `Step::Close` carries `close_notify` in the same send. A full exchange with a
   closing reply goes from 4 sends to 2. Held records go out at once whenever a
   turn ends without a reply.
-- Per-worker listeners on the reactor (D-197): each worker accepts on its own
+- Per-worker listeners on the reactor: each worker accepts on its own
   socket in its own event loop, with no accept thread and no wake between threads
   for each connection. The gate's `admit` for these listeners runs on the worker.
   `remove_listener` still returns only once the group's sockets are closed.
 - A graceful close on the reactor that needs no linger no longer calls `shutdown`
-  before `close`: the close sends the FIN itself, one system call fewer (D-198).
+  before `close`: the close sends the FIN itself, one system call fewer.
 - A drain, a shutdown, and `remove_listener` return at most about 2 s after their
   deadline, even when a blocking handler never returns after its kill; the stop
   then waits up to 2 s for its worker threads and leaves the rest running,
-  detached, counted in `Stats::workers_detached` (D-213). A detached thread keeps
+  detached, counted in `Stats::workers_detached`. A detached thread keeps
   its socket until its handler returns. A gate's `admit` must still return
   promptly, since accept threads are joined without a bound.
 - A server builds without `.gate(..)`: `NoGate`, the builder's default, admits
-  every connection, as `AllowAll` does (D-215).
-- UDP budgets (D-221): a source is a prefix (`UdpOptions::source_prefix`, IPv4
+  every connection, as `AllowAll` does.
+- UDP budgets: a source is a prefix (`UdpOptions::source_prefix`, IPv4
   /32 and IPv6 /64 by default), so one IPv6 host no longer gets a budget per
   address; a source new to the table starts with a burst of 16
   (`new_source_burst`) that fills to the full burst at the budget's rate; and
@@ -77,38 +77,36 @@
 ### Fixed
 
 - A refusal now shows in `Stats` by the time the client sees it; it was counted
-  just after the socket closed (D-199).
+  just after the socket closed.
 - On the blocking driver, a drain whose deadline ended a graceful close's linger
   reported the close as `Killed(KillReason(0))`; it now keeps the close's own
-  reason, as the reactor does, and the drain report counts it graceful (D-201).
+  reason, as the reactor does, and the drain report counts it graceful.
 - A reactor worker whose loop ended on a panic or a failed wait kept receiving
   its share of new connections, which nobody served, and `drain`,
   `shutdown`, and the server's drop waited for them for ever. Such a worker is now
   marked dead: it takes no more connections, what waited for it is closed, its
   own listening socket of a per-worker group goes to the next live worker, and
   `Stats::workers_lost` counts it; with no live worker left, new connections are
-  refused as `Busy` (D-211).
+  refused as `Busy`.
 - A connection dropped by an unwinding panic left its kill slot active, so a
   `KillHandle` used later could shut down whatever socket then held the same
-  number. The slot now ends with the connection (D-212).
+  number. The slot now ends with the connection.
 - With `buffer_budget` unset, a reactor server with more than 512 workers was
   refused as if it had the blocking pool's 64 MiB default; `build` and
-  `add_listener` now check the budget against the resolved driver's defaults
-  (D-214).
+  `add_listener` now check the budget against the resolved driver's defaults.
 - Linux: a file send (`sendfile`) to a peer that had reset raised SIGPIPE, which
   ended a process that keeps the default disposition. SIGPIPE is now blocked on
-  the thread for the call (D-216).
+  the thread for the call.
 - `Operation::SendFile` with `len` 0 sent the rest of the file on Windows, macOS,
-  and FreeBSD; it now completes as `Ok(0)` with no system call on every platform
-  (D-217).
+  and FreeBSD; it now completes as `Ok(0)` with no system call on every platform.
 - Linux: `recv_file` could lose bytes when the file failed after they had left
   the socket, and place later bytes at the wrong offset. A file write failure is
-  now reported as `Os { op: "write" }` and closes the connection (D-218).
+  now reported as `Os { op: "write" }` and closes the connection.
 - Unix: a signal during a blocking connect reported a failure; the connect now
-  goes on within its timeout (D-219).
+  goes on within its timeout.
 - A systemd take that failed part way left the descriptors it had not reached
-  open; it now closes every descriptor of its plan (D-220).
-- UDP receives (D-222): a non-blocking receive returned only when it found a
+  open; it now closes every descriptor of its plan.
+- UDP receives: a non-blocking receive returned only when it found a
   datagram within budget, so a flood of dropped datagrams held it; it now reports
   nothing ready after 64 drops. Host and network unreachable, and on Unix
   `EHOSTDOWN`, `ENONET`, `ENOPROTOOPT`, `EPROTO`, and `EMSGSIZE`, and on Windows
@@ -117,22 +115,21 @@
   Linux leaves the socket in the mode it found it in.
 - A PROXY v2 LOCAL header with a family other than UNSPEC, or with a short
   address block, was refused; LOCAL now ignores its address block whatever the
-  family, as the specification says (D-223).
+  family, as the specification says.
 - Windows hand-off: once an adopted socket was closed and Windows reused its
   handle value, a later hand-off naming that value was refused and its socket
-  leaked. The claim on a received socket is now its inherit flag (D-224).
+  leaked. The claim on a received socket is now its inherit flag.
 - Windows: `ListenOptions::reuse_address(true)` set `SO_REUSEADDR`, which lets
   another local socket bind over a live listener. It is now ignored, and
-  listeners stay `SO_EXCLUSIVEADDRUSE` (D-225).
+  listeners stay `SO_EXCLUSIVEADDRUSE`.
 - Windows: a graceful named-pipe close to a client that never reads held the
   closing thread for a second each time. The closes of one thread now wait at
-  most one second in all, which comes back at 100 ms a second (D-226).
+  most one second in all, which comes back at 100 ms a second.
 
 ## [0.7.2] - 2026-11-11
 
-A security release. An independent review of 0.7.1 found the defects below; this
-release fixes the critical and high ones, and 0.6.3 carries the same fixes for the
-0.6 line. Upgrade, especially on Windows with named pipes or listener hand-off, and
+A security release. It fixes the defects below in 0.7.1, and 0.6.3 carries the
+same fixes for the 0.6 line. Upgrade, especially on Windows with named pipes or listener hand-off, and
 with TLS on the reactor. No API change.
 
 ### Security
@@ -140,26 +137,26 @@ with TLS on the reactor. No API change.
 - Windows, reactor driver: a named-pipe connection whose gate denied a write could
   corrupt the worker's memory and end the process. Pipe IO outside the driver no
   longer reports to the worker's completion port, and the port ignores any
-  completion it did not start (D-203).
+  completion it did not start.
 - Windows listener hand-off (`receive_shared`): a forged message could make the
   receiving process take over, or close, one of its own sockets. A socket that is
   not a fresh duplicate is now refused and left alone, and the sender must run as
-  the same user and have started before the pipe connected (D-204).
+  the same user and have started before the pipe connected.
 - Windows named pipes: a name with `/` or `..` could open a file or a network path
   instead of a pipe. Names with `\` or `/`, the names `.` and `..`, and names over
-  247 characters are refused with `InvalidConfig` (D-205). A name with `/` used to
+  247 characters are refused with `InvalidConfig`. A name with `/` used to
   mean a nested pipe name; use another character.
 - Reactor with TLS: connections that sent nothing held 128 KiB each of the shared
   buffer budget until their handshake deadline, so enough of them stalled every
   other connection, and the budget did not come back afterwards. A TLS connection
   now takes its buffers when its first bytes arrive, unfinished handshakes hold at
   most a quarter of the budget, and buffers a worker no longer needs go back to the
-  budget (D-206).
+  budget.
 - Unix sockets: binding in a directory other users can write to could change the
   mode or owner of a different file. Mode and owner are now set without going
   through a path another user can change, and a directory that every user can write
   to and that is not sticky is refused with
-  `InvalidConfig { reason: ConfigReason::InsecureDirectory }` (D-207).
+  `InvalidConfig { reason: ConfigReason::InsecureDirectory }`.
 
 ### Added
 
@@ -174,13 +171,12 @@ with TLS on the reactor. No API change.
   budget. Enough warm idle TLS connections spent the budget, and other
   connections' pushes then failed (`OutputFull`, `Limit(BufferBudget)`). The
   output and the session's input now go back as a plaintext connection's do
-  (D-200; found by tls-net). Affects 0.7.0; on 0.6 such a connection held its
+  (found by tls-net). Affects 0.7.0; on 0.6 such a connection held its
   128 KiB of TLS buffers as well.
 
 ## [0.7.0] - 2026-11-08
 
-Hardening: an adversarial review of the whole crate with every finding of medium
-severity or above fixed, attack tests for every threat, continuous fuzzing, a
+Hardening: every known defect of medium severity or above fixed, attack tests for every threat, continuous fuzzing, a
 soak, and a database consumer's transport needs.
 
 ### Security
@@ -353,8 +349,8 @@ worker, and for a drain that could cut a request short on Linux. No API change.
 
 ## [0.6.1] - 2026-11-04
 
-A patch for serve-net's requests 4 and 7 and three defects found by the 0.7
-review. No API change.
+A patch for serve-net's requests 4 and 7 and three defects found while
+hardening for 0.7. No API change.
 
 ### Security
 

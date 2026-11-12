@@ -485,7 +485,7 @@ fn test_file_stream_looks_at_the_os_every_256_kib() {
 
 /// The reactor's wait failing: every connection on the worker closes at once with its
 /// close counted and its caps returned, instead of waiting for completions that will
-/// never be read (review finding).
+/// never be read.
 #[cfg(all(feature = "reactor", not(net_io_force_blocking)))]
 #[test]
 fn test_reactor_wait_failure_closes_every_connection() {

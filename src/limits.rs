@@ -1033,7 +1033,7 @@ mod tests {
     }
 
     /// "No limit" spelled `Duration::MAX` is refused at build instead of panicking
-    /// on the first deadline (review finding).
+    /// on the first deadline.
     #[test]
     fn test_timeouts_over_a_year_and_huge_caps_rejected() {
         for field in ["idle_timeout", "read_timeout", "drain_timeout"] {
@@ -1114,7 +1114,7 @@ mod tests {
         };
         assert!(Limits::builder().pressure(bad).build().is_err());
         assert!(Limits::builder().lane_reserve(Lane(8), 1).build().is_err());
-        // A later valid lane 7 does not hide the invalid one (review finding).
+        // A later valid lane 7 does not hide the invalid one.
         assert!(
             Limits::builder()
                 .lane_reserve(Lane(8), 1)
