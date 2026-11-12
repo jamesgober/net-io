@@ -63,8 +63,8 @@ pub(crate) use iocp::{
 mod pipe;
 #[cfg(all(windows, feature = "local"))]
 pub(crate) use pipe::{
-    Descriptor, PipeParams, PipeServer, PipeStream, is_name_taken, is_no_pipe, owner_sddl,
-    pipe_connect,
+    Descriptor, PipeParams, PipeServer, PipeStream, current_user_sid, is_name_taken, is_no_pipe,
+    owner_sddl, pipe_connect, process_user_and_start,
 };
 
 mod kill;

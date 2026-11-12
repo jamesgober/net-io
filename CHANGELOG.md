@@ -60,6 +60,43 @@
   reported the close as `Killed(KillReason(0))`; it now keeps the close's own
   reason, as the reactor does, and the drain report counts it graceful (D-201).
 
+## [0.7.2] - 2026-11-11
+
+A security release. An independent review of 0.7.1 found the defects below; this
+release fixes the critical and high ones, and 0.6.3 carries the same fixes for the
+0.6 line. Upgrade, especially on Windows with named pipes or listener hand-off, and
+with TLS on the reactor. No API change.
+
+### Security
+
+- Windows, reactor driver: a named-pipe connection whose gate denied a write could
+  corrupt the worker's memory and end the process. Pipe IO outside the driver no
+  longer reports to the worker's completion port, and the port ignores any
+  completion it did not start (D-203).
+- Windows listener hand-off (`receive_shared`): a forged message could make the
+  receiving process take over, or close, one of its own sockets. A socket that is
+  not a fresh duplicate is now refused and left alone, and the sender must run as
+  the same user and have started before the pipe connected (D-204).
+- Windows named pipes: a name with `/` or `..` could open a file or a network path
+  instead of a pipe. Names with `\` or `/`, the names `.` and `..`, and names over
+  247 characters are refused with `InvalidConfig` (D-205). A name with `/` used to
+  mean a nested pipe name; use another character.
+- Reactor with TLS: connections that sent nothing held 128 KiB each of the shared
+  buffer budget until their handshake deadline, so enough of them stalled every
+  other connection, and the budget did not come back afterwards. A TLS connection
+  now takes its buffers when its first bytes arrive, unfinished handshakes hold at
+  most a quarter of the budget, and buffers a worker no longer needs go back to the
+  budget (D-206).
+- Unix sockets: binding in a directory other users can write to could change the
+  mode or owner of a different file. Mode and owner are now set without going
+  through a path another user can change, and a directory that every user can write
+  to and that is not sticky is refused with
+  `InvalidConfig { reason: ConfigReason::InsecureDirectory }` (D-207).
+
+### Added
+
+- `ConfigReason::InsecureDirectory`, `PoolStats::freed`.
+
 ## [0.7.1] - 2026-11-08
 
 ### Fixed
@@ -596,7 +633,8 @@ The scaffold and the plan. No functional code yet.
   dependencies, testing, open decisions, and the decision log.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/jamesgober/net-io/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/jamesgober/net-io/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/net-io/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/jamesgober/net-io/compare/v0.6.1...v0.6.2

@@ -1128,8 +1128,16 @@ impl Drop for Adoption {
 }
 
 /// The socket a description from [`share_socket`] names, not inheritable.
-/// `AlreadyExists` when it names a socket this process already owns through an
-/// earlier description: that one keeps its single owner, and nothing is closed.
+/// `AlreadyExists` when it names a socket this process already owns, through an
+/// earlier description or any other way: that one keeps its single owner, and
+/// nothing is closed.
+///
+/// Windows makes the socket in this process when the sender describes it, and the
+/// description names it by its handle value here, so a forged one can name any
+/// socket the process holds; `WSASocketW` then returns that socket. A fresh
+/// duplicate is inheritable (the sender's flag), while every socket net-io or std
+/// makes is not, and adoption clears the flag: a socket that is not inheritable is
+/// already owned here and is left alone.
 #[cfg(feature = "local")]
 pub(crate) fn socket_from_shared(
     blob: &[u8; SHARED_SOCKET],
@@ -1154,6 +1162,15 @@ pub(crate) fn socket_from_shared(
     if s == c::INVALID_SOCKET {
         return Err(last_error());
     }
+    let mut flags = 0u32;
+    // SAFETY: `flags` is written during the call; a value that is not an open
+    // handle fails it. Nothing here takes ownership of `s` yet.
+    if unsafe { GetHandleInformation(s as *mut c_void, &raw mut flags) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & c::HANDLE_FLAG_INHERIT == 0 {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
     let mut list = adopted();
     if list.contains(&(s as RawSocket)) {
         return Err(io::Error::from(io::ErrorKind::AlreadyExists));
@@ -1161,8 +1178,8 @@ pub(crate) fn socket_from_shared(
     list.push(s as RawSocket);
     drop(list);
     let adoption = Adoption(s as RawSocket);
-    // SAFETY: `s` is open and was not on the list, so this call made it: nothing
-    // else in the process owns it.
+    // SAFETY: `s` is open, inheritable, and was not on the list, so the sender's
+    // duplicate made it and nothing else in the process owns it.
     let sock = unsafe { OwnedSocket::from_raw_socket(s as RawSocket) };
     // The flag passed above does not reach a socket made from a description (the
     // sender's duplicate is inheritable), so it is cleared here.
@@ -1175,7 +1192,7 @@ pub(crate) fn socket_from_shared(
     Ok((sock, adoption))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "local"))]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetHandleInformation(handle: *mut c_void, flags: *mut u32) -> i32;

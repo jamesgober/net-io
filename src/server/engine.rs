@@ -1632,6 +1632,10 @@ pub(crate) struct Engine<W, G: Gate> {
     pub(crate) clock: ClockRef,
     pub(crate) wipe: bool,
     pub(crate) budget: Arc<AtomicU64>,
+    /// What each worker's pool keeps in its free lists: the budget divided by the
+    /// workers, a fair share. Above it a released buffer is freed and its bytes go
+    /// back to the budget, so one burst cannot hold the budget for good.
+    pub(crate) pool_keep: u64,
     pub(crate) limits: Effective,
     /// One bounded inbox per reactor worker.
     #[cfg(feature = "reactor")]
@@ -1906,6 +1910,7 @@ where
         clock: cfg.clock.map_or(ClockRef::Monotonic, ClockRef::Custom),
         wipe: cfg.wipe,
         budget: Arc::new(AtomicU64::new(limits.buffer_budget)),
+        pool_keep: limits.buffer_budget / u64::from(cfg.workers.max(1)),
         limits,
     });
     let weak = Arc::downgrade(&engine);
@@ -2840,7 +2845,7 @@ fn worker_loop<W: Serve, G: Gate>(engine: &Arc<Engine<W, G>>, idx: usize) {
             gate: engine.gate.clone(),
             ticket: None,
         })),
-        pool: BufferPool::new(engine.budget.clone(), engine.wipe),
+        pool: BufferPool::new(engine.budget.clone(), engine.wipe, engine.pool_keep),
         output: Output::new(
             engine.budget.clone(),
             engine.limits.output_budget,

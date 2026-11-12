@@ -45,7 +45,7 @@ loop:
 
 The driver is the reactor's real interface (D-005). On epoll and kqueue, `ReadyDriver` remembers readiness per direction, because the OS reports edges, and makes the call as soon as it can; a send tries first, since a socket is nearly always writable. On Windows the operation goes to the kernel. Either way the reactor sees one completion per operation, carrying the buffers back.
 
-An idle connection holds no buffer. It waits with `ReceiveZero`; when that completes the worker takes a pool buffer and receives. When the session consumed everything, the buffer goes back. A connection whose read finds the buffer budget spent pauses on a list, oldest first, and TCP pushes back on its peer.
+An idle connection holds no buffer. It waits with `ReceiveZero`; when that completes the worker takes a pool buffer and receives. A TLS connection starts the same way: its two TLS buffers are taken when the first bytes of the handshake arrive, and a worker's unfinished handshakes hold at most a quarter of its share of the budget. When the session consumed everything, the buffer goes back. A connection whose read finds the buffer budget spent pauses on a list, oldest first, and TCP pushes back on its peer.
 
 An output keeps up to four spare buffers between sends, so a session that moves its input to its output with `Input::swap` and `push_buffer` allocates nothing, however long it runs; it takes the buffers its worker's pool already holds before it charges the budget (D-169). When a connection goes idle its spares go back to the pool (D-164).
 

@@ -216,7 +216,9 @@ impl UnixListener {
     /// # Errors
     ///
     /// `PathTooLong`, `StaleSocketInUse`, `PermissionDenied`, `NotFound` (no such
-    /// directory), `InvalidConfig { field: "path" }`, `Os`.
+    /// directory), `InvalidConfig { field: "path" }` (a NUL byte, a path that
+    /// ends in `/`, `.`, or `..`, or `reason: InsecureDirectory`, see
+    /// [`UnixListener::bind_with`]), `Os`.
     pub fn bind<P: AsRef<Path>>(path: P) -> Result<UnixListener, NetError> {
         UnixListener::bind_with(path, LocalOptions::new())
     }
@@ -224,6 +226,27 @@ impl UnixListener {
     /// Binds `path` with `options`: the socket is bound, given its mode and owner,
     /// and only then listens, so no connection is accepted under the umask's
     /// permissions.
+    ///
+    /// The mode and owner are never set through a path another user can change.
+    /// The socket's directory is opened once and checked:
+    ///
+    /// - writable by every user without the sticky bit: refused with
+    ///   `InvalidConfig { field: "path", reason: InsecureDirectory }`, as anyone
+    ///   could swap the socket file for a link to another file;
+    /// - owned by this user or root, and writable by nobody else (or sticky, as
+    ///   `/tmp`): the socket is bound at `path` and its mode and owner are set by
+    ///   name relative to the open directory;
+    /// - otherwise (writable by its group, or owned by another user): the socket
+    ///   is bound in a new private directory next to `path` (`.nio` and 8 hex
+    ///   digits, mode `0700`), given its mode and owner there, and linked to
+    ///   `path` once it listens; the private directory is then removed. The
+    ///   directory's path plus 15 bytes must then also fit the platform limit,
+    ///   or the bind fails with `PathTooLong`.
+    ///
+    /// In the last case the name the OS reports for the socket (`getsockname`,
+    /// and so for a listener adopted from it) is the private one, as with
+    /// [`UnixListener::bind_atomic`]; [`UnixListener::path`] and
+    /// [`ListenerInfo::local`] are always `path`.
     ///
     /// # Errors
     ///
@@ -237,7 +260,10 @@ impl UnixListener {
 
     /// As [`UnixListener::bind_with`], but bound under a temporary name in the
     /// same directory and renamed into place once it listens with its final
-    /// mode: the path never names a socket that refuses or is not ready.
+    /// mode: the path never names a socket that refuses or is not ready, and a
+    /// stale socket at it is replaced in one step. The directory is checked as
+    /// for `bind_with`; where others can change it, the temporary name is the
+    /// socket in the private directory, and the rename moves it from there.
     ///
     /// # Errors
     ///
@@ -250,10 +276,23 @@ impl UnixListener {
     }
 
     fn create(path: &Path, options: &LocalOptions, atomic: bool) -> Result<UnixListener, NetError> {
+        use std::os::unix::fs::MetadataExt;
         let bytes = path_bytes(path)?;
         let shared_path = Arc::new(UnixPath::new(bytes).ok_or(NetError::PathTooLong {
             max: sys::UNIX_PATH_MAX,
         })?);
+        let (dir_bytes, leaf) = split_path(bytes)?;
+        // The directory is opened once; the mode, owner, and final name are then set
+        // relative to this descriptor, never through the path again.
+        let dir = sys::open_directory(Path::new(os_str(dir_bytes)), false)
+            .map_err(|e| os_error("open", e))?;
+        let dir_meta = dir.metadata().map_err(|e| os_error("fstat", e))?;
+        let trust = dir_trust(dir_meta.uid(), dir_meta.mode(), sys::effective_uid()).ok_or(
+            NetError::InvalidConfig {
+                field: "path",
+                reason: ConfigReason::InsecureDirectory,
+            },
+        )?;
         // An existing file: a live listener's socket, a stale one, or not a socket.
         if let Some((_, is_socket)) = file_id(path) {
             let stale = is_socket && !live(bytes)?;
@@ -272,46 +311,16 @@ impl UnixListener {
                 std::fs::remove_file(path).map_err(|e| os_error("unlink", e))?;
             }
         }
-        let target = if atomic {
-            temporary_name(path)?
-        } else {
-            path.to_path_buf()
-        };
-        let target_bytes = path_bytes(&target)?;
         let sock = sys::unix_socket().map_err(|e| NetError::from_os("socket", e))?;
-        if let Err(e) = sys::unix_bind(sock.as_fd(), target_bytes) {
-            return Err(match e.kind() {
-                io::ErrorKind::AddrInUse => NetError::StaleSocketInUse {
-                    path: path.to_path_buf(),
-                },
-                _ => os_error("bind", e),
-            });
-        }
-        let result = (|| {
-            let created = match file_id(&target) {
-                Some((id, true)) => id,
-                _ => return Err(replaced(&target)),
-            };
-            set_access(&target, options)?;
-            // The mode and owner were set on the file this socket created.
-            if file_id(&target) != Some((created, true)) {
-                return Err(replaced(&target));
-            }
-            sys::unix_listen(sock.as_fd(), options.backlog)
-                .map_err(|e| NetError::from_os("listen", e))?;
-            if atomic {
-                std::fs::rename(&target, path).map_err(|e| os_error("rename", e))?;
-            }
-            Ok(created)
-        })();
-        let created = match result {
-            Ok(id) => id,
-            Err(e) => {
-                if file_id(&target).is_some_and(|(_, sock)| sock) {
-                    let _ = std::fs::remove_file(&target);
-                }
-                return Err(e);
-            }
+        let place = Place {
+            dir: &dir,
+            dir_bytes,
+            leaf,
+            path,
+        };
+        let created = match trust {
+            DirTrust::Safe => place.bind_in_place(sock.as_fd(), options, atomic)?,
+            DirTrust::Shared => place.bind_privately(sock.as_fd(), options, atomic)?,
         };
         let inner = std::os::unix::net::UnixListener::from(sock);
         // Accepts wait in poll, like TCP listeners.
@@ -561,37 +570,291 @@ fn replaced(path: &Path) -> NetError {
     }
 }
 
-/// Sets the socket file's mode, then its owner and group (`lchown`: a symbolic
-/// link put in its place is never followed).
+/// Who besides this process can rename or replace entries in the socket's
+/// directory.
 #[cfg(unix)]
-fn set_access(path: &Path, options: &LocalOptions) -> Result<(), NetError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(options.mode))
-        .map_err(|e| os_error("chmod", e))?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirTrust {
+    /// Only this user or root: the socket is bound at its path (or its temporary
+    /// name) and its mode and owner are set there.
+    Safe,
+    /// Members of the directory's group, or the directory's owner, can: the
+    /// socket is bound in a new private directory, given its mode and owner
+    /// there, and only then moved to its path.
+    Shared,
+}
+
+/// Classifies a directory by its owner and mode bits for a process whose
+/// effective user id is `me`. `None` refuses it: writable by every user and not
+/// sticky, so anyone could swap the socket file for something else.
+#[cfg(unix)]
+fn dir_trust(owner: u32, mode: u32, me: u32) -> Option<DirTrust> {
+    let sticky = mode & 0o1000 != 0;
+    if mode & 0o002 != 0 && !sticky {
+        return None;
+    }
+    // In a sticky directory only an entry's owner (or the directory's) may
+    // rename or remove it.
+    let nobody_else_writes = mode & 0o022 == 0 || sticky;
+    if (owner == me || owner == 0) && nobody_else_writes {
+        Some(DirTrust::Safe)
+    } else {
+        Some(DirTrust::Shared)
+    }
+}
+
+/// Splits a socket path into its directory and its name in it, at the last `/`
+/// of the bytes the kernel will see (`Path::parent` would drop a trailing `.`
+/// and name a different directory than the bind uses).
+#[cfg(unix)]
+fn split_path(bytes: &[u8]) -> Result<(&[u8], &[u8]), NetError> {
+    let (dir, leaf) = match bytes.iter().rposition(|&b| b == b'/') {
+        Some(0) => (&b"/"[..], &bytes[1..]),
+        Some(i) => (&bytes[..i], &bytes[i + 1..]),
+        None => (&b"."[..], bytes),
+    };
+    if leaf.is_empty() || leaf == b"." || leaf == b".." {
+        return Err(NetError::InvalidConfig {
+            field: "path",
+            reason: ConfigReason::Malformed,
+        });
+    }
+    Ok((dir, leaf))
+}
+
+#[cfg(unix)]
+fn os_str(bytes: &[u8]) -> &std::ffi::OsStr {
+    <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes)
+}
+
+/// `dir/name` as a path.
+#[cfg(unix)]
+fn join(dir: &[u8], name: &[u8]) -> PathBuf {
+    let mut joined = Vec::with_capacity(dir.len() + 1 + name.len());
+    joined.extend_from_slice(dir);
+    if dir.last() != Some(&b'/') {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(name);
+    PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(joined))
+}
+
+/// A name for the `*_at` calls; the path checks already refused a NUL.
+#[cfg(unix)]
+fn c_name(name: &[u8]) -> Result<std::ffi::CString, NetError> {
+    std::ffi::CString::new(name).map_err(|_| NetError::InvalidConfig {
+        field: "path",
+        reason: ConfigReason::Malformed,
+    })
+}
+
+/// A temporary name for `bind_atomic` next to `name`: `.<name>.<pid>.<n>`.
+#[cfg(unix)]
+fn temporary_leaf(name: &[u8]) -> Vec<u8> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let mut leaf = Vec::with_capacity(name.len() + 24);
+    leaf.push(b'.');
+    leaf.extend_from_slice(name);
+    leaf.extend_from_slice(
+        format!(
+            ".{}.{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+        .as_bytes(),
+    );
+    leaf
+}
+
+/// 32 bits nobody outside this process can predict: std's `RandomState` keys
+/// come from the OS's random source (as for the per-source table, D-062).
+#[cfg(unix)]
+fn random_u32() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    h.write_u64(NEXT.fetch_add(1, Ordering::Relaxed));
+    h.finish() as u32
+}
+
+/// Binds `sock` to `at`; a name already taken is `StaleSocketInUse` for `path`.
+#[cfg(unix)]
+fn bind_socket(sock: BorrowedFd<'_>, at: &Path, path: &Path) -> Result<(), NetError> {
+    sys::unix_bind(sock, path_bytes(at)?).map_err(|e| match e.kind() {
+        io::ErrorKind::AddrInUse => NetError::StaleSocketInUse {
+            path: path.to_path_buf(),
+        },
+        _ => os_error("bind", e),
+    })
+}
+
+/// How many fresh names `private_directory` tries before giving up.
+#[cfg(unix)]
+const PRIVATE_DIRECTORY_TRIES: usize = 8;
+
+/// Makes `.nio<8 hex digits>` (mode `0700`) in the directory `dir` (whose path is
+/// `dir_bytes`), opens it without following a symbolic link, and checks it is a
+/// directory this user owns that nobody else may enter. Returns its name and the
+/// open directory.
+#[cfg(unix)]
+fn private_directory(
+    dir: &std::fs::File,
+    dir_bytes: &[u8],
+) -> Result<(Vec<u8>, std::fs::File), NetError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let me = sys::effective_uid();
+    for _ in 0..PRIVATE_DIRECTORY_TRIES {
+        let name = format!(".nio{:08x}", random_u32()).into_bytes();
+        let at = join(dir_bytes, &name);
+        match std::fs::DirBuilder::new().mode(0o700).create(&at) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(os_error("mkdir", e)),
+        }
+        let opened = match sys::open_directory(&at, true) {
+            Ok(opened) => opened,
+            Err(e) => {
+                // Removed by its name in the open parent, never through the path.
+                if let Ok(c) = c_name(&name) {
+                    let _ = sys::unlink_at(dir.as_fd(), &c, true);
+                }
+                return Err(os_error("open", e));
+            }
+        };
+        let meta = opened.metadata().map_err(|e| os_error("fstat", e))?;
+        if !meta.is_dir() || meta.uid() != me || meta.mode() & 0o077 != 0 {
+            // Not the directory just made: someone renamed it away and put another
+            // in its place. Whatever is there now is left alone.
+            return Err(NetError::Os {
+                op: "mkdir",
+                source: io::Error::other("the private directory was replaced"),
+            });
+        }
+        return Ok((name, opened));
+    }
+    Err(os_error(
+        "mkdir",
+        io::Error::from(io::ErrorKind::AlreadyExists),
+    ))
+}
+
+/// Where a listener's socket goes: its directory (open), that directory's path,
+/// the socket's name in it, and the whole path as the caller gave it.
+#[cfg(unix)]
+struct Place<'a> {
+    dir: &'a std::fs::File,
+    dir_bytes: &'a [u8],
+    leaf: &'a [u8],
+    path: &'a Path,
+}
+
+#[cfg(unix)]
+impl Place<'_> {
+    /// Binds in a directory nobody else can change: at the path (or the temporary
+    /// name for `bind_atomic`), with the mode and owner set by name relative to the
+    /// open directory. If a component above the directory was swapped after it was
+    /// opened, the bind lands elsewhere and the `*_at` calls fail, so the bind does.
+    fn bind_in_place(
+        &self,
+        sock: BorrowedFd<'_>,
+        options: &LocalOptions,
+        atomic: bool,
+    ) -> Result<FileId, NetError> {
+        let target_leaf = if atomic {
+            temporary_leaf(self.leaf)
+        } else {
+            self.leaf.to_vec()
+        };
+        let target = join(self.dir_bytes, &target_leaf);
+        bind_socket(sock, &target, self.path)?;
+        let result = (|| {
+            let created = match file_id(&target) {
+                Some((id, true)) => id,
+                _ => return Err(replaced(&target)),
+            };
+            let name = c_name(&target_leaf)?;
+            set_access(self.dir, &name, options)?;
+            sys::unix_listen(sock, options.backlog).map_err(|e| NetError::from_os("listen", e))?;
+            if atomic {
+                let fin = c_name(self.leaf)?;
+                sys::rename_at(self.dir.as_fd(), &name, self.dir.as_fd(), &fin)
+                    .map_err(|e| os_error("rename", e))?;
+            }
+            Ok(created)
+        })();
+        if result.is_err() && file_id(&target).is_some_and(|(_, sock)| sock) {
+            let _ = std::fs::remove_file(&target);
+        }
+        result
+    }
+
+    /// Binds in a directory others can change: the socket is made as `s` in a new
+    /// private directory next to the path, gets its mode and owner there (where no
+    /// other user can reach it), and listens; then it is moved to the path
+    /// (`bind_atomic`: renamed over a stale socket; otherwise linked, which fails
+    /// if anything took the name) and the private directory is removed.
+    fn bind_privately(
+        &self,
+        sock: BorrowedFd<'_>,
+        options: &LocalOptions,
+        atomic: bool,
+    ) -> Result<FileId, NetError> {
+        let (private_leaf, private) = private_directory(self.dir, self.dir_bytes)?;
+        let private_path = join(self.dir_bytes, &private_leaf);
+        let result = (|| {
+            bind_socket(sock, &private_path.join("s"), self.path)?;
+            set_access(&private, c"s", options)?;
+            sys::unix_listen(sock, options.backlog).map_err(|e| NetError::from_os("listen", e))?;
+            let fin = c_name(self.leaf)?;
+            if atomic {
+                sys::rename_at(private.as_fd(), c"s", self.dir.as_fd(), &fin)
+                    .map_err(|e| os_error("rename", e))?;
+            } else {
+                sys::link_at(private.as_fd(), c"s", self.dir.as_fd(), &fin).map_err(|e| match e
+                    .kind()
+                {
+                    io::ErrorKind::AlreadyExists => NetError::StaleSocketInUse {
+                        path: self.path.to_path_buf(),
+                    },
+                    _ => os_error("link", e),
+                })?;
+            }
+            // The file the path names now, for `Drop`: anything but a socket means
+            // it was replaced the moment it arrived.
+            match file_id(self.path) {
+                Some((id, true)) => Ok(id),
+                _ => Err(replaced(self.path)),
+            }
+        })();
+        // Relative to the descriptors, so a renamed or replaced private directory
+        // never sends these anywhere else. After a rename `s` is already gone.
+        let _ = sys::unlink_at(private.as_fd(), c"s", false);
+        if let Ok(name) = c_name(&private_leaf) {
+            let _ = sys::unlink_at(self.dir.as_fd(), &name, true);
+        }
+        result
+    }
+}
+
+/// Sets the socket file's mode, then its owner and group, by its name in `dir`.
+/// The mode follows a symbolic link (Linux has no other `fchmodat`), which is safe
+/// only because callers pass a directory whose entries no other user can change;
+/// the owner and group never follow one.
+#[cfg(unix)]
+fn set_access(
+    dir: &std::fs::File,
+    name: &std::ffi::CStr,
+    options: &LocalOptions,
+) -> Result<(), NetError> {
+    sys::chmod_at(dir.as_fd(), name, options.mode).map_err(|e| os_error("chmod", e))?;
     if options.owner.is_some() || options.group.is_some() {
-        std::os::unix::fs::lchown(path, options.owner, options.group)
+        sys::chown_at(dir.as_fd(), name, options.owner, options.group)
             .map_err(|e| os_error("chown", e))?;
     }
     Ok(())
-}
-
-/// A temporary name next to `path`: `.<name>.<pid>.<n>`.
-#[cfg(unix)]
-fn temporary_name(path: &Path) -> Result<PathBuf, NetError> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let file = path.file_name().ok_or(NetError::InvalidConfig {
-        field: "path",
-        reason: ConfigReason::Malformed,
-    })?;
-    let mut name = std::ffi::OsString::from(".");
-    name.push(file);
-    name.push(format!(
-        ".{}.{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    Ok(path.with_file_name(name))
 }
 
 #[cfg(unix)]
@@ -1332,6 +1595,279 @@ mod tests {
         c.close().unwrap();
         t.join().unwrap();
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A fresh directory with `mode`.
+    fn dir_with_mode(tag: &str, mode: u32) -> PathBuf {
+        let d = dir(tag);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+        d
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn names_in(d: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A directory any user can rename entries in (writable by others, no
+    /// sticky bit) is refused before anything is created in it; with the sticky
+    /// bit, as on `/tmp`, the same directory binds.
+    #[test]
+    fn test_bind_refuses_a_directory_others_can_rename_in() {
+        let d = dir_with_mode("open", 0o777);
+        let path = d.join("s.sock");
+        for atomic in [false, true] {
+            let r = if atomic {
+                UnixListener::bind_atomic(&path, LocalOptions::new())
+            } else {
+                UnixListener::bind(&path)
+            };
+            assert!(
+                matches!(
+                    r,
+                    Err(NetError::InvalidConfig {
+                        field: "path",
+                        reason: ConfigReason::InsecureDirectory
+                    })
+                ),
+                "atomic {atomic}: {r:?}"
+            );
+        }
+        assert!(names_in(&d).is_empty(), "{:?}", names_in(&d));
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let l = UnixListener::bind(&path).unwrap();
+        assert_eq!(mode_of(&path) & 0o777, 0o600);
+        drop(l);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Someone who can rename entries in the socket's directory (here a
+    /// group-writable one) swaps every socket file that appears there for a
+    /// symbolic link to a file of the binding process. The mode meant for the
+    /// socket must never reach that file, through `bind_with` or `bind_atomic`.
+    #[test]
+    fn test_socket_swapped_for_a_link_never_changes_its_target() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let d = dir_with_mode("swap", 0o770);
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"secret").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = d.join("s.sock");
+        let stop = Arc::new(AtomicBool::new(false));
+        let (v2, d2, s2) = (victim.clone(), d.clone(), stop.clone());
+        let swapper = std::thread::spawn(move || {
+            let link = d2.join("link");
+            let mut swaps = 0u64;
+            while !s2.load(Ordering::Relaxed) {
+                let Ok(entries) = std::fs::read_dir(&d2) else {
+                    continue;
+                };
+                for e in entries.flatten() {
+                    if std::fs::symlink_metadata(&link).is_err() {
+                        let _ = std::os::unix::fs::symlink(&v2, &link);
+                    }
+                    if e.file_type().is_ok_and(|t| t.is_socket())
+                        && std::fs::rename(&link, e.path()).is_ok()
+                    {
+                        swaps += 1;
+                    }
+                }
+            }
+            swaps
+        });
+        let start = Instant::now();
+        let mut tries = 0u32;
+        let mut changed = false;
+        while tries < 400 && start.elapsed() < Duration::from_secs(20) && !changed {
+            tries += 1;
+            let _ = std::fs::remove_file(&path);
+            let options = LocalOptions::new().mode(0o666);
+            let r = if tries % 2 == 0 {
+                UnixListener::bind_atomic(&path, options)
+            } else {
+                UnixListener::bind_with(&path, options)
+            };
+            drop(r);
+            changed = mode_of(&victim) != 0o644;
+        }
+        stop.store(true, Ordering::Relaxed);
+        let swaps = swapper.join().unwrap();
+        eprintln!("{tries} binds, {swaps} swaps, {:?}", start.elapsed());
+        assert!(
+            !changed,
+            "the victim's mode changed to {:o} after {tries} binds ({swaps} swaps)",
+            mode_of(&victim)
+        );
+        let left: Vec<_> = names_in(&d)
+            .into_iter()
+            .filter(|n| n.as_encoded_bytes().starts_with(b".nio"))
+            .collect();
+        assert!(left.is_empty(), "private directories left behind: {left:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// In a directory others can change (group-writable), the socket arrives at
+    /// its path with its mode and group already set, `bind_atomic` replaces a
+    /// stale socket in one step, and nothing else is left in the directory.
+    #[test]
+    fn test_shared_directory_binds_with_mode_and_group() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let d = dir_with_mode("shared", 0o770);
+        // The group new files here get: one this process may always set.
+        let gid = std::fs::metadata(&d).unwrap().gid();
+        let path = d.join("s.sock");
+        let l = UnixListener::bind_with(&path, LocalOptions::new().group_access(gid)).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_socket());
+        assert_eq!((meta.mode() & 0o7777, meta.gid()), (0o660, gid));
+        assert_eq!(l.path(), Some(path.as_path()));
+        assert_eq!(names_in(&d), ["s.sock"]);
+        let c = UnixConnection::connect(&path).unwrap();
+        let (_s, _) = l.accept().unwrap();
+        drop(c);
+        // A live listener's path is never taken.
+        assert!(matches!(
+            UnixListener::bind(&path),
+            Err(NetError::StaleSocketInUse { .. })
+        ));
+        assert!(matches!(
+            UnixListener::bind_atomic(&path, LocalOptions::new()),
+            Err(NetError::StaleSocketInUse { .. })
+        ));
+        drop(l);
+        assert!(!path.exists(), "the listener removed its file");
+        // A stale socket: replaced by the rename.
+        {
+            let s = sys::unix_socket().unwrap();
+            sys::unix_bind(s.as_fd(), path.as_os_str().as_encoded_bytes()).unwrap();
+        }
+        let stale = std::fs::symlink_metadata(&path).unwrap().ino();
+        let l = UnixListener::bind_atomic(&path, LocalOptions::new().mode(0o640)).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_socket() && meta.ino() != stale);
+        assert_eq!(meta.mode() & 0o7777, 0o640);
+        assert_eq!(names_in(&d), ["s.sock"]);
+        let c = UnixConnection::connect(&path).unwrap();
+        let (_s, _) = l.accept().unwrap();
+        drop(c);
+        drop(l);
+        // And the plain bind removes a stale socket first.
+        {
+            let s = sys::unix_socket().unwrap();
+            sys::unix_bind(s.as_fd(), path.as_os_str().as_encoded_bytes()).unwrap();
+        }
+        let l = UnixListener::bind(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(names_in(&d), ["s.sock"]);
+        drop(l);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// In a directory only this user can change, the socket is bound in place
+    /// with its mode and group; `bind_atomic` still replaces a stale socket.
+    #[test]
+    fn test_private_directory_binds_in_place_with_mode_and_group() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let d = dir_with_mode("own", 0o700);
+        // The group new files here get: one this process may always set.
+        let gid = std::fs::metadata(&d).unwrap().gid();
+        let path = d.join("s.sock");
+        let l = UnixListener::bind_with(&path, LocalOptions::new().group_access(gid)).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_socket());
+        assert_eq!((meta.mode() & 0o7777, meta.gid()), (0o660, gid));
+        assert_eq!(names_in(&d), ["s.sock"]);
+        drop(l);
+        {
+            let s = sys::unix_socket().unwrap();
+            sys::unix_bind(s.as_fd(), path.as_os_str().as_encoded_bytes()).unwrap();
+        }
+        let l = UnixListener::bind_atomic(&path, LocalOptions::new().mode(0o604)).unwrap();
+        assert_eq!(mode_of(&path), 0o604);
+        assert_eq!(names_in(&d), ["s.sock"]);
+        let c = UnixConnection::connect(&path).unwrap();
+        let (_s, _) = l.accept().unwrap();
+        drop(c);
+        drop(l);
+        assert!(matches!(
+            UnixListener::bind(d.join("missing").join("s.sock")),
+            Err(NetError::NotFound)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A directory owned by another user is shared even when nobody else may
+    /// write to it (its owner can rename entries). Needs root to set it up.
+    #[test]
+    fn test_another_users_directory_binds_through_a_private_one() {
+        if sys::effective_uid() != 0 {
+            return;
+        }
+        let d = dir_with_mode("theirs", 0o755);
+        std::os::unix::fs::chown(&d, Some(65_534), None).unwrap();
+        let path = d.join("s.sock");
+        let l = UnixListener::bind_with(&path, LocalOptions::new().owner(65_534)).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (
+                meta.permissions().mode() & 0o7777,
+                std::os::unix::fs::MetadataExt::uid(&meta)
+            ),
+            (0o600, 65_534)
+        );
+        assert_eq!(names_in(&d), ["s.sock"]);
+        drop(l);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_directory_trust_from_owner_and_mode() {
+        use DirTrust::{Safe, Shared};
+        let me = 1000;
+        let cases = [
+            (me, 0o700, Some(Safe)),
+            (me, 0o755, Some(Safe)),
+            (0, 0o755, Some(Safe)),
+            (0, 0o1777, Some(Safe)),
+            (me, 0o1777, Some(Safe)),
+            (me, 0o1770, Some(Safe)),
+            (me, 0o770, Some(Shared)),
+            (0, 0o775, Some(Shared)),
+            (2000, 0o700, Some(Shared)),
+            (2000, 0o1777, Some(Shared)),
+            (me, 0o777, None),
+            (0, 0o777, None),
+            (me, 0o703, None),
+            (2000, 0o2777, None),
+        ];
+        for (owner, mode, want) in cases {
+            assert_eq!(dir_trust(owner, mode, me), want, "{owner} {mode:o}");
+        }
+        assert_eq!(
+            split_path(b"/run/a.sock").unwrap(),
+            (&b"/run"[..], &b"a.sock"[..])
+        );
+        assert_eq!(split_path(b"/a.sock").unwrap(), (&b"/"[..], &b"a.sock"[..]));
+        assert_eq!(split_path(b"a.sock").unwrap(), (&b"."[..], &b"a.sock"[..]));
+        assert_eq!(split_path(b"x//a").unwrap(), (&b"x/"[..], &b"a"[..]));
+        for bad in [&b"x/"[..], b"x/.", b"x/..", b".", b".."] {
+            assert!(matches!(
+                split_path(bad),
+                Err(NetError::InvalidConfig {
+                    field: "path",
+                    reason: ConfigReason::Malformed
+                })
+            ));
+        }
     }
 
     #[test]

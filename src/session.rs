@@ -509,12 +509,19 @@ impl Output {
     /// instead of charging the budget again. Before this, spares an output gave the
     /// pool after a send were never taken back, and every flush of more than one
     /// buffer charged the budget anew until it ran out (found by ws-net).
+    ///
+    /// With none of its class cached, the pool frees buffers it caches for other
+    /// classes if the budget could not cover the next push otherwise: the push
+    /// charges the budget directly and cannot reach them.
     pub(crate) fn refill(&mut self, pool: &mut BufferPool) {
         while self.free.len() < FREE_MAX {
             match pool.take_cached(OUTPUT_CLASS) {
                 Some(b) => self.free.push(b),
-                None => return,
+                None => break,
             }
+        }
+        if self.free.is_empty() {
+            pool.make_room(OUTPUT_CLASS);
         }
     }
 
@@ -755,6 +762,17 @@ impl Output {
             if let Some(b) = self.free.pop() {
                 pool.put(b);
             }
+        }
+    }
+
+    /// Gives every free buffer to `pool`, for an output set aside while its
+    /// connection waits: there the pool's keep limit applies and other classes can
+    /// reach them, and the next session to take an output gets them back through
+    /// `refill`.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn return_all_spares(&mut self, pool: &mut BufferPool) {
+        while let Some(b) = self.free.pop() {
+            pool.put(b);
         }
     }
 

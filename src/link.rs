@@ -271,6 +271,12 @@ pub(crate) struct TlsLayer {
     /// `close_notify` is in `cout` (sealed with the last reply, D-180): a close
     /// sends no second one.
     notified: bool,
+    /// Both buffers went back to the pool while the connection waits (D-181), or
+    /// were never taken because no byte has arrived yet (reactor). A buffer out
+    /// with an operation in flight leaves a stand-in too, so this flag, not the
+    /// stand-in, says which it is.
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    released: bool,
     done: bool,
     eof: bool,
     /// What the engine reported last, not acted on yet.
@@ -278,6 +284,27 @@ pub(crate) struct TlsLayer {
     /// The input range of the last engine step: plaintext must lie inside it.
     data_from: usize,
     data_to: usize,
+}
+
+impl TlsLayer {
+    fn new(session: Box<dyn TlsSession>, cin: Buffer, cout: Buffer, released: bool) -> Box<Self> {
+        Box::new(TlsLayer {
+            session,
+            cin,
+            start: 0,
+            plain_at: 0,
+            plain_end: 0,
+            cout,
+            held: 0,
+            notified: false,
+            released,
+            done: false,
+            eof: false,
+            event: None,
+            data_from: 0,
+            data_to: 0,
+        })
+    }
 }
 
 /// What one round of the TLS engine produced.
@@ -490,22 +517,23 @@ impl Link {
             }
         }
         self.pending_at = 0;
-        self.tls = Some(Box::new(TlsLayer {
-            session,
-            cin,
-            start: 0,
-            plain_at: 0,
-            plain_end: 0,
-            cout,
-            held: 0,
-            notified: false,
-            done: false,
-            eof: false,
-            event: None,
-            data_from: 0,
-            data_to: 0,
-        }));
+        self.tls = Some(TlsLayer::new(session, cin, cout, false));
         ahead
+    }
+
+    /// Puts TLS on this connection without its buffers, for a connection that has
+    /// not sent a byte yet: they come from the pool with `tls_restore` once bytes
+    /// arrive, so a peer that connects and stays silent holds none. Only without
+    /// bytes read ahead (those must go to the engine at once: `attach_tls`).
+    #[cfg(all(feature = "tls", feature = "reactor"))]
+    pub(crate) fn attach_tls_released(&mut self, session: Box<dyn TlsSession>) {
+        debug_assert!(!self.has_read_ahead(), "read-ahead needs the buffers now");
+        self.tls = Some(TlsLayer::new(
+            session,
+            Buffer::placeholder(),
+            Buffer::placeholder(),
+            true,
+        ));
     }
 
     /// Whether TLS is on this connection.
@@ -522,6 +550,7 @@ impl Link {
     pub(crate) fn tls_release(&mut self) -> Option<(Buffer, Buffer)> {
         let t = self.tls.as_mut()?;
         let idle = t.done
+            && !t.released
             && !t.eof
             && t.event.is_none()
             && t.start >= t.cin.len()
@@ -539,24 +568,35 @@ impl Link {
         t.data_to = 0;
         let cin = std::mem::replace(&mut t.cin, Buffer::placeholder());
         let cout = std::mem::replace(&mut t.cout, Buffer::placeholder());
+        t.released = true;
         Some((cin, cout))
     }
 
-    /// Whether the TLS buffers went back to the pool (`tls_release`).
+    /// Whether the TLS buffers are with the pool (`tls_release`, or a TLS start
+    /// that took none yet: `attach_tls_released`). Not while a buffer is merely out
+    /// with an operation: restoring then would drop the buffer that comes back.
     #[cfg(feature = "reactor")]
     pub(crate) fn tls_released(&self) -> bool {
-        self.tls.as_ref().is_some_and(|t| t.cin.capacity() == 0)
+        self.tls.as_ref().is_some_and(|t| t.released)
     }
 
-    /// Gives a released connection its TLS buffers again.
+    /// Gives a released connection its TLS buffers again. `Err` hands them back
+    /// when the connection is not released, so a buffer in use is never replaced.
     #[cfg(feature = "reactor")]
-    pub(crate) fn tls_restore(&mut self, mut cin: Buffer, mut cout: Buffer) {
+    pub(crate) fn tls_restore(
+        &mut self,
+        mut cin: Buffer,
+        mut cout: Buffer,
+    ) -> Result<(), (Buffer, Buffer)> {
+        let Some(t) = self.tls.as_mut().filter(|t| t.released) else {
+            return Err((cin, cout));
+        };
         cin.set_len(0);
         cout.set_len(0);
-        if let Some(t) = self.tls.as_mut() {
-            t.cin = cin;
-            t.cout = cout;
-        }
+        t.cin = cin;
+        t.cout = cout;
+        t.released = false;
+        Ok(())
     }
 
     /// The TLS buffers, for their pool.
@@ -844,7 +884,9 @@ impl Link {
         let Some(mut t) = self.tls.take() else {
             return;
         };
-        if t.done && !t.eof && !t.notified {
+        // Without its output buffer (released, and none could be taken back) the
+        // close is a plain FIN.
+        if t.done && !t.eof && !t.notified && t.cout.capacity() > 0 {
             t.cout.set_len(t.held);
             if let Ok(n) = t.session.close(t.cout.spare()) {
                 t.cout.set_len((t.held + n).min(t.cout.capacity()));
@@ -2361,7 +2403,12 @@ impl Link {
     /// Closes the socket after the driver let go of it.
     #[cfg(feature = "reactor")]
     pub(crate) fn finish_reactor(mut self, reason: CloseReason) -> CloseReason {
-        if reason.is_abortive() && self.soft_close().is_none() {
+        // A pipe (the one stream that does not half-close) has written through the
+        // driver; only a denial writes through the stream itself, and a denial
+        // write still pending here waits for a client that is not reading. The
+        // stream would wait up to a second for it on drop, on the worker's thread:
+        // drop it instead, as a reset would (D-209).
+        if (reason.is_abortive() && self.soft_close().is_none()) || !self.stream.half_closes() {
             self.stream.set_abortive();
         }
         self.slot.begin_close();
