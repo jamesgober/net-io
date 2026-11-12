@@ -552,6 +552,18 @@ impl Limits {
         self.completion_queue
     }
     /// Total bytes of buffers all workers may allocate.
+    ///
+    /// Each worker's pool keeps at most the budget divided by the workers in its
+    /// free lists and frees what is released above that, and a pool that needs a
+    /// buffer of one size with the budget spent frees the buffers it keeps of other
+    /// sizes first, so the budget comes back after a burst.
+    ///
+    /// On the reactor a TLS connection takes its two buffers (the largest read class
+    /// in, 64 KiB out) only when its first bytes arrive, and the connections whose
+    /// handshake has not finished may hold at most a quarter of the budget, divided
+    /// by the workers, on each worker (at least one handshake each). A connection
+    /// whose handshake would take buffers above that is closed with
+    /// `Limit(BufferBudget)`; plaintext connections keep the rest.
     #[must_use]
     pub fn buffer_budget(&self) -> Option<u64> {
         self.buffer_budget
@@ -653,7 +665,9 @@ impl LimitsBuilder {
         min_rate, MinRate);
     setter!(/// Pool memory a connection's output may hold.
         output_budget, u32);
-    setter!(/// Total bytes of buffers all workers may allocate.
+    setter!(/// Total bytes of buffers all workers may allocate. A quarter of it, shared
+        /// among the workers, is the most unfinished TLS handshakes may hold on the
+        /// reactor; see [`Limits::buffer_budget`].
         buffer_budget, u64);
     setter!(/// The drain deadline.
         drain_timeout, Duration);

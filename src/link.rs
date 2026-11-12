@@ -177,6 +177,12 @@ pub(crate) struct TlsLayer {
     plain_end: usize,
     /// Ciphertext out: scratch, flushed within each call.
     cout: Buffer,
+    /// Both buffers went back to the pool while the connection waits (D-181), or
+    /// were never taken because no byte has arrived yet (reactor). A buffer out
+    /// with an operation in flight leaves a stand-in too, so this flag, not the
+    /// stand-in, says which it is.
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    released: bool,
     done: bool,
     eof: bool,
     /// What the engine reported last, not acted on yet.
@@ -184,6 +190,25 @@ pub(crate) struct TlsLayer {
     /// The input range of the last engine step: plaintext must lie inside it.
     data_from: usize,
     data_to: usize,
+}
+
+impl TlsLayer {
+    fn new(session: Box<dyn TlsSession>, cin: Buffer, cout: Buffer, released: bool) -> Box<Self> {
+        Box::new(TlsLayer {
+            session,
+            cin,
+            start: 0,
+            plain_at: 0,
+            plain_end: 0,
+            cout,
+            released,
+            done: false,
+            eof: false,
+            event: None,
+            data_from: 0,
+            data_to: 0,
+        })
+    }
 }
 
 /// What one round of the TLS engine produced.
@@ -383,20 +408,23 @@ impl Link {
             }
         }
         self.pending_at = 0;
-        self.tls = Some(Box::new(TlsLayer {
-            session,
-            cin,
-            start: 0,
-            plain_at: 0,
-            plain_end: 0,
-            cout,
-            done: false,
-            eof: false,
-            event: None,
-            data_from: 0,
-            data_to: 0,
-        }));
+        self.tls = Some(TlsLayer::new(session, cin, cout, false));
         ahead
+    }
+
+    /// Puts TLS on this connection without its buffers, for a connection that has
+    /// not sent a byte yet: they come from the pool with `tls_restore` once bytes
+    /// arrive, so a peer that connects and stays silent holds none. Only without
+    /// bytes read ahead (those must go to the engine at once: `attach_tls`).
+    #[cfg(all(feature = "tls", feature = "reactor"))]
+    pub(crate) fn attach_tls_released(&mut self, session: Box<dyn TlsSession>) {
+        debug_assert!(!self.has_read_ahead(), "read-ahead needs the buffers now");
+        self.tls = Some(TlsLayer::new(
+            session,
+            Buffer::placeholder(),
+            Buffer::placeholder(),
+            true,
+        ));
     }
 
     /// Whether TLS is on this connection.
@@ -413,6 +441,7 @@ impl Link {
     pub(crate) fn tls_release(&mut self) -> Option<(Buffer, Buffer)> {
         let t = self.tls.as_mut()?;
         let idle = t.done
+            && !t.released
             && !t.eof
             && t.event.is_none()
             && t.start >= t.cin.len()
@@ -429,24 +458,35 @@ impl Link {
         t.data_to = 0;
         let cin = std::mem::replace(&mut t.cin, Buffer::placeholder());
         let cout = std::mem::replace(&mut t.cout, Buffer::placeholder());
+        t.released = true;
         Some((cin, cout))
     }
 
-    /// Whether the TLS buffers went back to the pool (`tls_release`).
+    /// Whether the TLS buffers are with the pool (`tls_release`, or a TLS start
+    /// that took none yet: `attach_tls_released`). Not while a buffer is merely out
+    /// with an operation: restoring then would drop the buffer that comes back.
     #[cfg(feature = "reactor")]
     pub(crate) fn tls_released(&self) -> bool {
-        self.tls.as_ref().is_some_and(|t| t.cin.capacity() == 0)
+        self.tls.as_ref().is_some_and(|t| t.released)
     }
 
-    /// Gives a released connection its TLS buffers again.
+    /// Gives a released connection its TLS buffers again. `Err` hands them back
+    /// when the connection is not released, so a buffer in use is never replaced.
     #[cfg(feature = "reactor")]
-    pub(crate) fn tls_restore(&mut self, mut cin: Buffer, mut cout: Buffer) {
+    pub(crate) fn tls_restore(
+        &mut self,
+        mut cin: Buffer,
+        mut cout: Buffer,
+    ) -> Result<(), (Buffer, Buffer)> {
+        let Some(t) = self.tls.as_mut().filter(|t| t.released) else {
+            return Err((cin, cout));
+        };
         cin.set_len(0);
         cout.set_len(0);
-        if let Some(t) = self.tls.as_mut() {
-            t.cin = cin;
-            t.cout = cout;
-        }
+        t.cin = cin;
+        t.cout = cout;
+        t.released = false;
+        Ok(())
     }
 
     /// The TLS buffers, for their pool.
@@ -731,7 +771,9 @@ impl Link {
         let Some(mut t) = self.tls.take() else {
             return;
         };
-        if t.done && !t.eof {
+        // Without its output buffer (released, and none could be taken back) the
+        // close is a plain FIN.
+        if t.done && !t.eof && t.cout.capacity() > 0 {
             t.cout.set_len(0);
             if let Ok(n) = t.session.close(t.cout.spare()) {
                 t.cout.set_len(n.min(t.cout.capacity()));
