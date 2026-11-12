@@ -45,7 +45,8 @@ Linked from the C library that `std` already links. All declared `extern "C"`.
 | `getrlimit` | `RLIMIT_NOFILE` (FR-61) | `getrlimit(2)` | 0.3 |
 | `open` | the reserve descriptor (`/dev/null`, `O_RDONLY \| O_CLOEXEC`) | `open(2)` | 0.3 |
 | `fstat`, `lstat` | inherited descriptors are sockets; stale socket paths (no symlink following) | `stat(2)` | 0.4 |
-| `chmod`, `chown`, `unlink`, `rename` | Unix socket files | `chmod(2)`, `chown(2)`, `unlink(2)`, `rename(2)` | 0.4 |
+| `chmod`, `chown`, `unlink`, `rename` | Unix socket files (through `std`; from 0.6.3 only `unlink` is still used, the rest is done by the `*at` calls below) | `chmod(2)`, `chown(2)`, `unlink(2)`, `rename(2)` | 0.4 |
+| `fchmodat`, `fchownat`, `renameat`, `linkat`, `unlinkat` | a Unix socket file's mode, owner, and final name, set by name relative to an open directory nobody else can change (the socket's own, or a private one made next to it), never through a path; the directories are opened with `std` (`O_DIRECTORY`, `O_NOFOLLOW` as custom flags) and checked with `std`'s metadata | `fchmodat(2)`, `fchownat(2)`, `renameat(2)`, `linkat(2)`, `unlinkat(2)` | 0.6.3 |
 | `getpid` | `LISTEN_PID`, fork detection | `getpid(2)` | 0.3 |
 | `sendfile` | file sends (Linux `sendfile(out, in, off, n)`; macOS and FreeBSD have different signatures, declared per OS) | `sendfile(2)` | 0.6 |
 
@@ -98,6 +99,8 @@ Declared per target; values from the target's system headers, cross-checked in C
 | ancillary data | `SCM_RIGHTS` | all |
 | shutdown | `SHUT_RD`, `SHUT_WR`, `SHUT_RDWR` | all |
 | fcntl | `F_GETFL`, `F_SETFL`, `F_GETFD`, `F_SETFD`, `F_DUPFD_CLOEXEC`, `FD_CLOEXEC`, `O_NONBLOCK`, `O_CLOEXEC`, `O_RDONLY` | all |
+| open flags | `O_DIRECTORY`, `O_NOFOLLOW` (0.6.3; values differ between Linux x86_64 and aarch64) | all |
+| `*at` flags | `AT_SYMLINK_NOFOLLOW`, `AT_REMOVEDIR` (0.6.3) | all, values per OS |
 | poll | `POLLIN`, `POLLOUT`, `POLLERR`, `POLLHUP`, `POLLNVAL` | all |
 | limits | `RLIMIT_NOFILE`, `RLIM_INFINITY` | all |
 | stat | `S_IFMT`, `S_IFSOCK` | all |
@@ -111,7 +114,7 @@ Declared per target; values from the target's system headers, cross-checked in C
 | Struct | Used for | Platforms |
 |---|---|---|
 | `sockaddr`, `sockaddr_in`, `sockaddr_in6`, `sockaddr_un`, `sockaddr_storage`, `in_addr`, `in6_addr` | addresses (BSD layouts have `sin_len`) | all |
-| `socklen_t`, `sa_family_t` | type aliases | all |
+| `socklen_t`, `sa_family_t`, `mode_t` | type aliases (`mode_t` 32 bits on Linux, 16 on macOS and FreeBSD; 0.6.3) | all |
 | `linger` | `SO_LINGER` | all |
 | `timeval` | `SO_RCVTIMEO`, `SO_SNDTIMEO` | all |
 | `iovec`, `msghdr`, `cmsghdr` (plus the `CMSG_*` arithmetic written as `const fn`s) | vectored IO, ancillary data | all |
@@ -225,4 +228,4 @@ Added: `sendfile` (three signatures: Linux, macOS, FreeBSD), `recvmmsg`, `sendmm
 
 ## 0.6.3 as built
 
-Added on Windows: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` 0x1000, `GetProcessTimes` and the struct `FILETIME` (a hand-off sender's user SID, through the existing token calls, and its start time); `GetHandleInformation` outside tests (a socket made from a `WSAPROTOCOL_INFOW` is taken only while it is inheritable). `SetHandleInformation` now also clears `HANDLE_FLAG_INHERIT` on a socket made from a `WSAPROTOCOL_INFOW`: `WSA_FLAG_NO_HANDLE_INHERIT` does not reach such a socket. Every overlapped call on a pipe sets the low bit of `OVERLAPPED.hEvent`, so it queues no completion packet. The constant and the struct have layout tests against `windows-sys`.
+Added on Windows: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` 0x1000, `GetProcessTimes` and the struct `FILETIME` (a hand-off sender's user SID, through the existing token calls, and its start time); `GetHandleInformation` outside tests (a socket made from a `WSAPROTOCOL_INFOW` is taken only while it is inheritable). `SetHandleInformation` now also clears `HANDLE_FLAG_INHERIT` on a socket made from a `WSAPROTOCOL_INFOW`: `WSA_FLAG_NO_HANDLE_INHERIT` does not reach such a socket. Every overlapped call on a pipe sets the low bit of `OVERLAPPED.hEvent`, so it queues no completion packet. The constant and the struct have layout tests against `windows-sys`. On Unix: `fchmodat`, `fchownat`, `renameat`, `linkat`, `unlinkat`, the type `mode_t`, and the flags `O_DIRECTORY`, `O_NOFOLLOW`, `AT_SYMLINK_NOFOLLOW`, `AT_REMOVEDIR` (a Unix socket's mode, owner, and final name set relative to an open directory); each signature, constant, and the type are checked against `libc`.

@@ -1003,6 +1003,19 @@ pub enum ConfigReason {
     Inconsistent,
     /// A byte or character the value cannot contain (a NUL in a socket path).
     Malformed,
+    /// A Unix socket's directory is writable by other users and has no sticky
+    /// bit, so anyone could rename or replace the socket file in it. Bind in a
+    /// directory only the service's user (or root) can write to, or set the
+    /// sticky bit on it, as `/tmp` has.
+    ///
+    /// ```
+    /// use net_io::ConfigReason;
+    /// assert_eq!(
+    ///     ConfigReason::InsecureDirectory.to_string(),
+    ///     "the socket's directory is writable by other users and not sticky"
+    /// );
+    /// ```
+    InsecureDirectory,
 }
 
 impl fmt::Display for ConfigReason {
@@ -1030,6 +1043,9 @@ impl fmt::Display for ConfigReason {
             }
             ConfigReason::Inconsistent => f.write_str("values contradict each other"),
             ConfigReason::Malformed => f.write_str("contains a byte or character it cannot"),
+            ConfigReason::InsecureDirectory => {
+                f.write_str("the socket's directory is writable by other users and not sticky")
+            }
         }
     }
 }
