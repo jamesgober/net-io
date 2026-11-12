@@ -1175,7 +1175,11 @@ fn test_multi_buffer_flushes_reuse_their_buffers() {
             "{driver:?}: no buffer for a second connection, {:?}",
             server.stats()
         );
-        assert!(total > 16 << 20, "{driver:?}: {total} bytes streamed");
+        assert!(
+            total > 16 << 20,
+            "{driver:?}: {total} bytes streamed; closes {:?}",
+            server.stats().closes().collect::<Vec<_>>()
+        );
         assert_eq!(
             server
                 .stats()
