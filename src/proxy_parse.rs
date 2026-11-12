@@ -93,13 +93,16 @@ pub struct ProxyHeader<'a> {
     /// `Proxy`, or `Local` (a connection made by the proxy itself, such as a
     /// health check: keep the socket's own addresses).
     pub command: ProxyCommand,
-    /// The transport of the proxied connection.
+    /// The transport of the proxied connection (`Unspecified` for a v2 `LOCAL`
+    /// header with a family the specification does not list).
     pub transport: ProxyTransport,
     /// The real client; `None` for `LOCAL`, v1 `UNKNOWN`, and v2 `UNSPEC`.
     pub source: Option<ProxyAddress<'a>>,
     /// The address the client connected to; `None` as for `source`.
     pub destination: Option<ProxyAddress<'a>>,
-    /// The v2 TLVs (empty for v1); `NOOP` entries are skipped.
+    /// The v2 TLVs (empty for v1, and for a v2 `LOCAL` header whose family is
+    /// unknown or whose address block is short, which is ignored whole); `NOOP`
+    /// entries are skipped.
     pub tlvs: Tlvs<'a>,
     crc_checked: bool,
 }
@@ -369,15 +372,23 @@ impl ProxyParser {
             _ => return Err(ProxyError::V2BadCommand),
         };
         let family = input[13];
-        let (address_len, transport) = match family {
-            0x00 => (0, ProxyTransport::Unspecified),
-            0x11 => (12, ProxyTransport::Stream),
-            0x12 => (12, ProxyTransport::Datagram),
-            0x21 => (36, ProxyTransport::Stream),
-            0x22 => (36, ProxyTransport::Datagram),
-            0x31 => (216, ProxyTransport::Stream),
-            0x32 => (216, ProxyTransport::Datagram),
-            _ => return Err(ProxyError::V2BadFamily),
+        let known = match family {
+            0x00 => Some((0, ProxyTransport::Unspecified)),
+            0x11 => Some((12, ProxyTransport::Stream)),
+            0x12 => Some((12, ProxyTransport::Datagram)),
+            0x21 => Some((36, ProxyTransport::Stream)),
+            0x22 => Some((36, ProxyTransport::Datagram)),
+            0x31 => Some((216, ProxyTransport::Stream)),
+            0x32 => Some((216, ProxyTransport::Datagram)),
+            _ => None,
+        };
+        // LOCAL: the receiver uses the real endpoints and ignores the family and
+        // the address block, as the specification says (section 2.2), so neither
+        // is checked; an unknown family is reported as unspecified.
+        let (address_len, transport) = match (known, command) {
+            (Some(k), _) => k,
+            (None, ProxyCommand::Local) => (0, ProxyTransport::Unspecified),
+            (None, ProxyCommand::Proxy) => return Err(ProxyError::V2BadFamily),
         };
         let declared = u16::from_be_bytes([input[14], input[15]]);
         if declared > self.v2_body_max {
@@ -394,16 +405,25 @@ impl ProxyParser {
         }
         let header = &input[..total];
         let body = &header[V2_FIXED..];
-        if body.len() < address_len {
+        let local = command == ProxyCommand::Local;
+        if body.len() < address_len && !local {
             return Err(ProxyError::V2AddressTooShort);
         }
-        let (source, destination) = if command == ProxyCommand::Proxy {
-            v2_addresses(family >> 4, &body[..address_len])
+        // Where the TLVs start. A LOCAL header whose family is unknown or whose
+        // block is shorter than its family's addresses has no place where they
+        // could start: the whole body is the ignored block.
+        let tlv_at = if local && (known.is_none() || body.len() < address_len) {
+            body.len()
         } else {
-            (None, None)
+            address_len
         };
-        let tlv_bytes = &body[address_len..];
-        let crc_checked = check_tlvs(header, V2_FIXED + address_len)?;
+        let (source, destination) = if local {
+            (None, None)
+        } else {
+            v2_addresses(family >> 4, &body[..address_len])
+        };
+        let tlv_bytes = &body[tlv_at..];
+        let crc_checked = check_tlvs(header, V2_FIXED + tlv_at)?;
         Ok(ProxyProgress::Done {
             header: ProxyHeader {
                 version: 2,
@@ -1106,6 +1126,39 @@ mod tests {
         assert_eq!(
             (hd.transport, hd.source),
             (ProxyTransport::Unspecified, None)
+        );
+    }
+
+    /// A LOCAL header is accepted whatever its family byte and however short its
+    /// address block: the receiver uses the real endpoints and ignores both.
+    #[test]
+    fn test_v2_local_ignores_the_family_and_the_address_block() {
+        for (family, body) in [
+            (0x11, &[][..]),
+            (0x13, &[][..]),
+            (0x21, &[0u8; 5][..]),
+            (0xFF, &[1, 2, 3][..]),
+        ] {
+            let h = v2(0, family, body, &[], false);
+            let (hd, consumed) = done(&mut ProxyParser::new(ProxyVersions::V2, 1024), &h);
+            assert_eq!((hd.command, hd.source), (ProxyCommand::Local, None));
+            assert_eq!(hd.destination, None);
+            assert_eq!(consumed, h.len());
+            assert_eq!(hd.tlvs.count(), 0, "family {family:#x}");
+        }
+        // A whole address block of a known family: its TLVs are still read.
+        let h = v2(0, 0x11, &ipv4_block(), &[(TLV_ALPN, b"h2")], false);
+        let (hd, _) = done(&mut ProxyParser::new(ProxyVersions::V2, 1024), &h);
+        assert_eq!(hd.tlvs.count(), 1);
+        // PROXY keeps every check.
+        let feed = |h: &[u8]| ProxyParser::new(ProxyVersions::V2, 64).feed(h).map(|_| ());
+        assert_eq!(
+            feed(&v2(1, 0x13, &[], &[], false)).unwrap_err(),
+            ProxyError::V2BadFamily
+        );
+        assert_eq!(
+            feed(&v2(1, 0x11, &[], &[], false)).unwrap_err(),
+            ProxyError::V2AddressTooShort
         );
     }
 
