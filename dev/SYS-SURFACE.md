@@ -155,7 +155,7 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 | `recv`, `send`, `recvfrom`, `sendto` | ws2_32 | blocking driver IO | winsock2 | 0.3 (`*from`/`*to` 0.4) |
 | `WSARecv`, `WSASend`, `WSARecvFrom`, `WSASendTo` | ws2_32 | vectored and overlapped IO | winsock2 | 0.3 (overlapped 0.5) |
 | `WSAPoll` | ws2_32 | every wait in the blocking driver, the accept threads, connect completion (D-052, D-056) | winsock2 | 0.3 |
-| `WSAIoctl` | ws2_32 | extension pointers, `SIO_KEEPALIVE_VALS`, `SIO_AF_UNIX_GETPEERPID`, `SIO_UDP_CONNRESET`, `SIO_BASE_HANDLE` | winsock2 | 0.3 |
+| `WSAIoctl` | ws2_32 | extension pointers, `SIO_KEEPALIVE_VALS`, `SIO_AF_UNIX_GETPEERPID`, `SIO_UDP_CONNRESET`, `SIO_UDP_NETRESET` (0.8), `SIO_BASE_HANDLE` | winsock2 | 0.3 |
 | `WSAGetLastError` | ws2_32 | error codes | winsock2 | 0.3 |
 | `WSADuplicateSocketW` | ws2_32 | hand-off | winsock2 | 0.5 |
 | `WSAEnumProtocolsW` | ws2_32 | detect providers without `XP1_IFS_HANDLES` before enabling skip-on-success | winsock2 | 0.5 |
@@ -191,7 +191,7 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 | socket level | `SOL_SOCKET`, `SO_REUSEADDR`, `SO_EXCLUSIVEADDRUSE`, `SO_KEEPALIVE`, `SO_LINGER`, `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_ERROR`, `SO_TYPE`, `SO_ACCEPTCONN`, `SO_PROTOCOL_INFOW`, `SO_UPDATE_CONNECT_CONTEXT` |
 | TCP | `TCP_NODELAY`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_FASTOPEN`, `TCP_MAXRT` |
 | IP | `IP_TTL`, `IP_TOS`, `IP_PKTINFO`, `IP_ADD_MEMBERSHIP`, `IPV6_V6ONLY`, `IPV6_UNICAST_HOPS`, `IPV6_PKTINFO`, `IPV6_ADD_MEMBERSHIP` |
-| ioctl codes | `FIONBIO`, `SIO_GET_EXTENSION_FUNCTION_POINTER`, `SIO_KEEPALIVE_VALS`, `SIO_AF_UNIX_GETPEERPID`, `SIO_UDP_CONNRESET`, `SIO_BASE_HANDLE` |
+| ioctl codes | `FIONBIO`, `SIO_GET_EXTENSION_FUNCTION_POINTER`, `SIO_KEEPALIVE_VALS`, `SIO_AF_UNIX_GETPEERPID`, `SIO_UDP_CONNRESET`, `SIO_UDP_NETRESET`, `SIO_BASE_HANDLE` |
 | extension GUIDs | `WSAID_CONNECTEX`, `WSAID_TRANSMITFILE` |
 | shutdown | `SD_RECEIVE`, `SD_SEND`, `SD_BOTH` |
 | poll | `POLLRDNORM`, `POLLWRNORM`, `POLLERR`, `POLLHUP`, `POLLNVAL` |
@@ -200,7 +200,7 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 | processes | `PROCESS_QUERY_LIMITED_INFORMATION` (0.7.2) |
 | handles, IOCP | `INVALID_HANDLE_VALUE`, `HANDLE_FLAG_INHERIT`, `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, `FILE_SKIP_SET_EVENT_ON_HANDLE`, `INFINITE`, `WAIT_OBJECT_0`, `WAIT_TIMEOUT`, `XP1_IFS_HANDLES` |
 | random | `BCRYPT_USE_SYSTEM_PREFERRED_RNG` |
-| errors | `WSAEINTR`, `WSAEWOULDBLOCK`, `WSAEINPROGRESS`, `WSAEALREADY`, `WSAEMFILE`, `WSAENOBUFS`, `WSAECONNABORTED`, `WSAECONNRESET`, `WSAECONNREFUSED`, `WSAETIMEDOUT`, `WSAEADDRINUSE`, `WSAEADDRNOTAVAIL`, `WSAEACCES`, `WSAENOTCONN`, `WSAENOTSOCK`, `WSAEINVAL`, `WSAEMSGSIZE`, `WSAESHUTDOWN`, `WSAENETUNREACH`, `WSAEHOSTUNREACH`, `WSAEAFNOSUPPORT`, `WSA_IO_PENDING`, `WSA_OPERATION_ABORTED`, `ERROR_PIPE_BUSY`, `ERROR_PIPE_CONNECTED`, `ERROR_NO_DATA`, `ERROR_ACCESS_DENIED`, `ERROR_FILE_NOT_FOUND`, `ERROR_NOT_FOUND`, `ERROR_NETNAME_DELETED`, `ERROR_OPERATION_ABORTED`, `ERROR_IO_PENDING`, `ERROR_SEM_TIMEOUT` |
+| errors | `WSAEINTR`, `WSAEWOULDBLOCK`, `WSAEINPROGRESS`, `WSAEALREADY`, `WSAEMFILE`, `WSAENOBUFS`, `WSAECONNABORTED`, `WSAECONNRESET`, `WSAECONNREFUSED`, `WSAETIMEDOUT`, `WSAEADDRINUSE`, `WSAEADDRNOTAVAIL`, `WSAEACCES`, `WSAENOTCONN`, `WSAENOTSOCK`, `WSAEINVAL`, `WSAEMSGSIZE`, `WSAENETRESET`, `WSAESHUTDOWN`, `WSAENETUNREACH`, `WSAEHOSTUNREACH`, `WSAEAFNOSUPPORT`, `WSA_IO_PENDING`, `WSA_OPERATION_ABORTED`, `ERROR_PIPE_BUSY`, `ERROR_PIPE_CONNECTED`, `ERROR_NO_DATA`, `ERROR_ACCESS_DENIED`, `ERROR_FILE_NOT_FOUND`, `ERROR_NOT_FOUND`, `ERROR_NETNAME_DELETED`, `ERROR_OPERATION_ABORTED`, `ERROR_IO_PENDING`, `ERROR_SEM_TIMEOUT` |
 
 ### 4.2 Windows structs
 
@@ -252,3 +252,7 @@ Added on Windows: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` 0x1000,
 ## 0.8.0 review fixes
 
 On Unix: `pthread_sigmask`, `sigpending`, and `sigtimedwait` with `sigset_t`, `SIGPIPE`, `SIG_BLOCK`, and `SIG_UNBLOCK` (Linux), so that `sendfile`, which takes no flags, raises no SIGPIPE; `EINTR`, `EPIPE`, `EALREADY`, and `EISCONN` are now classified (a blocking Unix connect that a signal interrupts goes on; a non-blocking connect that reports `EINTR` is in progress). `splice`, `pipe2`, and `SPLICE_F_MOVE` (0.7, `recv_file`) were declared before they were listed. FreeBSD's `CPU_LEVEL_WHICH` and `CPU_WHICH_TID` moved into the constants module so that the layout test can compare them. The layout tests now check every Unix function signature against `libc` (rule 3), the offsets of `msghdr`'s `msg_iov`, `msg_control`, and `msg_controllen`, `mmsghdr`'s `msg_len`, every field of `ucred`, `xucred`'s `cr_uid`, `cr_groups`, and `cr_pid`, and the constants `MSG_WAITFORONE`, `IP_PKTINFO` / `IP_RECVPKTINFO` / `IP_RECVDSTADDR` and `IPV6_RECVPKTINFO` / `IPV6_PKTINFO` with the packet-info address offset per OS, FreeBSD's `SOCK_CLOEXEC` and `MSG_CMSG_CLOEXEC`, and the bit `sigset_t` keeps each signal at. The earlier text of this file said `SOCK_NONBLOCK` was used at creation and that FreeBSD sends with `MSG_NOSIGNAL`; neither was true (FreeBSD sockets carry `SO_NOSIGPIPE`, as on macOS), and both rows are corrected above.
+
+## 0.8.0 as built (Windows)
+
+Added: `SIO_UDP_NETRESET` (`0x9800000F`), switched off on every UDP socket as `SIO_UDP_CONNRESET` is, and `WSAENETRESET` (10052), which a UDP receive still reporting a "time exceeded" message gives and which the socket counts as an ICMP report. Removed: the list of adopted socket values in `socket_from_shared`; the inherit flag, read and cleared under one lock, is the claim. The Windows checks now cover every function `sys/windows.rs` and `sys/pipe.rs` declare: each declaration and its `windows-sys` counterpart are cast to an `extern "system"` function pointer and compared argument by argument as the calling convention sees them (an integer of a size and signedness, or a pointer), since the pointer types of the two differ only in what they point to (rule 3 is written for `libc`, where the types match). Also checked now: `AF_UNIX`, `TCP_MAXRT`, `TCP_FASTOPEN`, `WSAEINTR`, `SIO_AF_UNIX_GETPEERPID`, `FROM_PROTOCOL_INFO`, `BCRYPT_USE_SYSTEM_PREFERRED_RNG`, `SE_KERNEL_OBJECT`, `SDDL_REVISION_1`, `INFINITE`, the length of `sun_path`, and the field offsets of `OVERLAPPED`, `WSAPROTOCOL_INFOW`, `GROUP_AFFINITY`, and `SECURITY_ATTRIBUTES`. The dev-dependency gains the `windows-sys` features those declarations live under (`Win32_Security_Authorization`, `Win32_Security_Cryptography`, `Win32_System_Performance`, `Win32_System_SystemInformation`). Not covered here: the declarations of `sys/iocp.rs`.

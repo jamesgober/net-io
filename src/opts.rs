@@ -250,7 +250,11 @@ impl ListenOptions {
         self
     }
 
-    /// Unix: `SO_REUSEADDR`. Windows: `false` = `SO_EXCLUSIVEADDRUSE`, `true` = `SO_REUSEADDR`.
+    /// Unix: `SO_REUSEADDR`, so a restart binds while connections of the old
+    /// process linger. Windows: ignored, the port is always `SO_EXCLUSIVEADDRUSE`.
+    /// An exclusive listener there can already bind again at once after a restart,
+    /// and Windows `SO_REUSEADDR` means something else: another local socket could
+    /// bind the same port over the listener and take its connections.
     pub fn reuse_address(mut self, on: bool) -> ListenOptions {
         self.reuse_address = on;
         self

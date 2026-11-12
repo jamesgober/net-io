@@ -41,6 +41,9 @@ pub(crate) mod errno {
     pub const WSAEHOSTUNREACH: i32 = 10065;
     #[cfg(feature = "udp")]
     pub const WSAEMSGSIZE: i32 = 10040;
+    /// On a datagram socket: an ICMP "time exceeded" report about an earlier send.
+    #[cfg(feature = "udp")]
+    pub const WSAENETRESET: i32 = 10052;
 }
 
 /// How an `accept` failure is handled (FR-9, FR-10). Socket handles do not come
@@ -93,6 +96,8 @@ pub(super) mod c {
     pub const IPPROTO_UDP: i32 = 17;
     #[cfg(feature = "udp")]
     pub const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+    #[cfg(feature = "udp")]
+    pub const SIO_UDP_NETRESET: u32 = 0x9800_000F;
     pub const IPPROTO_IP: i32 = 0;
     pub const IPPROTO_TCP: i32 = 6;
     pub const IPPROTO_IPV6: i32 = 41;
@@ -482,8 +487,9 @@ fn decode_addr(b: &[u8; 128], len: i32) -> Option<SocketAddr> {
 
 /// Creates and binds a UDP socket: not inheritable, `SO_EXCLUSIVEADDRUSE` so no
 /// other process can bind the port, `IPV6_V6ONLY` as asked, and ICMP "port
-/// unreachable" reports switched off (`SIO_UDP_CONNRESET`), which would
-/// otherwise fail the next receive of an unconnected socket.
+/// unreachable" and "time exceeded" reports switched off (`SIO_UDP_CONNRESET`,
+/// `SIO_UDP_NETRESET`), which would otherwise fail the next receive of an
+/// unconnected socket.
 #[cfg(feature = "udp")]
 pub(crate) fn udp_bind(addr: SocketAddr, ipv6_only: bool) -> io::Result<std::net::UdpSocket> {
     #[cfg(any(test, net_io_shim))]
@@ -519,23 +525,25 @@ pub(crate) fn udp_bind(addr: SocketAddr, ipv6_only: bool) -> io::Result<std::net
             i32::from(ipv6_only),
         )?;
     }
-    let off: i32 = 0;
-    let mut returned = 0u32;
-    // SAFETY: SIO_UDP_CONNRESET takes a BOOL input and no output; `off` and
-    // `returned` are live locals; no overlapped IO.
-    cvt(unsafe {
-        WSAIoctl(
-            raw(owned.as_socket()),
-            c::SIO_UDP_CONNRESET,
-            (&raw const off).cast::<c_void>(),
-            size_of::<i32>() as u32,
-            std::ptr::null_mut(),
-            0,
-            &raw mut returned,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    })?;
+    for code in [c::SIO_UDP_CONNRESET, c::SIO_UDP_NETRESET] {
+        let off: i32 = 0;
+        let mut returned = 0u32;
+        // SAFETY: both codes take a BOOL input and no output; `off` and
+        // `returned` are live locals; no overlapped IO.
+        cvt(unsafe {
+            WSAIoctl(
+                raw(owned.as_socket()),
+                code,
+                (&raw const off).cast::<c_void>(),
+                size_of::<i32>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &raw mut returned,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        })?;
+    }
     bind_to(owned.as_socket(), addr)?;
     Ok(std::net::UdpSocket::from(owned))
 }
@@ -611,6 +619,8 @@ pub(crate) fn tcp_socket(v6: bool) -> io::Result<OwnedSocket> {
 /// Options set on a listening socket before `bind` and `listen`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ListenParams {
+    /// Not applied on Windows (see [`tcp_listener`]).
+    #[allow(dead_code)]
     pub reuse_address: bool,
     pub reuse_port: bool,
     pub ipv6_only: bool,
@@ -622,8 +632,12 @@ pub(crate) struct ListenParams {
     pub incoming_cpu: Option<u32>,
 }
 
-/// Creates, configures, binds, and listens. Without `reuse_address`, the socket
-/// uses `SO_EXCLUSIVEADDRUSE`, so no other process can bind the same port.
+/// Creates, configures, binds, and listens, always with `SO_EXCLUSIVEADDRUSE`, so
+/// no other socket can bind the same port. `reuse_address` is not applied: on
+/// Unix it lets a restart bind while old connections linger, which an exclusive
+/// socket on Windows already may (tested with an accepted connection still open),
+/// while Windows `SO_REUSEADDR` would let another socket bind over a live listener
+/// and take its connections.
 pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<TcpListener> {
     if p.reuse_port {
         return Err(io::Error::new(
@@ -635,11 +649,7 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
         return Err(io::Error::from(io::ErrorKind::Unsupported));
     }
     let s = tcp_socket(addr.is_ipv6())?;
-    if p.reuse_address {
-        set_int(s.as_socket(), c::SOL_SOCKET, c::SO_REUSEADDR, 1)?;
-    } else {
-        set_int(s.as_socket(), c::SOL_SOCKET, c::SO_EXCLUSIVEADDRUSE, 1)?;
-    }
+    set_int(s.as_socket(), c::SOL_SOCKET, c::SO_EXCLUSIVEADDRUSE, 1)?;
     if addr.is_ipv6() {
         set_int(
             s.as_socket(),
@@ -1087,45 +1097,11 @@ pub(crate) fn share_socket(sock: Sock<'_>, pid: u32) -> io::Result<[u8; SHARED_S
     Ok(out)
 }
 
-/// Sockets made from descriptions and still owned in this process, by handle value.
-/// Windows hands back the socket it made before when a description is used again,
-/// and the provider-reserved field could name any socket here, so a value on this
-/// list is refused rather than given a second owner (two closes of one handle).
+/// Held while a socket made from a description is checked and claimed, so two
+/// hand-offs that name one handle (a description used twice, in one frame or two)
+/// cannot both see it unclaimed.
 #[cfg(feature = "local")]
-static ADOPTED: std::sync::Mutex<Vec<RawSocket>> = std::sync::Mutex::new(Vec::new());
-
-#[cfg(feature = "local")]
-fn adopted() -> std::sync::MutexGuard<'static, Vec<RawSocket>> {
-    ADOPTED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// A socket's place on the adopted list. Kept after the socket, so dropping both
-/// closes the socket first and then frees its value.
-#[cfg(feature = "local")]
-#[derive(Debug)]
-pub(crate) struct Adoption(RawSocket);
-
-#[cfg(feature = "local")]
-impl Adoption {
-    /// The socket moves to an owner that does not carry this: its value stays
-    /// taken for the life of the process, so a later description that names it
-    /// is refused even after that owner closes it (a reused value fails closed).
-    pub(crate) fn keep_for_good(self) {
-        std::mem::forget(self);
-    }
-}
-
-#[cfg(feature = "local")]
-impl Drop for Adoption {
-    fn drop(&mut self) {
-        let mut list = adopted();
-        if let Some(at) = list.iter().position(|&s| s == self.0) {
-            list.swap_remove(at);
-        }
-    }
-}
+static CLAIMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The socket a description from [`share_socket`] names, not inheritable.
 /// `AlreadyExists` when it names a socket this process already owns, through an
@@ -1137,17 +1113,21 @@ impl Drop for Adoption {
 /// socket the process holds; `WSASocketW` then returns that socket. A fresh
 /// duplicate is inheritable (the sender's flag), while every socket net-io or std
 /// makes is not, and adoption clears the flag: a socket that is not inheritable is
-/// already owned here and is left alone.
+/// already owned here and is left alone. The flag is the claim. It belongs to the
+/// handle, so when the owner closes the socket and Windows gives the value to a
+/// new duplicate, that one is inheritable again and is taken: nothing about a
+/// value outlives its socket. The check and the clear run under one lock.
 #[cfg(feature = "local")]
-pub(crate) fn socket_from_shared(
-    blob: &[u8; SHARED_SOCKET],
-) -> io::Result<(OwnedSocket, Adoption)> {
+pub(crate) fn socket_from_shared(blob: &[u8; SHARED_SOCKET]) -> io::Result<OwnedSocket> {
     startup();
     let mut info = std::mem::MaybeUninit::<WsaProtocolInfo>::uninit();
     // SAFETY: `info` has room for the bytes, and any bytes are a valid WsaProtocolInfo.
     unsafe {
         std::ptr::copy_nonoverlapping(blob.as_ptr(), info.as_mut_ptr().cast::<u8>(), SHARED_SOCKET);
     }
+    let claiming = CLAIMING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // SAFETY: the structure is live for the call; the kernel checks what it holds.
     let s = unsafe {
         WSASocketW(
@@ -1171,25 +1151,20 @@ pub(crate) fn socket_from_shared(
     if flags & c::HANDLE_FLAG_INHERIT == 0 {
         return Err(io::Error::from(io::ErrorKind::AlreadyExists));
     }
-    let mut list = adopted();
-    if list.contains(&(s as RawSocket)) {
-        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
-    }
-    list.push(s as RawSocket);
-    drop(list);
-    let adoption = Adoption(s as RawSocket);
-    // SAFETY: `s` is open, inheritable, and was not on the list, so the sender's
-    // duplicate made it and nothing else in the process owns it.
+    // SAFETY: `s` is open and inheritable, so the sender's duplicate made it and
+    // nothing else in the process owns it; the lock keeps another adoption from
+    // reaching this point with the same handle before the flag is cleared.
     let sock = unsafe { OwnedSocket::from_raw_socket(s as RawSocket) };
     // The flag passed above does not reach a socket made from a description (the
-    // sender's duplicate is inheritable), so it is cleared here.
+    // sender's duplicate is inheritable), so it is cleared here: this is the claim.
     // SAFETY: the handle is open; clearing the flag is the call's documented use.
     if unsafe { SetHandleInformation(s as *mut c_void, c::HANDLE_FLAG_INHERIT, 0) } == 0 {
         let e = io::Error::last_os_error();
-        drop((sock, adoption));
+        drop(sock);
         return Err(e);
     }
-    Ok((sock, adoption))
+    drop(claiming);
+    Ok(sock)
 }
 
 #[cfg(any(test, feature = "local"))]
@@ -1539,6 +1514,124 @@ impl Wake {
     }
 }
 
+/// Signature checks for the layout tests: an extern declaration here and the
+/// `windows-sys` one are both cast to an `extern "system"` function pointer, and
+/// every argument and the result reduced to what the calling convention sees (an
+/// integer of a size and signedness, or a pointer). Pointer types differ between
+/// the two only in what they point to, which the convention does not see.
+#[cfg(test)]
+pub(super) mod abi {
+    use std::mem::size_of;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Shape {
+        Int { bytes: usize, signed: bool },
+        Ptr,
+    }
+
+    pub(crate) trait Arg {
+        const SHAPE: Shape;
+    }
+
+    macro_rules! ints {
+        ($($t:ty => $signed:expr),*) => {
+            $(impl Arg for $t {
+                const SHAPE: Shape = Shape::Int { bytes: size_of::<$t>(), signed: $signed };
+            })*
+        };
+    }
+    ints!(i8 => true, i16 => true, i32 => true, i64 => true, isize => true,
+          u8 => false, u16 => false, u32 => false, u64 => false, usize => false);
+
+    impl<T> Arg for *mut T {
+        const SHAPE: Shape = Shape::Ptr;
+    }
+
+    impl<T> Arg for *const T {
+        const SHAPE: Shape = Shape::Ptr;
+    }
+
+    /// `WSAIoctl`'s completion routine: a nullable function pointer.
+    impl Arg for windows_sys::Win32::Networking::WinSock::LPWSAOVERLAPPED_COMPLETION_ROUTINE {
+        const SHAPE: Shape = Shape::Ptr;
+    }
+
+    pub(crate) trait Sig {
+        fn shape() -> Vec<Shape>;
+    }
+
+    macro_rules! sigs {
+        ($($a:ident)*) => {
+            impl<R: Arg, $($a: Arg),*> Sig for unsafe extern "system" fn($($a),*) -> R {
+                fn shape() -> Vec<Shape> {
+                    vec![$(<$a as Arg>::SHAPE,)* R::SHAPE]
+                }
+            }
+        };
+    }
+    sigs!();
+    sigs!(A);
+    sigs!(A B);
+    sigs!(A B C);
+    sigs!(A B C D);
+    sigs!(A B C D E);
+    sigs!(A B C D E F);
+    sigs!(A B C D E F G);
+    sigs!(A B C D E F G H);
+    sigs!(A B C D E F G H I);
+
+    pub(crate) fn shape<F: Sig>(_: F) -> Vec<Shape> {
+        F::shape()
+    }
+
+    /// Asserts that `$ours` and `$theirs`, each cast to a function pointer with as
+    /// many arguments as there are `_`, have the same shape.
+    macro_rules! same_abi {
+        ($ours:path, $theirs:path, $($arg:tt)*) => {
+            assert_eq!(
+                $crate::sys::windows::abi::shape(
+                    $ours as unsafe extern "system" fn($($arg)*) -> _
+                ),
+                $crate::sys::windows::abi::shape(
+                    $theirs as unsafe extern "system" fn($($arg)*) -> _
+                ),
+                "{}",
+                stringify!($ours)
+            )
+        };
+    }
+    pub(crate) use same_abi;
+
+    /// The shapes tell arity, size, signedness, and pointers apart.
+    #[test]
+    fn test_shapes_tell_signatures_apart() {
+        extern "system" fn a(_: i32, _: *mut u8) -> i32 {
+            0
+        }
+        extern "system" fn b(_: u32, _: *const u16) -> i32 {
+            0
+        }
+        extern "system" fn c(_: i64, _: usize) -> i32 {
+            0
+        }
+        extern "system" fn d(_: i32, _: *const u32) -> i32 {
+            0
+        }
+        extern "system" fn e(_: i32) -> i32 {
+            0
+        }
+        let a = shape(a as unsafe extern "system" fn(_, _) -> _);
+        let b = shape(b as unsafe extern "system" fn(_, _) -> _);
+        let c = shape(c as unsafe extern "system" fn(_, _) -> _);
+        let d = shape(d as unsafe extern "system" fn(_, _) -> _);
+        let e = shape(e as unsafe extern "system" fn(_) -> _);
+        assert_ne!(a, b, "signedness");
+        assert_ne!(a, c, "size and pointer");
+        assert_ne!(a, e, "arity");
+        assert_eq!(a, d, "what a pointer points to is not seen");
+    }
+}
+
 #[cfg(test)]
 mod layout {
     //! Cross-checks the declarations above against `windows-sys` (a dev-dependency).
@@ -1706,7 +1799,9 @@ mod layout {
         assert_eq!(c::SOCK_DGRAM as i64, ws::SOCK_DGRAM as i64);
         assert_eq!(c::IPPROTO_UDP as i64, ws::IPPROTO_UDP as i64);
         assert_eq!(c::SIO_UDP_CONNRESET as i64, ws::SIO_UDP_CONNRESET as i64);
+        assert_eq!(c::SIO_UDP_NETRESET as i64, ws::SIO_UDP_NETRESET as i64);
         assert_eq!(errno::WSAEMSGSIZE as i64, ws::WSAEMSGSIZE as i64);
+        assert_eq!(errno::WSAENETRESET as i64, ws::WSAENETRESET as i64);
         assert!(size_of::<AddrBuf>() >= size_of::<ws::SOCKADDR_STORAGE>());
     }
 
@@ -1729,14 +1824,152 @@ mod layout {
         assert_eq!(from, src6.local_addr().unwrap());
     }
 
+    /// Every function declared in this file against its `windows-sys` declaration.
     #[test]
     fn test_layout_signatures_match_windows_sys() {
-        let _: unsafe extern "system" fn(Socket, i32) -> i32 = listen;
-        let _: unsafe extern "system" fn(ws::SOCKET, i32) -> i32 = ws::listen;
-        let _: unsafe extern "system" fn() -> i32 = WSAGetLastError;
-        let _: unsafe extern "system" fn() -> ws::WSA_ERROR = ws::WSAGetLastError;
-        let _: unsafe extern "system" fn(*mut WsaPollFd, u32, i32) -> i32 = WSAPoll;
-        let _: unsafe extern "system" fn(*mut ws::WSAPOLLFD, u32, i32) -> i32 = ws::WSAPoll;
+        use super::abi::same_abi;
+        use windows_sys::Win32::System::{IO as io_sys, Performance as perf, Threading as th};
+        same_abi!(WSAStartup, ws::WSAStartup, _, _);
+        same_abi!(WSASocketW, ws::WSASocketW, _, _, _, _, _, _);
+        same_abi!(bind, ws::bind, _, _, _);
+        same_abi!(listen, ws::listen, _, _);
+        same_abi!(connect, ws::connect, _, _, _);
+        same_abi!(setsockopt, ws::setsockopt, _, _, _, _, _);
+        same_abi!(getsockopt, ws::getsockopt, _, _, _, _, _);
+        same_abi!(WSAPoll, ws::WSAPoll, _, _, _);
+        same_abi!(WSAGetLastError, ws::WSAGetLastError,);
+        same_abi!(SetHandleInformation, wf::SetHandleInformation, _, _, _);
+        same_abi!(GetHandleInformation, wf::GetHandleInformation, _, _);
+        same_abi!(
+            GetActiveProcessorGroupCount,
+            th::GetActiveProcessorGroupCount,
+        );
+        same_abi!(GetActiveProcessorCount, th::GetActiveProcessorCount, _);
+        same_abi!(GetCurrentThread, th::GetCurrentThread,);
+        same_abi!(SetThreadGroupAffinity, th::SetThreadGroupAffinity, _, _, _);
+        same_abi!(CreateEventW, th::CreateEventW, _, _, _, _);
+        same_abi!(SetEvent, th::SetEvent, _);
+        same_abi!(CancelIoEx, io_sys::CancelIoEx, _, _);
+        same_abi!(QueryPerformanceCounter, perf::QueryPerformanceCounter, _);
+        same_abi!(
+            QueryPerformanceFrequency,
+            perf::QueryPerformanceFrequency,
+            _
+        );
+        #[cfg(feature = "udp")]
+        same_abi!(recvfrom, ws::recvfrom, _, _, _, _, _, _);
+        #[cfg(any(feature = "udp", feature = "local"))]
+        same_abi!(WSAIoctl, ws::WSAIoctl, _, _, _, _, _, _, _, _, _);
+        #[cfg(feature = "local")]
+        {
+            use windows_sys::Win32::Security::Cryptography as crypt;
+            use windows_sys::Win32::Storage::FileSystem as fs;
+            same_abi!(accept_raw, ws::accept, _, _, _);
+            same_abi!(WSADuplicateSocketW, ws::WSADuplicateSocketW, _, _, _);
+            same_abi!(BCryptGenRandom, crypt::BCryptGenRandom, _, _, _, _);
+            same_abi!(
+                GetFileInformationByHandleEx,
+                fs::GetFileInformationByHandleEx,
+                _,
+                _,
+                _,
+                _
+            );
+        }
+    }
+
+    /// Constants and layouts the tests above do not reach.
+    #[test]
+    fn test_layout_remaining_constants_and_offsets_match_windows_sys() {
+        use std::mem::offset_of;
+        use windows_sys::Win32::System::SystemInformation as si;
+        assert_eq!(c::TCP_MAXRT as i64, ws::TCP_MAXRT as i64);
+        assert_eq!(c::TCP_FASTOPEN as i64, ws::TCP_FASTOPEN as i64);
+        assert_eq!(c::WSAEINTR as i64, ws::WSAEINTR as i64);
+        assert_eq!(size_of::<GroupAffinity>(), size_of::<si::GROUP_AFFINITY>());
+        assert_eq!(
+            offset_of!(GroupAffinity, group),
+            offset_of!(si::GROUP_AFFINITY, Group)
+        );
+        #[cfg(feature = "local")]
+        {
+            use windows_sys::Win32::Security::Cryptography as crypt;
+            assert_eq!(c::AF_UNIX as i64, ws::AF_UNIX as i64);
+            assert_eq!(
+                SIO_AF_UNIX_GETPEERPID as i64,
+                ws::SIO_AF_UNIX_GETPEERPID as i64
+            );
+            assert_eq!(FROM_PROTOCOL_INFO as i64, ws::FROM_PROTOCOL_INFO as i64);
+            assert_eq!(
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG as i64,
+                crypt::BCRYPT_USE_SYSTEM_PREFERRED_RNG as i64
+            );
+            let path = size_of::<ws::SOCKADDR_UN>() - offset_of!(ws::SOCKADDR_UN, sun_path);
+            assert_eq!(UNIX_PATH_MAX, path);
+        }
+        #[cfg(any(feature = "reactor", feature = "local"))]
+        {
+            use windows_sys::Win32::System::IO as io_sys;
+            assert_eq!(size_of::<Overlapped>(), size_of::<io_sys::OVERLAPPED>());
+            assert_eq!(
+                offset_of!(Overlapped, internal_high),
+                offset_of!(io_sys::OVERLAPPED, InternalHigh)
+            );
+            assert_eq!(
+                offset_of!(Overlapped, offset),
+                offset_of!(io_sys::OVERLAPPED, Anonymous)
+            );
+            assert_eq!(
+                offset_of!(Overlapped, event),
+                offset_of!(io_sys::OVERLAPPED, hEvent)
+            );
+            type Info = ws::WSAPROTOCOL_INFOW;
+            assert_eq!(size_of::<WsaProtocolInfo>(), size_of::<Info>());
+            for (ours, theirs) in [
+                (
+                    offset_of!(WsaProtocolInfo, provider_id),
+                    offset_of!(Info, ProviderId),
+                ),
+                (
+                    offset_of!(WsaProtocolInfo, catalog_entry_id),
+                    offset_of!(Info, dwCatalogEntryId),
+                ),
+                (
+                    offset_of!(WsaProtocolInfo, chain_len),
+                    offset_of!(Info, ProtocolChain),
+                ),
+                (
+                    offset_of!(WsaProtocolInfo, version),
+                    offset_of!(Info, iVersion),
+                ),
+                (
+                    offset_of!(WsaProtocolInfo, address_family),
+                    offset_of!(Info, iAddressFamily),
+                ),
+                (
+                    offset_of!(WsaProtocolInfo, socket_type),
+                    offset_of!(Info, iSocketType),
+                ),
+                (
+                    offset_of!(WsaProtocolInfo, i_protocol),
+                    offset_of!(Info, iProtocol),
+                ),
+                (
+                    offset_of!(WsaProtocolInfo, message_size),
+                    offset_of!(Info, dwMessageSize),
+                ),
+                (
+                    offset_of!(WsaProtocolInfo, provider_reserved),
+                    offset_of!(Info, dwProviderReserved),
+                ),
+                (
+                    offset_of!(WsaProtocolInfo, protocol),
+                    offset_of!(Info, szProtocol),
+                ),
+            ] {
+                assert_eq!(ours, theirs);
+            }
+        }
     }
 
     #[test]
@@ -1804,6 +2037,41 @@ mod layout {
         );
         let second = tcp_listener(l.local_addr().unwrap(), &p);
         assert!(second.is_err());
+    }
+
+    /// `reuse_address` asks for Unix semantics; on Windows it keeps the port
+    /// exclusive, so another socket asking for `SO_REUSEADDR` cannot bind over it.
+    #[test]
+    fn test_reuse_address_keeps_the_port_exclusive() {
+        let p = ListenParams {
+            reuse_address: true,
+            reuse_port: false,
+            ipv6_only: true,
+            send_buffer: None,
+            receive_buffer: None,
+            backlog: 16,
+            defer_accept: None,
+            fast_open: None,
+            incoming_cpu: None,
+        };
+        let l = tcp_listener("127.0.0.1:0".parse().unwrap(), &p).unwrap();
+        assert_eq!(
+            get_int(l.as_socket(), c::SOL_SOCKET, c::SO_EXCLUSIVEADDRUSE).unwrap(),
+            1
+        );
+        let at = l.local_addr().unwrap();
+        let s = tcp_socket(false).unwrap();
+        set_int(s.as_socket(), c::SOL_SOCKET, c::SO_REUSEADDR, 1).unwrap();
+        assert!(
+            bind_to(s.as_socket(), at).is_err(),
+            "bound over the listener"
+        );
+        // A restart binds again at once, with an accepted connection still open.
+        let _client = TcpStream::connect(at).unwrap();
+        let (accepted, _) = l.accept().unwrap();
+        drop(l);
+        let again = tcp_listener(at, &p).expect("the port is free again");
+        drop((again, accepted));
     }
 
     #[test]
