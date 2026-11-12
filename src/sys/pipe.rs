@@ -42,6 +42,7 @@ const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
 const SECURITY_IDENTIFICATION: u32 = 1 << 16;
 const SDDL_REVISION_1: u32 = 1;
 const TOKEN_QUERY: u32 = 8;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const TOKEN_USER_CLASS: i32 = 1;
 const WAIT_TIMEOUT: u32 = 258;
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;
@@ -125,6 +126,14 @@ unsafe extern "system" {
     fn WaitForMultipleObjects(count: u32, handles: *const Handle, all: i32, ms: u32) -> u32;
     fn WaitForSingleObject(handle: Handle, ms: u32) -> u32;
     fn GetCurrentProcess() -> Handle;
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+    fn GetProcessTimes(
+        process: Handle,
+        creation: *mut FileTime,
+        exit: *mut FileTime,
+        kernel: *mut FileTime,
+        user: *mut FileTime,
+    ) -> i32;
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
 }
 
@@ -214,8 +223,13 @@ impl Side {
     }
 
     fn arm(&mut self) -> *mut Overlapped {
+        // The low bit of the event tells the kernel to queue no completion packet.
+        // The handle may be on a reactor worker's completion port, and a packet for
+        // an operation that lives in this box must never reach that port: the
+        // stream waits on its own event. Handle values are multiples of four, so
+        // the waits that read the field ignore the bit.
         self.overlapped = Overlapped {
-            event: self.event.as_raw_handle() as usize,
+            event: self.event.as_raw_handle() as usize | 1,
             ..Overlapped::default()
         };
         &raw mut self.overlapped
@@ -545,9 +559,69 @@ impl Drop for Descriptor {
 
 /// The SDDL that lets only the current user in (and the system, when asked).
 pub(crate) fn owner_sddl(system: bool) -> io::Result<String> {
+    let user = current_user_sid()?;
+    let mut sddl = format!("D:P(A;;GA;;;{user})");
+    if system {
+        sddl.push_str("(A;;GA;;;SY)");
+    }
+    Ok(sddl)
+}
+
+/// `FILETIME`: 100 ns units since 1601, in two halves.
+#[repr(C)]
+#[derive(Default)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+
+/// The user this process runs as, as a string SID.
+pub(crate) fn current_user_sid() -> io::Result<String> {
+    // SAFETY: the current-process pseudo handle is always valid and needs no closing.
+    unsafe { user_sid_of(GetCurrentProcess()) }
+}
+
+/// The user process `pid` runs as (a string SID) and when it started (100 ns
+/// units since 1601, the system clock). Fails when this process may not query
+/// it, for example a process of another user.
+pub(crate) fn process_user_and_start(pid: u32) -> io::Result<(String, u64)> {
+    // SAFETY: no handle is inherited; a null result is checked below.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` was just returned, is open, and has no other owner.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: the handle is open and was opened with the access the token needs.
+    let user = unsafe { user_sid_of(process.as_raw_handle()) }?;
+    let mut times = [
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+    ];
+    let [created, exited, kernel, used] = &mut times;
+    // SAFETY: the handle is open; the four structures are written during the call.
+    let ok = unsafe { GetProcessTimes(process.as_raw_handle(), created, exited, kernel, used) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        user,
+        (u64::from(created.high) << 32) | u64::from(created.low),
+    ))
+}
+
+/// The `TokenUser` SID of `process`'s token, as a string SID.
+///
+/// # Safety
+///
+/// `process` is an open process handle with query access, or the current-process
+/// pseudo handle.
+unsafe fn user_sid_of(process: Handle) -> io::Result<String> {
     let mut token: Handle = std::ptr::null_mut();
-    // SAFETY: the current-process pseudo handle needs no closing; `token` is written.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+    // SAFETY: by this function's contract; `token` is written.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `token` was just returned, is open, and has no other owner.
@@ -576,7 +650,7 @@ pub(crate) fn owner_sddl(system: bool) -> io::Result<String> {
     }
     let mut len = 0;
     // SAFETY: the string is terminated, per the conversion's contract.
-    let user = unsafe {
+    let out = unsafe {
         while *text.add(len) != 0 {
             len += 1;
         }
@@ -584,11 +658,7 @@ pub(crate) fn owner_sddl(system: bool) -> io::Result<String> {
     };
     // SAFETY: the conversion says to free it so.
     let _ = unsafe { LocalFree(text.cast()) };
-    let mut sddl = format!("D:P(A;;GA;;;{user})");
-    if system {
-        sddl.push_str("(A;;GA;;;SY)");
-    }
-    Ok(sddl)
+    Ok(out)
 }
 
 /// What every instance of a pipe is created with.
@@ -703,8 +773,9 @@ impl PipeServer {
     fn connect(&self, handle: &OwnedHandle, wake: Option<&Wake>) -> io::Result<bool> {
         let raw = handle.as_raw_handle();
         let ev = event()?;
+        // No completion packet, as in `Side::arm`: this file never queues one.
         let mut overlapped = Overlapped {
-            event: ev.as_raw_handle() as usize,
+            event: ev.as_raw_handle() as usize | 1,
             ..Overlapped::default()
         };
         // SAFETY: `overlapped` and `ev` outlive the operation: every path below waits
@@ -824,6 +895,18 @@ mod tests {
         assert_eq!(SECURITY_SQOS_PRESENT, fs::SECURITY_SQOS_PRESENT);
         assert_eq!(SECURITY_IDENTIFICATION, fs::SECURITY_IDENTIFICATION);
         assert_eq!(TOKEN_QUERY, sec::TOKEN_QUERY);
+        assert_eq!(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION
+        );
+        assert_eq!(
+            size_of::<FileTime>(),
+            size_of::<windows_sys::Win32::Foundation::FILETIME>()
+        );
+        assert_eq!(
+            align_of::<FileTime>(),
+            align_of::<windows_sys::Win32::Foundation::FILETIME>()
+        );
         assert_eq!(TOKEN_USER_CLASS, sec::TokenUser);
         assert_eq!(WAIT_TIMEOUT, wf::WAIT_TIMEOUT);
         assert_eq!(WAIT_FAILED, wf::WAIT_FAILED);

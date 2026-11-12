@@ -6,6 +6,8 @@
 //! man-pages project (`socket(7)`, `tcp(7)`, `ipv6(7)`, `poll(2)`, `send(2)`,
 //! `getrlimit(2)`, `fcntl(2)`) and the macOS man pages of the same names.
 
+#[cfg(feature = "local")]
+use std::ffi::{CStr, c_char};
 use std::ffi::{c_int, c_short, c_void};
 use std::io::{self, IoSlice};
 use std::mem::size_of;
@@ -192,6 +194,19 @@ mod c {
     pub const MSG_CTRUNC: c_int = 0x8;
     #[cfg(feature = "local")]
     pub const MSG_CMSG_CLOEXEC: c_int = 0x4000_0000;
+    #[cfg(feature = "local")]
+    pub const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
+    #[cfg(feature = "local")]
+    pub const AT_REMOVEDIR: c_int = 0x200;
+    /// The open flags differ between Linux architectures (`fcntl.h`).
+    #[cfg(all(feature = "local", target_arch = "x86_64"))]
+    pub const O_DIRECTORY: c_int = 0x1_0000;
+    #[cfg(all(feature = "local", target_arch = "x86_64"))]
+    pub const O_NOFOLLOW: c_int = 0x2_0000;
+    #[cfg(all(feature = "local", target_arch = "aarch64"))]
+    pub const O_DIRECTORY: c_int = 0x4000;
+    #[cfg(all(feature = "local", target_arch = "aarch64"))]
+    pub const O_NOFOLLOW: c_int = 0x8000;
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -297,7 +312,28 @@ mod c {
     pub const LOCAL_PEERPID: c_int = 0x002;
     #[cfg(all(feature = "local", target_os = "freebsd"))]
     pub const LOCAL_PEERCRED: c_int = 1;
+    #[cfg(all(feature = "local", target_os = "macos"))]
+    pub const AT_SYMLINK_NOFOLLOW: c_int = 0x20;
+    #[cfg(all(feature = "local", target_os = "macos"))]
+    pub const AT_REMOVEDIR: c_int = 0x80;
+    #[cfg(all(feature = "local", target_os = "freebsd"))]
+    pub const AT_SYMLINK_NOFOLLOW: c_int = 0x200;
+    #[cfg(all(feature = "local", target_os = "freebsd"))]
+    pub const AT_REMOVEDIR: c_int = 0x800;
+    #[cfg(all(feature = "local", target_os = "macos"))]
+    pub const O_DIRECTORY: c_int = 0x10_0000;
+    #[cfg(all(feature = "local", target_os = "freebsd"))]
+    pub const O_DIRECTORY: c_int = 0x2_0000;
+    #[cfg(feature = "local")]
+    pub const O_NOFOLLOW: c_int = 0x100;
 }
+
+/// `mode_t`: 32 bits on Linux, 16 on macOS and FreeBSD.
+#[cfg(all(feature = "local", target_os = "linux"))]
+type ModeT = u32;
+/// `mode_t`: 32 bits on Linux, 16 on macOS and FreeBSD.
+#[cfg(all(feature = "local", not(target_os = "linux")))]
+type ModeT = u16;
 
 // ---- structs ---------------------------------------------------------------
 
@@ -471,6 +507,22 @@ unsafe extern "C" {
     ) -> c_int;
     #[cfg(feature = "local")]
     fn geteuid() -> u32;
+    #[cfg(feature = "local")]
+    fn fchmodat(dir: c_int, path: *const c_char, mode: ModeT, flags: c_int) -> c_int;
+    #[cfg(feature = "local")]
+    fn fchownat(dir: c_int, path: *const c_char, owner: u32, group: u32, flags: c_int) -> c_int;
+    #[cfg(feature = "local")]
+    fn renameat(from_dir: c_int, from: *const c_char, to_dir: c_int, to: *const c_char) -> c_int;
+    #[cfg(feature = "local")]
+    fn linkat(
+        from_dir: c_int,
+        from: *const c_char,
+        to_dir: c_int,
+        to: *const c_char,
+        flags: c_int,
+    ) -> c_int;
+    #[cfg(feature = "local")]
+    fn unlinkat(dir: c_int, path: *const c_char, flags: c_int) -> c_int;
     fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int;
     #[cfg(target_os = "linux")]
     fn syscall(num: std::ffi::c_long, ...) -> std::ffi::c_long;
@@ -1381,6 +1433,116 @@ pub(crate) fn monotonic_micros() -> u64 {
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid(2) takes no arguments and cannot fail.
     unsafe { geteuid() }
+}
+
+/// Opens a directory for use with the `*_at` calls below (read-only, close-on-exec
+/// through `std`). `O_DIRECTORY` makes anything else fail with `ENOTDIR`; with
+/// `nofollow`, a symbolic link at the last component fails instead of being followed.
+#[cfg(feature = "local")]
+pub(crate) fn open_directory(path: &std::path::Path, nofollow: bool) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = if nofollow {
+        c::O_DIRECTORY | c::O_NOFOLLOW
+    } else {
+        c::O_DIRECTORY
+    };
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+}
+
+/// Sets the mode of `name` in `dir` (`fchmodat(2)`, flags 0). The call follows a
+/// symbolic link, as Linux offers no other choice, so callers pass only names in
+/// a directory whose entries no other user can change.
+#[cfg(feature = "local")]
+pub(crate) fn chmod_at(dir: BorrowedFd<'_>, name: &CStr, mode: u32) -> io::Result<()> {
+    // The permission, set-id, and sticky bits fit every platform's mode_t.
+    #[allow(clippy::unnecessary_cast)] // u32 on Linux
+    let mode = (mode & 0o7777) as ModeT;
+    // SAFETY: `dir` is an open descriptor borrowed for the call; `name` is a
+    // NUL-terminated string that lives for the call; fchmodat(2) reads both and
+    // keeps neither.
+    cvt(unsafe { fchmodat(dir.as_raw_fd(), name.as_ptr(), mode, 0) }).map(drop)
+}
+
+/// Sets the owner and group of `name` in `dir` without following a symbolic link
+/// (`fchownat(2)` with `AT_SYMLINK_NOFOLLOW`); `None` leaves that id unchanged.
+#[cfg(feature = "local")]
+pub(crate) fn chown_at(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    owner: Option<u32>,
+    group: Option<u32>,
+) -> io::Result<()> {
+    // (uid_t)-1 and (gid_t)-1 mean "unchanged" (POSIX).
+    let owner = owner.unwrap_or(u32::MAX);
+    let group = group.unwrap_or(u32::MAX);
+    // SAFETY: as in `chmod_at`; the ids are plain integers.
+    cvt(unsafe {
+        fchownat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            owner,
+            group,
+            c::AT_SYMLINK_NOFOLLOW,
+        )
+    })
+    .map(drop)
+}
+
+/// Renames `from` in `from_dir` to `to` in `to_dir`, replacing a file there in
+/// one step (`renameat(2)`).
+#[cfg(feature = "local")]
+pub(crate) fn rename_at(
+    from_dir: BorrowedFd<'_>,
+    from: &CStr,
+    to_dir: BorrowedFd<'_>,
+    to: &CStr,
+) -> io::Result<()> {
+    // SAFETY: both descriptors are open and borrowed for the call; both names are
+    // NUL-terminated strings that live for the call; renameat(2) keeps none of them.
+    cvt(unsafe {
+        renameat(
+            from_dir.as_raw_fd(),
+            from.as_ptr(),
+            to_dir.as_raw_fd(),
+            to.as_ptr(),
+        )
+    })
+    .map(drop)
+}
+
+/// Gives the file `from` in `from_dir` a second name, `to` in `to_dir`, failing
+/// with `EEXIST` when `to` exists (`linkat(2)`, flags 0: a symbolic link at `from`
+/// is linked itself, never followed).
+#[cfg(feature = "local")]
+pub(crate) fn link_at(
+    from_dir: BorrowedFd<'_>,
+    from: &CStr,
+    to_dir: BorrowedFd<'_>,
+    to: &CStr,
+) -> io::Result<()> {
+    // SAFETY: as in `rename_at`; the flags are a plain integer.
+    cvt(unsafe {
+        linkat(
+            from_dir.as_raw_fd(),
+            from.as_ptr(),
+            to_dir.as_raw_fd(),
+            to.as_ptr(),
+            0,
+        )
+    })
+    .map(drop)
+}
+
+/// Removes `name` from `dir` (`unlinkat(2)`); with `directory`, an empty
+/// directory (`AT_REMOVEDIR`). A symbolic link is removed itself.
+#[cfg(feature = "local")]
+pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &CStr, directory: bool) -> io::Result<()> {
+    let flags = if directory { c::AT_REMOVEDIR } else { 0 };
+    // SAFETY: as in `chmod_at`.
+    cvt(unsafe { unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) }).map(drop)
 }
 
 /// The inode of this process's pidfd, which systemd passes as `LISTEN_PIDFDID`
@@ -2480,6 +2642,38 @@ mod layout {
         );
     }
 
+    /// The `*_at` wrappers act on names inside the directory they are given.
+    #[cfg(feature = "local")]
+    #[test]
+    fn test_at_calls_act_inside_the_directory() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = std::env::temp_dir().join(format!("nio-at-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("a"), b"x").unwrap();
+        let dir = open_directory(&d, true).unwrap();
+        chmod_at(dir.as_fd(), c"a", 0o640).unwrap();
+        let meta = std::fs::metadata(d.join("a")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
+        chown_at(dir.as_fd(), c"a", None, Some(meta.gid())).unwrap();
+        link_at(dir.as_fd(), c"a", dir.as_fd(), c"b").unwrap();
+        let exists = link_at(dir.as_fd(), c"a", dir.as_fd(), c"b").unwrap_err();
+        assert_eq!(exists.kind(), io::ErrorKind::AlreadyExists);
+        rename_at(dir.as_fd(), c"b", dir.as_fd(), c"c").unwrap();
+        assert_eq!(std::fs::read(d.join("c")).unwrap(), b"x");
+        unlink_at(dir.as_fd(), c"c", false).unwrap();
+        std::fs::create_dir(d.join("sub")).unwrap();
+        unlink_at(dir.as_fd(), c"sub", true).unwrap();
+        assert!(!d.join("sub").exists() && !d.join("c").exists());
+        // A file is not a directory, and a link to one is not followed.
+        let not_dir = open_directory(&d.join("a"), false).unwrap_err();
+        assert_eq!(not_dir.raw_os_error(), Some(libc::ENOTDIR));
+        std::os::unix::fs::symlink(&d, d.join("l")).unwrap();
+        assert!(open_directory(&d.join("l"), true).is_err());
+        assert!(open_directory(&d.join("l"), false).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[cfg(feature = "local")]
     #[test]
     fn test_layout_local_matches_libc() {
@@ -2517,6 +2711,28 @@ mod layout {
             std::mem::offset_of!(SockaddrUn, sun_path),
             std::mem::offset_of!(libc::sockaddr_un, sun_path)
         );
+        assert_eq!(c::AT_SYMLINK_NOFOLLOW, libc::AT_SYMLINK_NOFOLLOW);
+        assert_eq!(c::AT_REMOVEDIR, libc::AT_REMOVEDIR);
+        assert_eq!(c::O_DIRECTORY, libc::O_DIRECTORY);
+        assert_eq!(c::O_NOFOLLOW, libc::O_NOFOLLOW);
+        assert_eq!(size_of::<ModeT>(), size_of::<libc::mode_t>());
+        // A mismatch in argument or return types fails to compile.
+        type Chmod = unsafe extern "C" fn(c_int, *const c_char, ModeT, c_int) -> c_int;
+        let _: Chmod = fchmodat;
+        let _: Chmod = libc::fchmodat;
+        type Chown = unsafe extern "C" fn(c_int, *const c_char, u32, u32, c_int) -> c_int;
+        let _: Chown = fchownat;
+        let _: Chown = libc::fchownat;
+        type Rename = unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char) -> c_int;
+        let _: Rename = renameat;
+        let _: Rename = libc::renameat;
+        type Link =
+            unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char, c_int) -> c_int;
+        let _: Link = linkat;
+        let _: Link = libc::linkat;
+        type Unlink = unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int;
+        let _: Unlink = unlinkat;
+        let _: Unlink = libc::unlinkat;
         for n in [0usize, 4, 8, 12, 4 * MAX_FDS] {
             #[allow(unused_unsafe)]
             // SAFETY: CMSG_SPACE and CMSG_LEN are arithmetic on their argument.

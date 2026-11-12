@@ -982,8 +982,24 @@ pub(crate) fn share_socket(sock: Sock<'_>, pid: u32) -> io::Result<[u8; SHARED_S
     Ok(out)
 }
 
-/// The socket a description from [`share_socket`] names. Windows hands back the same
-/// socket if a description is used twice, so the caller keeps each to one use.
+/// Serialises the inheritable check and the clearing of the flag in
+/// [`socket_from_shared`], so two hand-offs received at once cannot both see one
+/// fresh socket as unclaimed.
+#[cfg(feature = "local")]
+static CLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The socket a description from [`share_socket`] names, not inheritable.
+/// `AlreadyExists` when it names a socket this process already owns, through an
+/// earlier description or any other way: that one keeps its single owner, and
+/// nothing is closed.
+///
+/// Windows makes the socket in this process when the sender describes it, and the
+/// description names it by its handle value here, so a forged one can name any
+/// socket the process holds; `WSASocketW` then returns that socket. Windows also
+/// hands back the same socket when a description is used twice. A fresh
+/// duplicate is inheritable (the sender's flag), while every socket net-io or std
+/// makes is not, and adoption clears the flag: a socket that is not inheritable is
+/// already owned here and is left alone.
 #[cfg(feature = "local")]
 pub(crate) fn socket_from_shared(blob: &[u8; SHARED_SOCKET]) -> io::Result<OwnedSocket> {
     startup();
@@ -1006,8 +1022,47 @@ pub(crate) fn socket_from_shared(blob: &[u8; SHARED_SOCKET]) -> io::Result<Owned
     if s == c::INVALID_SOCKET {
         return Err(last_error());
     }
-    // SAFETY: `s` was just created, is open, and is owned by no one else.
-    Ok(unsafe { OwnedSocket::from_raw_socket(s as RawSocket) })
+    let claim = CLAIM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut flags = 0u32;
+    // SAFETY: `flags` is written during the call; a value that is not an open
+    // handle fails it. Nothing here takes ownership of `s` yet.
+    if unsafe { GetHandleInformation(s as *mut c_void, &raw mut flags) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & c::HANDLE_FLAG_INHERIT == 0 {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
+    // SAFETY: `s` is open and inheritable, so the sender's duplicate made it and
+    // nothing else in the process owns it.
+    let sock = unsafe { OwnedSocket::from_raw_socket(s as RawSocket) };
+    // The flag passed above does not reach a socket made from a description (the
+    // sender's duplicate is inheritable), so it is cleared here; that also marks
+    // the socket as owned for any later description that names it.
+    // SAFETY: the handle is open; clearing the flag is the call's documented use.
+    if unsafe { SetHandleInformation(s as *mut c_void, c::HANDLE_FLAG_INHERIT, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(claim);
+    Ok(sock)
+}
+
+#[cfg(feature = "local")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetHandleInformation(handle: *mut c_void, flags: *mut u32) -> i32;
+}
+
+/// Whether a process this one starts with handle inheritance would get `sock`.
+#[cfg(all(test, feature = "local"))]
+pub(crate) fn is_inheritable(sock: Sock<'_>) -> io::Result<bool> {
+    let mut flags = 0u32;
+    // SAFETY: the socket is open for the call; `flags` is written during it.
+    if unsafe { GetHandleInformation(raw(sock) as *mut c_void, &raw mut flags) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & c::HANDLE_FLAG_INHERIT != 0)
 }
 
 /// Bytes from the OS's preferred random source.

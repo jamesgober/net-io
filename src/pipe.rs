@@ -100,22 +100,33 @@ fn os_error(op: &'static str, e: io::Error) -> NetError {
     }
 }
 
-/// The name part of `\\.\pipe\<name>`: no backslash, within the OS's length.
+/// The longest name part: the OS takes at most 256 characters for the whole path,
+/// and `\\.\pipe\` is nine of them.
+const NAME_MAX: usize = 256 - 9;
+
+/// The name part of `\\.\pipe\<name>`. Windows rewrites a `\\.\` path before it
+/// opens it: `/` becomes `\`, and `.` and `..` components are resolved. So a name
+/// holds no separator of either kind and is not `.` or `..`; otherwise
+/// `../C:/file` would open a file, and `../UNC/host/share` a network path, instead
+/// of a pipe. A name with no separator is one component, so nothing in it can
+/// climb out of `\\.\pipe\`.
 fn check_name(name: &str) -> Result<Arc<PipeName>, NetError> {
-    if name.is_empty() || name.contains(['\\', '\0']) {
+    if name.is_empty() || name.contains(['\\', '/', '\0']) || name == "." || name == ".." {
         return Err(NetError::InvalidConfig {
             field: "name",
             reason: ConfigReason::Malformed,
         });
     }
-    PipeName::new(name)
-        .map(Arc::new)
-        .ok_or(NetError::InvalidConfig {
-            field: "name",
-            reason: ConfigReason::TooLarge {
-                max: PipeName::MAX as u64,
-            },
-        })
+    let too_long = NetError::InvalidConfig {
+        field: "name",
+        reason: ConfigReason::TooLarge {
+            max: NAME_MAX as u64,
+        },
+    };
+    if name.encode_utf16().count() > NAME_MAX {
+        return Err(too_long);
+    }
+    PipeName::new(name).map(Arc::new).ok_or(too_long)
 }
 
 /// Listens on `\\.\pipe\<name>`. Remote clients are always rejected, and the first
@@ -153,7 +164,8 @@ impl PipeListener {
     /// # Errors
     ///
     /// `PipeNameInUse` (another process owns the name: possible squatting),
-    /// `InvalidConfig` (a backslash, or an empty name, or bad SDDL),
+    /// `InvalidConfig` (an empty name, a `\` or `/`, the name `.` or `..`, more
+    /// than 247 characters, or bad SDDL),
     /// `PermissionDenied`, `Os`.
     pub fn create_with(name: &str, options: PipeOptions) -> Result<PipeListener, NetError> {
         let shared = check_name(name)?;
@@ -306,7 +318,8 @@ impl PipeConnection {
     /// # Errors
     ///
     /// `NotFound` (nobody serves the name), `PermissionDenied`,
-    /// `TimedOut { kind: Connect }`, `InvalidConfig`, `Os`.
+    /// `TimedOut { kind: Connect }`, `InvalidConfig` (a name `create_with` refuses),
+    /// `Os`.
     pub fn connect(name: &str, timeout: Duration) -> Result<PipeConnection, NetError> {
         let shared = check_name(name)?;
         let stream = sys::pipe_connect(name, timeout).map_err(|e| {
@@ -457,6 +470,15 @@ impl PipeConnection {
     /// The process at the far end, whichever end this is.
     pub(crate) fn peer_pid(&self) -> Result<u32, NetError> {
         self.inner.pipe_pid(self.info().origin == Origin::Dialed)
+    }
+
+    /// The pipe's handle, for tests that need its value.
+    #[cfg(test)]
+    pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
+        match &self.inner.link_ref().stream {
+            sys::Stream::Pipe(p) => p.raw(),
+            _ => std::ptr::null_mut(),
+        }
     }
 }
 
@@ -617,12 +639,37 @@ mod tests {
 
     #[test]
     fn test_names_are_checked_before_any_call() {
-        for bad in ["", "a\\b", "a\0b"] {
+        let long = "n".repeat(NAME_MAX + 1);
+        for bad in [
+            "",
+            "a\\b",
+            "a\0b",
+            "a/b",
+            ".",
+            "..",
+            "../C:/Windows/win.ini",
+            "../UNC/host/share",
+            "x/../../C:/file",
+            &long,
+        ] {
             assert!(matches!(
                 PipeListener::create(bad),
                 Err(NetError::InvalidConfig { .. })
             ));
+            assert!(
+                matches!(
+                    PipeConnection::connect(bad, Duration::from_millis(50)),
+                    Err(NetError::InvalidConfig { .. })
+                ),
+                "{bad:?}"
+            );
         }
+        // The longest name the OS takes still works.
+        let longest: String = format!("{}{}", name(), "n".repeat(NAME_MAX))
+            .chars()
+            .take(NAME_MAX)
+            .collect();
+        assert!(PipeListener::create(&longest).is_ok());
         assert!(matches!(
             PipeConnection::connect("nobody-serves-this-name", Duration::from_millis(50)),
             Err(NetError::NotFound)
