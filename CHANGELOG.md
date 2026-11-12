@@ -31,6 +31,12 @@
 - `Limits::first_request_grace` (D-189, default 1 s): a drain does not close a
   connection that was just accepted and has sent nothing yet, so a client that
   connected as the drain began still gets its first request answered.
+- `UdpOptions::source_prefix(PrefixPolicy)` and `UdpOptions::new_source_burst(n)`
+  (D-221): how UDP sources are grouped for their budgets, and how many datagrams
+  a new source may send at once. `UdpBudget::GLOBAL_DEFAULT` names the default
+  socket-wide budget.
+- `Stats::workers_lost` (D-211) and `Stats::workers_detached` (D-213).
+- `NoGate` implements `Gate` (D-215).
 
 ### Changed
 
@@ -51,6 +57,22 @@
   `remove_listener` still returns only once the group's sockets are closed.
 - A graceful close on the reactor that needs no linger no longer calls `shutdown`
   before `close`: the close sends the FIN itself, one system call fewer (D-198).
+- A drain, a shutdown, and `remove_listener` return at most about 2 s after their
+  deadline, even when a blocking handler never returns after its kill; the stop
+  then waits up to 2 s for its worker threads and leaves the rest running,
+  detached, counted in `Stats::workers_detached` (D-213). A detached thread keeps
+  its socket until its handler returns. A gate's `admit` must still return
+  promptly, since accept threads are joined without a bound.
+- A server builds without `.gate(..)`: `NoGate`, the builder's default, admits
+  every connection, as `AllowAll` does (D-215).
+- UDP budgets (D-221): a source is a prefix (`UdpOptions::source_prefix`, IPv4
+  /32 and IPv6 /64 by default), so one IPv6 host no longer gets a budget per
+  address; a source new to the table starts with a burst of 16
+  (`new_source_burst`) that fills to the full burst at the budget's rate; and
+  every socket now has a global budget by default (`UdpBudget::GLOBAL_DEFAULT`:
+  100,000 datagrams/s, 150 MB/s, bursts of 10,000). A server that expects more
+  than that must raise it with `UdpOptions::global_budget`. The source table
+  costs about 200 bytes per source, 12.5 MiB full (about 130 and 8.5 MiB before).
 
 ### Fixed
 
@@ -59,6 +81,52 @@
 - On the blocking driver, a drain whose deadline ended a graceful close's linger
   reported the close as `Killed(KillReason(0))`; it now keeps the close's own
   reason, as the reactor does, and the drain report counts it graceful (D-201).
+- A reactor worker whose loop ended on a panic or a failed wait kept receiving
+  its share of new connections, which nobody served, and `drain`,
+  `shutdown`, and the server's drop waited for them for ever. Such a worker is now
+  marked dead: it takes no more connections, what waited for it is closed, its
+  own listening socket of a per-worker group goes to the next live worker, and
+  `Stats::workers_lost` counts it; with no live worker left, new connections are
+  refused as `Busy` (D-211).
+- A connection dropped by an unwinding panic left its kill slot active, so a
+  `KillHandle` used later could shut down whatever socket then held the same
+  number. The slot now ends with the connection (D-212).
+- With `buffer_budget` unset, a reactor server with more than 512 workers was
+  refused as if it had the blocking pool's 64 MiB default; `build` and
+  `add_listener` now check the budget against the resolved driver's defaults
+  (D-214).
+- Linux: a file send (`sendfile`) to a peer that had reset raised SIGPIPE, which
+  ended a process that keeps the default disposition. SIGPIPE is now blocked on
+  the thread for the call (D-216).
+- `Operation::SendFile` with `len` 0 sent the rest of the file on Windows, macOS,
+  and FreeBSD; it now completes as `Ok(0)` with no system call on every platform
+  (D-217).
+- Linux: `recv_file` could lose bytes when the file failed after they had left
+  the socket, and place later bytes at the wrong offset. A file write failure is
+  now reported as `Os { op: "write" }` and closes the connection (D-218).
+- Unix: a signal during a blocking connect reported a failure; the connect now
+  goes on within its timeout (D-219).
+- A systemd take that failed part way left the descriptors it had not reached
+  open; it now closes every descriptor of its plan (D-220).
+- UDP receives (D-222): a non-blocking receive returned only when it found a
+  datagram within budget, so a flood of dropped datagrams held it; it now reports
+  nothing ready after 64 drops. Host and network unreachable, and on Unix
+  `EHOSTDOWN`, `ENONET`, `ENOPROTOOPT`, `EPROTO`, and `EMSGSIZE`, and on Windows
+  `WSAENETRESET`, are counted and skipped like a refused port instead of ending a
+  receive loop. `SIO_UDP_NETRESET` is switched off on Windows. `recv_batch` off
+  Linux leaves the socket in the mode it found it in.
+- A PROXY v2 LOCAL header with a family other than UNSPEC, or with a short
+  address block, was refused; LOCAL now ignores its address block whatever the
+  family, as the specification says (D-223).
+- Windows hand-off: once an adopted socket was closed and Windows reused its
+  handle value, a later hand-off naming that value was refused and its socket
+  leaked. The claim on a received socket is now its inherit flag (D-224).
+- Windows: `ListenOptions::reuse_address(true)` set `SO_REUSEADDR`, which lets
+  another local socket bind over a live listener. It is now ignored, and
+  listeners stay `SO_EXCLUSIVEADDRUSE` (D-225).
+- Windows: a graceful named-pipe close to a client that never reads held the
+  closing thread for a second each time. The closes of one thread now wait at
+  most one second in all, which comes back at 100 ms a second (D-226).
 
 ## [0.7.2] - 2026-11-11
 
