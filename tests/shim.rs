@@ -609,3 +609,38 @@ fn test_receive_timeout_error_closes_the_connection() {
     d.read_exact(&mut back).expect("served after the fault");
     assert_eq!(&back, b"ping");
 }
+
+/// Linux: a file error after bytes left the socket for the pipe fails the
+/// receive. Those bytes cannot be received again, so going on with plain receives
+/// would put the next bytes at the wrong offset, with a gap before them.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_recv_file_fails_when_the_file_fails_after_bytes_left_the_socket() {
+    let _shim = Shim::take();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let at = l.local_addr().expect("addr");
+    let peer = std::thread::spawn(move || {
+        let (mut c, _) = l.accept().expect("accept");
+        let _ = c.write_all(&[5u8; 256 << 10]);
+    });
+    let mut conn = net_io::connect(at).expect("connect");
+    let path = std::env::temp_dir().join(format!("nio-shim-file-{}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .expect("open");
+    // `splice` into the file is turned down, then the copy of the pipe's bytes fails.
+    program(Op::FileWrite, 0, 2, Fault::Os(22));
+    let got = conn.recv_file(&file, 0, 256 << 10);
+    drop(conn);
+    let _ = peer.join();
+    let _ = std::fs::remove_file(&path);
+    let err = got.expect_err("bytes were lost: the receive must fail");
+    assert!(
+        matches!(err, net_io::NetError::Os { op: "write", .. }),
+        "{err:?}"
+    );
+}

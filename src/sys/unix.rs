@@ -2,7 +2,8 @@
 //!
 //! Declarations come from the platforms' system headers; every constant,
 //! struct layout, and function signature is checked against `libc` by the
-//! `layout` tests at the bottom of this file. References: the Linux
+//! `layout` tests at the bottom of this file, on the targets the tests run on
+//! (a cross build checks the `const` size and alignment assertions only). References: the Linux
 //! man-pages project (`socket(7)`, `tcp(7)`, `ipv6(7)`, `poll(2)`, `send(2)`,
 //! `getrlimit(2)`, `fcntl(2)`) and the macOS man pages of the same names.
 
@@ -31,12 +32,14 @@ type Nfds = std::ffi::c_uint;
 #[cfg(target_os = "linux")]
 pub(crate) mod errno {
     pub const EPERM: i32 = 1;
+    pub const EINTR: i32 = 4;
     pub const EBADF: i32 = 9;
     pub const ENOMEM: i32 = 12;
     pub const EACCES: i32 = 13;
     pub const EINVAL: i32 = 22;
     pub const ENFILE: i32 = 23;
     pub const EMFILE: i32 = 24;
+    pub const EPIPE: i32 = 32;
     pub const ENONET: i32 = 64;
     pub const EPROTO: i32 = 71;
     pub const ENOTSOCK: i32 = 88;
@@ -47,22 +50,29 @@ pub(crate) mod errno {
     pub const ENETUNREACH: i32 = 101;
     pub const ECONNABORTED: i32 = 103;
     pub const ENOBUFS: i32 = 105;
+    #[cfg(feature = "local")]
+    pub const EISCONN: i32 = 106;
     pub const ETIMEDOUT: i32 = 110;
     pub const ECONNREFUSED: i32 = 111;
     pub const EHOSTDOWN: i32 = 112;
     pub const EHOSTUNREACH: i32 = 113;
+    #[cfg(feature = "local")]
+    pub const EALREADY: i32 = 114;
 }
 
 /// Error numbers net-io classifies (`intro(2)` on macOS, `errno(2)` on FreeBSD).
 #[cfg(not(target_os = "linux"))]
 pub(crate) mod errno {
     pub const EPERM: i32 = 1;
+    pub const EINTR: i32 = 4;
     pub const EBADF: i32 = 9;
     pub const ENOMEM: i32 = 12;
     pub const EACCES: i32 = 13;
     pub const EINVAL: i32 = 22;
     pub const ENFILE: i32 = 23;
     pub const EMFILE: i32 = 24;
+    #[cfg(feature = "local")]
+    pub const EALREADY: i32 = 37;
     pub const ENOTSOCK: i32 = 38;
     pub const ENOPROTOOPT: i32 = 42;
     pub const ENOTCONN: i32 = 57;
@@ -71,6 +81,8 @@ pub(crate) mod errno {
     pub const ENETUNREACH: i32 = 51;
     pub const ECONNABORTED: i32 = 53;
     pub const ENOBUFS: i32 = 55;
+    #[cfg(feature = "local")]
+    pub const EISCONN: i32 = 56;
     pub const ETIMEDOUT: i32 = 60;
     pub const ECONNREFUSED: i32 = 61;
     pub const EHOSTDOWN: i32 = 64;
@@ -193,6 +205,9 @@ mod c {
     pub const SHUT_RD: c_int = 0;
     pub const RLIMIT_NOFILE: c_int = 7;
     pub const EINPROGRESS: c_int = 115;
+    pub const SIGPIPE: c_int = 13;
+    pub const SIG_BLOCK: c_int = 0;
+    pub const SIG_UNBLOCK: c_int = 1;
     #[cfg(feature = "local")]
     pub const SO_PEERCRED: c_int = 17;
     #[cfg(feature = "local")]
@@ -272,6 +287,10 @@ mod c {
     pub const SO_NOSIGPIPE: c_int = 0x1022;
     #[cfg(target_os = "freebsd")]
     pub const SO_NOSIGPIPE: c_int = 0x0800;
+    #[cfg(target_os = "freebsd")]
+    pub const CPU_LEVEL_WHICH: c_int = 3;
+    #[cfg(target_os = "freebsd")]
+    pub const CPU_WHICH_TID: c_int = 1;
     #[cfg(target_os = "macos")]
     pub const SO_LINGER_SEC: c_int = 0x1080;
     /// FreeBSD's `SO_LINGER` is in seconds already.
@@ -449,11 +468,38 @@ struct Rlimit {
     rlim_max: u64,
 }
 
+/// `sigset_t` of glibc and musl: 1,024 bits, signal `n` at bit `n - 1`.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SigSet {
+    bits: [u64; 16],
+}
+
+#[cfg(target_os = "linux")]
+impl SigSet {
+    const EMPTY: SigSet = SigSet { bits: [0; 16] };
+
+    const fn only(sig: c_int) -> SigSet {
+        let mut set = SigSet::EMPTY;
+        let bit = (sig - 1) as usize;
+        set.bits[bit / 64] = 1 << (bit % 64);
+        set
+    }
+
+    const fn has(&self, sig: c_int) -> bool {
+        let bit = (sig - 1) as usize;
+        self.bits[bit / 64] & (1 << (bit % 64)) != 0
+    }
+}
+
 const _: () = assert!(size_of::<SockaddrIn>() == 16);
 const _: () = assert!(size_of::<SockaddrIn6>() == 28);
 const _: () = assert!(size_of::<Linger>() == 8);
 const _: () = assert!(size_of::<PollFd>() == 8);
 const _: () = assert!(size_of::<Rlimit>() == 16);
+#[cfg(target_os = "linux")]
+const _: () = assert!(size_of::<SigSet>() == 128 && align_of::<SigSet>() == 8);
 const _: () = assert!(size_of::<Timespec>() == 16 && align_of::<Timespec>() == 8);
 #[cfg(target_os = "linux")]
 const _: () = assert!(size_of::<MsgHdr>() == 56);
@@ -525,6 +571,12 @@ unsafe extern "C" {
     ) -> isize;
     #[cfg(target_os = "linux")]
     fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn pthread_sigmask(how: c_int, set: *const SigSet, old: *mut SigSet) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn sigpending(set: *mut SigSet) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn sigtimedwait(set: *const SigSet, info: *mut c_void, timeout: *const Timespec) -> c_int;
     #[cfg(target_os = "macos")]
     fn sendfile(
         file: c_int,
@@ -1113,68 +1165,130 @@ pub(crate) fn tcp_listener(addr: SocketAddr, p: &ListenParams) -> io::Result<Tcp
 }
 
 /// One `sendfile` on a non-blocking socket: `WouldBlock` when the buffer is full, `0`
-/// when the file has nothing at `offset`.
+/// when the file has nothing at `offset` or `len` is 0. Raises no SIGPIPE.
 pub(crate) fn send_file(
     sock: Sock<'_>,
     file: &std::fs::File,
     offset: u64,
     len: usize,
 ) -> io::Result<usize> {
+    // macOS and FreeBSD read a count of 0 as "to the end of the file".
+    if len == 0 {
+        return Ok(0);
+    }
     let raw_file = file.as_raw_fd();
     let start = i64::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    retry_interrupted(|| {
-        #[cfg(any(test, net_io_shim))]
-        let len = match super::shim::io(super::shim::Op::Send, len)? {
-            Some(n) => n,
-            None => len,
-        };
-        #[cfg(target_os = "linux")]
-        {
-            let mut at = start;
-            // SAFETY: both descriptors are open for the call, and `at` is a live local.
-            let n = unsafe { sendfile(sock.as_raw_fd(), raw_file, &raw mut at, len) };
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(n.unsigned_abs())
+    let once = || {
+        retry_interrupted(|| {
+            #[cfg(any(test, net_io_shim))]
+            let len = match super::shim::io(super::shim::Op::Send, len)? {
+                Some(n) => n,
+                None => len,
+            };
+            #[cfg(target_os = "linux")]
+            {
+                let mut at = start;
+                // SAFETY: both descriptors are open for the call, and `at` is a live local.
+                let n = unsafe { sendfile(sock.as_raw_fd(), raw_file, &raw mut at, len) };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n.unsigned_abs())
+                }
             }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let mut moved = len as i64;
-            // SAFETY: both descriptors are open for the call; no headers; `moved` is a
-            // live local that the call reads as the count and writes as the result.
-            let ret = unsafe {
-                sendfile(
-                    raw_file,
-                    sock.as_raw_fd(),
-                    start,
-                    &raw mut moved,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            sendfile_result(ret, moved)
-        }
-        #[cfg(target_os = "freebsd")]
-        {
-            let mut moved = 0i64;
-            // SAFETY: both descriptors are open for the call; no headers; `moved` is a
-            // live local written during the call.
-            let ret = unsafe {
-                sendfile(
-                    raw_file,
-                    sock.as_raw_fd(),
-                    start,
-                    len,
-                    std::ptr::null_mut(),
-                    &raw mut moved,
-                    0,
-                )
-            };
-            sendfile_result(ret, moved)
-        }
-    })
+            #[cfg(target_os = "macos")]
+            {
+                let mut moved = len as i64;
+                // SAFETY: both descriptors are open for the call; no headers; `moved` is a
+                // live local that the call reads as the count and writes as the result.
+                let ret = unsafe {
+                    sendfile(
+                        raw_file,
+                        sock.as_raw_fd(),
+                        start,
+                        &raw mut moved,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                sendfile_result(ret, moved)
+            }
+            #[cfg(target_os = "freebsd")]
+            {
+                let mut moved = 0i64;
+                // SAFETY: both descriptors are open for the call; no headers; `moved` is a
+                // live local written during the call.
+                let ret = unsafe {
+                    sendfile(
+                        raw_file,
+                        sock.as_raw_fd(),
+                        start,
+                        len,
+                        std::ptr::null_mut(),
+                        &raw mut moved,
+                        0,
+                    )
+                };
+                sendfile_result(ret, moved)
+            }
+        })
+    };
+    // Linux `sendfile` takes no flags, so `MSG_NOSIGNAL` cannot reach it.
+    without_sigpipe(once)
+}
+
+/// Runs `send`, a write to a socket that cannot take `MSG_NOSIGNAL` (Linux
+/// `sendfile`), so that it raises no SIGPIPE whatever the process's disposition
+/// (FR-63). SIGPIPE is blocked on this thread for the call, and one the call raised
+/// (it failed with `EPIPE`) is taken off the pending set before SIGPIPE is
+/// unblocked. A SIGPIPE pending before the call (only possible when the thread had
+/// it blocked already) is left for its owner. Cost: two `rt_sigprocmask` calls per
+/// send, plus one `sigtimedwait` after an `EPIPE`; a thread that blocks SIGPIPE
+/// itself pays one `rt_sigprocmask` and one `rt_sigpending` instead.
+#[cfg(target_os = "linux")]
+fn without_sigpipe<T>(send: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let pipe = SigSet::only(c::SIGPIPE);
+    let mut old = SigSet::EMPTY;
+    // SAFETY: both sets are live and laid out as the C library's `sigset_t`;
+    // pthread_sigmask(3) changes only the calling thread's mask.
+    let ret = unsafe { pthread_sigmask(c::SIG_BLOCK, &raw const pipe, &raw mut old) };
+    if ret != 0 {
+        return Err(io::Error::from_raw_os_error(ret));
+    }
+    let was_blocked = old.has(c::SIGPIPE);
+    let pending_before = was_blocked && sigpipe_pending();
+    let result = send();
+    if !pending_before && matches!(&result, Err(e) if e.raw_os_error() == Some(errno::EPIPE)) {
+        let zero = Timespec::default();
+        // A zero timeout returns at once: with the SIGPIPE the call raised, or with
+        // EAGAIN when it raised none (an injected error).
+        let _ = retry_interrupted(|| {
+            // SAFETY: `pipe` and `zero` are live; sigtimedwait(2) allows a null `info`.
+            cvt(unsafe { sigtimedwait(&raw const pipe, std::ptr::null_mut(), &raw const zero) })
+        });
+    }
+    if !was_blocked {
+        // SAFETY: as above; this only undoes the block made here.
+        let _ = unsafe { pthread_sigmask(c::SIG_UNBLOCK, &raw const pipe, std::ptr::null_mut()) };
+    }
+    result
+}
+
+/// macOS and FreeBSD: `SO_NOSIGPIPE`, which net-io sets on every socket it creates
+/// or accepts, covers `sendfile` too.
+#[cfg(not(target_os = "linux"))]
+fn without_sigpipe<T>(send: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    send()
+}
+
+/// Whether a SIGPIPE is pending for this thread or the process; `true` when that
+/// cannot be read, so that nothing is taken off the pending set.
+#[cfg(target_os = "linux")]
+fn sigpipe_pending() -> bool {
+    let mut set = SigSet::EMPTY;
+    // SAFETY: `set` is live and laid out as `sigset_t`; sigpending(2) only writes it.
+    let ret = unsafe { sigpending(&raw mut set) };
+    ret != 0 || set.has(c::SIGPIPE)
 }
 
 /// On the BSDs a call that stopped at a full buffer fails and still reports its bytes.
@@ -1202,6 +1316,8 @@ pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) ->
 
 /// Writes all of `buf` to `file` at `offset`, leaving its position alone.
 pub(crate) fn write_file_at(file: &std::fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::FileWrite)?;
     std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
 }
 
@@ -1233,12 +1349,35 @@ pub(crate) fn splice_pipe() -> io::Result<SplicePipe> {
     })
 }
 
+/// How a receive into a file through a pipe failed.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) enum SpliceError {
+    /// Before any byte left the socket. A `send_file_refused` error means the socket
+    /// cannot be spliced and the bytes can still be received by copying; any other is
+    /// the receive's own failure.
+    Socket(io::Error),
+    /// After bytes left the socket for the pipe, writing them into the file failed.
+    /// They cannot be received again, so the transfer has failed, whatever the error.
+    File(io::Error),
+}
+
+/// A receive into a file through a pipe.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Spliced {
+    /// Bytes now in the file; 0 is the peer's FIN.
+    pub(crate) bytes: usize,
+    /// The file turned `splice` down, so these bytes were copied out of the pipe;
+    /// later receives into this file should copy from the start.
+    pub(crate) file_refused: bool,
+}
+
 /// One receive of at most `len` bytes (at most the pipe's 64 KiB) from `sock` into
 /// `file` at `offset`, through `pipe`, without copying through user space: blocks
-/// like `recv` (under `SO_RCVTIMEO`), and 0 is the peer's FIN. Bytes that reached the
-/// pipe always reach the file: if the file turns `splice` down after them, they are
-/// read out of the pipe and written instead. `send_file_refused` errors before any
-/// byte moved mean the socket cannot be spliced, and the caller receives by copying.
+/// like `recv` (under `SO_RCVTIMEO`). Bytes that reached the pipe reach the file or
+/// the call fails with `SpliceError::File`: if the file turns `splice` down after
+/// them, they are read out of the pipe and written instead.
 #[cfg(target_os = "linux")]
 pub(crate) fn splice_to_file(
     sock: Sock<'_>,
@@ -1246,8 +1385,9 @@ pub(crate) fn splice_to_file(
     file: &std::fs::File,
     offset: u64,
     len: usize,
-) -> io::Result<usize> {
-    let start = i64::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+) -> Result<Spliced, SpliceError> {
+    let start = i64::try_from(offset)
+        .map_err(|_| SpliceError::Socket(io::Error::from(io::ErrorKind::InvalidInput)))?;
     let len = len.min(64 << 10);
     let n = retry_interrupted(|| {
         #[cfg(any(test, net_io_shim))]
@@ -1272,43 +1412,69 @@ pub(crate) fn splice_to_file(
         } else {
             Ok(n.unsigned_abs())
         }
-    })?;
+    })
+    .map_err(SpliceError::Socket)?;
+    // From here on the bytes are out of the socket: every failure is the file's.
     let mut moved = 0usize;
+    let mut file_refused = false;
     while moved < n {
-        let mut at = start + moved as i64;
-        // SAFETY: both descriptors are open for the call, and `at` is a live local
-        // the call reads and advances.
-        let m = unsafe {
-            splice(
-                pipe.read.as_raw_fd(),
-                std::ptr::null_mut(),
-                file.as_raw_fd(),
-                &raw mut at,
-                n - moved,
-                SPLICE_F_MOVE,
-            )
-        };
-        if m > 0 {
-            moved += m.unsigned_abs();
-            continue;
-        }
-        let e = io::Error::last_os_error();
-        if m < 0 && e.kind() == io::ErrorKind::Interrupted {
-            continue;
+        match splice_into_file(pipe, file, start + moved as i64, n - moved) {
+            Ok(m) if m > 0 => {
+                moved += m;
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            _ => {}
         }
         // The file turned it down (or wrote nothing): copy what the pipe holds.
+        file_refused = true;
         let mut rest = [0u8; 4096];
         while moved < n {
             let want = (n - moved).min(rest.len());
-            let got = retry_interrupted(|| io::Read::read(&mut &pipe.read, &mut rest[..want]))?;
+            let got = retry_interrupted(|| io::Read::read(&mut &pipe.read, &mut rest[..want]))
+                .map_err(SpliceError::File)?;
             if got == 0 {
-                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                return Err(SpliceError::File(io::Error::from(
+                    io::ErrorKind::UnexpectedEof,
+                )));
             }
-            write_file_at(file, &rest[..got], offset + moved as u64)?;
+            write_file_at(file, &rest[..got], offset + moved as u64).map_err(SpliceError::File)?;
             moved += got;
         }
     }
-    Ok(n)
+    Ok(Spliced {
+        bytes: n,
+        file_refused,
+    })
+}
+
+/// One `splice` of up to `len` bytes from `pipe` into `file` at `at`.
+#[cfg(target_os = "linux")]
+fn splice_into_file(
+    pipe: &SplicePipe,
+    file: &std::fs::File,
+    mut at: i64,
+    len: usize,
+) -> io::Result<usize> {
+    #[cfg(any(test, net_io_shim))]
+    super::shim::check(super::shim::Op::FileWrite)?;
+    // SAFETY: both descriptors are open for the call, and `at` is a live local
+    // the call reads and advances.
+    let m = unsafe {
+        splice(
+            pipe.read.as_raw_fd(),
+            std::ptr::null_mut(),
+            file.as_raw_fd(),
+            &raw mut at,
+            len,
+            SPLICE_F_MOVE,
+        )
+    };
+    if m < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(m.unsigned_abs())
+    }
 }
 
 /// Whether this OS can pin a thread.
@@ -1336,11 +1502,9 @@ pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
 /// Pins the calling thread to `cpu`.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
-    const CPU_LEVEL_WHICH: c_int = 3;
-    const CPU_WHICH_TID: c_int = 1;
     let mask = cpu_mask(cpu)?;
     // SAFETY: id -1 means the calling thread; `mask` is live, and 32 bytes is `cpuset_t`.
-    cvt(unsafe { cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 32, mask.as_ptr()) })
+    cvt(unsafe { cpuset_setaffinity(c::CPU_LEVEL_WHICH, c::CPU_WHICH_TID, -1, 32, mask.as_ptr()) })
         .map(drop)
 }
 
@@ -1430,7 +1594,9 @@ pub(crate) fn connect_start(sock: Sock<'_>, addr: SocketAddr) -> io::Result<bool
         return Ok(false);
     }
     let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(c::EINPROGRESS) {
+    // connect(2): an interrupted connect is not aborted and completes asynchronously,
+    // as one in progress does; the caller waits for writability and reads `SO_ERROR`.
+    if matches!(err.raw_os_error(), Some(c::EINPROGRESS | errno::EINTR)) {
         Ok(true)
     } else {
         Err(err)
@@ -1758,6 +1924,14 @@ pub(crate) fn dup_to(sock: Sock<'_>, target: RawFd) -> io::Result<()> {
 pub(crate) fn close_number(fd: RawFd) {
     // SAFETY: `fd` was placed by `dup_to` and has no owner.
     drop(unsafe { OwnedFd::from_raw_fd(fd) });
+}
+
+/// Whether descriptor number `fd` is open (tests only).
+#[cfg(test)]
+pub(crate) fn is_open(fd: RawFd) -> bool {
+    // SAFETY: F_GETFD only reads the descriptor's flags; on a closed number it
+    // fails with EBADF and touches nothing.
+    unsafe { fcntl(fd, c::F_GETFD) != -1 }
 }
 
 /// Accepts one connection. On Linux `std` uses `accept4(SOCK_CLOEXEC)` and the
@@ -2711,14 +2885,76 @@ pub(crate) fn unix_listen(sock: Sock<'_>, backlog: u32) -> io::Result<()> {
 }
 
 /// Connects a blocking Unix socket to `path`. On Linux a full backlog makes this
-/// wait up to the socket's send timeout (`SO_SNDTIMEO`).
+/// wait up to the socket's send timeout (`SO_SNDTIMEO`); a signal during that wait
+/// does not fail it (FR-64).
 #[cfg(feature = "local")]
 pub(crate) fn unix_connect(sock: Sock<'_>, path: &[u8]) -> io::Result<()> {
     #[cfg(any(test, net_io_shim))]
     super::shim::check(super::shim::Op::Connect)?;
     let (sa, len) = encode_unix(path)?;
-    // SAFETY: as in `unix_bind`.
-    cvt(unsafe { connect(sock.as_raw_fd(), (&raw const sa).cast::<c_void>(), len) }).map(drop)
+    let connect_once = || {
+        // SAFETY: as in `unix_bind`.
+        cvt(unsafe { connect(sock.as_raw_fd(), (&raw const sa).cast::<c_void>(), len) }).map(drop)
+    };
+    match connect_once() {
+        Err(e) if e.raw_os_error() == Some(errno::EINTR) => {
+            connect_after_interrupt(sock, connect_once)
+        }
+        other => other,
+    }
+}
+
+/// The rest of a blocking connect that a signal interrupted, within what is left
+/// of the socket's send timeout, counted from the interruption. connect(2) leaves
+/// the attempt going on (the BSDs) or, for a Linux Unix socket that waited for room
+/// in a full backlog, drops it and leaves the socket unconnected. So: wait until the
+/// socket is writable, read `SO_ERROR`, and if it has no peer yet, connect again.
+#[cfg(feature = "local")]
+fn connect_after_interrupt(
+    sock: Sock<'_>,
+    connect_once: impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    use std::time::Instant;
+    // SAFETY: `sock` is open for the call; `ManuallyDrop` keeps this temporary
+    // view from closing the descriptor it borrows.
+    let view = std::mem::ManuallyDrop::new(unsafe {
+        std::os::unix::net::UnixStream::from_raw_fd(sock.as_raw_fd())
+    });
+    let timeout = view.write_timeout()?;
+    // A send timeout too large for an `Instant` is no deadline.
+    let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
+    // What is left before the deadline; `WouldBlock` once it has passed, the error a
+    // blocking connect reports when its send timeout runs out.
+    let left = || match deadline {
+        None => Ok(None),
+        Some(d) => match d.checked_duration_since(Instant::now()) {
+            Some(t) if !t.is_zero() => Ok(Some(t)),
+            _ => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        },
+    };
+    loop {
+        if wait(sock, Interest::Write, None, left()?)? == Ready::TimedOut {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        if let Some(e) = take_error(sock)? {
+            return Err(e);
+        }
+        if has_peer(sock)? {
+            return Ok(());
+        }
+        // Dropped: connect again, for no longer than is left.
+        view.set_write_timeout(left()?)?;
+        let again = connect_once();
+        view.set_write_timeout(timeout)?;
+        match again {
+            Ok(()) => return Ok(()),
+            Err(e) => match e.raw_os_error() {
+                Some(errno::EISCONN) => return Ok(()),
+                Some(errno::EINTR | errno::EALREADY | c::EINPROGRESS) => {}
+                _ => return Err(e),
+            },
+        }
+    }
 }
 
 /// Accepts one Unix connection from a non-blocking listener and sets it up for
@@ -2809,6 +3045,8 @@ mod layout {
             }
             assert_eq!(c::F_SETFD, libc::F_SETFD);
             assert_eq!(c::FD_CLOEXEC, libc::FD_CLOEXEC);
+            #[cfg(target_os = "freebsd")]
+            assert_eq!(c::SOCK_CLOEXEC, libc::SOCK_CLOEXEC);
         }
     }
 
@@ -2816,6 +3054,16 @@ mod layout {
     fn test_layout_errno_match_libc() {
         use errno::*;
         assert_eq!(EPERM, libc::EPERM);
+        assert_eq!(EINTR, libc::EINTR);
+        #[cfg(target_os = "linux")]
+        assert_eq!(EPIPE, libc::EPIPE);
+        #[cfg(feature = "local")]
+        {
+            assert_eq!(EALREADY, libc::EALREADY);
+            assert_eq!(EISCONN, libc::EISCONN);
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(ENOTCONN, libc::ENOTCONN);
         assert_eq!(EBADF, libc::EBADF);
         assert_eq!(ENOMEM, libc::ENOMEM);
         assert_eq!(EACCES, libc::EACCES);
@@ -2825,8 +3073,6 @@ mod layout {
         assert_eq!(EPROTO, libc::EPROTO);
         assert_eq!(ENOTSOCK, libc::ENOTSOCK);
         assert_eq!(ENOPROTOOPT, libc::ENOPROTOOPT);
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(ENOTCONN, libc::ENOTCONN);
         assert_eq!(EOPNOTSUPP, libc::EOPNOTSUPP);
         assert_eq!(EADDRINUSE, libc::EADDRINUSE);
         assert_eq!(EADDRNOTAVAIL, libc::EADDRNOTAVAIL);
@@ -2858,6 +3104,30 @@ mod layout {
         assert_eq!(
             std::mem::offset_of!(MsgHdr, msg_flags),
             std::mem::offset_of!(libc::msghdr, msg_flags)
+        );
+        assert_eq!(
+            std::mem::offset_of!(MsgHdr, msg_iov),
+            std::mem::offset_of!(libc::msghdr, msg_iov)
+        );
+        assert_eq!(
+            std::mem::offset_of!(MsgHdr, msg_control),
+            std::mem::offset_of!(libc::msghdr, msg_control)
+        );
+        assert_eq!(
+            std::mem::offset_of!(MsgHdr, msg_controllen),
+            std::mem::offset_of!(libc::msghdr, msg_controllen)
+        );
+        assert_eq!(
+            std::mem::offset_of!(Rlimit, rlim_max),
+            std::mem::offset_of!(libc::rlimit, rlim_max)
+        );
+        assert_eq!(
+            std::mem::offset_of!(Linger, l_linger),
+            std::mem::offset_of!(libc::linger, l_linger)
+        );
+        assert_eq!(
+            std::mem::offset_of!(Timespec, tv_nsec),
+            std::mem::offset_of!(libc::timespec, tv_nsec)
         );
         assert_eq!(size_of::<IoSlice<'_>>(), size_of::<libc::iovec>());
         assert_eq!(
@@ -2922,8 +3192,16 @@ mod layout {
             assert_eq!(c::MSG_CMSG_CLOEXEC, libc::MSG_CMSG_CLOEXEC);
             assert_eq!(size_of::<Ucred>(), size_of::<libc::ucred>());
             assert_eq!(
+                std::mem::offset_of!(Ucred, pid),
+                std::mem::offset_of!(libc::ucred, pid)
+            );
+            assert_eq!(
                 std::mem::offset_of!(Ucred, uid),
                 std::mem::offset_of!(libc::ucred, uid)
+            );
+            assert_eq!(
+                std::mem::offset_of!(Ucred, gid),
+                std::mem::offset_of!(libc::ucred, gid)
             );
         }
         #[cfg(target_os = "macos")]
@@ -2934,13 +3212,31 @@ mod layout {
         #[cfg(target_os = "freebsd")]
         {
             assert_eq!(size_of::<Xucred>(), size_of::<libc::xucred>());
+            assert_eq!(
+                std::mem::offset_of!(Xucred, cr_uid),
+                std::mem::offset_of!(libc::xucred, cr_uid)
+            );
+            assert_eq!(
+                std::mem::offset_of!(Xucred, cr_groups),
+                std::mem::offset_of!(libc::xucred, cr_groups)
+            );
+            // libc names the union that holds `cr_pid`.
+            assert_eq!(
+                std::mem::offset_of!(Xucred, cr_pid),
+                std::mem::offset_of!(libc::xucred, cr_pid__c_anonymous_union)
+            );
             assert_eq!(c::SOL_LOCAL, libc::SOL_LOCAL);
             assert_eq!(c::LOCAL_PEERCRED, libc::LOCAL_PEERCRED);
+            assert_eq!(c::MSG_CMSG_CLOEXEC, libc::MSG_CMSG_CLOEXEC);
         }
         assert_eq!(size_of::<CmsgHdr>(), size_of::<libc::cmsghdr>());
         assert_eq!(
             std::mem::offset_of!(CmsgHdr, cmsg_level),
             std::mem::offset_of!(libc::cmsghdr, cmsg_level)
+        );
+        assert_eq!(
+            std::mem::offset_of!(CmsgHdr, cmsg_type),
+            std::mem::offset_of!(libc::cmsghdr, cmsg_type)
         );
         assert_eq!(size_of::<SockaddrUn>(), size_of::<libc::sockaddr_un>());
         assert_eq!(
@@ -3185,6 +3481,35 @@ mod layout {
         assert_eq!(c::SOCK_DGRAM, libc::SOCK_DGRAM);
         assert_eq!(c::MSG_TRUNC, libc::MSG_TRUNC);
         assert!(size_of::<AddrBuf>() >= size_of::<libc::sockaddr_storage>());
+        assert_eq!(c::IPV6_RECVPKTINFO, libc::IPV6_RECVPKTINFO);
+        assert_eq!(c::IPV6_PKTINFO_TYPE, libc::IPV6_PKTINFO);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(c::MSG_WAITFORONE, libc::MSG_WAITFORONE);
+            assert_eq!(size_of::<MmsgHdr>(), size_of::<libc::mmsghdr>());
+            assert_eq!(
+                std::mem::offset_of!(MmsgHdr, len),
+                std::mem::offset_of!(libc::mmsghdr, msg_len)
+            );
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            // One value both asks for the record and labels it (`IP_PKTINFO` on Linux;
+            // macOS names the option `IP_RECVPKTINFO`, also 26, which `libc` omits).
+            assert_eq!(c::IP_RECVPKTINFO, libc::IP_PKTINFO);
+            assert_eq!(c::IP_PKTINFO_TYPE, libc::IP_PKTINFO);
+            assert_eq!(
+                c::PKTINFO_ADDR_AT,
+                std::mem::offset_of!(libc::in_pktinfo, ipi_addr)
+            );
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            // `IP_RECVDSTADDR`: the record is a bare `in_addr`.
+            assert_eq!(c::IP_RECVPKTINFO, libc::IP_RECVDSTADDR);
+            assert_eq!(c::IP_PKTINFO_TYPE, libc::IP_RECVDSTADDR);
+            assert_eq!(c::PKTINFO_ADDR_AT, 0);
+        }
     }
 
     #[cfg(feature = "udp")]
@@ -3292,17 +3617,215 @@ mod layout {
         }
     }
 
+    /// Every function declared above, against `libc`: a different count, order, or
+    /// type of an argument or of the result fails to compile. Where a declaration
+    /// takes a pointer to a struct of this file (or an untyped address), `libc`'s
+    /// function is assigned to the same shape with `libc`'s struct in that place, and
+    /// the pair of structs is compared by the layout tests above.
     #[test]
     fn test_layout_signatures_match_libc() {
-        // A mismatch in argument or return types fails to compile.
-        let _: unsafe extern "C" fn(c_int, c_int, c_int) -> c_int = socket;
-        let _: unsafe extern "C" fn(c_int, c_int, c_int) -> c_int = libc::socket;
-        let _: unsafe extern "C" fn(c_int, c_int) -> c_int = listen;
-        let _: unsafe extern "C" fn(c_int, c_int) -> c_int = libc::listen;
-        let _: unsafe extern "C" fn(c_int, c_int) -> c_int = shutdown;
-        let _: unsafe extern "C" fn(c_int, c_int) -> c_int = libc::shutdown;
-        let _: unsafe extern "C" fn(c_int, *const c_void, usize, c_int) -> isize = c_send;
-        let _: unsafe extern "C" fn(c_int, *const c_void, usize, c_int) -> isize = libc::send;
+        type Fd3 = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
+        let (_, _): (Fd3, Fd3) = (socket, libc::socket);
+        type Fd2 = unsafe extern "C" fn(c_int, c_int) -> c_int;
+        let (_, _): (Fd2, Fd2) = (listen, libc::listen);
+        let (_, _): (Fd2, Fd2) = (shutdown, libc::shutdown);
+        let _: unsafe extern "C" fn(c_int, *const c_void, SockLen) -> c_int = bind;
+        let _: unsafe extern "C" fn(c_int, *const libc::sockaddr, SockLen) -> c_int = libc::bind;
+        let _: unsafe extern "C" fn(c_int, *const c_void, SockLen) -> c_int = connect;
+        let _: unsafe extern "C" fn(c_int, *const libc::sockaddr, SockLen) -> c_int = libc::connect;
+        type SetOpt = unsafe extern "C" fn(c_int, c_int, c_int, *const c_void, SockLen) -> c_int;
+        let (_, _): (SetOpt, SetOpt) = (setsockopt, libc::setsockopt);
+        type GetOpt = unsafe extern "C" fn(c_int, c_int, c_int, *mut c_void, *mut SockLen) -> c_int;
+        let (_, _): (GetOpt, GetOpt) = (getsockopt, libc::getsockopt);
+        type Send = unsafe extern "C" fn(c_int, *const c_void, usize, c_int) -> isize;
+        let (_, _): (Send, Send) = (c_send, libc::send);
+        let _: unsafe extern "C" fn(c_int, *const MsgHdr, c_int) -> isize = sendmsg;
+        let _: unsafe extern "C" fn(c_int, *const libc::msghdr, c_int) -> isize = libc::sendmsg;
+        let _: unsafe extern "C" fn(*mut PollFd, Nfds, c_int) -> c_int = poll;
+        let _: unsafe extern "C" fn(*mut libc::pollfd, Nfds, c_int) -> c_int = libc::poll;
+        let _: unsafe extern "C" fn(c_int, *mut Rlimit) -> c_int = getrlimit;
+        // glibc takes the resource as unsigned: the same size, and every value used fits.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let _: unsafe extern "C" fn(std::ffi::c_uint, *mut libc::rlimit) -> c_int = libc::getrlimit;
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        let _: unsafe extern "C" fn(c_int, *mut libc::rlimit) -> c_int = libc::getrlimit;
+        type Fcntl = unsafe extern "C" fn(c_int, c_int, ...) -> c_int;
+        let (_, _): (Fcntl, Fcntl) = (fcntl, libc::fcntl);
+        type Name = unsafe extern "C" fn(c_int, *mut c_void, *mut SockLen) -> c_int;
+        type LibcName = unsafe extern "C" fn(c_int, *mut libc::sockaddr, *mut SockLen) -> c_int;
+        let (_, _): (Name, LibcName) = (getsockname, libc::getsockname);
+        let (_, _): (Name, LibcName) = (getpeername, libc::getpeername);
+        let _: unsafe extern "C" fn(c_int, *mut Timespec) -> c_int = clock_gettime;
+        // macOS declares `clockid_t` as an unsigned enum: the same size, and the value fits.
+        #[cfg(target_os = "macos")]
+        type ClockId = std::ffi::c_uint;
+        #[cfg(not(target_os = "macos"))]
+        type ClockId = c_int;
+        let _: unsafe extern "C" fn(ClockId, *mut libc::timespec) -> c_int = libc::clock_gettime;
+        #[cfg(target_os = "linux")]
+        {
+            let _: unsafe extern "C" fn(c_int, usize, *const u64) -> c_int = sched_setaffinity;
+            let _: unsafe extern "C" fn(c_int, usize, *const libc::cpu_set_t) -> c_int =
+                libc::sched_setaffinity;
+            assert_eq!(size_of::<[u64; 16]>(), size_of::<libc::cpu_set_t>());
+            type SendFile = unsafe extern "C" fn(c_int, c_int, *mut i64, usize) -> isize;
+            let (_, _): (SendFile, SendFile) = (sendfile, libc::sendfile);
+            type Splice = unsafe extern "C" fn(
+                c_int,
+                *mut i64,
+                c_int,
+                *mut i64,
+                usize,
+                std::ffi::c_uint,
+            ) -> isize;
+            let (_, _): (Splice, Splice) = (splice, libc::splice);
+            type Pipe2 = unsafe extern "C" fn(*mut c_int, c_int) -> c_int;
+            let (_, _): (Pipe2, Pipe2) = (pipe2, libc::pipe2);
+            type Syscall = unsafe extern "C" fn(std::ffi::c_long, ...) -> std::ffi::c_long;
+            let (_, _): (Syscall, Syscall) = (syscall, libc::syscall);
+            let _: unsafe extern "C" fn(c_int, *const SigSet, *mut SigSet) -> c_int =
+                pthread_sigmask;
+            let _: unsafe extern "C" fn(
+                c_int,
+                *const libc::sigset_t,
+                *mut libc::sigset_t,
+            ) -> c_int = libc::pthread_sigmask;
+            let _: unsafe extern "C" fn(*mut SigSet) -> c_int = sigpending;
+            let _: unsafe extern "C" fn(*mut libc::sigset_t) -> c_int = libc::sigpending;
+            let _: unsafe extern "C" fn(*const SigSet, *mut c_void, *const Timespec) -> c_int =
+                sigtimedwait;
+            let _: unsafe extern "C" fn(
+                *const libc::sigset_t,
+                *mut libc::siginfo_t,
+                *const libc::timespec,
+            ) -> c_int = libc::sigtimedwait;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _: unsafe extern "C" fn(c_int, c_int, i64, *mut i64, *mut c_void, c_int) -> c_int =
+                sendfile;
+            let _: unsafe extern "C" fn(
+                c_int,
+                c_int,
+                i64,
+                *mut i64,
+                *mut libc::sf_hdtr,
+                c_int,
+            ) -> c_int = libc::sendfile;
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            let _: unsafe extern "C" fn(
+                c_int,
+                c_int,
+                i64,
+                usize,
+                *mut c_void,
+                *mut i64,
+                c_int,
+            ) -> c_int = sendfile;
+            let _: unsafe extern "C" fn(
+                c_int,
+                c_int,
+                i64,
+                usize,
+                *mut libc::sf_hdtr,
+                *mut i64,
+                c_int,
+            ) -> c_int = libc::sendfile;
+            let _: unsafe extern "C" fn(c_int, c_int, i64, usize, *const u64) -> c_int =
+                cpuset_setaffinity;
+            let _: unsafe extern "C" fn(c_int, c_int, i64, usize, *const libc::cpuset_t) -> c_int =
+                libc::cpuset_setaffinity;
+            // `pin_current_thread` passes 32 bytes of its mask, the size of `cpuset_t`.
+            assert_eq!(size_of::<libc::cpuset_t>(), 32);
+            assert_eq!(c::CPU_LEVEL_WHICH, libc::CPU_LEVEL_WHICH);
+            assert_eq!(c::CPU_WHICH_TID, libc::CPU_WHICH_TID);
+        }
+        #[cfg(feature = "local")]
+        {
+            type Euid = unsafe extern "C" fn() -> u32;
+            let (_, _): (Euid, Euid) = (geteuid, libc::geteuid);
+        }
+        #[cfg(all(feature = "local", not(target_os = "linux")))]
+        {
+            type PeerEid = unsafe extern "C" fn(c_int, *mut u32, *mut u32) -> c_int;
+            let (_, _): (PeerEid, PeerEid) = (getpeereid, libc::getpeereid);
+        }
+        #[cfg(any(feature = "local", feature = "udp"))]
+        {
+            let _: unsafe extern "C" fn(c_int, *mut MsgHdr, c_int) -> isize = recvmsg;
+            let _: unsafe extern "C" fn(c_int, *mut libc::msghdr, c_int) -> isize = libc::recvmsg;
+        }
+        #[cfg(all(feature = "udp", target_os = "linux"))]
+        {
+            let _: unsafe extern "C" fn(
+                c_int,
+                *mut MmsgHdr,
+                std::ffi::c_uint,
+                c_int,
+                *mut c_void,
+            ) -> c_int = recvmmsg;
+            let _: unsafe extern "C" fn(c_int, *mut MmsgHdr, std::ffi::c_uint, c_int) -> c_int =
+                sendmmsg;
+            // musl takes the flags as unsigned: the same size, and every flag used fits.
+            #[cfg(target_env = "gnu")]
+            type Flags = c_int;
+            #[cfg(not(target_env = "gnu"))]
+            type Flags = std::ffi::c_uint;
+            let _: unsafe extern "C" fn(
+                c_int,
+                *mut libc::mmsghdr,
+                std::ffi::c_uint,
+                Flags,
+                *mut libc::timespec,
+            ) -> c_int = libc::recvmmsg;
+            let _: unsafe extern "C" fn(
+                c_int,
+                *mut libc::mmsghdr,
+                std::ffi::c_uint,
+                Flags,
+            ) -> c_int = libc::sendmmsg;
+            let _: unsafe extern "C" fn(
+                c_int,
+                *mut c_void,
+                usize,
+                c_int,
+                *mut c_void,
+                *mut SockLen,
+            ) -> isize = recvfrom;
+            let _: unsafe extern "C" fn(
+                c_int,
+                *mut c_void,
+                usize,
+                c_int,
+                *mut libc::sockaddr,
+                *mut SockLen,
+            ) -> isize = libc::recvfrom;
+        }
+    }
+
+    /// `SigSet` holds a signal where the C library does, and is its size.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_layout_signal_set_matches_libc() {
+        assert_eq!(c::SIGPIPE, libc::SIGPIPE);
+        assert_eq!(c::SIG_BLOCK, libc::SIG_BLOCK);
+        assert_eq!(c::SIG_UNBLOCK, libc::SIG_UNBLOCK);
+        assert_eq!(size_of::<SigSet>(), size_of::<libc::sigset_t>());
+        // glibc refuses to add 32 and 33, which it keeps for itself.
+        for sig in [1, libc::SIGPIPE, 31, 34, 64] {
+            // SAFETY: a zeroed sigset_t is a valid empty set; sigemptyset and
+            // sigaddset only write the live local.
+            let theirs: SigSet = unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&raw mut set);
+                assert_eq!(libc::sigaddset(&raw mut set, sig), 0);
+                std::mem::transmute(set)
+            };
+            assert_eq!(theirs.bits, SigSet::only(sig).bits, "signal {sig}");
+            assert!(SigSet::only(sig).has(sig) && !SigSet::EMPTY.has(sig));
+        }
     }
 
     #[test]
@@ -3473,12 +3996,137 @@ mod layout {
         let mut got = 0;
         while got < 5000 {
             let n = splice_to_file(rx.as_fd(), &pipe, &file, 100 + got as u64, 5000 - got);
-            got += n.expect("spliced, not refused");
+            let n = n.expect("spliced");
+            assert!(!n.file_refused, "a regular file takes `splice`");
+            got += n.bytes;
         }
         assert_eq!(file.stream_position().unwrap(), 0);
         let body = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(body.len(), 5100);
         assert!(body[100..].iter().all(|&b| b == 7));
+    }
+
+    /// Linux: `sendfile` to a peer that reset raises no SIGPIPE, even where the
+    /// process has the default disposition, which ends it (a C host, or a program
+    /// that restores it). Runs in a child process: this test binary again, with
+    /// only this test, after SIGPIPE is set back to `SIG_DFL`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_send_file_to_a_reset_peer_raises_no_sigpipe() {
+        use std::os::unix::process::ExitStatusExt;
+        if std::env::var_os(SIGPIPE_CHILD).is_some() {
+            std::process::exit(sigpipe_child());
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sys::unix::layout::test_send_file_to_a_reset_peer_raises_no_sigpipe",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(SIGPIPE_CHILD, "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), None, "the child died of a signal");
+        assert_eq!(status.code(), Some(SURVIVED), "{status:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    const SIGPIPE_CHILD: &str = "NET_IO_TEST_SIGPIPE_CHILD";
+    /// The child's exit code once `sendfile` failed with `EPIPE` and it lived on.
+    #[cfg(target_os = "linux")]
+    const SURVIVED: i32 = 42;
+
+    #[cfg(target_os = "linux")]
+    fn sigpipe_child() -> i32 {
+        // SAFETY: sets SIGPIPE's disposition back to the default; this process
+        // runs nothing else.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tx = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (rx, _) = l.accept().unwrap();
+        // The peer resets: later writes fail, from the second one with EPIPE.
+        set_linger(rx.as_fd(), Some(Duration::ZERO)).unwrap();
+        drop(rx);
+        let path = std::env::temp_dir().join(format!("nio-sigpipe-{}", std::process::id()));
+        std::fs::write(&path, vec![1u8; 1 << 16]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for _ in 0..400 {
+            match send_file(tx.as_fd(), &file, 0, 1 << 16) {
+                Err(e) if e.raw_os_error() == Some(libc::EPIPE) => return SURVIVED,
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        3
+    }
+
+    /// Linux: a signal that interrupts a blocking connect (a full backlog makes it
+    /// wait for room) does not fail it; the connect goes through once there is room.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    #[test]
+    fn test_unix_connect_goes_on_after_a_signal() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CAUGHT: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn caught(_: c_int) {
+            CAUGHT.fetch_add(1, Ordering::Relaxed);
+        }
+        // A handler without SA_RESTART, so the signal interrupts the call it lands in.
+        // SAFETY: a zeroed sigaction is a valid one (empty mask, no flags), and the
+        // handler only touches an atomic. Nothing else in the tests uses SIGUSR2.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = caught as extern "C" fn(c_int) as usize;
+            assert_eq!(libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut()), 0);
+        }
+        let dir = std::env::temp_dir().join(format!("net-io-eintr-{}", std::process::id()));
+        let _ = std::fs::create_dir(&dir);
+        let path = dir.join("s.sock");
+        let _ = std::fs::remove_file(&path);
+        let p = path.as_os_str().as_encoded_bytes().to_vec();
+        let l = unix_socket().unwrap();
+        unix_bind(l.as_fd(), &p).unwrap();
+        unix_listen(l.as_fd(), 0).unwrap();
+        let l = UnixListener::from(l);
+        // Fill the backlog: non-blocking connects until one would have to wait.
+        let mut queued = Vec::new();
+        loop {
+            let c = UnixStream::from(unix_socket().unwrap());
+            c.set_nonblocking(true).unwrap();
+            match unix_connect(c.as_fd(), &p) {
+                Ok(()) => queued.push(c),
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
+                    break;
+                }
+            }
+            assert!(queued.len() < 1000, "the backlog never filled");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let c = UnixStream::from(unix_socket().unwrap());
+            c.set_write_timeout(Some(Duration::from_secs(20))).unwrap();
+            // SAFETY: pthread_self has no preconditions. Sent as a number: on musl
+            // `pthread_t` is a pointer, which is not `Send`.
+            tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
+            let r = unix_connect(c.as_fd(), &p);
+            (r, c)
+        });
+        let thread = rx.recv().unwrap() as libc::pthread_t;
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(20));
+            // SAFETY: the thread is joined only below, so its id stays valid.
+            unsafe { libc::pthread_kill(thread, libc::SIGUSR2) };
+        }
+        // Room in the backlog: the waiting connect goes through.
+        let _first = l.accept().unwrap();
+        let (r, c) = t.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+        assert!(CAUGHT.load(Ordering::Relaxed) > 0, "no signal arrived");
+        r.expect("a signal does not fail a blocking connect");
+        assert!(c.peer_addr().is_ok(), "connected");
     }
 }

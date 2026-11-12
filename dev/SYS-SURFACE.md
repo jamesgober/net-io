@@ -1,6 +1,6 @@
 # net-io - OS surface
 
-> Every operating-system function, constant, and struct that `src/sys/` declares, per platform, with the documentation it relies on and the version that first needs it. Frozen at the `0.2.0` design lock (decision D-014 in [`PLAN.md`](./PLAN.md)); adding an item needs a decision-log entry. Values of constants and layouts of structs are not written here: they are declared per target in `src/sys/` and cross-checked against `libc` and `windows-sys` (dev-dependencies only) by `tests/layout.rs` in CI, which is the authority if this list and the code ever disagree.
+> Every operating-system function, constant, and struct that `src/sys/` declares, per platform, with the documentation it relies on and the version that first needs it. Frozen at the `0.2.0` design lock (decision D-014 in [`PLAN.md`](./PLAN.md)); adding an item needs a decision-log entry. Values of constants and layouts of structs are not written here: they are declared per target in `src/sys/` and cross-checked against `libc` and `windows-sys` (dev-dependencies only) by the layout tests next to the declarations (`#[cfg(test)]` in each `src/sys/` file), which are the authority if this list and the code ever disagree. Those tests run on the targets CI runs tests on; a cross build checks only the `const` size and alignment assertions (rule 2).
 >
 > Targets with hand-written declarations: `x86_64` and `aarch64` on `unknown-linux-gnu`, `unknown-linux-musl`, `apple-darwin`, `unknown-freebsd`, `pc-windows-msvc`, `pc-windows-gnu`. Every other target builds the blocking driver over `std` alone and returns `Unsupported` for anything below.
 
@@ -30,13 +30,13 @@ Linked from the C library that `std` already links. All declared `extern "C"`.
 
 | Function | Purpose | Reference | Version |
 |---|---|---|---|
-| `socket` | create sockets (Linux and FreeBSD with `SOCK_CLOEXEC \| SOCK_NONBLOCK`) | `socket(2)` | 0.3 |
+| `socket` | create sockets (Linux and FreeBSD with `SOCK_CLOEXEC`; macOS sets `FD_CLOEXEC` after; non-blocking mode is set afterwards where it is wanted) | `socket(2)` | 0.3 |
 | `bind`, `listen`, `connect` | | `bind(2)`, `listen(2)`, `connect(2)` | 0.3 |
 | `accept` | macOS accept (then `fcntl`) | `accept(2)` | 0.3 |
 | `getsockname`, `getpeername` | endpoints | `getsockname(2)`, `getpeername(2)` | 0.3 |
 | `setsockopt`, `getsockopt` | every option | `setsockopt(2)`, `getsockopt(2)` | 0.3 |
-| `recv`, `send`, `recvfrom`, `sendto` | IO (`MSG_NOSIGNAL` on Linux and FreeBSD) | `recv(2)`, `send(2)` | 0.3 (`*from`/`*to` 0.4) |
-| `readv`, `writev` | vectored IO (macOS writes; Linux and FreeBSD use `sendmsg` for `MSG_NOSIGNAL`) | `readv(2)`, `writev(2)` | 0.3 |
+| `recv`, `send`, `recvfrom`, `sendto` | IO (`MSG_NOSIGNAL` on Linux; on macOS and FreeBSD every socket net-io creates or accepts has `SO_NOSIGPIPE`) | `recv(2)`, `send(2)` | 0.3 (`*from`/`*to` 0.4) |
+| `readv`, `writev` | vectored IO (not declared: every Unix writes vectors with `sendmsg`, and reads go through `std`) | `readv(2)`, `writev(2)` | 0.3 |
 | `sendmsg`, `recvmsg` | vectored writes with flags; `SCM_RIGHTS`; UDP truncation and packet info | `sendmsg(2)`, `recvmsg(2)`, `unix(7)`, `cmsg(3)` | 0.3 (ancillary data 0.4) |
 | `shutdown`, `close` | | `shutdown(2)`, `close(2)` | 0.3 |
 | `fcntl` | `F_GETFL`, `F_SETFL` (`O_NONBLOCK`), `F_GETFD`, `F_SETFD` (`FD_CLOEXEC`), `F_DUPFD_CLOEXEC` | `fcntl(2)` | 0.3 |
@@ -48,7 +48,7 @@ Linked from the C library that `std` already links. All declared `extern "C"`.
 | `chmod`, `chown`, `unlink`, `rename` | Unix socket files (through `std`; from 0.7.2 only `unlink` is still used, the rest is done by the `*at` calls below) | `chmod(2)`, `chown(2)`, `unlink(2)`, `rename(2)` | 0.4 |
 | `fchmodat`, `fchownat`, `renameat`, `linkat`, `unlinkat` | a Unix socket file's mode, owner, and final name, set by name relative to an open directory nobody else can change (the socket's own, or a private one made next to it), never through a path; the directories are opened with `std` (`O_DIRECTORY`, `O_NOFOLLOW` as custom flags) and checked with `std`'s metadata | `fchmodat(2)`, `fchownat(2)`, `renameat(2)`, `linkat(2)`, `unlinkat(2)` | 0.7.2 |
 | `getpid` | `LISTEN_PID`, fork detection | `getpid(2)` | 0.3 |
-| `sendfile` | file sends (Linux `sendfile(out, in, off, n)`; macOS and FreeBSD have different signatures, declared per OS) | `sendfile(2)` | 0.6 |
+| `sendfile` | file sends (Linux `sendfile(out, in, off, n)`; macOS and FreeBSD have different signatures, declared per OS). A count of 0 never reaches it: macOS and FreeBSD read 0 as "to the end of the file" | `sendfile(2)` | 0.6 |
 | `geteuid` | the expected peer uid of a hand-off | `geteuid(2)` | 0.4 |
 | `clock_gettime` | `CLOCK_MONOTONIC` for `monotonic_micros` | `clock_gettime(2)` | 0.4 |
 
@@ -63,6 +63,8 @@ Linked from the C library that `std` already links. All declared `extern "C"`.
 | `recvmmsg`, `sendmmsg` | UDP batches | `recvmmsg(2)`, `sendmmsg(2)` | 0.6 |
 | `sched_setaffinity` | placement (P2) | `sched_setaffinity(2)` | 0.6 |
 | `pidfd_open` (through `syscall`) | `LISTEN_PIDFDID` check (systemd 259+) | `pidfd_open(2)` | 0.4 |
+| `splice`, `pipe2` | `recv_file`: socket to pipe to file (`SPLICE_F_MOVE`; the pipe with `O_CLOEXEC`) | `splice(2)`, `pipe2(2)` | 0.7 |
+| `pthread_sigmask`, `sigpending`, `sigtimedwait` | no SIGPIPE from `sendfile`, which takes no `MSG_NOSIGNAL`: SIGPIPE is blocked on the calling thread for the call, and one the call raised is taken (zero timeout) before it is unblocked | `pthread_sigmask(3)`, `sigpending(2)`, `sigtimedwait(2)` | 0.8 |
 | `syscall` | `pidfd_open` and the io_uring calls, which have no C library wrappers in older glibc and musl | `syscall(2)` | 0.4 |
 | `io_uring_setup`, `io_uring_enter`, `io_uring_register` (through `syscall`), `mmap`, `munmap` | io_uring driver (P3) | `io_uring_setup(2)`, `io_uring_enter(2)`, `io_uring_register(2)`, `mmap(2)` | after 1.0 |
 
@@ -88,7 +90,7 @@ Declared per target; values from the target's system headers, cross-checked in C
 | Group | Constants | Platforms |
 |---|---|---|
 | families, types, protocols | `AF_INET`, `AF_INET6`, `AF_UNIX`, `SOCK_STREAM`, `SOCK_DGRAM`, `IPPROTO_TCP`, `IPPROTO_UDP`, `IPPROTO_IP`, `IPPROTO_IPV6` | all |
-| creation flags | `SOCK_CLOEXEC`, `SOCK_NONBLOCK` | Linux, FreeBSD |
+| creation flags | `SOCK_CLOEXEC` (`SOCK_NONBLOCK` is not used) | Linux, FreeBSD |
 | socket level | `SOL_SOCKET`, `SO_REUSEADDR`, `SO_REUSEPORT`, `SO_KEEPALIVE`, `SO_LINGER`, `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_ERROR`, `SO_TYPE`, `SO_ACCEPTCONN`, `SO_DOMAIN` | all (`SO_DOMAIN` Linux and FreeBSD; macOS reads the family from `getsockname`) |
 | socket level, one OS | `SO_NOSIGPIPE`, `SO_LINGER_SEC` (macOS); `SO_INCOMING_CPU`, `SO_PEERCRED` (Linux); `SO_REUSEPORT_LB` (FreeBSD, P3) | as listed |
 | TCP | `TCP_NODELAY`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_FASTOPEN` | all |
@@ -97,10 +99,12 @@ Declared per target; values from the target's system headers, cross-checked in C
 | IP | `IP_TTL`, `IP_TOS`, `IP_PKTINFO` (Linux) / `IP_RECVDSTADDR` (BSD), `IP_ADD_MEMBERSHIP`, `IPV6_V6ONLY`, `IPV6_UNICAST_HOPS`, `IPV6_TCLASS`, `IPV6_RECVPKTINFO`, `IPV6_PKTINFO`, `IPV6_JOIN_GROUP` / `IPV6_ADD_MEMBERSHIP` | all, names per OS |
 | UDP, Linux | `UDP_SEGMENT`, `UDP_GRO` (P3) | Linux |
 | local credentials | `SOL_LOCAL`, `LOCAL_PEERPID` (macOS); `LOCAL_PEERCRED` (FreeBSD) | as listed |
-| message flags | `MSG_NOSIGNAL` (Linux, FreeBSD), `MSG_PEEK`, `MSG_TRUNC`, `MSG_CTRUNC`, `MSG_CMSG_CLOEXEC` (Linux, FreeBSD), `MSG_DONTWAIT` | as listed |
+| message flags | `MSG_NOSIGNAL` (Linux; macOS and FreeBSD use `SO_NOSIGPIPE`), `MSG_PEEK`, `MSG_TRUNC`, `MSG_CTRUNC`, `MSG_CMSG_CLOEXEC` (Linux, FreeBSD), `MSG_DONTWAIT`, `MSG_WAITFORONE` (Linux) | as listed |
 | ancillary data | `SCM_RIGHTS` | all |
 | shutdown | `SHUT_RD`, `SHUT_WR`, `SHUT_RDWR` | all |
 | fcntl | `F_GETFL`, `F_SETFL`, `F_GETFD`, `F_SETFD`, `F_DUPFD_CLOEXEC`, `FD_CLOEXEC`, `O_NONBLOCK`, `O_CLOEXEC`, `O_RDONLY` | all |
+| splice | `SPLICE_F_MOVE` | Linux |
+| signals | `SIGPIPE`, `SIG_BLOCK`, `SIG_UNBLOCK` | Linux |
 | open flags | `O_DIRECTORY`, `O_NOFOLLOW` (0.7.2; values differ between Linux x86_64 and aarch64) | all |
 | `*at` flags | `AT_SYMLINK_NOFOLLOW`, `AT_REMOVEDIR` (0.7.2) | all, values per OS |
 | poll | `POLLIN`, `POLLOUT`, `POLLERR`, `POLLHUP`, `POLLNVAL` | all |
@@ -110,7 +114,7 @@ Declared per target; values from the target's system headers, cross-checked in C
 | kqueue | `EVFILT_READ`, `EVFILT_WRITE`, `EVFILT_USER`, `EV_ADD`, `EV_DELETE`, `EV_ENABLE`, `EV_DISABLE`, `EV_DISPATCH`, `EV_CLEAR`, `EV_EOF`, `EV_ERROR`, `NOTE_TRIGGER` | macOS, FreeBSD |
 | CPU sets | `CPU_LEVEL_WHICH`, `CPU_WHICH_TID` | FreeBSD |
 | clocks | `CLOCK_MONOTONIC` | all, values per OS |
-| error numbers | `EINTR`, `EAGAIN`, `EWOULDBLOCK`, `EINPROGRESS`, `EALREADY`, `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`, `EPROTO`, `EPERM`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET` (Linux), `EHOSTUNREACH`, `ENETUNREACH`, `EOPNOTSUPP`, `EBADF`, `EINVAL`, `ENOTSOCK`, `ENOTCONN`, `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `ETIMEDOUT`, `EADDRINUSE`, `EADDRNOTAVAIL`, `EACCES`, `ENOENT`, `ENAMETOOLONG`, `ENOSYS` | all, values per OS (read back through `io::Error::raw_os_error`) |
+| error numbers | `EINTR`, `EAGAIN`, `EWOULDBLOCK`, `EINPROGRESS`, `EALREADY`, `EISCONN`, `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`, `EPROTO`, `EPERM`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET` (Linux), `EHOSTUNREACH`, `ENETUNREACH`, `EOPNOTSUPP`, `EBADF`, `EINVAL`, `ENOTSOCK`, `ENOTCONN`, `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `ETIMEDOUT`, `EADDRINUSE`, `EADDRNOTAVAIL`, `EACCES`, `ENOENT`, `ENAMETOOLONG`, `ENOSYS` | all, values per OS (read back through `io::Error::raw_os_error`) |
 | random | `GRND_NONBLOCK` is not used (blocking until seeded is correct at start-up) | |
 
 ## 3. Unix structs
@@ -133,6 +137,7 @@ Declared per target; values from the target's system headers, cross-checked in C
 | `kevent` | kqueue | macOS, FreeBSD |
 | `mmsghdr` | batches | Linux |
 | `cpu_set_t`, `cpuset_t` | placement | Linux, FreeBSD |
+| `sigset_t` (1,024 bits on glibc and musl) | `pthread_sigmask`, `sigpending`, `sigtimedwait` | Linux |
 | `io_uring_params`, `io_uring_sqe`, `io_uring_cqe`, ring offsets | io_uring (P3) | Linux |
 
 ---
@@ -218,9 +223,9 @@ Declared `extern "system"`. `ws2_32` for Winsock, `kernel32` for handles and IOC
 ## 5. Rules for this surface
 
 1. Every declaration has a `// SAFETY:`-commented safe wrapper in the same platform module; no raw pointer or raw descriptor crosses `src/sys/`.
-2. Every struct has a `const` assertion of size and alignment for each declared target, and a layout test (field offsets) against `libc` / `windows-sys`. The `const` assertions are checked on every build for the target, including a cross-compiled one; the layout tests run only where the tests run.
-3. Every function signature is checked in `tests/layout.rs` by assigning the dev-dependency's function to a pointer of net-io's declared type (a mismatch fails to compile).
-4. Every constant is compared with the dev-dependency's value.
+2. Every struct has a `const` assertion of size and alignment for each declared target, and a layout test against `libc` / `windows-sys`: the size, and the offset of every field net-io reads or writes. The `const` assertions are checked on every build for the target, including a cross-compiled one; the layout tests run only where the tests run.
+3. Every function signature is checked by a layout test next to its declaration: net-io's function and the dev-dependency's are each assigned to a function pointer type, so a different count, order, or type of an argument or the result fails to compile. Where net-io's declaration takes a pointer to its own struct (or an untyped address for a `sockaddr`), the dev-dependency's function is assigned to the same shape with its own struct in that place, and the pair of structs is compared under rule 2. Where the C libraries disagree on signedness of an argument of the same size (glibc's `getrlimit` resource, musl's `recvmmsg` and `sendmmsg` flags, macOS's `clockid_t`), the check uses the library's own type for that argument.
+4. Every constant is compared with the dev-dependency's value. A value the dev-dependency does not export is compared with an equal one it does (macOS `IP_RECVPKTINFO` with `IP_PKTINFO`) or exercised by a test that uses it.
 5. A function needed by a later version is declared in that version, not earlier (no unused unsafe surface), but it must already be on this list.
 
 ## 0.5.0 as built
@@ -236,3 +241,7 @@ Added: `sendfile` (three signatures: Linux, macOS, FreeBSD), `recvmmsg`, `sendmm
 Added on Windows: `GetSecurityInfo` with `SE_KERNEL_OBJECT` 6 and `OWNER_SECURITY_INFORMATION` 1 (it returns its error code rather than setting the thread's last error); `GetFileInformationByHandleEx` with `FileAttributeTagInfo` 9 and the struct `FILE_ATTRIBUTE_TAG_INFO`, on a file opened through `std`'s `OpenOptionsExt` with `FILE_READ_ATTRIBUTES` 0x80, `FILE_FLAG_OPEN_REPARSE_POINT` 0x00200000, and `FILE_FLAG_BACKUP_SEMANTICS` 0x02000000; `IO_REPARSE_TAG_AF_UNIX` 0x80000023; `TokenOwner` 4 (tests); `GetHandleInformation` (tests). `SetHandleInformation` now also clears `HANDLE_FLAG_INHERIT` on a socket made from a `WSAPROTOCOL_INFOW`: `WSA_FLAG_NO_HANDLE_INHERIT` does not reach such a socket. `FILE_FLAG_FIRST_PIPE_INSTANCE` is now passed whenever the listener holds no instance of its name, not only for the first. Each constant and the struct have a layout test against `windows-sys`, except `SE_KERNEL_OBJECT` and `IO_REPARSE_TAG_AF_UNIX`, whose windows-sys features are not enabled: `test_owner_sid_is_the_creators_default_owner` exercises the first, and `test_layout_socket_files_match_windows_sys` reads the second back from a socket file.
 
 On Unix: the list above now names every item `src/sys/` declares: `geteuid`, `clock_gettime`, `timespec`, `EV_DISPATCH`, and FreeBSD's `CPU_LEVEL_WHICH` and `CPU_WHICH_TID` were declared before they were listed. FreeBSD now creates sockets with `SOCK_CLOEXEC` (`0x10000000`) and receives descriptors with `MSG_CMSG_CLOEXEC` (`0x00040000`), as Linux does; only macOS sets close-on-exec in a second step. Every struct has its `const` size and alignment assertion, including `cmsghdr`, `ucred`, `xucred`, `sockaddr_un`, `mmsghdr`, `timespec`, `epoll_event`, and `kevent`. The batch calls pass `IoSlice` and `IoSliceMut` as `struct iovec`, never a tuple.
+
+## 0.8.0 review fixes
+
+On Unix: `pthread_sigmask`, `sigpending`, and `sigtimedwait` with `sigset_t`, `SIGPIPE`, `SIG_BLOCK`, and `SIG_UNBLOCK` (Linux), so that `sendfile`, which takes no flags, raises no SIGPIPE; `EINTR`, `EPIPE`, `EALREADY`, and `EISCONN` are now classified (a blocking Unix connect that a signal interrupts goes on; a non-blocking connect that reports `EINTR` is in progress). `splice`, `pipe2`, and `SPLICE_F_MOVE` (0.7, `recv_file`) were declared before they were listed. FreeBSD's `CPU_LEVEL_WHICH` and `CPU_WHICH_TID` moved into the constants module so that the layout test can compare them. The layout tests now check every Unix function signature against `libc` (rule 3), the offsets of `msghdr`'s `msg_iov`, `msg_control`, and `msg_controllen`, `mmsghdr`'s `msg_len`, every field of `ucred`, `xucred`'s `cr_uid`, `cr_groups`, and `cr_pid`, and the constants `MSG_WAITFORONE`, `IP_PKTINFO` / `IP_RECVPKTINFO` / `IP_RECVDSTADDR` and `IPV6_RECVPKTINFO` / `IPV6_PKTINFO` with the packet-info address offset per OS, FreeBSD's `SOCK_CLOEXEC` and `MSG_CMSG_CLOEXEC`, and the bit `sigset_t` keeps each signal at. The earlier text of this file said `SOCK_NONBLOCK` was used at creation and that FreeBSD sends with `MSG_NOSIGNAL`; neither was true (FreeBSD sockets carry `SO_NOSIGPIPE`, as on macOS), and both rows are corrected above.

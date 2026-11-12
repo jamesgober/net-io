@@ -162,7 +162,8 @@ pub enum Operation {
         chunks: SendChunks,
     },
     /// Sends up to `len` bytes of `file` from `offset`, zero copy where the OS can. The
-    /// result says how many went out; `Ok(0)` means the file has nothing there.
+    /// result says how many went out; `Ok(0)` means the file has nothing there. A `len`
+    /// of 0 completes at once with `Ok(0)` and sends nothing.
     SendFile {
         /// The socket.
         token: Token,
