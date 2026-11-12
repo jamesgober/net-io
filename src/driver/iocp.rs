@@ -237,6 +237,13 @@ impl Driver for IocpDriver {
                 self.port.receive(on, token.0, Some(buffer))
             }
             Operation::Send { chunks, .. } if out_free => self.port.send(on, token.0, chunks),
+            Operation::SendFile { len: 0, .. } if out_free => {
+                // Nothing to send, and no call: `TransmitFile` reads a count of 0 as
+                // "the whole file".
+                self.local
+                    .push_back(Completion::new(token, OperationKind::SendFile, Ok(0)));
+                return Ok(());
+            }
             Operation::SendFile {
                 file, offset, len, ..
             } if out_free => match self.port.send_file(on, token.0, file, offset, len) {

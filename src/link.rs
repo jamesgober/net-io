@@ -1833,17 +1833,29 @@ impl Link {
             // Set when the bytes went straight into the file, not into `buf`.
             let spliced = std::cell::Cell::new(false);
             #[cfg(target_os = "linux")]
+            let file_failed = std::cell::Cell::new(None);
+            #[cfg(target_os = "linux")]
             let result = match &pipe {
                 Some(pipe) if !refused.get() => {
                     self.read_raw_with(&mut buf[..take], |stream, b| {
                         if !refused.get() {
                             match sys::splice_to_file(stream.sock(), pipe, file, at, b.len()) {
-                                Ok(n) => {
+                                Ok(s) => {
                                     spliced.set(true);
-                                    return Ok(n);
+                                    refused.set(s.file_refused);
+                                    return Ok(s.bytes);
                                 }
-                                Err(e) if sys::send_file_refused(&e) => refused.set(true),
-                                Err(e) => return Err(e),
+                                Err(sys::SpliceError::Socket(e)) if sys::send_file_refused(&e) => {
+                                    refused.set(true);
+                                }
+                                Err(sys::SpliceError::Socket(e)) => return Err(e),
+                                // Bytes left the socket and are lost: never fall back to
+                                // `recv`, which would put later bytes in their place.
+                                Err(sys::SpliceError::File(e)) => {
+                                    let same = Self::same_error(&e);
+                                    file_failed.set(Some(e));
+                                    return Err(same);
+                                }
                             }
                         }
                         sys::recv(stream, b)
@@ -1851,6 +1863,12 @@ impl Link {
                 }
                 _ => self.read(&mut buf[..take]),
             };
+            #[cfg(target_os = "linux")]
+            if let Some(e) = file_failed.take() {
+                // The read path closed the connection with this error's class; the
+                // caller hears it as the file write it was.
+                return Err(NetError::from_os("write", e));
+            }
             #[cfg(not(target_os = "linux"))]
             let result = self.read(&mut buf[..take]);
             match result? {
@@ -1866,6 +1884,13 @@ impl Link {
             }
         }
         Ok(got)
+    }
+
+    /// An error with the OS code (or the kind) of `e`, where `e` itself goes elsewhere.
+    #[cfg(target_os = "linux")]
+    fn same_error(e: &io::Error) -> io::Error {
+        e.raw_os_error()
+            .map_or_else(|| io::Error::from(e.kind()), io::Error::from_raw_os_error)
     }
 
     fn file_truncated(&mut self, sent: u64) -> NetError {

@@ -326,6 +326,11 @@ impl Driver for ReadyDriver {
                 reg.out = Out::Chunks(chunks);
                 ReadyDriver::try_send(reg, local, arm);
             }
+            Operation::SendFile { len: 0, .. } if matches!(reg.out, Out::None) => {
+                // Nothing to send, and no call: `sendfile` on macOS and FreeBSD reads a
+                // count of 0 as "to the end of the file".
+                local.push_back(Completion::new(token, OperationKind::SendFile, Ok(0)));
+            }
             Operation::SendFile {
                 file, offset, len, ..
             } if matches!(reg.out, Out::None) => {

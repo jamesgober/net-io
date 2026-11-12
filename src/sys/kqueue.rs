@@ -337,6 +337,31 @@ mod tests {
         assert_eq!(EV_EOF, libc::EV_EOF);
         assert_eq!(EV_ERROR, libc::EV_ERROR);
         assert_eq!(NOTE_TRIGGER, libc::NOTE_TRIGGER);
+        assert_eq!(F_SETFD, libc::F_SETFD);
+        assert_eq!(FD_CLOEXEC, libc::FD_CLOEXEC);
+        assert_eq!(size_of::<Timespec>(), size_of::<libc::timespec>());
+        // A mismatch in argument or result types fails to compile; `Kevent` and
+        // `Timespec` against `libc`'s are compared above.
+        type Kqueue = unsafe extern "C" fn() -> c_int;
+        let (_, _): (Kqueue, Kqueue) = (kqueue, libc::kqueue);
+        let _: unsafe extern "C" fn(
+            c_int,
+            *const Kevent,
+            c_int,
+            *mut Kevent,
+            c_int,
+            *const Timespec,
+        ) -> c_int = kevent;
+        let _: unsafe extern "C" fn(
+            c_int,
+            *const libc::kevent,
+            c_int,
+            *mut libc::kevent,
+            c_int,
+            *const libc::timespec,
+        ) -> c_int = libc::kevent;
+        type Fcntl = unsafe extern "C" fn(c_int, c_int, ...) -> c_int;
+        let (_, _): (Fcntl, Fcntl) = (fcntl, libc::fcntl);
     }
 
     #[test]

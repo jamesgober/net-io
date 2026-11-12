@@ -727,6 +727,11 @@ impl Port {
         offset: u64,
         len: u32,
     ) -> io::Result<Started> {
+        // `TransmitFile` reads a count of 0 as "the whole file"; callers complete an
+        // empty send themselves, so one that reaches here is refused, never widened.
+        if len == 0 {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
         // SAFETY: open between `register` and `deregister` by the `Driver` contract.
         let sock = unsafe { win::borrow(on.socket) };
         let transmit = self.transmit_file(sock)?;
@@ -986,6 +991,9 @@ mod tests {
         let (stream, _) = listener.accept().unwrap();
         let mut port = Port::with_skip(true).unwrap();
         let on = port.associate(stream.as_socket()).unwrap();
+        // A count of 0 would be "the whole file" to `TransmitFile`: refused.
+        let empty = port.send_file(on, 7, file.clone(), 0, 0).map(drop);
+        assert_eq!(empty.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
         let mut send = |len| match port.send_file(on, 7, file.clone(), 0, len).unwrap() {
             Started::Done(f) => f.result,
             Started::Pending(_) => {
