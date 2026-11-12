@@ -701,10 +701,16 @@ fn same_user_sender(pid: u32, connected: std::time::Instant) -> bool {
     let Ok((theirs, started)) = sys::process_user_and_start(pid) else {
         return false;
     };
-    let Some(latest) = filetime_at(connected).and_then(|t| t.checked_add(ticks(SLACK)))
-    else {
+    let Some(latest) = filetime_at(connected).and_then(|t| t.checked_add(ticks(SLACK))) else {
         return false;
     };
+    sender_is(&ours, &theirs, started, latest)
+}
+
+/// The rule `same_user_sender` applies: the same user, started no later than
+/// `latest` (both in `FILETIME` units).
+#[cfg(all(windows, feature = "local"))]
+fn sender_is(ours: &str, theirs: &str, started: u64, latest: u64) -> bool {
     theirs == ours && started <= latest
 }
 
@@ -1308,18 +1314,21 @@ mod tests {
         assert!(same_user_sender(std::process::id(), Instant::now()));
         // The system process runs as another account.
         assert!(!same_user_sender(4, Instant::now()));
+        // A connection time in the future cannot be placed on the clock: refused.
+        assert!(!same_user_sender(
+            std::process::id(),
+            Instant::now() + Duration::from_secs(60)
+        ));
         // A process that started after the pipe connected took a number that
-        // belonged to someone else.
-        let connected = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "ping", "-n", "3", "127.0.0.1"])
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let later = same_user_sender(child.id(), connected);
-        let _ = child.kill();
-        let _ = child.wait();
-        assert!(!later, "a process started after the connection was accepted");
+        // belonged to someone else. (No child process here: one started while
+        // another test holds a fresh, still inheritable duplicate would keep it.)
+        let me = sys::current_user_sid().unwrap();
+        assert!(sender_is(&me, &me, 100, 100));
+        assert!(!sender_is(&me, &me, 101, 100));
+        assert!(!sender_is(&me, "S-1-5-18", 100, 100));
+        let now = filetime_at(Instant::now()).unwrap();
+        let earlier = filetime_at(Instant::now().checked_sub(Duration::from_secs(5)).unwrap());
+        assert!(earlier.unwrap() < now);
     }
 
     #[cfg(all(windows, feature = "local"))]

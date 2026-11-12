@@ -246,6 +246,9 @@ pub(crate) enum Started {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InFlight(usize);
 
+/// The operations a port has room for before its set first grows.
+const IN_FLIGHT_START: usize = 1024;
+
 /// Hashes the address of an operation: boxes are at least 8-aligned, so the low
 /// bits carry nothing; a multiply spreads the rest. Two map operations per
 /// operation started, on the worker's own thread.
@@ -259,7 +262,7 @@ impl Hasher for AddrHasher {
 
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            self.0 = (self.0 << 8 | u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            self.0 = ((self.0 << 8) | u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         }
     }
 
@@ -394,7 +397,13 @@ impl Port {
             port,
             entries: Box::new([OverlappedEntry::default(); ENTRIES]),
             free: Vec::new(),
-            in_flight: HashSet::default(),
+            // Room for a worker's usual operations up front, so the steady state
+            // allocates nothing (the set never shrinks, and it grows only past its
+            // highest count so far).
+            in_flight: HashSet::with_capacity_and_hasher(
+                IN_FLIGHT_START,
+                BuildHasherDefault::default(),
+            ),
             foreign: 0,
             skip,
             connect_ex: None,

@@ -740,19 +740,14 @@ pub(crate) fn process_user_and_start(pid: u32) -> io::Result<(String, u64)> {
     ];
     let [created, exited, kernel, used] = &mut times;
     // SAFETY: the handle is open; the four structures are written during the call.
-    let ok = unsafe {
-        GetProcessTimes(
-            process.as_raw_handle(),
-            created,
-            exited,
-            kernel,
-            used,
-        )
-    };
+    let ok = unsafe { GetProcessTimes(process.as_raw_handle(), created, exited, kernel, used) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((user, u64::from(created.high) << 32 | u64::from(created.low)))
+    Ok((
+        user,
+        (u64::from(created.high) << 32) | u64::from(created.low),
+    ))
 }
 
 /// A SID from `process`'s token.

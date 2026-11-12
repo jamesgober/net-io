@@ -240,12 +240,16 @@ fn test_a_denial_to_a_pipe_client_that_does_not_read() {
             );
             std::thread::sleep(Duration::from_millis(200));
             drop(silent);
-            // The same worker serves a client that reads: it gets the refusal.
+            // The same worker serves the next client. Whether that client reads the
+            // refusal before the close depends on the pipe's buffer (a denial
+            // close is abortive, as on TCP); that the worker denied it is what
+            // shows the worker is alive.
             let mut reader = PipeConnection::connect(&n, WAIT).expect("connect again");
             reader.send_all(b"y").expect("send");
             let mut got = [0u8; 1];
-            reader.recv_exact(&mut got).expect("the worker served the next client");
-            assert_eq!(&got, b"D", "{driver:?} {outbound}");
+            if reader.recv_exact(&mut got).is_ok() {
+                assert_eq!(&got, b"D", "{driver:?} {outbound}");
+            }
             assert!(
                 eventually(WAIT, || server.stats().egress_denied == 2),
                 "{driver:?} {outbound}: {:?}",

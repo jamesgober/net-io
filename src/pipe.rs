@@ -554,7 +554,8 @@ impl PipeConnection {
     /// The pipe's handle, for tests that need its value.
     #[cfg(test)]
     pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
-        self.stream().map_or(std::ptr::null_mut(), sys::PipeStream::raw)
+        self.stream()
+            .map_or(std::ptr::null_mut(), sys::PipeStream::raw)
     }
 }
 
