@@ -57,6 +57,10 @@ pub trait Gate: Send + Sync + 'static {
     /// After accept and before any read (`Accept`), on `Server::adopt` (`Adopt`),
     /// or when a client connection gets a gate (`Dialed`).
     ///
+    /// It runs on an accept thread (or, for a per-worker listener, the worker), so
+    /// it must return promptly: a stop joins accept threads, and one that never
+    /// returns from `admit` holds `drain`, `shutdown`, and the server's drop.
+    ///
     /// # Errors
     ///
     /// A [`Refusal`] closes the connection without reading: abortively, or after
