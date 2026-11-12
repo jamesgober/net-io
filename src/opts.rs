@@ -522,19 +522,24 @@ impl LocalOptions {
         }
     }
 
-    /// The socket file's permission bits (only the low 9 bits are used).
+    /// The socket file's permission bits (only the low 9 bits are used). They
+    /// are set before the socket listens, by the file's name relative to its open
+    /// directory, or inside a private directory when other users can change the
+    /// socket's directory (see `UnixListener::bind_with`); a directory writable by
+    /// every user without the sticky bit is refused.
     pub fn mode(mut self, mode: u32) -> LocalOptions {
         self.mode = mode & 0o777;
         self
     }
 
-    /// The socket file's owner (needs the privilege to change owners).
+    /// The socket file's owner (needs the privilege to change owners). Set as
+    /// the mode is, after it, and never through a symbolic link.
     pub fn owner(mut self, uid: u32) -> LocalOptions {
         self.owner = Some(uid);
         self
     }
 
-    /// The socket file's group; the mode is unchanged.
+    /// The socket file's group; the mode is unchanged. Set as the owner is.
     pub fn group(mut self, gid: u32) -> LocalOptions {
         self.group = Some(gid);
         self

@@ -17,6 +17,9 @@
 //! ```
 //!
 //! An idle connection holds no read buffer and no output queue, only its state.
+//! Neither does a TLS connection before its first byte: its handshake takes its
+//! buffers when bytes arrive, and a worker's unfinished handshakes may hold at
+//! most a quarter of its share of the buffer budget.
 
 use std::collections::VecDeque;
 use std::io::IoSlice;
@@ -179,6 +182,11 @@ struct Conn<S> {
     paused: bool,
     /// The last send moved nothing: once is retried, twice is an error.
     zero_send: bool,
+    /// Bytes of TLS buffers this connection holds for a handshake that has not
+    /// finished, counted in the worker's handshake total; 0 when none. Cleared,
+    /// and the total lowered, exactly once: when the handshake ends or the
+    /// connection does.
+    handshake_held: u32,
 }
 
 struct Slot<S> {
@@ -217,6 +225,13 @@ struct Reactor<'a, F: SessionFactory, G: Gate> {
     cells: Vec<Box<GateCell<G>>>,
     facts_pool: Vec<Arc<ProxyFacts>>,
     done: Option<Completions>,
+    /// Connections whose unfinished TLS handshake holds buffers, and the bytes
+    /// they hold (`Conn::handshake_held`).
+    handshakes: usize,
+    handshake_bytes: u64,
+    /// The most bytes this worker's unfinished handshakes may hold: a quarter of
+    /// the buffer budget, divided by the workers. One handshake is always allowed.
+    handshake_cap: u64,
 }
 
 /// Runs one worker until the server stops.
@@ -231,6 +246,7 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         killed: Mutex::new(Vec::new()),
         waker: driver.waker(),
     });
+    let workers = (shared.workers.len() as u64).max(1);
     let mut r = Reactor {
         engine,
         shared,
@@ -241,7 +257,7 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         open: 0,
         wheel: Wheel::with_capacity(1024),
         ticks: Ticks::new(start, engine.limits.tick),
-        pool: BufferPool::new(engine.budget.clone(), engine.wipe),
+        pool: BufferPool::new(engine.budget.clone(), engine.wipe, engine.pool_keep),
         outputs: Vec::new(),
         starved: VecDeque::new(),
         bulk_sent: 0,
@@ -259,6 +275,9 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         cells: Vec::new(),
         facts_pool: Vec::new(),
         done: Some(Completions::new()),
+        handshakes: 0,
+        handshake_bytes: 0,
+        handshake_cap: engine.limits.buffer_budget / 4 / workers,
     };
     if guarded(|| r.main()).is_none() {
         // A panic got past every inner boundary: nothing on this worker can be
@@ -511,6 +530,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             opened: false,
             paused: false,
             zero_send: false,
+            handshake_held: 0,
         };
         self.slots[index as usize].conn = Some(conn);
         let setup = {
@@ -599,15 +619,25 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 }
                 Err(_) => return self.close(index, CloseReason::TlsFailed),
             };
-            let limits = *c.link.limits;
-            let Some(cin) = self.pool.take(limits.read_class_max) else {
+            if !c.link.has_read_ahead() {
+                // Nothing read yet: the connection waits for its first bytes without
+                // buffers, as an idle one does, so a client that connects and says
+                // nothing holds none of the budget. They come with the bytes
+                // (`tls_first_bytes`); the handshake deadline runs from accept.
+                c.link.attach_tls_released(session);
+                c.link.begin_handshake(accepted + timeout);
+                c.wait = Wait::Handshake;
+                return self.receive_zero(index);
+            }
+            // Bytes read past a PROXY header are ciphertext for the engine now.
+            let Some((cin, cout)) = self.take_handshake_buffers(index) else {
                 return self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
             };
-            let Some(cout) = self.pool.take(SizeClass::LARGE) else {
+            let Some(c) = self.conn(index) else {
                 self.pool.put(cin);
-                return self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
+                self.pool.put(cout);
+                return;
             };
-            let Some(c) = self.conn(index) else { return };
             let ahead = c.link.attach_tls(session, cin, cout);
             c.link.begin_handshake(accepted + timeout);
             if let Some(ahead) = ahead {
@@ -740,6 +770,92 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
 
     // ---- the TLS machine ----------------------------------------------------------
 
+    /// A handshake's TLS buffers, under this worker's cap on what unfinished
+    /// handshakes hold; `None`, with nothing taken, when the cap or the budget
+    /// refuses (the caller closes with `Limit(BufferBudget)`, as a TLS start always
+    /// has). The connection counts against the cap until `handshake_done`.
+    fn take_handshake_buffers(&mut self, index: u32) -> Option<(Buffer, Buffer)> {
+        let c = self.conn(index)?;
+        debug_assert_eq!(c.handshake_held, 0, "a handshake takes its buffers once");
+        let class = c.link.limits.read_class_max;
+        let need = class.bytes() + SizeClass::LARGE.bytes();
+        let held = self.handshake_bytes;
+        if held > 0 && held + u64::from(need) > self.handshake_cap {
+            return None;
+        }
+        let cin = self.pool.take(class)?;
+        let Some(cout) = self.pool.take(SizeClass::LARGE) else {
+            self.pool.put(cin);
+            return None;
+        };
+        let Some(c) = self.conn(index) else {
+            self.pool.put(cin);
+            self.pool.put(cout);
+            return None;
+        };
+        c.handshake_held = need;
+        self.handshakes += 1;
+        self.handshake_bytes += u64::from(need);
+        Some((cin, cout))
+    }
+
+    /// The connection's handshake stops counting against the cap: it finished (its
+    /// buffers belong to the session now, which gives them back while it idles,
+    /// D-181) or the connection is closing.
+    fn handshake_done(&mut self, index: u32) {
+        let held = self
+            .conn(index)
+            .map_or(0, |c| std::mem::take(&mut c.handshake_held));
+        self.uncount_handshake(held);
+    }
+
+    fn uncount_handshake(&mut self, held: u32) {
+        if held != 0 {
+            self.handshakes -= 1;
+            self.handshake_bytes -= u64::from(held);
+        }
+    }
+
+    /// The first bytes arrived for a TLS handshake that waited without buffers:
+    /// they are worth taking now. Closes with `Limit(BufferBudget)` when the cap or
+    /// the budget refuses.
+    fn tls_first_bytes(&mut self, index: u32) {
+        let Some((cin, cout)) = self.take_handshake_buffers(index) else {
+            return self.close(index, CloseReason::Limit(LimitKind::BufferBudget));
+        };
+        let refused = match self.conn(index) {
+            Some(c) => c.link.tls_restore(cin, cout).err(),
+            None => Some((cin, cout)),
+        };
+        if let Some((cin, cout)) = refused {
+            // Not a connection waiting without buffers after all: fail closed.
+            self.pool.put(cin);
+            self.pool.put(cout);
+            self.handshake_done(index);
+            return self.close(index, CloseReason::TlsFailed);
+        }
+        self.tls_turn(index);
+    }
+
+    /// Waits for bytes without holding a buffer (a zero-byte receive), under the
+    /// deadline of the connection's wait.
+    fn receive_zero(&mut self, index: u32) {
+        let Some(c) = self.conn(index) else { return };
+        let token = c.token;
+        c.recv = Recv::Zero;
+        if self
+            .driver
+            .submit(Operation::ReceiveZero { token })
+            .is_err()
+        {
+            if let Some(c) = self.conn(index) {
+                c.recv = Recv::None;
+            }
+            return self.close(index, CloseReason::Io(OsErrorClass::Other(0)));
+        }
+        self.arm_timer(index);
+    }
+
     /// Takes the TLS buffers back for a connection that released them while idle
     /// (D-181); `false`, with nothing taken, when the budget is spent.
     fn tls_retake(&mut self, index: u32) -> bool {
@@ -757,12 +873,13 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             self.pool.put(cin);
             return false;
         };
-        match self.conn(index) {
-            Some(c) => c.link.tls_restore(cin, cout),
-            None => {
-                self.pool.put(cin);
-                self.pool.put(cout);
-            }
+        let refused = match self.conn(index) {
+            Some(c) => c.link.tls_restore(cin, cout).err(),
+            None => Some((cin, cout)),
+        };
+        if let Some((cin, cout)) = refused {
+            self.pool.put(cin);
+            self.pool.put(cout);
         }
         true
     }
@@ -813,7 +930,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 }
                 TlsNext::Handshaken => {
                     let _ = c.link.end_handshake(None);
-                    if !c.opened {
+                    self.handshake_done(index);
+                    if self.conn(index).is_some_and(|c| !c.opened) {
                         return self.open_session(index);
                     }
                 }
@@ -986,6 +1104,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         if c.sending == Sending::None && c.output.as_ref().is_some_and(|o| o.is_empty()) {
             if let Some(mut output) = c.output.take() {
                 output.reset();
+                // Its spare buffers wait in the pool, not in an output set aside.
+                output.return_all_spares(&mut self.pool);
                 self.outputs.push(output);
             }
         }
@@ -1501,12 +1621,14 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 if closing {
                     return self.settle(index);
                 }
+                c.readable = true;
                 if matches!(wait, Wait::Read) {
                     // Bytes are there: now a buffer is worth taking.
-                    c.readable = true;
                     self.read(index);
-                } else {
-                    c.readable = true;
+                } else if wait == Wait::Handshake && !c.opened && c.link.tls_released() {
+                    // The same for a TLS handshake's first bytes (or the peer's
+                    // close, which the engine then reads as the end).
+                    self.tls_first_bytes(index);
                 }
             }
             Recv::Input => {
@@ -2075,7 +2197,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let reason = c.link.killed().map_or(reason, CloseReason::Killed);
         c.closing = Some(reason);
         if !reason.is_abortive() {
-            if c.link.tls_released() {
+            if c.opened && c.link.tls_released() {
                 // `close_notify` needs the output buffer; without one the close is a
                 // plain FIN.
                 let _ = self.tls_retake(index);
@@ -2160,8 +2282,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
         if let Some(mut output) = c.output.take() {
             output.reset();
+            output.return_all_spares(&mut self.pool);
             self.outputs.push(output);
         }
+        self.uncount_handshake(c.handshake_held);
         if let Some(mut p) = c.proxy.take() {
             if let Some(b) = p.buffer.take() {
                 self.pool.put(b);
@@ -2198,6 +2322,12 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         self.slot_pool.push(slot);
         self.free.push(index);
         self.open -= 1;
+        debug_assert!(
+            self.open > 0 || (self.handshakes == 0 && self.handshake_bytes == 0),
+            "handshake count left over: {} ({} bytes)",
+            self.handshakes,
+            self.handshake_bytes
+        );
         ws.load.fetch_sub(1, Ordering::Relaxed);
         count_drained(shared, reason);
         shared.release(&c.listener, c.source);
@@ -2242,6 +2372,8 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             record_close(shared, ws, &info, reason, bytes_in, bytes_out, lifetime);
         }
         self.open = 0;
+        self.handshakes = 0;
+        self.handshake_bytes = 0;
         shared.notify_progress();
     }
 }

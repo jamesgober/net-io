@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,4 +107,76 @@ fn test_paused_connection_closes_cleanly() {
     assert!(eventually(Duration::from_secs(5), || seen
         .load(Ordering::SeqCst)
         >= 2));
+}
+
+/// Echoes a line; holds anything without a newline in its input. Counts its calls.
+struct LineEcho(Arc<AtomicUsize>);
+
+impl Session for LineEcho {
+    fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        if input.bytes().last() == Some(&b'\n') {
+            let taken = cx.output().push_partial(input.bytes());
+            input.consume(taken);
+            return Step::Write;
+        }
+        Step::Read
+    }
+}
+
+/// Buffers one size class gave back serve another: connections on a listener with
+/// 64 KiB inputs spend a 1 MiB budget and leave, and a connection on a listener
+/// with 16 KiB inputs is then served from the budget their buffers return. Before,
+/// the 64 KiB buffers stayed in the worker's free list for their class and the
+/// budget stayed spent until a restart.
+#[test]
+fn test_buffers_one_class_freed_serve_another() {
+    let budget = 1u64 << 20;
+    let large = Limits::builder()
+        .read_class(SizeClass::LARGE, SizeClass::LARGE)
+        .build()
+        .expect("limits");
+    let limits = Limits::builder()
+        .buffer_budget(budget)
+        .build()
+        .expect("limits");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let server = ServerBuilder::new()
+        .listener(ListenerSpec::tcp("127.0.0.1:0").limits(large))
+        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .driver(DriverKind::Reactor)
+        .workers(1)
+        .limits(limits)
+        .sessions(move |_: &ConnectionInfo| LineEcho(counter.clone()))
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let medium = server.listeners()[1].local.socket_addr().expect("ip");
+    let n = budget / u64::from(SizeClass::LARGE.bytes());
+    let mut holders = Vec::new();
+    for _ in 0..n {
+        let mut c = TcpStream::connect(addr(&server)).expect("connect");
+        c.write_all(b"x").expect("write");
+        holders.push(c);
+    }
+    // Each holds a 64 KiB input with one byte in it: the budget is spent.
+    assert!(eventually(Duration::from_secs(5), || calls
+        .load(Ordering::SeqCst)
+        == n as usize));
+    drop(holders);
+    assert!(eventually(Duration::from_secs(5), || server.stats().open == 0));
+    let mut c = TcpStream::connect(medium).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    c.write_all(b"ping\n").expect("write");
+    let mut back = [0u8; 5];
+    let served = c.read_exact(&mut back).is_ok();
+    assert!(
+        served,
+        "not served after the budget came back: {:?}",
+        server.stats()
+    );
+    assert_eq!(&back, b"ping\n");
 }
