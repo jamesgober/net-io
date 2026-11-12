@@ -169,3 +169,98 @@ fn test_kill_ends_a_pending_read() {
         );
     }
 }
+
+/// Denies every write; the session's refusal is 512 bytes.
+struct DenyWrites;
+
+impl net_io::Gate for DenyWrites {
+    type Ticket = ();
+    fn admit(
+        &self,
+        _: &ConnectionInfo,
+        _: net_io::AdmitStage,
+    ) -> Result<net_io::Admitted<()>, net_io::Refusal> {
+        Ok(net_io::Admitted {
+            lane: net_io::Lane(0),
+            ticket: (),
+            tag: net_io::GateTag(0),
+        })
+    }
+    fn readmit(&self, _: &mut (), _: &ConnectionInfo) -> Result<(), net_io::Refusal> {
+        Ok(())
+    }
+    fn check(&self, _: &mut (), _: &net_io::WriteCheck) -> Result<(), net_io::Denial> {
+        Err(net_io::Denial { code: 7 })
+    }
+}
+
+struct Refuses;
+
+impl Session for Refuses {
+    fn on_data(&mut self, cx: &mut SessionContext<'_>, input: &mut Input) -> Step {
+        input.consume(input.bytes().len());
+        let _ = cx.output().push(b"reply");
+        Step::Write
+    }
+
+    fn on_denied(&mut self, _code: u16, output: &mut net_io::Output) {
+        let _ = output.push(&[b'D'; 512]);
+    }
+}
+
+/// A denial written to a pipe client that does not read leaves the write in the
+/// kernel when the connection closes. On the reactor the pipe is on the worker's
+/// completion port, and that write must neither reach the port as if it were one
+/// of the worker's operations nor stall the worker: the worker serves the next
+/// client, and shutdown returns. Run with no outbound buffer (the write cannot
+/// finish at once), a one-byte buffer, and a large one.
+#[test]
+fn test_a_denial_to_a_pipe_client_that_does_not_read() {
+    for driver in DRIVERS {
+        for outbound in [0u32, 1, 64 * 1024] {
+            let n = name();
+            let server = ServerBuilder::new()
+                .listener(ListenerSpec::pipe(
+                    &n,
+                    PipeOptions::new().buffer_sizes(64 * 1024, outbound),
+                ))
+                .driver(driver)
+                .workers(1)
+                .sessions(|_: &ConnectionInfo| Refuses)
+                .gate(DenyWrites)
+                .build()
+                .expect("build");
+            server.open_door().expect("open");
+            let mut silent = PipeConnection::connect(&n, WAIT).expect("connect");
+            silent.send_all(b"x").expect("send");
+            assert!(
+                eventually(WAIT, || server.stats().egress_denied == 1),
+                "{driver:?} {outbound}: {:?}",
+                server.stats()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            drop(silent);
+            // The same worker serves a client that reads: it gets the refusal.
+            let mut reader = PipeConnection::connect(&n, WAIT).expect("connect again");
+            reader.send_all(b"y").expect("send");
+            let mut got = [0u8; 1];
+            reader.recv_exact(&mut got).expect("the worker served the next client");
+            assert_eq!(&got, b"D", "{driver:?} {outbound}");
+            assert!(
+                eventually(WAIT, || server.stats().egress_denied == 2),
+                "{driver:?} {outbound}: {:?}",
+                server.stats()
+            );
+            drop(reader);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = server.shutdown(std::time::Instant::now() + Duration::from_secs(1));
+                let _ = tx.send(());
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "{driver:?} {outbound}: shutdown did not return"
+            );
+        }
+    }
+}

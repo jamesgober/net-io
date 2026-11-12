@@ -639,21 +639,25 @@ impl SharedListeners {
 }
 
 /// Receives listeners sent with [`SharedListeners::write_to`]. The process at the
-/// far end must be `expect.pid` when that is set; `expect.uid` has no meaning here,
-/// since the pipe's security descriptor decides who gets to the pipe. The message
-/// must be intact and never seen before, and every socket a listener bound to the
-/// address the manifest names. All or nothing: on any error every received socket
-/// is closed, also those listed after the one that failed. A description that
-/// names a socket this process already owns (the same one twice, one from an
-/// earlier hand-off, or a forged one) is refused, so no socket gets two owners.
-/// Received sockets are not inheritable.
+/// far end of the pipe must run as the same user as this one, must have started
+/// before the pipe connected, and must be `expect.pid` when that is set; it is
+/// checked before anything is read. This holds whichever end created the pipe:
+/// when this process dialed, the pipe's security descriptor is the other side's,
+/// so it does not decide who sends. `expect.uid` has no meaning on Windows. The
+/// message must be intact and never seen before, and every socket a listener bound
+/// to the address the manifest names. All or nothing: on any error every received
+/// socket is closed, also those listed after the one that failed. A description
+/// that names a socket this process already owns (the same one twice, one from an
+/// earlier hand-off, or one this process made or adopted any other way) is
+/// refused and that socket is left as it was, so no socket gets two owners and
+/// none is closed. Received sockets are not inheritable.
 ///
 /// Windows makes each socket in this process when the sender describes it, so a
 /// message that arrives damaged (`Truncated`, `BadChecksum`, or a bad manifest)
 /// leaves the sockets it described open here, unclaimed, until this process
 /// exits: their descriptions cannot be trusted enough to claim them. Only a
-/// process the pipe's security descriptor admits can cause that; set
-/// `expect.pid` to narrow it to the one expected sender.
+/// process of the same user can cause that; set `expect.pid` to narrow it to the
+/// one expected sender.
 ///
 /// # Errors
 ///
@@ -670,6 +674,9 @@ pub fn receive_shared(
     if expect.pid.is_some_and(|p| p != peer) {
         return Err(HandoffError::PeerMismatch);
     }
+    if !same_user_sender(peer, pipe.info().accepted_at) {
+        return Err(HandoffError::PeerMismatch);
+    }
     pipe.set_phase(crate::session::Phase::Receiving);
     pipe.set_exchange_deadline(Some(deadline));
     let result = read_shared(pipe);
@@ -678,6 +685,45 @@ pub fn receive_shared(
     let (nonce, blobs) = tail.split_at(NONCE);
     let nonce: [u8; NONCE] = nonce.try_into().map_err(|_| HandoffError::Truncated)?;
     adopt_shared(records, nonce, blobs)
+}
+
+/// Whether process `pid` runs as this process's user and started before the pipe
+/// connected at `connected` (so it is not a later process that took the number
+/// of a sender that has exited). A process this one may not query fails.
+#[cfg(all(windows, feature = "local"))]
+fn same_user_sender(pid: u32, connected: std::time::Instant) -> bool {
+    // System clock adjustments move both readings; a second of slack keeps one of
+    // them from refusing a real sender.
+    const SLACK: std::time::Duration = std::time::Duration::from_secs(1);
+    let Ok(ours) = sys::current_user_sid() else {
+        return false;
+    };
+    let Ok((theirs, started)) = sys::process_user_and_start(pid) else {
+        return false;
+    };
+    let Some(latest) = filetime_at(connected).and_then(|t| t.checked_add(ticks(SLACK)))
+    else {
+        return false;
+    };
+    theirs == ours && started <= latest
+}
+
+/// `at` on the system clock, in `FILETIME` units (100 ns since 1601).
+#[cfg(all(windows, feature = "local"))]
+fn filetime_at(at: std::time::Instant) -> Option<u64> {
+    /// 1601 to 1970 in 100 ns units.
+    const EPOCH: u64 = 116_444_736_000_000_000;
+    let ago = std::time::Instant::now().checked_duration_since(at)?;
+    let then = std::time::SystemTime::now()
+        .checked_sub(ago)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    ticks(then).checked_add(EPOCH)
+}
+
+#[cfg(all(windows, feature = "local"))]
+fn ticks(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_nanos() / 100).unwrap_or(u64::MAX)
 }
 
 #[cfg(all(windows, feature = "local"))]
@@ -1165,6 +1211,115 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(5);
         let got = receive_shared(&mut rx, &HandoffPeer::default(), until).unwrap();
         assert!(!sys::is_inheritable(got[0].as_socket()).unwrap());
+    }
+
+    /// A description from `share_socket` with the handle value it names here
+    /// changed to `to`.
+    #[cfg(all(windows, feature = "local"))]
+    fn naming(to: usize) -> [u8; sys::SHARED_SOCKET] {
+        use std::os::windows::io::AsSocket;
+        let decoy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut blob = sys::share_socket(decoy.as_socket(), std::process::id()).unwrap();
+        // `dwProviderReserved`: the socket's handle value in the receiving process.
+        blob[112..116].copy_from_slice(&u32::try_from(to).unwrap().to_ne_bytes());
+        blob
+    }
+
+    /// A description that names a socket this process made itself is refused, and
+    /// that socket is neither taken nor closed.
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_a_description_naming_a_socket_owned_here_is_refused() {
+        use std::os::windows::io::AsRawSocket;
+        let victim = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let raw = usize::try_from(victim.as_raw_socket()).unwrap();
+        match sys::socket_from_shared(&naming(raw)) {
+            Ok((sock, adoption)) => {
+                let same = sock.as_raw_socket() == victim.as_raw_socket();
+                std::mem::forget((sock, adoption));
+                panic!("adopted a socket owned here (same handle: {same})");
+            }
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),
+        }
+        let addr = victim.local_addr().unwrap();
+        let _c = std::net::TcpStream::connect(addr).expect("the socket still listens");
+        assert!(victim.accept().is_ok());
+    }
+
+    /// Through `receive_shared`: a frame that names the receiver's own listener at
+    /// its real address is refused, and one whose check would fail does not close
+    /// that listener.
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_a_forged_hand_off_neither_adopts_nor_closes_a_listener_here() {
+        use std::os::windows::io::AsRawSocket;
+        use std::time::{Duration, Instant};
+        let victim = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = victim.local_addr().unwrap();
+        let raw = usize::try_from(victim.as_raw_socket()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let (mut tx, mut rx) = pipe_pair("forged");
+        tx.send_all(&frame(&[tcp_record(addr)], &[naming(raw)]))
+            .unwrap();
+        assert!(matches!(
+            refused(receive_shared(&mut rx, &HandoffPeer::default(), until)),
+            HandoffError::VerifyFailed { index: 0, .. }
+        ));
+        let wrong: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        tx.send_all(&frame(&[tcp_record(wrong)], &[naming(raw)]))
+            .unwrap();
+        assert!(receive_shared(&mut rx, &HandoffPeer::default(), until).is_err());
+        let _c = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+            .expect("the listener survived");
+        assert!(victim.accept().is_ok());
+    }
+
+    /// Descriptions naming handles that are not sockets (a file, the channel's own
+    /// pipe) leave those handles working.
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_a_forged_hand_off_leaves_other_handles_alone() {
+        use std::io::{Read, Seek};
+        use std::os::windows::io::AsRawHandle;
+        use std::time::{Duration, Instant};
+        let mut file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let (mut tx, mut rx) = pipe_pair("others");
+        let channel = rx.raw_handle() as usize;
+        let any: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let blobs = [naming(file.as_raw_handle() as usize), naming(channel)];
+        tx.send_all(&frame(&[tcp_record(any), tcp_record(any)], &blobs))
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        assert!(receive_shared(&mut rx, &HandoffPeer::default(), until).is_err());
+        let mut buf = [0u8; 2];
+        file.rewind().unwrap();
+        assert!(file.read(&mut buf).is_ok(), "the file was closed");
+        tx.send_all(b"hi").unwrap();
+        rx.recv_exact(&mut buf).expect("the channel was closed");
+        assert_eq!(&buf, b"hi");
+    }
+
+    /// The sender must run as this user and must have started before the pipe
+    /// connected.
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_only_a_sender_of_this_user_that_was_already_running_is_accepted() {
+        use std::time::{Duration, Instant};
+        assert!(same_user_sender(std::process::id(), Instant::now()));
+        // The system process runs as another account.
+        assert!(!same_user_sender(4, Instant::now()));
+        // A process that started after the pipe connected took a number that
+        // belonged to someone else.
+        let connected = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping", "-n", "3", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let later = same_user_sender(child.id(), connected);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!later, "a process started after the connection was accepted");
     }
 
     #[cfg(all(windows, feature = "local"))]

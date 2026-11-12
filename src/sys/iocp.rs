@@ -13,7 +13,9 @@
 //! `SetFileCompletionNotificationModes`, `WSARecv`, `WSASend`, `ConnectEx`.
 //! Layouts and constants are checked against `windows-sys` by the tests below.
 
+use std::collections::HashSet;
 use std::ffi::c_void;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -244,6 +246,28 @@ pub(crate) enum Started {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InFlight(usize);
 
+/// Hashes the address of an operation: boxes are at least 8-aligned, so the low
+/// bits carry nothing; a multiply spreads the rest. Two map operations per
+/// operation started, on the worker's own thread.
+#[derive(Default)]
+struct AddrHasher(u64);
+
+impl Hasher for AddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8 | u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0 = ((n as u64) >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
 /// A socket on a port.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Associated {
@@ -300,7 +324,13 @@ pub(crate) struct Port {
     /// Boxed because the kernel holds them by address.
     #[allow(clippy::vec_box)]
     free: Vec<Box<Op>>,
-    outstanding: usize,
+    /// The address of every operation this port handed to the kernel whose packet
+    /// has not been dequeued. A packet whose `OVERLAPPED` is not here was not
+    /// started by this port (an overlapped call some other code made on a handle
+    /// associated with it) and is skipped: its memory is not ours to read or free.
+    in_flight: HashSet<usize, BuildHasherDefault<AddrHasher>>,
+    /// Packets skipped because this port did not start their operation.
+    foreign: u64,
     /// Whether every provider gives real handles, so the skip mode is sound.
     skip: bool,
     connect_ex: Option<ConnectEx>,
@@ -310,7 +340,8 @@ pub(crate) struct Port {
 impl std::fmt::Debug for Port {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Port")
-            .field("outstanding", &self.outstanding)
+            .field("in_flight", &self.in_flight.len())
+            .field("foreign", &self.foreign)
             .field("skip", &self.skip)
             .finish_non_exhaustive()
     }
@@ -363,7 +394,8 @@ impl Port {
             port,
             entries: Box::new([OverlappedEntry::default(); ENTRIES]),
             free: Vec::new(),
-            outstanding: 0,
+            in_flight: HashSet::default(),
+            foreign: 0,
             skip,
             connect_ex: None,
             transmit_file: None,
@@ -507,7 +539,7 @@ impl Port {
                 return Started::Done(unsafe { self.reclaim(raw, Err(e)) });
             }
         }
-        self.outstanding += 1;
+        self.in_flight.insert(raw as usize);
         Started::Pending(InFlight(raw as usize))
     }
 
@@ -843,10 +875,15 @@ impl Port {
                 self.wake.pending.store(false, Ordering::Release);
                 continue;
             }
+            if !self.in_flight.remove(&entry.overlapped) {
+                // Not an operation of this port: never read, never freed.
+                self.foreign += 1;
+                continue;
+            }
             let raw = entry.overlapped as *mut Op;
-            self.outstanding -= 1;
-            // SAFETY: a dequeued packet's `OVERLAPPED` is the start of an `Op` that
-            // came from `Box::into_raw` here, and the kernel is done with it.
+            // SAFETY: the address was in `in_flight`, so it is the start of an `Op`
+            // that came from `Box::into_raw` here, and its packet was just dequeued:
+            // the kernel is done with it.
             let status = unsafe { (*raw).overlapped.internal } as u32;
             let result = if status < 0x8000_0000 {
                 Ok(entry.bytes as usize)
@@ -907,7 +944,7 @@ impl Drop for Port {
         // The kernel writes into an operation until its packet arrives. The driver
         // cancelled everything; what is still out after a second stays allocated.
         for _ in 0..10 {
-            if self.outstanding == 0 {
+            if self.in_flight.is_empty() {
                 return;
             }
             let _ = self.wait(Some(Duration::from_millis(100)), drop);
@@ -957,6 +994,33 @@ mod tests {
         peer.read_exact(&mut back).unwrap();
         drop((stream, port));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A packet for an operation this port did not start (an overlapped call other
+    /// code made on a handle on the port) is skipped: its `OVERLAPPED` is never read
+    /// as an operation nor freed, and the count of operations out stays right.
+    #[test]
+    fn test_a_foreign_packet_is_skipped() {
+        let mut port = Port::with_skip(true).unwrap();
+        let mut foreign = Overlapped::default();
+        for _ in 0..2 {
+            // SAFETY: the port is open; `foreign` outlives the wait that dequeues it.
+            let ok = unsafe {
+                PostQueuedCompletionStatus(port.port.as_raw_handle(), 5, 0, &raw mut foreign)
+            };
+            assert_ne!(ok, 0);
+        }
+        let mut finished = 0;
+        port.wait(Some(Duration::from_secs(1)), |_| finished += 1)
+            .unwrap();
+        assert_eq!(finished, 0, "a foreign packet was taken for an operation");
+        assert_eq!(port.foreign, 2);
+        assert!(port.in_flight.is_empty());
+        // The port still serves its own wake afterwards.
+        port.waker().wake();
+        port.wait(Some(Duration::from_secs(1)), |_| finished += 1)
+            .unwrap();
+        assert_eq!(finished, 0);
     }
 
     #[test]
