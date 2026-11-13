@@ -473,7 +473,7 @@ mod tests {
     }
 
     /// A clock that goes back cannot hang the wheel: an entry due between the two
-    /// times fires instead of circling the due list (review finding).
+    /// times fires instead of circling the due list.
     #[test]
     fn test_clock_going_back_does_not_spin() {
         let mut w = Wheel::with_capacity(8);

@@ -250,7 +250,11 @@ impl ListenOptions {
         self
     }
 
-    /// Unix: `SO_REUSEADDR`. Windows: `false` = `SO_EXCLUSIVEADDRUSE`, `true` = `SO_REUSEADDR`.
+    /// Unix: `SO_REUSEADDR`, so a restart binds while connections of the old
+    /// process linger. Windows: ignored, the port is always `SO_EXCLUSIVEADDRUSE`.
+    /// An exclusive listener there can already bind again at once after a restart,
+    /// and Windows `SO_REUSEADDR` means something else: another local socket could
+    /// bind the same port over the listener and take its connections.
     pub fn reuse_address(mut self, on: bool) -> ListenOptions {
         self.reuse_address = on;
         self
@@ -306,13 +310,16 @@ impl ListenOptions {
         self
     }
 
-    /// One socket and one accept thread per reactor worker, in a `SO_REUSEPORT` group
-    /// (Linux; `Unsupported` elsewhere, `InvalidConfig` on the blocking driver). Each
-    /// feeds its own worker, so no connection crosses to another worker, and no accept
-    /// thread is a bottleneck; with `ServerBuilder::placement` each socket also takes
-    /// the connections its worker's CPU received. Costs: a socket and a thread per
-    /// worker, the kernel's hash decides the balance, and such a listener cannot be
-    /// handed off: closing one socket of a group resets what is queued on it.
+    /// One socket per reactor worker, in a `SO_REUSEPORT` group (Linux; `Unsupported`
+    /// elsewhere, `InvalidConfig` on the blocking driver). Each worker accepts on its
+    /// own socket in its own event loop, runs the caps and the gate there, and starts
+    /// the connection in the same turn: no accept thread, no hand-off between threads,
+    /// and no connection crosses to another worker. With `ServerBuilder::placement`
+    /// each socket also takes the connections its worker's CPU received. Costs: a
+    /// socket per worker; the kernel's hash decides the balance; the gate's `admit`
+    /// runs on the worker, so a slow gate delays that worker's other connections; and
+    /// such a listener cannot be handed off: closing one socket of a group resets what
+    /// is queued on it.
     pub fn per_worker(mut self, on: bool) -> ListenOptions {
         self.per_worker = on;
         self.reuse_port = self.reuse_port || on;

@@ -99,6 +99,20 @@ const NO_LISTENER: u32 = u32::MAX;
 /// How often a drain looks again for connections that became idle.
 const DRAIN_PASS: Duration = Duration::from_millis(10);
 
+/// How long a drain waits, after it killed what was left (at its deadline, or at a
+/// stop), for those connections to close before it returns anyway, and how long a
+/// stop then waits for its worker threads. A killed connection closes in
+/// microseconds once its owner sees the kill; an owner that does not (a blocking
+/// handler that computes, sleeps, or waits on a lock and never touches the socket,
+/// or a session callback that does not return) is left running, detached, and
+/// counted in `Stats::workers_detached`. Cost: a stop returns at most this long after
+/// its deadline, plus the join below; nothing on a normal drain, which ends when
+/// the last connection closes.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a stop waits for its worker threads after a drain gave up on some.
+const JOIN_SLACK: Duration = Duration::from_millis(100);
+
 /// Accept errors in a row, none of them a connection, before the accept loop pauses.
 const SKIPS_BEFORE_PAUSE: u32 = 64;
 
@@ -245,6 +259,11 @@ pub(crate) struct WorkerShared {
     /// Wakes this worker's loop, reactor only.
     #[cfg(feature = "reactor")]
     pub(crate) waker: OnceLock<DriverWaker>,
+    /// The worker's loop ended on a panic or a failed wait, reactor only: it takes
+    /// no more connections, and what waited in its inbox was closed. Set under the
+    /// inbox lock, so a hand-over either sees it or leaves a job the worker closes.
+    #[cfg(feature = "reactor")]
+    pub(crate) dead: AtomicBool,
 }
 
 /// A worker's inbox, on cache lines of its own: its owner locks it on every turn.
@@ -349,6 +368,12 @@ pub(crate) struct Shared {
     /// The global cap, for `pressure`.
     #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
     max_open: u32,
+    /// Workers shared by every listener without workers of its own: the first
+    /// `shared_workers` of `workers`.
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    shared_workers: usize,
+    /// Soft closes in progress, against `Limits::denial_linger_max` (D-182).
+    pub(crate) soft_closes: Arc<crate::link::SoftCloses>,
     /// The server's limits, for listeners added later.
     pub(crate) base_limits: Limits,
     /// The server's trusted proxies, for listeners added later.
@@ -358,6 +383,14 @@ pub(crate) struct Shared {
     /// Accept threads between their door check and the end of an admission: a
     /// drain is not over while one is (D-179).
     admitting: AtomicUsize,
+    /// Moves on every change to the listeners reactor workers accept on themselves
+    /// (D-197): a worker rescans its own when this differs from the one it saw.
+    #[cfg(feature = "reactor")]
+    pub(crate) listener_epoch: AtomicU64,
+    /// A drain the control line asked for has its thread: a worker that sees it
+    /// cannot wait in it the way an accept thread does (D-197).
+    #[cfg(feature = "reactor")]
+    control_drain: AtomicBool,
     control: Arc<dyn ControlLine>,
     sink: Option<Arc<dyn EventSink>>,
     open: AtomicU32,
@@ -368,6 +401,13 @@ pub(crate) struct Shared {
     descriptor_pressure: AtomicU64,
     drained_graceful: AtomicU32,
     drained_killed: AtomicU32,
+    /// Reactor workers whose loop ended on a panic or a failed wait.
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    workers_lost: AtomicU32,
+    /// Worker threads a stop left running past its bound (`DRAIN_GRACE`).
+    workers_detached: AtomicU32,
+    /// Worker threads still running, for a stop's bounded join.
+    running: AtomicUsize,
     pub(crate) drain_timeout: Duration,
     /// The TLS engine, when any listener serves TLS.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
@@ -487,10 +527,15 @@ impl Shared {
         }
         let opened = !self.door.swap(true, Ordering::AcqRel);
         // Every listener's door opens, including listeners added since the last call.
+        let mut workers = false;
         for e in self.lock_listeners().iter() {
             if !e.conf.door.swap(true, Ordering::AcqRel) {
                 e.conf.wake.wake();
+                workers |= e.conf.on_workers;
             }
+        }
+        if workers {
+            self.wake_workers();
         }
         if opened {
             self.event(Event::DoorOpened);
@@ -522,7 +567,7 @@ impl Shared {
             return Ok(());
         };
         for e in self.lock_listeners().iter_mut() {
-            if e.thread.is_none() {
+            if e.thread.is_none() && !e.conf.on_workers {
                 e.thread = Some(spawn(e.conf.clone(), e.runtime.clone(), 0)?);
                 for (i, s) in e.siblings.iter_mut().enumerate() {
                     s.thread = Some(spawn(e.conf.clone(), s.runtime.clone(), i + 1)?);
@@ -538,6 +583,12 @@ impl Shared {
         for e in &entries {
             e.conf.removed.store(true, Ordering::Release);
             e.conf.wake.wake();
+        }
+        #[cfg(feature = "reactor")]
+        for e in entries.iter().filter(|e| e.conf.on_workers) {
+            let mut all = vec![&e.runtime];
+            all.extend(e.siblings.iter().map(|s| &s.runtime));
+            self.release_from_workers(&all);
         }
         for mut e in entries {
             if let Some(t) = e.thread.take() {
@@ -620,7 +671,7 @@ impl Shared {
             },
         })?);
         let (mut entry, info) =
-            bind_listener(spec, id, &self.base_limits, self.driver, &self.layout)?;
+            bind_listener(spec, id, &self.base_limits, self.driver, &self.layout, None)?;
         let Some(spawn) = self.spawn_accept.get() else {
             return Err(NetError::ShuttingDown);
         };
@@ -628,11 +679,21 @@ impl Shared {
             driver: DriverKind::Blocking,
             source: e,
         };
-        entry.thread = Some(spawn(entry.conf.clone(), entry.runtime.clone(), 0).map_err(setup)?);
-        for (i, s) in entry.siblings.iter_mut().enumerate() {
-            s.thread = Some(spawn(entry.conf.clone(), s.runtime.clone(), i + 1).map_err(setup)?);
+        let on_workers = entry.conf.on_workers;
+        if !on_workers {
+            entry.thread =
+                Some(spawn(entry.conf.clone(), entry.runtime.clone(), 0).map_err(setup)?);
+            for (i, s) in entry.siblings.iter_mut().enumerate() {
+                s.thread =
+                    Some(spawn(entry.conf.clone(), s.runtime.clone(), i + 1).map_err(setup)?);
+            }
         }
         self.lock_listeners().push(entry);
+        #[cfg(feature = "reactor")]
+        if on_workers {
+            self.listener_epoch.fetch_add(1, Ordering::AcqRel);
+            self.wake_workers();
+        }
         self.event(Event::ListenerOpened {
             listener: id,
             local: info.local.socket_addr(),
@@ -670,6 +731,12 @@ impl Shared {
         conf.door.store(false, Ordering::Release);
         conf.removed.store(true, Ordering::Release);
         conf.wake.wake();
+        #[cfg(feature = "reactor")]
+        if conf.on_workers {
+            let mut all = vec![&runtime];
+            all.extend(siblings.iter().map(|s| &s.runtime));
+            self.release_from_workers(&all);
+        }
         if let Some(t) = thread {
             let _ = t.join();
         }
@@ -700,6 +767,10 @@ impl Shared {
             if now >= deadline && !killed_at_deadline {
                 killed_at_deadline = true;
                 self.command(CMD_LISTENER_KILL);
+            }
+            // What is left ignored the kill (a callback that does not return).
+            if killed_at_deadline && now >= deadline + DRAIN_GRACE {
+                break;
             }
             let wait = if killed_at_deadline {
                 Duration::from_millis(50)
@@ -772,6 +843,10 @@ impl Shared {
                     }
                 }
             }
+            // What is left ignored the kill (a handler that does not return).
+            if killed_at_deadline && now >= deadline + DRAIN_GRACE {
+                break;
+            }
             let wait = if killed_at_deadline {
                 Duration::from_millis(50)
             } else {
@@ -825,6 +900,84 @@ impl Shared {
         self.workers.len()
     }
 
+    /// The driver this server runs, which its limits resolve for.
+    pub(crate) fn driver(&self) -> DriverKind {
+        self.driver
+    }
+
+    /// Wakes every worker (not the accept threads).
+    fn wake_workers(&self) {
+        for i in 0..self.workers.len() {
+            self.wake_worker(i);
+        }
+    }
+
+    /// Returns once no worker holds these listening sockets: each one that accepts
+    /// on them sees the epoch move, deregisters, and drops its handle, so the
+    /// sockets close when the caller drops its own, as a joined accept thread's do.
+    /// A worker answers at its next turn; one held in a session callback holds
+    /// this, as a gate callback holds an accept thread's join.
+    #[cfg(feature = "reactor")]
+    fn release_from_workers(&self, runtimes: &[&Arc<ListenerRuntime>]) {
+        self.listener_epoch.fetch_add(1, Ordering::AcqRel);
+        while runtimes.iter().any(|r| Arc::strong_count(r) > 1) {
+            self.wake_workers();
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    /// The listeners worker `idx` accepts on itself (D-197): for each listener of a
+    /// per-worker group, the socket of that worker's place in the group, and the
+    /// socket of each dead worker it is heir to (the first live worker after it), so
+    /// that the connections the kernel puts on a dead worker's socket are accepted.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn worker_listeners(
+        &self,
+        idx: usize,
+    ) -> Vec<(Arc<ListenerConf>, Arc<ListenerRuntime>)> {
+        let dead = |i: usize| {
+            self.workers
+                .get(i)
+                .is_none_or(|w| w.dead.load(Ordering::Acquire))
+        };
+        let mut out = Vec::new();
+        if dead(idx) {
+            return out;
+        }
+        for e in self
+            .lock_listeners()
+            .iter()
+            .filter(|e| e.conf.on_workers && !e.conf.removed.load(Ordering::Acquire))
+        {
+            let places = e.siblings.len() + 1;
+            for place in 0..places {
+                let heir = (0..places)
+                    .map(|k| (place + k) % places)
+                    .find(|&i| !dead(i));
+                if heir != Some(idx) {
+                    continue;
+                }
+                let rt = match place {
+                    0 => &e.runtime,
+                    i => &e.siblings[i - 1].runtime,
+                };
+                out.push((e.conf.clone(), rt.clone()));
+            }
+        }
+        out
+    }
+
+    /// A reactor worker died (`Engine::retire` marked it): the others look again at
+    /// the listeners they accept on, so an heir takes its sockets, and a drain
+    /// waiting for its connections looks again.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn worker_lost(&self) {
+        self.workers_lost.fetch_add(1, Ordering::Relaxed);
+        self.listener_epoch.fetch_add(1, Ordering::AcqRel);
+        self.wake_workers();
+        self.notify_progress();
+    }
+
     pub(crate) fn wake_all(&self) {
         for e in self.lock_listeners().iter() {
             e.conf.wake.wake();
@@ -835,13 +988,33 @@ impl Shared {
     }
 
     pub(crate) fn kill(&self, id: ConnectionId, reason: KillReason) -> bool {
+        self.with_slot(id, |slot, generation| slot.kill(generation, reason))
+    }
+
+    /// A soft kill: the owner sends what is queued, then closes gracefully, all
+    /// within `within` (`ServerHandle::close_after_flush`).
+    pub(crate) fn close_after_flush(
+        &self,
+        id: ConnectionId,
+        reason: KillReason,
+        within: Duration,
+    ) -> bool {
+        let within = within.min(crate::time::LONGEST);
+        self.with_slot(id, |slot, generation| {
+            slot.kill_soft(generation, reason, within)
+        })
+    }
+
+    /// Runs `f` on the kill slot of connection `id` with its generation; `false`
+    /// when no open connection of this server has that id.
+    fn with_slot(&self, id: ConnectionId, f: impl FnOnce(&KillSlot, u32) -> bool) -> bool {
         #[cfg(feature = "reactor")]
         if self.reactor {
             let found = self
                 .conn_shard(id.get())
                 .get(&id.get())
                 .map(|c| (c.slot.clone(), c.generation));
-            return found.is_some_and(|(slot, generation)| slot.kill(generation, reason));
+            return found.is_some_and(|(slot, generation)| f(&slot, generation));
         }
         for w in &self.workers {
             if w.current.load(Ordering::Acquire) != id.get() {
@@ -851,7 +1024,7 @@ impl Shared {
             if w.current.load(Ordering::Acquire) != id.get() {
                 return false;
             }
-            return w.slot.kill(generation, reason);
+            return f(&w.slot, generation);
         }
         false
     }
@@ -868,6 +1041,8 @@ impl Shared {
             accepted: self.accepted.load(Ordering::Relaxed),
             refused: self.refused.load(Ordering::Relaxed),
             descriptor_pressure: self.descriptor_pressure.load(Ordering::Relaxed),
+            workers_lost: u64::from(self.workers_lost.load(Ordering::Relaxed)),
+            workers_detached: u64::from(self.workers_detached.load(Ordering::Relaxed)),
             ..Stats::default()
         };
         let mut closed_by = [0u64; CloseReason::COUNT];
@@ -912,7 +1087,8 @@ impl Shared {
             });
         }
         let mut guard = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut killed_at_deadline = false;
+        // When the drain first killed what was left.
+        let mut killed_at: Option<Instant> = None;
         while !self.idle() {
             // Close every connection that waits for its next exchange; repeated each
             // pass for connections that finish an exchange during the drain.
@@ -924,12 +1100,19 @@ impl Shared {
                 || self.control.state() == ControlState::Stopping;
             if stop {
                 self.kill_all(CAUSE_STOP);
-                killed_at_deadline = true;
+                let _ = killed_at.get_or_insert(now);
             } else if now >= deadline {
                 // Every pass, not once: a connection admitted late is killed too.
-                killed_at_deadline = true;
+                let _ = killed_at.get_or_insert(now);
                 self.kill_all(CAUSE_DRAIN);
             }
+            // What is left ignored the kill: an owner that never looks at its socket
+            // or a callback that does not return. The drain ends anyway, and
+            // `stats().open` still counts them.
+            if killed_at.is_some_and(|at| now >= at + DRAIN_GRACE) {
+                break;
+            }
+            let killed_at_deadline = killed_at.is_some();
             let wait = if killed_at_deadline {
                 Duration::from_millis(50)
             } else {
@@ -1015,10 +1198,41 @@ impl Shared {
                 && !w.slot.drained()
             {
                 w.idle_cause.store(IDLE_SHED, Ordering::Release);
-                if !w.slot.drain_idle(generation) {
+                if !w.slot.shed_idle(generation) {
                     w.idle_cause.store(IDLE_DRAIN, Ordering::Release);
                 }
             }
+        }
+    }
+
+    /// Joins the worker threads of a stopping server, waiting at most `DRAIN_GRACE`
+    /// (`JOIN_SLACK` when the drain already gave up on some connections); a thread
+    /// still running then is left detached and counted: it ends, and frees what it
+    /// holds, when its handler returns.
+    pub(crate) fn join_workers(&self, threads: Vec<JoinHandle<()>>) {
+        let bound = Instant::now() + if self.idle() { DRAIN_GRACE } else { JOIN_SLACK };
+        let mut guard = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        while self.running.load(Ordering::Acquire) > 0 {
+            let now = Instant::now();
+            if now >= bound {
+                break;
+            }
+            guard = self
+                .progress_cv
+                .wait_timeout(guard, bound - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        drop(guard);
+        let left = self.running.load(Ordering::Acquire);
+        for t in threads {
+            if left == 0 || t.is_finished() {
+                let _ = t.join();
+            }
+        }
+        if left > 0 {
+            let left = u32::try_from(left).unwrap_or(u32::MAX);
+            self.workers_detached.fetch_add(left, Ordering::Relaxed);
         }
     }
 
@@ -1089,7 +1303,7 @@ impl ListenerProxy {
 /// connection it admitted hold it, so a removed listener's connections keep
 /// their limits and give their cap slots back where they took them.
 pub(crate) struct ListenerConf {
-    id: ListenerId,
+    pub(crate) id: ListenerId,
     pub(crate) limits: Arc<Effective>,
     tcp: TcpOptions,
     /// `Some` when the listener requires a PROXY header.
@@ -1113,6 +1327,13 @@ pub(crate) struct ListenerConf {
     /// queued connections close with `Drained`.
     pub(crate) removed: AtomicBool,
     wake: Wakes,
+    /// Reactor workers of its own: the first index and how many (`None`: the
+    /// server's shared workers).
+    #[cfg_attr(not(feature = "reactor"), allow(dead_code))]
+    pub(crate) workers: Option<(usize, usize)>,
+    /// A per-worker group on the reactor: each worker accepts on its own socket in
+    /// its own loop, and no accept thread runs (D-197).
+    pub(crate) on_workers: bool,
 }
 
 #[cfg(feature = "reactor")]
@@ -1149,8 +1370,21 @@ impl Wakes {
 }
 
 thread_local! {
-    /// On an accept thread of a per-worker group: the worker it feeds.
-    static FEEDS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// On an accept thread of a per-worker group, the worker it feeds; during a
+    /// reactor worker's own accepts, that worker, with `true`: it takes its inbox
+    /// after the batch, so no wake is sent (D-197).
+    static FEEDS: std::cell::Cell<Option<(usize, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// A worker thread, counted in `Shared::running` until it ends (or its spawn fails
+/// and the closure holding this is dropped), however it ends.
+struct Running(Arc<Shared>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::AcqRel);
+        self.0.notify_progress();
+    }
 }
 
 /// One accept thread inside an admission, for the drain (see `Shared::admitting`).
@@ -1179,8 +1413,31 @@ fn bind_listener(
     base: &Limits,
     driver: DriverKind,
     layout: &Layout,
+    dedicated: Option<(usize, usize)>,
 ) -> Result<(ListenerEntry, ListenerInfo), NetError> {
     let per_worker = spec.options.is_some_and(|o| o.per_worker);
+    if let Some(n) = spec.workers {
+        let reason = if n == 0 {
+            crate::error::ConfigReason::Zero
+        } else {
+            crate::error::ConfigReason::Inconsistent
+        };
+        #[cfg(feature = "udp")]
+        let udp = spec.udp.is_some();
+        #[cfg(not(feature = "udp"))]
+        let udp = false;
+        if n == 0
+            || per_worker
+            || udp
+            || driver.resolve() != DriverKind::Reactor
+            || dedicated.is_none()
+        {
+            return Err(NetError::InvalidConfig {
+                field: "workers",
+                reason,
+            });
+        }
+    }
     if per_worker && !cfg!(target_os = "linux") {
         return Err(NetError::Unsupported {
             feature: "per-worker listeners",
@@ -1350,6 +1607,8 @@ fn bind_listener(
             source: e,
         })?;
     let wake = Wakes(wakes);
+    let on_workers =
+        per_worker && cfg!(feature = "reactor") && matches!(runtime, ListenerRuntime::Tcp(_));
     let conf = Arc::new(ListenerConf {
         id,
         limits: Arc::new(lim),
@@ -1364,6 +1623,8 @@ fn bind_listener(
         door: AtomicBool::new(false),
         removed: AtomicBool::new(false),
         wake,
+        workers: dedicated,
+        on_workers,
     });
     Ok((
         ListenerEntry {
@@ -1410,7 +1671,7 @@ impl<T> Job<T> {
 
 // Listeners are few, and each lives as long as its thread.
 #[allow(clippy::large_enum_variant)]
-enum ListenerRuntime {
+pub(crate) enum ListenerRuntime {
     Tcp(TcpListener),
     #[cfg(feature = "udp")]
     Udp(Mutex<crate::udp::UdpSocket>, ListenerInfo),
@@ -1423,6 +1684,16 @@ enum ListenerRuntime {
 }
 
 impl ListenerRuntime {
+    /// The listening TCP socket, for a worker that accepts on it (D-197).
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tcp_sock(&self) -> Option<sys::Sock<'_>> {
+        match self {
+            ListenerRuntime::Tcp(l) => Some(l.std().sock()),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// Until a connection waits, or `wake` fires. A pipe's accept does this itself.
     fn wait(&self, wake: &sys::Wake) {
         let sock = match self {
@@ -1515,6 +1786,18 @@ impl<W, G: Gate> Engine<W, G> {
             .pop_front()
     }
 
+    /// Worker `idx`'s loop ended for good: it is marked dead under its inbox lock,
+    /// so no hand-over adds to the inbox after this, and gets what waited there, to
+    /// close.
+    pub(crate) fn retire(&self, idx: usize) -> VecDeque<Job<G::Ticket>> {
+        let mut inbox = self.inboxes[idx]
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.shared.workers[idx].dead.store(true, Ordering::Release);
+        std::mem::take(&mut *inbox)
+    }
+
     pub(crate) fn inbox_empty(&self, idx: usize) -> bool {
         self.inboxes[idx]
             .0
@@ -1530,22 +1813,32 @@ impl<W, G: Gate> Engine<W, G> {
     #[allow(clippy::result_large_err)]
     fn hand_to_worker(&self, job: Job<G::Ticket>) -> Result<(), Job<G::Ticket>> {
         let shared = &self.shared;
-        let idx = FEEDS
+        let (base, len) = job.listener.workers.unwrap_or((0, shared.shared_workers));
+        // An accept thread whose worker died hands to the others.
+        let feed = FEEDS
             .with(std::cell::Cell::get)
-            .unwrap_or_else(|| least_loaded(&shared.workers, &shared.next_worker));
+            .filter(|&(i, _)| !shared.workers[i].dead.load(Ordering::Relaxed));
+        let idx = feed.map_or_else(
+            || base + least_loaded(&shared.workers[base..base + len], &shared.next_worker),
+            |(i, _)| i,
+        );
         {
             let mut inbox = self.inboxes[idx]
                 .0
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if inbox.len() >= INBOX_MAX {
+            // Read under the lock the dying worker sets it under: no job is left in
+            // an inbox nobody takes.
+            if inbox.len() >= INBOX_MAX || shared.workers[idx].dead.load(Ordering::Acquire) {
                 return Err(job);
             }
             // Counted now, so a burst spreads over the workers.
             shared.workers[idx].load.fetch_add(1, Ordering::Relaxed);
             inbox.push_back(job);
         }
-        shared.wake_worker(idx);
+        if !feed.is_some_and(|(_, own)| own) {
+            shared.wake_worker(idx);
+        }
         Ok(())
     }
 }
@@ -1553,7 +1846,8 @@ impl<W, G: Gate> Engine<W, G> {
 /// The worker with the fewest open connections, looking from a start that moves on
 /// by one each call: with short connections every load is usually 0, and taking the
 /// first minimum gave every connection to worker 0 (found by tls-net, D-174). Stops
-/// at the first idle worker.
+/// at the first idle worker. A dead worker is never chosen while another lives (its
+/// load would read 0 for ever); when all are dead, the hand-over refuses.
 #[cfg(feature = "reactor")]
 fn least_loaded(workers: &[WorkerShared], next: &AtomicUsize) -> usize {
     let n = workers.len();
@@ -1565,6 +1859,9 @@ fn least_loaded(workers: &[WorkerShared], next: &AtomicUsize) -> usize {
     let mut least = u32::MAX;
     for k in 0..n {
         let i = (start + k) % n;
+        if workers[i].dead.load(Ordering::Relaxed) {
+            continue;
+        }
         let load = workers[i].load.load(Ordering::Relaxed);
         if load < least {
             least = load;
@@ -1586,15 +1883,35 @@ where
     let driver = cfg.driver;
     let reactor = driver == DriverKind::Reactor;
     let limits = cfg.limits.effective(driver);
+    // Listeners with workers of their own get them after the server's shared ones,
+    // in listener order (`ListenerSpec::workers`).
+    let shared_workers = usize::from(cfg.workers);
+    let mut ranges = Vec::with_capacity(cfg.listeners.len());
+    let mut total = shared_workers;
+    for spec in &cfg.listeners {
+        ranges.push(spec.workers.filter(|&n| n > 0).map(|n| {
+            let range = (total, usize::from(n));
+            total += usize::from(n);
+            range
+        }));
+    }
+    let Ok(all_workers) = u16::try_from(total) else {
+        return Err(NetError::InvalidConfig {
+            field: "workers",
+            reason: crate::error::ConfigReason::TooLarge {
+                max: u64::from(u16::MAX),
+            },
+        });
+    };
     let layout = Layout {
-        workers: cfg.workers,
+        workers: all_workers,
         placement: cfg.placement.clone(),
     };
     let mut entries = Vec::with_capacity(cfg.listeners.len());
     let mut infos = Vec::with_capacity(cfg.listeners.len());
-    for (i, spec) in cfg.listeners.into_iter().enumerate() {
+    for (i, (spec, range)) in cfg.listeners.into_iter().zip(ranges).enumerate() {
         let id = ListenerId(u16::try_from(i).unwrap_or(u16::MAX));
-        let (entry, info) = bind_listener(spec, id, &cfg.limits, driver, &layout)?;
+        let (entry, info) = bind_listener(spec, id, &cfg.limits, driver, &layout, range)?;
         entries.push(entry);
         infos.push(info);
     }
@@ -1604,8 +1921,8 @@ where
     } else {
         Some(Arc::new(cfg.sink))
     };
-    let mut worker_wakes = Vec::with_capacity(usize::from(cfg.workers));
-    for _ in 0..cfg.workers {
+    let mut worker_wakes = Vec::with_capacity(total);
+    for _ in 0..all_workers {
         worker_wakes.push(
             Wake::new()
                 .map(Arc::new)
@@ -1616,10 +1933,10 @@ where
         );
     }
     #[cfg(feature = "reactor")]
-    let mut backends = Vec::with_capacity(usize::from(cfg.workers));
+    let mut backends = Vec::with_capacity(total);
     #[cfg(feature = "reactor")]
     if reactor {
-        for _ in 0..cfg.workers {
+        for _ in 0..all_workers {
             backends.push(Some(Backend::new(1024)?));
         }
     }
@@ -1667,6 +1984,8 @@ where
                 load: AtomicU32::new(0),
                 #[cfg(feature = "reactor")]
                 waker: OnceLock::new(),
+                #[cfg(feature = "reactor")]
+                dead: AtomicBool::new(false),
             })
             .collect(),
         #[cfg(feature = "reactor")]
@@ -1679,6 +1998,8 @@ where
             .collect(),
         driver,
         max_open: limits.max_connections,
+        soft_closes: crate::link::SoftCloses::new(limits.denial_linger_max),
+        shared_workers,
         listeners: Mutex::new(entries),
         next_listener: AtomicU32::new(next_listener),
         spawn_accept: OnceLock::new(),
@@ -1688,6 +2009,10 @@ where
         queue_notify: OnceLock::new(),
         queue_len: AtomicUsize::new(0),
         admitting: AtomicUsize::new(0),
+        #[cfg(feature = "reactor")]
+        listener_epoch: AtomicU64::new(0),
+        #[cfg(feature = "reactor")]
+        control_drain: AtomicBool::new(false),
         control: cfg.control.unwrap_or_else(|| Arc::new(NoControl)),
         sink,
         open: AtomicU32::new(0),
@@ -1698,6 +2023,9 @@ where
         descriptor_pressure: AtomicU64::new(0),
         drained_graceful: AtomicU32::new(0),
         drained_killed: AtomicU32::new(0),
+        workers_lost: AtomicU32::new(0),
+        workers_detached: AtomicU32::new(0),
+        running: AtomicUsize::new(0),
         drain_timeout: limits.drain_timeout,
         tls: cfg.tls,
     });
@@ -1724,9 +2052,10 @@ where
         #[cfg(feature = "reactor")]
         drivers: Mutex::new(backends),
         work: cfg.work,
-        gated: TypeId::of::<G>() != TypeId::of::<AllowAll>(),
+        gated: TypeId::of::<G>() != TypeId::of::<AllowAll>()
+            && TypeId::of::<G>() != TypeId::of::<super::NoGate>(),
         gate: Arc::new(cfg.gate),
-        queue: Mutex::new(VecDeque::with_capacity(usize::from(cfg.workers))),
+        queue: Mutex::new(VecDeque::with_capacity(total)),
         queue_cv: Condvar::new(),
         clock: cfg.clock.map_or(ClockRef::Monotonic, ClockRef::Custom),
         wipe: cfg.wipe,
@@ -1758,19 +2087,22 @@ where
             .spawn(move || accept_loop(&e, &conf, &rt, slot))
     }));
 
-    let mut threads = Vec::with_capacity(usize::from(cfg.workers));
+    let mut threads = Vec::with_capacity(total);
     let spawn_error = |e: std::io::Error| NetError::DriverSetup {
         driver: DriverKind::Blocking,
         source: e,
     };
     let mut failure = None;
-    for i in 0..usize::from(cfg.workers) {
+    for i in 0..total {
         let e = engine.clone();
         let cpu = layout.cpu_of(i);
+        shared.running.fetch_add(1, Ordering::AcqRel);
+        let running = Running(shared.clone());
         match std::thread::Builder::new()
             .name(format!("net-io-worker-{i}"))
             .stack_size(WORKER_STACK)
             .spawn(move || {
+                let _running = running;
                 if let Some(cpu) = cpu {
                     // Placement is a tuning hint: a CPU this process may not use leaves
                     // the worker where it is, working.
@@ -1873,30 +2205,25 @@ fn accept_loop<W: super::Workload, G: Gate>(
     }
     let wake = conf.wake.0[slot].clone();
     if conf.wake.0.len() > 1 {
-        FEEDS.with(|f| f.set(Some(slot)));
+        FEEDS.with(|f| f.set(Some((slot, false))));
     }
-    let batch = conf.limits.accept_batch;
-    let mut acceptor = Acceptor::new();
-    let mut ids = IdBlock::new();
-    let mut view = ControlView::new();
-    let mut coalescer = Coalescer::new();
-    let mut pause_until: Option<Instant> = None;
-    let mut skipped = 0u32;
+    let mut st = AcceptState::new();
     loop {
         if shared.stopping.load(Ordering::Acquire) || conf.removed.load(Ordering::Acquire) {
             return;
         }
-        if view.refresh(shared.control.as_ref()) {
+        if st.view.refresh(shared.control.as_ref()) {
             shared.event(Event::ControlReacted {
-                state: view.state(),
+                state: st.view.state(),
             });
-            match view.state() {
+            match st.view.state() {
                 ControlState::Draining => {
                     shared.close_door();
-                    shared.request_stop(view.deadline());
+                    shared.request_stop(st.view.deadline());
                     // The drain runs here: the door is closed, so this thread has
                     // nothing else to do until it ends.
-                    let deadline = view
+                    let deadline = st
+                        .view
                         .deadline()
                         .unwrap_or_else(|| Instant::now() + shared.drain_timeout);
                     shared.drain(deadline);
@@ -1910,22 +2237,96 @@ fn accept_loop<W: super::Workload, G: Gate>(
                 _ => {}
             }
         }
-        let accepting = shared.door.load(Ordering::Acquire)
-            && conf.door.load(Ordering::Acquire)
-            && !shared.draining.load(Ordering::Acquire);
         let now = engine.clock.now();
-        if !accepting {
+        if !accepting(shared, conf) {
             let _ = sys::wait_wake(&wake, None);
             continue;
         }
-        if let Some(until) = pause_until {
+        if let Some(until) = st.pause_until {
             if now < until {
                 let _ = sys::wait_wake(&wake, Some(until - now));
                 continue;
             }
-            pause_until = None;
+            st.pause_until = None;
         }
-        for _ in 0..batch {
+        match engine.accept_some(conf, rt, &mut st, &wake) {
+            BatchEnd::More => {}
+            BatchEnd::Again => rt.wait(&wake),
+            BatchEnd::Failed => return,
+        }
+    }
+}
+
+/// The door is open for `conf`, and no drain runs.
+fn accepting(shared: &Shared, conf: &ListenerConf) -> bool {
+    shared.door.load(Ordering::Acquire)
+        && conf.door.load(Ordering::Acquire)
+        && !shared.draining.load(Ordering::Acquire)
+}
+
+/// One accept loop's own state: an accept thread's, or a reactor worker's for each
+/// listener it accepts on (D-197).
+pub(crate) struct AcceptState {
+    acceptor: Acceptor,
+    ids: IdBlock,
+    view: ControlView,
+    coalescer: Coalescer,
+    pause_until: Option<Instant>,
+    skipped: u32,
+}
+
+impl AcceptState {
+    pub(crate) fn new() -> AcceptState {
+        AcceptState {
+            acceptor: Acceptor::new(),
+            ids: IdBlock::new(),
+            view: ControlView::new(),
+            coalescer: Coalescer::new(),
+            pause_until: None,
+            skipped: 0,
+        }
+    }
+}
+
+/// How a batch of accepts ended.
+enum BatchEnd {
+    /// The batch ran out, the door closed, the control line moved, or a pause
+    /// began: the caller looks again.
+    More,
+    /// No connection waits.
+    Again,
+    /// The listener failed (`ListenerFailed` is out).
+    Failed,
+}
+
+/// What a reactor worker does next with a listener it accepts on (D-197).
+#[cfg(feature = "reactor")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerAccept {
+    /// No connection waits: arm `Operation::Accept`.
+    Armed,
+    /// More may wait: come back after this turn's other work.
+    Kick,
+    /// The door is closed or a drain runs: nothing until it opens.
+    Park,
+    /// Out of descriptors: nothing until then.
+    Paused(Instant),
+    /// The listener failed, or the server stops.
+    Gone,
+}
+
+impl<W: super::Workload, G: Gate> Engine<W, G> {
+    /// One batch of accepts and admissions on `rt`, bounded by `accept_batch`.
+    fn accept_some(
+        &self,
+        conf: &Arc<ListenerConf>,
+        rt: &ListenerRuntime,
+        st: &mut AcceptState,
+        wake: &Wake,
+    ) -> BatchEnd {
+        let shared = &self.shared;
+        let _ = wake;
+        for _ in 0..conf.limits.accept_batch {
             // Counted before the door is read: a drain that closes the door either
             // stops this accept or waits for this admission to finish, so a
             // connection it takes is queued and served, never closed unread when the
@@ -1938,44 +2339,58 @@ fn accept_loop<W: super::Workload, G: Gate>(
                 || !conf.door.load(Ordering::SeqCst)
                 || shared.draining.load(Ordering::Acquire)
                 || shared.stopping.load(Ordering::Acquire)
-                || view.moved(shared.control.as_ref())
+                || st.view.moved(shared.control.as_ref())
             {
                 break;
             }
             let outcome = match rt {
-                ListenerRuntime::Tcp(l) => match acceptor.accept(l.std()) {
+                ListenerRuntime::Tcp(l) => match st.acceptor.accept(l.std()) {
                     Accepted::Conn((stream, peer)) => {
-                        skipped = 0;
-                        engine.admit_tcp(stream, peer, conf, &mut ids, &view, &mut coalescer);
+                        st.skipped = 0;
+                        self.admit_tcp(
+                            stream,
+                            peer,
+                            conf,
+                            &mut st.ids,
+                            &st.view,
+                            &mut st.coalescer,
+                        );
                         continue;
                     }
                     other => other.without_conn(),
                 },
                 #[cfg(all(unix, feature = "local"))]
-                ListenerRuntime::Unix(l) => match acceptor.accept_unix(l.std()) {
+                ListenerRuntime::Unix(l) => match st.acceptor.accept_unix(l.std()) {
                     Accepted::Conn(stream) => {
-                        skipped = 0;
-                        engine.admit_unix(l, stream, conf, &mut ids, &view, &mut coalescer);
+                        st.skipped = 0;
+                        self.admit_unix(l, stream, conf, &mut st.ids, &st.view, &mut st.coalescer);
                         continue;
                     }
                     other => other.without_conn(),
                 },
                 #[cfg(feature = "udp")]
-                ListenerRuntime::Udp(..) => return,
+                ListenerRuntime::Udp(..) => return BatchEnd::Failed,
                 #[cfg(all(windows, feature = "local"))]
-                ListenerRuntime::AfUnix(l) => match acceptor.accept_af_unix(l.std()) {
+                ListenerRuntime::AfUnix(l) => match st.acceptor.accept_af_unix(l.std()) {
                     Accepted::Conn(stream) => {
-                        skipped = 0;
-                        engine.admit_af_unix(l, stream, conf, &mut ids, &view, &mut coalescer);
+                        st.skipped = 0;
+                        self.admit_af_unix(
+                            l,
+                            stream,
+                            conf,
+                            &mut st.ids,
+                            &st.view,
+                            &mut st.coalescer,
+                        );
                         continue;
                     }
                     other => other.without_conn(),
                 },
                 #[cfg(all(windows, feature = "local"))]
-                ListenerRuntime::Pipe(l) => match l.accept_or_wake(&wake) {
+                ListenerRuntime::Pipe(l) => match l.accept_or_wake(wake) {
                     Ok(Some(stream)) => {
-                        skipped = 0;
-                        engine.admit_pipe(l, stream, conf, &mut ids, &view, &mut coalescer);
+                        st.skipped = 0;
+                        self.admit_pipe(l, stream, conf, &mut st.ids, &st.view, &mut st.coalescer);
                         continue;
                     }
                     // The wake: the top of the loop decides what it meant.
@@ -1984,7 +2399,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     // and pausing would hide that.
                     Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Accepted::Failed(e),
                     // Out of instances or handles: the same pause as out of descriptors.
-                    Err(_) => acceptor.pause(),
+                    Err(_) => st.acceptor.pause(),
                 },
             };
             // No connection in hand: nothing for a drain to wait for, and what follows
@@ -2000,24 +2415,23 @@ fn accept_loop<W: super::Workload, G: Gate>(
                     // An error that never consumes a backlog entry (the network
                     // subsystem failing) would otherwise spin: after a batch of them
                     // in a row, pause as for descriptor pressure.
-                    skipped += 1;
-                    if skipped >= SKIPS_BEFORE_PAUSE {
-                        skipped = 0;
-                        if let Accepted::Pause(backoff) = acceptor.pause() {
-                            pause_until = Some(engine.clock.now() + backoff);
+                    st.skipped += 1;
+                    if st.skipped >= SKIPS_BEFORE_PAUSE {
+                        st.skipped = 0;
+                        if let Accepted::Pause(backoff) = st.acceptor.pause() {
+                            st.pause_until = Some(self.clock.now() + backoff);
                             break;
                         }
                     }
                 }
                 Accepted::Again => {
-                    skipped = 0;
+                    st.skipped = 0;
                     // A flood that stopped reports its folded tail now, not at the next
                     // refusal, which may be hours away.
                     if let Some(sink) = &shared.sink {
-                        coalescer.flush(&**sink);
+                        st.coalescer.flush(&**sink);
                     }
-                    rt.wait(&wake);
-                    break;
+                    return BatchEnd::Again;
                 }
                 Accepted::Pause(backoff) => {
                     shared.descriptor_pressure.fetch_add(1, Ordering::Relaxed);
@@ -2025,7 +2439,7 @@ fn accept_loop<W: super::Workload, G: Gate>(
                         listener: conf.id,
                         backoff,
                     });
-                    pause_until = Some(engine.clock.now() + backoff);
+                    st.pause_until = Some(self.clock.now() + backoff);
                     break;
                 }
                 Accepted::Failed(e) => {
@@ -2033,10 +2447,88 @@ fn accept_loop<W: super::Workload, G: Gate>(
                         listener: conf.id,
                         class: OsErrorClass::from_io(&e),
                     });
-                    return;
+                    return BatchEnd::Failed;
                 }
             }
         }
+        BatchEnd::More
+    }
+
+    /// A reactor worker's turn on a listener it accepts on itself (D-197): what one
+    /// pass of the accept thread's loop does, without waiting. Admitted connections
+    /// go to this worker's own inbox, which it takes after the batch, so no wake
+    /// crosses threads. The gate runs here, on the worker.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn worker_accept(
+        &self,
+        conf: &Arc<ListenerConf>,
+        rt: &ListenerRuntime,
+        idx: usize,
+        st: &mut AcceptState,
+    ) -> WorkerAccept {
+        let shared = &self.shared;
+        if shared.stopping.load(Ordering::Acquire) || conf.removed.load(Ordering::Acquire) {
+            return WorkerAccept::Gone;
+        }
+        if st.view.refresh(shared.control.as_ref()) {
+            shared.event(Event::ControlReacted {
+                state: st.view.state(),
+            });
+            match st.view.state() {
+                ControlState::Draining => {
+                    shared.close_door();
+                    shared.request_stop(st.view.deadline());
+                    // An accept thread runs the drain itself; a worker cannot wait in
+                    // it, so one thread does, once.
+                    if !shared.control_drain.swap(true, Ordering::AcqRel) {
+                        let deadline = st
+                            .view
+                            .deadline()
+                            .unwrap_or_else(|| Instant::now() + shared.drain_timeout);
+                        let s = shared.clone();
+                        let _ = std::thread::Builder::new()
+                            .name(String::from("net-io-drain"))
+                            .spawn(move || {
+                                let _ = s.drain(deadline);
+                            });
+                    }
+                }
+                ControlState::Stopping => {
+                    shared.close_door();
+                    shared.request_stop(Some(Instant::now()));
+                    shared.kill_all(CAUSE_STOP);
+                }
+                ControlState::Shed { from_lane } => shared.shed_idle(from_lane),
+                _ => {}
+            }
+        }
+        if !accepting(shared, conf) {
+            return WorkerAccept::Park;
+        }
+        if let Some(until) = st.pause_until {
+            if self.clock.now() < until {
+                return WorkerAccept::Paused(until);
+            }
+            st.pause_until = None;
+        }
+        FEEDS.with(|f| f.set(Some((idx, true))));
+        let end = self.accept_some(conf, rt, st, &conf.wake.0[0]);
+        FEEDS.with(|f| f.set(None));
+        match end {
+            BatchEnd::Again => WorkerAccept::Armed,
+            BatchEnd::Failed => WorkerAccept::Gone,
+            BatchEnd::More => match st.pause_until {
+                Some(until) => WorkerAccept::Paused(until),
+                None if !accepting(shared, conf) => WorkerAccept::Park,
+                None => WorkerAccept::Kick,
+            },
+        }
+    }
+
+    /// The door is open for `conf` and no drain runs (a parked listener's check).
+    #[cfg(feature = "reactor")]
+    pub(crate) fn accepting(&self, conf: &ListenerConf) -> bool {
+        accepting(&self.shared, conf)
     }
 }
 
@@ -2050,16 +2542,26 @@ impl<W, G: Gate> Engine<W, G> {
         co: &mut Coalescer,
     ) {
         let shared = &self.shared;
+        // Counted before the peer can see the refusal, so `stats` already shows it
+        // to a client that saw the reset or the FIN.
+        shared.refused.fetch_add(1, Ordering::Relaxed);
+        shared.refused_by[cause.index()].fetch_add(1, Ordering::Relaxed);
+        let mut sent = false;
         if let Some(b) = bytes {
             let max = usize::from(self.limits.refusal_bytes_max);
             if b.len() <= max {
-                let _ = sys::send(&stream, b);
+                sent = sys::send(&stream, b).is_ok_and(|n| n > 0);
             }
         }
-        let _ = sys::set_linger(stream.sock(), Some(Duration::ZERO));
+        if sent && !self.limits.denial_linger.is_zero() {
+            // The reply is followed by FIN, not a reset, which could destroy it before
+            // the peer reads it (D-182). The accept thread does not linger: nothing is
+            // read, and input the peer already sent still turns the close into a reset.
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        } else {
+            let _ = sys::set_linger(stream.sock(), Some(Duration::ZERO));
+        }
         drop(stream);
-        shared.refused.fetch_add(1, Ordering::Relaxed);
-        shared.refused_by[cause.index()].fetch_add(1, Ordering::Relaxed);
         if let Some(sink) = &shared.sink {
             co.emit(
                 sink.as_ref(),
@@ -2717,6 +3219,7 @@ impl<G: Gate> Worker<G> {
             WakeSource::Fixed(ws.wake.clone()),
             Phase::Idle,
         );
+        link.set_soft_closes(&shared.soft_closes);
         ws.current.store(link.info.id.get(), Ordering::Release);
         if self.gated {
             link.gate = Some(cell as Box<dyn ErasedGate>);
@@ -2794,7 +3297,11 @@ impl<G: Gate> Worker<G> {
             self.pool.put(cin);
             self.pool.put(cout);
         }
-        let reason = link.finish(reason);
+        // net-io's own kill (the drain's deadline, a stop) during the linger ends the
+        // linger and leaves the reason as it was, as on the reactor (D-201).
+        let own =
+            |k: KillReason| k == DRAIN_KILL && ws.kill_cause.load(Ordering::Acquire) != CAUSE_USER;
+        let reason = link.finish_with(reason, own);
         // Give the gate its ticket back with the reason; keep the cell for the next connection.
         match erased {
             Some(mut g) => {
@@ -3142,6 +3649,7 @@ fn drive<G: Gate, S: Session>(
     s: &mut S,
     input: &mut Input,
 ) -> CloseReason {
+    link.hear_drains();
     let Some(mut step) = call(w, link, s, |s, cx| s.on_open(cx)).0 else {
         return CloseReason::SessionPanicked;
     };
@@ -3164,9 +3672,19 @@ fn drive<G: Gate, S: Session>(
                 link.set_deadline_scale(w.shared.deadline_scale());
                 link.set_rescales();
                 let idle = link.phase() == Phase::Idle && input.bytes().is_empty();
-                // A request that already arrived is answered before the drain closes.
-                if w.draining() && idle && !link.input_waiting() {
-                    return CloseReason::Drained;
+                // A request that already arrived is answered before the drain closes,
+                // and a fresh connection may still bring its first one.
+                if w.draining()
+                    && idle
+                    && !link.drain_kept()
+                    && !link.input_waiting()
+                    && !link.awaits_first_request()
+                {
+                    match drain_reached(w, link, s) {
+                        Ok(next) => step = next,
+                        Err(reason) => return reason,
+                    }
+                    continue;
                 }
                 if idle && w.shed(link.info.lane) {
                     return CloseReason::Shed;
@@ -3192,7 +3710,12 @@ fn drive<G: Gate, S: Session>(
                     // request 7) reaches the session now; a drain, a kill, or the
                     // control line is seen at the top of the loop.
                     Ok(Got::Woken) => {
-                        if let Some((token, value)) = take_post(w, link) {
+                        if link.take_drain_reached() {
+                            match drain_reached(w, link, s) {
+                                Ok(next) => step = next,
+                                Err(reason) => return reason,
+                            }
+                        } else if let Some((token, value)) = take_post(w, link) {
                             match call(w, link, s, |s, cx| s.on_wake(cx, token, value)).0 {
                                 Some(next) => step = next,
                                 None => return CloseReason::SessionPanicked,
@@ -3244,12 +3767,34 @@ fn drive<G: Gate, S: Session>(
     }
 }
 
+/// A drain reached the connection between exchanges: the session's `on_drain`
+/// decides, once. `Close` flushes what it queued and closes with `Drained`; any other
+/// step keeps the connection through the drain (its deadline still bounds it).
+fn drain_reached<G: Gate, S: Session>(
+    w: &mut Worker<G>,
+    link: &mut Link,
+    s: &mut S,
+) -> Result<Step, CloseReason> {
+    match call(w, link, s, |s, cx| s.on_drain(cx)).0 {
+        None => Err(CloseReason::SessionPanicked),
+        Some(Step::Close) => {
+            flush(w, link, s)?;
+            Err(CloseReason::Drained)
+        }
+        Some(next) => {
+            link.keep_through_drain();
+            Ok(next)
+        }
+    }
+}
+
 fn on_data<G: Gate, S: Session>(
     w: &mut Worker<G>,
     link: &mut Link,
     s: &mut S,
     input: &mut Input,
 ) -> Option<Step> {
+    link.note_heard();
     let (step, grow) = call(w, link, s, |s, cx| s.on_data(cx, input));
     if let Some(class) = grow {
         if class > input.buf.class() {

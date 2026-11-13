@@ -183,7 +183,10 @@ pub struct Limits {
     completion_queue: Option<u32>,
     buffer_budget: Option<u64>,
     drain_timeout: Option<Duration>,
+    first_request_grace: Option<Duration>,
     graceful_linger: Option<(Duration, u32)>,
+    denial_linger: Option<Duration>,
+    denial_linger_max: Option<u32>,
     refusal_bytes_max: Option<u16>,
     tick: Option<Duration>,
     pressure: Option<Pressure>,
@@ -212,13 +215,24 @@ pub(crate) struct Effective {
     pub completion_queue: u32,
     pub buffer_budget: u64,
     pub drain_timeout: Duration,
+    /// How long a drain lets a connection that has sent nothing yet bring its first
+    /// request before it counts as idle.
+    pub first_request_grace: Duration,
     pub graceful_linger: Duration,
     pub graceful_linger_bytes: u32,
+    pub denial_linger: Duration,
+    /// Soft closes (denial lingers and `close_after_flush`) at once, server-wide.
+    pub denial_linger_max: u32,
     pub refusal_bytes_max: u16,
     pub tick: Duration,
     pub pressure: Option<Pressure>,
     /// Slots each of the most important lanes keeps free from the less important.
     pub lane_reserve: [u32; RESERVED_LANES],
+}
+
+/// The default cap on soft closes: a sixteenth of the connection cap, at least 1.
+fn soft_close_cap(max_connections: u32) -> u32 {
+    (max_connections / 16).max(1)
 }
 
 impl Effective {
@@ -254,8 +268,11 @@ impl Effective {
             completion_queue: if blocking { 1 } else { 1024 },
             buffer_budget: if blocking { 64 << 20 } else { 512 << 20 },
             drain_timeout: Duration::from_secs(30),
+            first_request_grace: Duration::from_secs(1),
             graceful_linger: Duration::from_secs(2),
             graceful_linger_bytes: 64 * 1024,
+            denial_linger: Duration::from_millis(100),
+            denial_linger_max: soft_close_cap(max_connections),
             refusal_bytes_max: 512,
             tick: Duration::from_millis(if blocking { 10 } else { 1 }),
             pressure: None,
@@ -330,8 +347,10 @@ impl Limits {
         out
     }
 
-    /// Checks the resolved values against each other, the worker count, and the
-    /// process's descriptor limit.
+    /// Checks the values, with unset ones taken from the blocking driver's
+    /// defaults, against each other, the worker count, and the process's
+    /// descriptor limit. `ServerBuilder::build` runs the same checks with the
+    /// defaults of the driver it resolved.
     ///
     /// # Errors
     ///
@@ -343,13 +362,24 @@ impl Limits {
     /// # Ok::<(), net_io::NetError>(())
     /// ```
     pub fn validate(&self, workers: u16, descriptor_limit: Option<u64>) -> Result<(), NetError> {
+        self.validate_for(DriverKind::Blocking, workers, descriptor_limit)
+    }
+
+    /// As `validate`, with unset values from `driver`'s defaults: a reactor's
+    /// buffer budget is not the blocking pool's.
+    pub(crate) fn validate_for(
+        &self,
+        driver: DriverKind,
+        workers: u16,
+        descriptor_limit: Option<u64>,
+    ) -> Result<(), NetError> {
         // Rules that need only the values themselves.
         LimitsBuilder {
             limits: self.clone(),
             bad_lane: false,
         }
         .check()?;
-        let e = self.effective(DriverKind::Blocking);
+        let e = self.effective(driver);
         let need_budget = u64::from(workers)
             .saturating_mul(u64::from(e.read_class_max.bytes()))
             .saturating_mul(2);
@@ -403,8 +433,13 @@ impl Limits {
             completion_queue: self.completion_queue.unwrap_or(d.completion_queue),
             buffer_budget: self.buffer_budget.unwrap_or(d.buffer_budget),
             drain_timeout: self.drain_timeout.unwrap_or(d.drain_timeout),
+            first_request_grace: self.first_request_grace.unwrap_or(d.first_request_grace),
             graceful_linger,
             graceful_linger_bytes,
+            denial_linger: self.denial_linger.unwrap_or(d.denial_linger),
+            denial_linger_max: self
+                .denial_linger_max
+                .unwrap_or_else(|| soft_close_cap(max_connections)),
             refusal_bytes_max: self.refusal_bytes_max.unwrap_or(d.refusal_bytes_max),
             tick: self.tick.unwrap_or(d.tick),
             pressure: self.pressure,
@@ -439,7 +474,10 @@ impl Limits {
             completion_queue,
             buffer_budget,
             drain_timeout,
+            first_request_grace,
             graceful_linger,
+            denial_linger,
+            denial_linger_max,
             refusal_bytes_max,
             tick,
             pressure
@@ -465,7 +503,10 @@ impl Limits {
             completion_queue: Some(e.completion_queue),
             buffer_budget: Some(e.buffer_budget),
             drain_timeout: Some(e.drain_timeout),
+            first_request_grace: Some(e.first_request_grace),
             graceful_linger: Some((e.graceful_linger, e.graceful_linger_bytes)),
+            denial_linger: Some(e.denial_linger),
+            denial_linger_max: Some(e.denial_linger_max),
             refusal_bytes_max: Some(e.refusal_bytes_max),
             tick: Some(e.tick),
             pressure: None,
@@ -573,10 +614,27 @@ impl Limits {
     pub fn drain_timeout(&self) -> Option<Duration> {
         self.drain_timeout
     }
+    /// How long a drain waits for the first request of a connection that has sent
+    /// nothing yet.
+    #[must_use]
+    pub fn first_request_grace(&self) -> Option<Duration> {
+        self.first_request_grace
+    }
     /// The graceful-close linger: time and bytes read and discarded.
     #[must_use]
     pub fn graceful_linger(&self) -> Option<(Duration, u32)> {
         self.graceful_linger
+    }
+    /// How long a connection that was sent a denial lingers before it closes.
+    #[must_use]
+    pub fn denial_linger(&self) -> Option<Duration> {
+        self.denial_linger
+    }
+    /// How many connections may close softly (linger after a denial, or
+    /// `close_after_flush`) at once, server-wide.
+    #[must_use]
+    pub fn denial_linger_max(&self) -> Option<u32> {
+        self.denial_linger_max
     }
     /// The largest refusal reply.
     #[must_use]
@@ -643,40 +701,88 @@ macro_rules! setter {
 pub(crate) const MAX_CONNECTIONS: u32 = 1 << 20;
 
 impl LimitsBuilder {
-    setter!(/// The global connection cap.
-        max_connections, u32);
-    setter!(/// The per-listener connection cap.
-        max_per_listener, u32);
-    setter!(/// The listen backlog.
-        backlog, u32);
-    setter!(/// Connections accepted per wake-up.
-        accept_batch, u16);
-    setter!(/// Time for the PROXY header and TLS handshake together.
-        handshake_timeout, Duration);
-    setter!(/// Time to wait for the next exchange.
-        idle_timeout, Duration);
-    setter!(/// Time to wait for bytes during an exchange.
-        read_timeout, Duration);
-    setter!(/// Time to wait for the peer to take bytes.
-        write_timeout, Duration);
-    setter!(/// Time a parked connection may wait for its completion.
-        park_timeout, Duration);
-    setter!(/// The minimum transfer rate ([`MinRate::off`] to disable).
-        min_rate, MinRate);
-    setter!(/// Pool memory a connection's output may hold.
-        output_budget, u32);
-    setter!(/// Total bytes of buffers all workers may allocate. A quarter of it, shared
+    setter!(
+        /// The global connection cap.
+        max_connections,
+        u32
+    );
+    setter!(
+        /// The per-listener connection cap.
+        max_per_listener,
+        u32
+    );
+    setter!(
+        /// The listen backlog.
+        backlog,
+        u32
+    );
+    setter!(
+        /// Connections accepted per wake-up.
+        accept_batch,
+        u16
+    );
+    setter!(
+        /// Time for the PROXY header and TLS handshake together.
+        handshake_timeout,
+        Duration
+    );
+    setter!(
+        /// Time to wait for the next exchange.
+        idle_timeout,
+        Duration
+    );
+    setter!(
+        /// Time to wait for bytes during an exchange.
+        read_timeout,
+        Duration
+    );
+    setter!(
+        /// Time to wait for the peer to take bytes.
+        write_timeout,
+        Duration
+    );
+    setter!(
+        /// Time a parked connection may wait for its completion.
+        park_timeout,
+        Duration
+    );
+    setter!(
+        /// The minimum transfer rate ([`MinRate::off`] to disable).
+        min_rate,
+        MinRate
+    );
+    setter!(
+        /// Pool memory a connection's output may hold.
+        output_budget,
+        u32
+    );
+    setter!(
+        /// Total bytes of buffers all workers may allocate. A quarter of it, shared
         /// among the workers, is the most unfinished TLS handshakes may hold on the
         /// reactor; see [`Limits::buffer_budget`].
-        buffer_budget, u64);
-    setter!(/// The drain deadline.
-        drain_timeout, Duration);
-    setter!(/// The largest refusal reply (at most 512).
-        refusal_bytes_max, u16);
-    setter!(/// The timer resolution (1 ms to 100 ms).
-        tick, Duration);
-    setter!(/// Adaptive deadlines under pressure.
-        pressure, Pressure);
+        buffer_budget,
+        u64
+    );
+    setter!(
+        /// The drain deadline.
+        drain_timeout,
+        Duration
+    );
+    setter!(
+        /// The largest refusal reply (at most 512).
+        refusal_bytes_max,
+        u16
+    );
+    setter!(
+        /// The timer resolution (1 ms to 100 ms).
+        tick,
+        Duration
+    );
+    setter!(
+        /// Adaptive deadlines under pressure.
+        pressure,
+        Pressure
+    );
 
     /// The per-source concurrency cap and how sources are grouped.
     pub fn max_per_source(mut self, n: u32, policy: PrefixPolicy) -> Self {
@@ -702,9 +808,41 @@ impl LimitsBuilder {
         self
     }
 
+    /// How long a drain waits, from a connection's accept, for the first request of
+    /// a connection that has sent nothing yet before it counts the connection idle
+    /// and closes it. A client that connected just before the drain and writes its
+    /// request right after is answered instead of finding the connection closed.
+    /// Default 1 s; the drain's deadline still bounds it; zero closes such a
+    /// connection at once, as before 0.8.
+    pub fn first_request_grace(mut self, time: Duration) -> Self {
+        self.limits.first_request_grace = Some(time);
+        self
+    }
+
     /// The graceful-close linger: time and bytes read and discarded.
     pub fn graceful_linger(mut self, time: Duration, bytes: u32) -> Self {
         self.limits.graceful_linger = Some((time, bytes));
+        self
+    }
+
+    /// How long a connection that was sent a denial (a `Session::on_denied` reply,
+    /// or a `Refusal::WithBytes` after a PROXY header) lingers before it closes:
+    /// FIN after the denial, then reads are discarded until the peer closes or this
+    /// passes, so the peer reads the denial instead of a reset. Default 100 ms; zero
+    /// closes with a reset at once, as before 0.8. A kill ends the linger.
+    pub fn denial_linger(mut self, time: Duration) -> Self {
+        self.limits.denial_linger = Some(time);
+        self
+    }
+
+    /// How many connections may close softly at once, server-wide: lingering after a
+    /// denial, or flushing and lingering after `ServerHandle::close_after_flush`. Past
+    /// it a denial closes with a reset at once and a `close_after_flush` acts as a
+    /// `kill`, so a storm of denials costs at most this many slots for at most the
+    /// linger each. Default: a sixteenth of `max_connections` (at least 1); zero
+    /// turns soft closes off. Read from the server's limits, not a listener's.
+    pub fn denial_linger_max(mut self, n: u32) -> Self {
+        self.limits.denial_linger_max = Some(n);
         self
     }
 
@@ -795,6 +933,12 @@ impl LimitsBuilder {
         }
         if l.graceful_linger.is_some_and(|(d, _)| long(d)) {
             return Err(invalid("graceful_linger", TOO_LONG));
+        }
+        if l.first_request_grace.is_some_and(long) {
+            return Err(invalid("first_request_grace", TOO_LONG));
+        }
+        if l.denial_linger.is_some_and(long) {
+            return Err(invalid("denial_linger", TOO_LONG));
         }
         if l.max_connections.is_some_and(|n| n > MAX_CONNECTIONS) {
             return Err(invalid(
@@ -937,7 +1081,7 @@ mod tests {
     }
 
     /// "No limit" spelled `Duration::MAX` is refused at build instead of panicking
-    /// on the first deadline (review finding).
+    /// on the first deadline.
     #[test]
     fn test_timeouts_over_a_year_and_huge_caps_rejected() {
         for field in ["idle_timeout", "read_timeout", "drain_timeout"] {
@@ -1018,7 +1162,7 @@ mod tests {
         };
         assert!(Limits::builder().pressure(bad).build().is_err());
         assert!(Limits::builder().lane_reserve(Lane(8), 1).build().is_err());
-        // A later valid lane 7 does not hide the invalid one (review finding).
+        // A later valid lane 7 does not hide the invalid one.
         assert!(
             Limits::builder()
                 .lane_reserve(Lane(8), 1)

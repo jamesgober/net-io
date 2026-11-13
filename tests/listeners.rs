@@ -127,13 +127,17 @@ fn removed_listener_closes_and_drains_only_its_connections() {
     // On the first listener: one connection that must survive.
     let mut keep = client(addr(&server));
     assert_eq!(line(&mut keep), "0");
-    // On the second: one idle connection, one busy in an exchange.
+    // On the second: one idle connection, one busy in an exchange. The idle one has
+    // had an exchange: one that never sent a byte still awaits its first request,
+    // which a drain gives `first_request_grace` (D-189).
+    let mut echo = [0u8; 1];
     let mut idle = client(second_addr);
     assert_eq!(line(&mut idle), "1");
+    idle.write_all(b"i").expect("idle");
+    idle.read_exact(&mut echo).expect("echo");
     let mut busy = client(second_addr);
     assert_eq!(line(&mut busy), "1");
     busy.write_all(b"b").expect("busy");
-    let mut echo = [0u8; 1];
     busy.read_exact(&mut echo).expect("echo");
 
     let report = server

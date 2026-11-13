@@ -571,7 +571,7 @@ impl TlsSession for PanickySession {
 }
 
 /// A panic inside the TLS engine closes only that connection, `TlsFailed`, on both
-/// drivers: the worker, its caps, and drain survive (review finding).
+/// drivers: the worker, its caps, and drain survive.
 #[test]
 fn test_engine_panic_closes_only_that_connection() {
     struct Echo;
@@ -629,7 +629,7 @@ fn test_engine_panic_closes_only_that_connection() {
 }
 
 /// A gate denial on a TLS connection goes out as a record, never as plaintext on the
-/// socket, on both drivers (review finding).
+/// socket, on both drivers.
 #[test]
 fn test_denial_under_tls_is_encrypted() {
     struct DenyAfterHandshake;
@@ -742,7 +742,7 @@ impl TlsSession for BigSession {
 
 /// A peer that takes the handshake flight a byte at a time (here: not at all) is
 /// closed at the handshake deadline, not after a write timeout each byte restarts,
-/// on both drivers (review finding: the pool waited on the write timeout).
+/// on both drivers (the pool used to wait on the write timeout).
 #[test]
 fn test_handshake_flight_is_bounded_by_the_handshake_deadline() {
     struct Nothing;
@@ -964,6 +964,69 @@ fn test_idle_tls_connections_after_a_large_reply_hold_no_buffers() {
     assert_eq!(server.stats().open, 100, "{:?}", server.stats());
 }
 
+/// tls-net's report: on the pool, the first connection after a handshake timeout
+/// was closed at once as a second `HandshakeTimeout`. A stalled hello times out,
+/// then a fresh client must complete its handshake, again and again.
+#[test]
+fn test_a_connection_after_a_handshake_timeout_gets_its_own_deadline() {
+    // A handler runs on the pool only.
+    {
+        let driver = net_io::DriverKind::Blocking;
+        let rec = Recorder::default();
+        let limits = Limits::blocking_defaults()
+            .to_builder()
+            .handshake_timeout(Duration::from_millis(300))
+            .build()
+            .expect("limits");
+        let server = ServerBuilder::new()
+            .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+            .driver(driver)
+            .workers(4)
+            .limits(limits)
+            .tls(Toy)
+            .handler(echo)
+            .gate(AllowAll)
+            .events(rec.clone())
+            .build()
+            .expect("build");
+        server.open_door().expect("open");
+        for round in 0..30 {
+            let before = rec.0.lock().expect("lock").len();
+            let mut stalled = client(addr(&server));
+            stalled.write_all(b"H").expect("one byte");
+            assert!(
+                eventually(WAIT, || rec.0.lock().expect("lock").len() > before),
+                "{driver:?} round {round}: no close"
+            );
+            assert_eq!(
+                rec.0.lock().expect("lock")[before],
+                CloseReason::HandshakeTimeout,
+                "{driver:?} round {round}"
+            );
+            let mut fresh = ToyClient::connect(&server);
+            let greeting = b"sni=Some(\"example.test\");";
+            assert_eq!(
+                fresh.recv_exact(greeting.len()),
+                greeting,
+                "{driver:?} round {round}"
+            );
+            fresh.send(b"ping");
+            assert_eq!(fresh.recv_exact(4), b"ping", "{driver:?} round {round}");
+            drop(fresh);
+            drop(stalled);
+            assert!(
+                eventually(WAIT, || rec.0.lock().expect("lock").len() == before + 2),
+                "{driver:?} round {round}"
+            );
+            let closes = rec.0.lock().expect("lock").clone();
+            assert_ne!(
+                closes[before + 1],
+                CloseReason::HandshakeTimeout,
+                "{driver:?} round {round}: {closes:?}"
+            );
+        }
+    }
+}
 /// Echoes and records the budget its worker's pool sees at each call.
 #[cfg(feature = "reactor")]
 struct Probe(Arc<AtomicU64>);

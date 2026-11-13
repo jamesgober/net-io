@@ -320,7 +320,7 @@ fn test_per_worker_is_refused_where_it_cannot_work() {
 
 /// The control line escalating from `Draining` (long deadline) to `Stopping` ends the
 /// drain at once: a handler mid-exchange is killed within a pass, not at the drain's
-/// deadline; and one drain emits one `DrainFinished` (review findings).
+/// deadline; and one drain emits one `DrainFinished`.
 #[test]
 fn test_stopping_during_a_drain_kills_at_once() {
     #[derive(Clone, Default)]

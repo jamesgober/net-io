@@ -1,6 +1,6 @@
 # net-io - Architecture
 
-How the crate fits together, as of 0.5.0. Draft: it becomes final at 0.8. `docs/API.md` is the contract, and `dev/PLAN.md` holds the reasoning and the decision log.
+How the crate fits together, as of 0.8.0. It is checked again for 1.0. `docs/API.md` is the contract, and `dev/PLAN.md` holds the reasoning and the decision log.
 
 ## Layers
 
@@ -15,11 +15,21 @@ How the crate fits together, as of 0.5.0. Draft: it becomes final at 0.8. `docs/
 
 ## A connection's path
 
-1. **Accept.** One thread per listener accepts, on both drivers, because Windows must never associate a listener with a completion port (D-016) and one path is simpler than two. It runs the caps and the gate; a refused connection costs no worker.
-2. **Hand-over.** The pool takes jobs from one bounded queue. The reactor picks the least-loaded worker and puts the job in that worker's bounded inbox, then wakes it. A full inbox refuses with `Busy`.
+1. **Accept.** One thread per listener accepts, on both drivers, because Windows must never associate a listener with a completion port (D-016) and one path is simpler than two. It runs the caps, the lockdown, the gate, the lane reserve, and the shed, in that order; a refused connection costs no worker, and it is counted before the peer can see the refusal (D-199). A listener with `ListenOptions::per_worker` on the Linux reactor has no accept thread: each worker accepts on its own socket of a `SO_REUSEPORT` group in its own event loop, through the same admission code (D-197).
+2. **Hand-over.** The pool takes jobs from one bounded queue. The reactor picks the least-loaded worker in the listener's range (its own workers with `ListenerSpec::workers`, D-186, the shared ones otherwise), scanning from a start that moves on by one each connection and stopping at the first idle worker (D-174), puts the job in that worker's bounded inbox (4,096), and wakes it. A full inbox refuses with `Busy`. A worker that accepted for itself takes its inbox in the same turn, with no wake.
 3. **Start.** The worker gives the connection a slab entry, registers it with its driver, and runs the PROXY and TLS handshakes as state machines on the loop.
 4. **Exchange.** The session sees input and returns a `Step`; net-io reads, writes, and enforces deadlines around it. The same `Session` runs on both drivers.
 5. **Close.** Exactly one `CloseReason`, one closed event, and one gate `close` per connection. The socket closes only after every operation on it came back.
+
+A close takes one of three shapes:
+
+| Shape | When | On the wire |
+|---|---|---|
+| Graceful | `Step::Close`, a drain, an idle timeout between exchanges | queued bytes, `close_notify` on TLS, FIN; then a linger that reads and discards input for up to 2 s and 64 KiB, only when input may still arrive (mid-exchange, the socket readable, or the session wrote while idle with no request to answer, D-192, D-201). Without a linger the reactor closes at once and the kernel sends the FIN behind what is queued (D-198) |
+| Flush then close | a denial whose bytes went out, `ServerHandle::close_after_flush` | no more input, queued bytes, FIN, reads discarded until the peer's EOF or `Limits::denial_linger` (D-182) |
+| Abortive | a kill, a timeout mid-exchange, a refusal without bytes | RST (linger 0) |
+
+A drain closes a connection between exchanges only when nothing waits in its socket, after `Session::on_drain` (D-183) and outside `Limits::first_request_grace` of its accept (D-189). The owner decides at its own wait, reached through its wake channel (D-178), so a request that already arrived is read and answered first. The drain is not over while an accept is between its door check and its hand-over (D-179). A drain returns at most 2 s after it killed what was left, and a stop then waits at most 2 s for its worker threads; a thread whose handler never returns is left running, detached and counted in `Stats::workers_detached`, with its socket. Accept threads are joined without a bound, so a gate's `admit` must return (D-213).
 
 ## The reactor
 
@@ -37,13 +47,19 @@ The driver is the reactor's real interface (D-005). On epoll and kqueue, `ReadyD
 
 An idle connection holds no buffer. It waits with `ReceiveZero`; when that completes the worker takes a pool buffer and receives. A TLS connection starts the same way: its two TLS buffers are taken when the first bytes of the handshake arrive, and a worker's unfinished handshakes hold at most a quarter of its share of the budget. When the session consumed everything, the buffer goes back. A connection whose read finds the buffer budget spent pauses on a list, oldest first, and TCP pushes back on its peer.
 
-An output keeps one free buffer between sends and gives the rest to the worker's pool the moment a send completes, so a session that moves its input to its output with `Input::swap` and `push_buffer` allocates nothing, however long it runs.
+An output keeps up to four spare buffers between sends, so a session that moves its input to its output with `Input::swap` and `push_buffer` allocates nothing, however long it runs; it takes the buffers its worker's pool already holds before it charges the budget (D-169). When a connection goes idle its spares go back to the pool (D-164).
+
+A TLS connection keeps two more buffers, the engine's ciphertext in and out (64 KiB each by default). Idle between exchanges with nothing in them, it gives both back along with its input and output and waits with a zero-byte receive as a plaintext connection does (D-181, D-200); it takes a pair again when bytes arrive, before a flush, and before a graceful close so `close_notify` can go out. The records the engine writes as its handshake ends (the tickets) wait at the front of the output when the client's request is already in, and leave with the first reply; a reply before `Step::Close` carries `close_notify` in the same buffer, so a full exchange with a closing reply is two sends (D-194).
 
 A connection has one timer, at its nearest deadline. Moving it is lazy: the wheel keeps the entry where it is and looks again when it fires, so an exchange costs one comparison. The clock is read once per trip through the OS, however many connections a turn touches.
 
-Accepting takes one thread per listener, or with `ListenOptions::per_worker` on Linux one `SO_REUSEPORT` socket and thread per worker, each feeding its own worker. A file in an output travels as its own operation: `sendfile` on Unix, `TransmitFile` on IOCP, with the gate checking 1 MiB at a time. TLS, pipes, and Unix sockets read the file into buffers instead.
+Accepting takes one thread per listener. A per-worker group (Linux) is part of the loop instead: the worker arms `Operation::Accept` on its own socket while no connection waits, accepts up to `accept_batch` when it fires, and queues a `Nop` to come back for the rest, so a backlog cannot hold the worker past one batch a round. A closed door or a drain parks the socket, looked at each turn; descriptor pressure pauses it until a deadline the wait honours. Listeners added or removed at run time move an epoch the workers compare each turn, and `remove_listener` returns only when every worker has dropped its socket (D-197). A file in an output travels as its own operation: `sendfile` on Unix, `TransmitFile` on IOCP, with the gate checking 1 MiB at a time. TLS, pipes, and Unix sockets read the file into buffers instead.
 
-A UDP listener is a thread of its own, not a reactor worker. The thread owns the socket, so the amplification guard stays lock-free and a `UdpSession` needs no synchronization; the door, stop, and drain apply as they do on TCP.
+A UDP listener is a thread of its own, not a reactor worker. The thread owns the socket, so the amplification guard stays lock-free and a `UdpSession` needs no synchronization; the door, stop, and drain apply as they do on TCP. The guard keeps two bounded tables (D-221): token buckets per source prefix (`UdpOptions::source_prefix`, /32 and /64 by default), and send allowances per exact address, which an admitted datagram adds to and a send to an unverified peer draws on; verified peers have a table of their own. A received datagram is charged to its prefix's bucket, then to the socket's global bucket, and only then credited to its address. A non-blocking receive gives the loop back after 64 drops (D-222).
+
+### When a worker dies
+
+Every session, engine, and sink call runs behind a panic boundary, so a worker's loop ends only on a panic past those guards or a failed wait. The worker is then marked dead under its inbox lock and never restarted, since its state cannot be trusted and a wait that keeps failing would restart in a loop (D-211). Hand-overs skip a dead worker: `least_loaded`, a listener's feed, and the inbox push each look at the mark, one relaxed load per worker. What waited in its inbox closes with a reset, its tickets and caps returned and each close counted; its connections were closed as its loop ended. Its socket of a per-worker group goes to the next live worker in the group's order, which takes it up at its next turn through the listener epoch. `Stats::workers_lost` counts it, and a drain waiting for its connections looks again. With every worker dead, new connections are refused as `Busy`.
 
 ## Ownership on Windows
 
@@ -51,11 +67,13 @@ An operation lives in a heap block that starts with its `OVERLAPPED` and owns it
 
 ## Kill
 
-A kill can come from any thread at any time. `KillSlot` keeps the connection's state word; its `KILLING` bit stops the owner from closing the socket while a kill makes a system call on it, so a kill never reaches a reused descriptor (D-053). On the pool the kill wakes the blocked thread (`shutdown` of the read side on Unix, the wake channel and `CancelIoEx` on Windows). On the reactor it puts the connection's index on the worker's list and wakes the loop.
+A kill can come from any thread at any time. `close_after_flush` is a soft kill: a `SOFT` bit beside `KILLED` ends reads and lets queued sends go on until its bound, then closes as a flush then close; a `kill` afterwards upgrades it to a reset (D-182).
+
+`KillSlot` keeps the connection's state word; its `KILLING` bit stops the owner from closing the socket while a kill makes a system call on it, so a kill never reaches a reused descriptor (D-053). A connection holds its slot through a `SlotLease`, which carries the slot's generation and drops before the stream: when no close path ran (the connection was dropped by an unwinding panic), the lease begins the close and uninstalls the slot for its own generation only, so a `KillHandle` kept from that connection never reaches the number's next owner, and a stale lease never ends another connection's slot (D-212). Cost: 8 bytes per connection. On the pool the kill wakes the blocked thread (`shutdown` of the read side on Unix, the wake channel and `CancelIoEx` on Windows). On the reactor it puts the connection's index on the worker's list and wakes the loop.
 
 ## Named pipes
 
-A pipe has no readiness, so `PipeStream` gives the core what it expects from a non-blocking socket: overlapped reads and writes against an internal buffer, `WouldBlock` while the kernel holds it, and a wait on the operation's event and the wake channel's. On the reactor those buffers never exist: the completion port reads and writes directly, with the same `Op` blocks as a socket.
+A pipe has no readiness, so `PipeStream` gives the core what it expects from a non-blocking socket: overlapped reads and writes against an internal buffer, `WouldBlock` while the kernel holds it, and a wait on the operation's event and the wake channel's. Each direction's `OVERLAPPED` and buffer live in an allocation of their own, reached only through a raw pointer and freed only after the operation ended: the kernel writes them while the operation runs, so no Rust reference may cover them then (D-227). A graceful close waits for its last write from a per-thread credit of one second that comes back at 100 ms a second (D-226). On the reactor those buffers never exist: the completion port reads and writes directly, with the same `Op` blocks as a socket.
 
 ## Testing
 
@@ -67,3 +85,5 @@ A pipe has no readiness, so `PipeStream` gives the core what it expects from a n
 | AddressSanitizer, ThreadSanitizer | The session and driver suites on Linux |
 | Fuzzing | Every parser of untrusted bytes |
 | Cross-process tests | Hand-off under load, systemd activation, FastCGI descriptor 0 |
+| Soak (`tests/soak.rs`) | Normal, pooled, and hostile peers for 24 hours per driver before each release, sampling memory, handles, and connections (D-162); on macOS and FreeBSD a reset the client's stack dropped is counted, not failed (D-193) |
+| `tests/accept_on_worker.rs` | Per-worker accept: no accept threads, the door, run-time add and remove, the control line, a dropped server (D-197) |

@@ -475,7 +475,10 @@ fn reason_refused_by_the_session_factory() {
     }
     let rec = Recorder::default();
     let s = server(&rec, defaults(), No);
-    let _c = client(addr(&s));
+    // The refusal resets the connection as soon as it is accepted; on a loaded Linux
+    // host the reset can reach the client before its `connect` returns, which then
+    // fails with `ECONNRESET`. Either way the server saw the connection.
+    let _c = std::net::TcpStream::connect(addr(&s));
     rec.expect_one(CloseReason::Refused(RefusalCause::Session));
 }
 
