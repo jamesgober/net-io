@@ -171,3 +171,38 @@ fn test_waker_ends_a_wait_from_another_thread() {
     assert!(start.elapsed() < Duration::from_secs(5));
     t.join().expect("thread");
 }
+
+/// A file send of no bytes completes at once with `Ok(0)` and sends nothing.
+/// `TransmitFile`, and `sendfile` on macOS and FreeBSD, read a count of 0 as "to
+/// the end of the file", so the driver must not pass one on.
+#[test]
+fn test_send_file_of_no_bytes_sends_nothing() {
+    let path = std::env::temp_dir().join(format!("nio-driver-empty-{}", std::process::id()));
+    std::fs::write(&path, vec![7u8; 4096]).expect("write");
+    let file = Arc::new(std::fs::File::open(&path).expect("open"));
+    let mut driver = new_reactor_driver(8).expect("driver");
+    let mut done = Completions::new();
+    let (mut client, server) = pair();
+    let token = Token(11);
+    driver.register(shared(server), token).expect("register");
+    driver
+        .submit(Operation::SendFile {
+            token,
+            file,
+            offset: 0,
+            len: 0,
+        })
+        .expect("submit");
+    let sent = next(driver.as_mut(), &mut done);
+    assert_eq!(sent.kind, OperationKind::SendFile);
+    assert_eq!(sent.result, Ok(0));
+    // Deregistering drops the last clone of the socket: the peer sees the end.
+    driver.deregister(token).expect("deregister");
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let mut got = Vec::new();
+    client.read_to_end(&mut got).expect("read");
+    let _ = std::fs::remove_file(&path);
+    assert!(got.is_empty(), "{} bytes reached the peer", got.len());
+}

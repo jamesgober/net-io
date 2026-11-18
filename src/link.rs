@@ -16,7 +16,7 @@ use crate::info::{ConnectionInfo, GateTag, Transport};
 use crate::limits::Effective;
 use crate::rate::Rate;
 use crate::session::Phase;
-use crate::sys::{self, AsSock, Interest, KillSlot, Ready, Wake};
+use crate::sys::{self, AsSock, Interest, KillSlot, Ready, SlotLease, Wake};
 use crate::tcp::Health;
 use crate::time::Clock;
 use crate::tls::{TlsError, TlsEvent, TlsFailure, TlsSession};
@@ -117,7 +117,88 @@ pub(crate) enum Got {
     Woken,
 }
 
+/// `Link::drains` bits.
+const DRAIN_HOOK: u8 = 1;
+const DRAIN_REACHED: u8 = 2;
+const DRAIN_KEPT: u8 = 4;
+/// Not a drain bit: net-io still picks the phase (the owner never set one).
+const AUTO_PHASE: u8 = 8;
+/// Not a drain bit: the session's last bytes went out while the connection was
+/// idle (a reply at open, a push). The peer may be sending its own request, so a
+/// close lingers instead of taking the idle shortcut; otherwise that request draws
+/// a reset and the peer's stack can discard the reply it already holds (D-192).
+const SPOKE_IDLE: u8 = 16;
+/// Not a drain bit: the session was given input in this exchange, so what it sends
+/// while idle is its answer, not news the peer did not ask for. Cleared when the
+/// exchange ends (`settle_phase` with nothing left over and the phase `Idle`).
+const HEARD: u8 = 32;
+
+/// Soft closes in progress across a server, against `Limits::denial_linger_max`.
+#[derive(Debug)]
+pub(crate) struct SoftCloses {
+    live: std::sync::atomic::AtomicU32,
+    max: u32,
+}
+
+impl SoftCloses {
+    pub(crate) fn new(max: u32) -> Arc<SoftCloses> {
+        Arc::new(SoftCloses {
+            live: std::sync::atomic::AtomicU32::new(0),
+            max,
+        })
+    }
+
+    /// One place, or `None` when `max` are taken.
+    fn take(self: &Arc<Self>) -> Option<SoftPermit> {
+        use std::sync::atomic::Ordering;
+        let mut n = self.live.load(Ordering::Acquire);
+        while n < self.max {
+            match self
+                .live
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(SoftPermit(self.clone())),
+                Err(seen) => n = seen,
+            }
+        }
+        None
+    }
+}
+
+/// A place among the soft closes, given back when the connection closes.
+#[derive(Debug)]
+struct SoftPermit(Arc<SoftCloses>);
+
+/// A connection's soft close: allocated only on a connection that has one, so an
+/// idle connection carries one pointer for it.
+#[derive(Debug, Default)]
+struct SoftClose {
+    /// When a soft kill stops letting output go out: set when the owner first sees
+    /// it, from its bound.
+    until: Option<Instant>,
+    /// This connection's place among the server's soft closes, once it took one.
+    permit: Option<SoftPermit>,
+    /// It may close softly (it has its place, or runs outside a server).
+    placed: bool,
+    /// The server's places were all taken: the close is a reset.
+    refused: bool,
+    /// A denial went out (`send_denial_once`): the close lingers for
+    /// `Limits::denial_linger` instead of resetting at once, so the peer reads it.
+    denial: bool,
+}
+
+impl Drop for SoftPermit {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 pub(crate) struct Link {
+    /// First, so that it drops before `stream`: a link dropped without a close
+    /// (unwinding) ends its kill slot before its descriptor closes.
+    pub(crate) slot: SlotLease,
     pub(crate) stream: sys::Stream,
     pub(crate) info: ConnectionInfo,
     pub(crate) limits: Arc<Effective>,
@@ -127,8 +208,6 @@ pub(crate) struct Link {
     exchange_deadline: Option<Instant>,
     rate_in: Rate,
     rate_out: Rate,
-    pub(crate) slot: Arc<KillSlot>,
-    pub(crate) generation: u32,
     wake: WakeSource,
     recv_timeout_set: Option<Duration>,
     pub(crate) gate: Option<Box<dyn ErasedGate>>,
@@ -143,10 +222,18 @@ pub(crate) struct Link {
     /// The session took a completer, so posts may come: on the pool a receive
     /// waits on the wake channel first, as on Windows and macOS (D-163).
     pub(crate) wakeable: std::cell::Cell<bool>,
-    /// net-io chooses the phase (an accepted connection whose owner never set one).
-    auto_phase: bool,
     /// Bytes went out since the last bytes came in.
     replied: bool,
+    /// `DRAIN_HOOK`: the owner hears a drain at its idle wait (`Session::on_drain`)
+    /// instead of the read closing with `Drained`; `DRAIN_REACHED`: that news;
+    /// `DRAIN_KEPT`: the session kept the connection through the drain; and
+    /// `AUTO_PHASE`: net-io picks the phase (the owner never set one); `SPOKE_IDLE`:
+    /// the last send went out while idle and unasked; `HEARD`: the session was given
+    /// input in this exchange. One byte.
+    drains: u8,
+    /// The soft close (after a denial, or `close_after_flush`), once there is one.
+    /// Boxed: one pointer on every connection, the rest only where it happens.
+    soft: Option<Box<SoftClose>>,
     /// The idle timeout in force: the limits' value, or this connection's override.
     idle_timeout: Duration,
     /// While a PROXY (or TLS) handshake runs: its deadline replaces the phase's.
@@ -175,8 +262,16 @@ pub(crate) struct TlsLayer {
     /// Decrypted plaintext not yet delivered: `[plain_at, plain_end)` inside `cin`.
     plain_at: usize,
     plain_end: usize,
-    /// Ciphertext out: scratch, flushed within each call.
+    /// Ciphertext out: scratch, flushed within each call, except `[0, held)`.
     cout: Buffer,
+    /// Records the engine wrote as the handshake ended, kept at the front of `cout`
+    /// to leave with the session's first reply in one send (the reactor, D-180).
+    /// They are already encrypted in sequence, so whatever is sent next goes after
+    /// them, never without them.
+    held: usize,
+    /// `close_notify` is in `cout` (sealed with the last reply, D-180): a close
+    /// sends no second one.
+    notified: bool,
     /// Both buffers went back to the pool while the connection waits (D-181), or
     /// were never taken because no byte has arrived yet (reactor). A buffer out
     /// with an operation in flight leaves a stand-in too, so this flag, not the
@@ -201,6 +296,8 @@ impl TlsLayer {
             plain_at: 0,
             plain_end: 0,
             cout,
+            held: 0,
+            notified: false,
             released,
             done: false,
             eof: false,
@@ -265,6 +362,11 @@ fn scale(d: Duration, by: f32) -> Duration {
 }
 
 impl Link {
+    /// The generation this connection holds its kill slot with.
+    pub(crate) fn generation(&self) -> u32 {
+        self.slot.generation()
+    }
+
     pub(crate) fn new(
         stream: sys::Stream,
         info: ConnectionInfo,
@@ -283,6 +385,7 @@ impl Link {
         let rate_out = Rate::new(&limits.min_rate, now);
         let idle_timeout = limits.idle_timeout;
         let mut link = Link {
+            slot: SlotLease::new(slot, generation),
             stream,
             info,
             limits,
@@ -292,8 +395,6 @@ impl Link {
             exchange_deadline: None,
             rate_in,
             rate_out,
-            slot,
-            generation,
             wake,
             recv_timeout_set: None,
             gate: None,
@@ -305,8 +406,9 @@ impl Link {
             terminal: None,
             likely_more: false,
             wakeable: std::cell::Cell::new(false),
-            auto_phase: phase == Phase::Idle,
             replied: false,
+            soft: None,
+            drains: if phase == Phase::Idle { AUTO_PHASE } else { 0 },
             idle_timeout,
             handshake_deadline: None,
             deadline_scale: 1.0,
@@ -333,7 +435,7 @@ impl Link {
 
     /// The owner sets the phase; net-io stops choosing it.
     pub(crate) fn set_phase(&mut self, phase: Phase) {
-        self.auto_phase = false;
+        self.drains &= !AUTO_PHASE;
         if phase == self.phase {
             return;
         }
@@ -355,13 +457,25 @@ impl Link {
     /// waits under the idle timeout and a drain can close it at once. Input left
     /// over (a pipelined request) keeps the read deadline and inbound rate.
     pub(crate) fn settle_phase(&mut self, done: bool) {
-        if done && self.auto_phase && self.replied && self.phase == Phase::Receiving {
+        if done && self.drains & AUTO_PHASE != 0 && self.replied && self.phase == Phase::Receiving {
             let now = self.now();
             self.phase = Phase::Idle;
             self.progress_at = now;
             self.rate_in.deactivate();
         }
+        // The exchange is over: what goes out from here until the next input is the
+        // session's own news (D-192).
+        if done && self.phase == Phase::Idle {
+            self.drains &= !HEARD;
+        }
         self.replied = false;
+    }
+
+    /// The session is about to see input: what it sends until the exchange ends
+    /// answers the peer.
+    #[inline]
+    pub(crate) fn note_heard(&mut self) {
+        self.drains |= HEARD;
     }
 
     pub(crate) fn set_exchange_deadline(&mut self, at: Option<Instant>) {
@@ -447,7 +561,8 @@ impl Link {
             && t.start >= t.cin.len()
             && t.plain_at >= t.plain_end
             && t.cin.capacity() > 0
-            && t.cout.capacity() > 0;
+            && t.cout.capacity() > 0
+            && t.held == 0;
         if !idle {
             return None;
         }
@@ -558,10 +673,11 @@ impl Link {
                     // Records the engine wrote on its own are not the session's reply:
                     // they must not end an exchange, and they go out under the
                     // outbound rate like any send.
-                    let replied = self.replied;
+                    let (replied, spoke) = (self.replied, self.drains & SPOKE_IDLE);
                     self.rate_out.activate(self.now());
                     let r = self.send_raw_all(t.cout.as_slice());
                     self.replied = replied;
+                    self.drains = self.drains & !SPOKE_IDLE | spoke;
                     r?;
                 }
                 TlsNext::NeedInput => {
@@ -612,10 +728,11 @@ impl Link {
             let start = t.start;
             let end = t.cin.len();
             let base = t.cin.as_slice().as_ptr() as usize;
+            let held = t.held;
             let TlsLayer {
                 session, cin, cout, ..
             } = &mut *t;
-            cout.set_len(0);
+            cout.set_len(held);
             let stepped = session
                 .step(&mut cin.as_mut_slice()[start..end], cout.spare())
                 .map(|p| {
@@ -645,7 +762,7 @@ impl Link {
             }
             t.event = Some(ev);
             if written > 0 {
-                t.cout.set_len(written.min(t.cout.capacity()));
+                t.cout.set_len((held + written).min(t.cout.capacity()));
                 return Ok(TlsNext::Transmit);
             }
         }
@@ -697,7 +814,8 @@ impl Link {
     /// output buffer.
     fn tls_budget(&self) -> usize {
         self.tls.as_ref().map_or(0, |t| {
-            (t.cout.capacity() / (TLS_RECORD + TLS_OVERHEAD)).max(1) * TLS_RECORD
+            let room = t.cout.capacity().saturating_sub(t.held);
+            (room / (TLS_RECORD + TLS_OVERHEAD)).max(1) * TLS_RECORD
         })
     }
 
@@ -738,7 +856,7 @@ impl Link {
         bufs: &[IoSlice<'_>],
         take: usize,
     ) -> Result<usize, NetError> {
-        t.cout.set_len(0);
+        t.cout.set_len(t.held);
         let mut taken = 0;
         let mut failed = None;
         'slices: for b in bufs.iter().take(sys::MAX_SLICES) {
@@ -773,14 +891,16 @@ impl Link {
         };
         // Without its output buffer (released, and none could be taken back) the
         // close is a plain FIN.
-        if t.done && !t.eof && t.cout.capacity() > 0 {
-            t.cout.set_len(0);
+        if t.done && !t.eof && !t.notified && t.cout.capacity() > 0 {
+            t.cout.set_len(t.held);
             if let Ok(n) = t.session.close(t.cout.spare()) {
-                t.cout.set_len(n.min(t.cout.capacity()));
+                t.cout.set_len((t.held + n).min(t.cout.capacity()));
                 if let Ok(sent) = sys::send(&self.stream, t.cout.as_slice()) {
                     self.bytes_out += sent as u64;
                 }
             }
+            t.held = 0;
+            t.notified = true;
         }
         self.tls = Some(t);
     }
@@ -903,6 +1023,118 @@ impl Link {
         }
     }
 
+    /// `check_terminal` for output: during a soft kill (`close_after_flush`) output
+    /// already queued still goes out, until the kill's bound.
+    fn check_sendable(&mut self) -> Result<(), NetError> {
+        if self.soft_kill_left().is_some_and(|left| !left.is_zero()) {
+            return match self.terminal {
+                None | Some(CloseReason::Killed(_)) => Ok(()),
+                Some(CloseReason::EgressDenied(code)) => Err(NetError::EgressDenied { code }),
+                Some(_) => Err(NetError::Closed),
+            };
+        }
+        self.check_terminal()
+    }
+
+    /// A session owner: a drain that reaches the idle wait is reported (`Got::Woken`
+    /// with `take_drain_reached`) for `Session::on_drain` instead of closing.
+    pub(crate) fn hear_drains(&mut self) {
+        self.drains |= DRAIN_HOOK;
+    }
+
+    /// Whether a drain reached the idle wait since the last call.
+    pub(crate) fn take_drain_reached(&mut self) -> bool {
+        let reached = self.drains & DRAIN_REACHED != 0;
+        self.drains &= !DRAIN_REACHED;
+        reached
+    }
+
+    /// The session kept the connection through the drain: its waits no longer count
+    /// as idle for a drain, so no pass marks it again.
+    pub(crate) fn keep_through_drain(&mut self) {
+        self.drains |= DRAIN_KEPT;
+    }
+
+    pub(crate) fn drain_kept(&self) -> bool {
+        self.drains & DRAIN_KEPT != 0
+    }
+
+    /// Where this connection takes its place for a soft close (a server's links).
+    pub(crate) fn set_soft_closes(&self, places: &Arc<SoftCloses>) {
+        self.slot.set_soft_closes(places);
+    }
+
+    /// Takes (once) this connection's place among the soft closes; `false` when the
+    /// server's `denial_linger_max` are all taken: the close is a reset instead.
+    fn soft_place(&mut self) -> bool {
+        let places = self.slot.soft_closes();
+        let soft = self.soft.get_or_insert_with(Box::default);
+        if soft.placed {
+            return true;
+        }
+        if soft.refused {
+            return false;
+        }
+        let Some(places) = places else {
+            soft.placed = true;
+            return true;
+        };
+        match places.take() {
+            Some(p) => {
+                soft.permit = Some(p);
+                soft.placed = true;
+                true
+            }
+            None => {
+                soft.refused = true;
+                false
+            }
+        }
+    }
+
+    /// When a soft kill stops letting output go out, once the owner has seen it.
+    fn soft_until(&self) -> Option<Instant> {
+        self.soft.as_ref().and_then(|s| s.until)
+    }
+
+    /// What is left of a soft kill's bound, while the kill is soft (a hard kill
+    /// upgrades it) and it has its place (without one it acts as a kill). The bound
+    /// runs from when the owner first sees the kill.
+    pub(crate) fn soft_kill_left(&mut self) -> Option<Duration> {
+        let bound = self.slot.soft_kill()?;
+        if !self.soft_place() {
+            return None;
+        }
+        let now = self.now();
+        let soft = self.soft.get_or_insert_with(Box::default);
+        let until = *soft
+            .until
+            .get_or_insert_with(|| now.checked_add(bound).unwrap_or(now + crate::time::LONGEST));
+        Some(until.saturating_duration_since(now))
+    }
+
+    /// Killed, and not by a soft kill that has its place.
+    fn hard_killed(&self) -> bool {
+        self.killed().is_some()
+            && (self.slot.soft_kill().is_none() || !self.soft.as_ref().is_some_and(|s| s.placed))
+    }
+
+    /// How long an abortive close lingers instead of resetting at once: what is left
+    /// of a soft kill, or the denial linger after a denial went out; `None` for a
+    /// reset (a hard kill, or no denial).
+    pub(crate) fn soft_close(&mut self) -> Option<Duration> {
+        if let Some(left) = self.soft_kill_left() {
+            return Some(left);
+        }
+        if self.killed().is_some() {
+            return None;
+        }
+        if !self.soft.as_ref().is_some_and(|s| s.denial) || !self.soft_place() {
+            return None;
+        }
+        Some(self.limits.denial_linger)
+    }
+
     fn timed_out(&mut self, kind: TimeoutKind) -> NetError {
         self.fail(CloseReason::for_timeout(kind), NetError::TimedOut { kind })
     }
@@ -940,13 +1172,18 @@ impl Link {
         if buf.is_empty() {
             return Ok(Got::Data(0));
         }
-        if let Some(mut t) = self.tls.take() {
+        let r = if let Some(mut t) = self.tls.take() {
             self.settle_phase(true);
             let r = self.read_tls(&mut t, buf);
             self.tls = Some(t);
-            return r;
+            r
+        } else {
+            self.read_raw(buf)
+        };
+        if matches!(r, Ok(Got::Data(n)) if n > 0) {
+            self.note_heard();
         }
-        self.read_raw(buf)
+        r
     }
 
     /// One read from the socket (or from the bytes left after a handshake),
@@ -1009,8 +1246,9 @@ impl Link {
                 .saturating_duration_since(now)
                 .max(Duration::from_millis(1));
 
-            // Waiting for the next exchange: a drain may close the connection now.
-            let idle = self.phase == Phase::Idle;
+            // Waiting for the next exchange: a drain may close the connection now
+            // (unless the session kept it through the drain).
+            let idle = self.phase == Phase::Idle && !self.drain_kept();
             if idle {
                 self.slot.set_idle(true);
             }
@@ -1064,7 +1302,18 @@ impl Link {
                             self.slot.undrain();
                             return Some(Ok(Got::Woken));
                         }
+                        if !self.slot.shed() && self.awaits_first_request() {
+                            // Fresh: a later pass of the drain marks it again.
+                            self.slot.undrain();
+                            return Some(Ok(Got::Woken));
+                        }
                         if !self.input_waiting() {
+                            if self.drains & DRAIN_HOOK != 0 {
+                                // The session hears it (`on_drain`) and decides.
+                                self.slot.undrain();
+                                self.drains |= DRAIN_REACHED;
+                                return Some(Ok(Got::Woken));
+                            }
                             return Some(Err(self.fail(CloseReason::Drained, NetError::Closed)));
                         }
                         self.slot.undrain();
@@ -1147,7 +1396,7 @@ impl Link {
     /// exchange deadline, and the outbound minimum rate.
     fn wait_writable(&mut self) -> Result<(), NetError> {
         loop {
-            self.check_terminal()?;
+            self.check_sendable()?;
             let now = self.now();
             let deadline = self.progress_at + self.limits.write_timeout;
             if now >= deadline {
@@ -1181,6 +1430,9 @@ impl Link {
             if let Some(c) = self.rate_out.next_check(&self.limits.min_rate, now) {
                 until = until.min(c);
             }
+            if let Some(d) = self.soft_until() {
+                until = until.min(d);
+            }
             let timeout = until
                 .saturating_duration_since(now)
                 .max(Duration::from_millis(1));
@@ -1196,6 +1448,13 @@ impl Link {
         let now = self.now();
         self.bytes_out += n as u64;
         self.replied = true;
+        // A reply the session wrote after it set `Idle` for the exchange it answered
+        // is not unasked: only bytes sent while idle with no input heard are (D-201).
+        if self.phase == Phase::Idle && self.drains & HEARD == 0 {
+            self.drains |= SPOKE_IDLE;
+        } else {
+            self.drains &= !SPOKE_IDLE;
+        }
         self.progress_at = now;
         self.rate_out.record(now, n);
         if n > 0 {
@@ -1216,7 +1475,7 @@ impl Link {
         // One gate check per write, for the bytes the gate has not approved yet:
         // a retry after `WouldBlock`, or the tail of a partial send offered again,
         // is not counted twice by a byte-counting gate.
-        self.check_terminal()?;
+        self.check_sendable()?;
         if self.tls.is_some() {
             let chunk = buf.len().min(TLS_RECORD);
             self.gate_check(chunk)?;
@@ -1235,7 +1494,7 @@ impl Link {
     fn send_raw(&mut self, buf: &[u8]) -> Result<usize, NetError> {
         let mut zero_writes = 0u8;
         loop {
-            self.check_terminal()?;
+            self.check_sendable()?;
             match sys::send(&self.stream, buf) {
                 Ok(0) => {
                     // Should not happen on TCP; treat once as "full", then as an error.
@@ -1322,12 +1581,12 @@ impl Link {
         }
         let now = self.now();
         self.rate_out.activate(now);
-        self.check_terminal()?;
+        self.check_sendable()?;
         self.gate_check(body.len())?;
         self.approved = 0;
         let mut zero_writes = 0u8;
         let first = loop {
-            self.check_terminal()?;
+            self.check_sendable()?;
             match sys::send_with_fds(&self.stream, body, fds) {
                 Ok(0) => {
                     zero_writes += 1;
@@ -1375,7 +1634,7 @@ impl Link {
         }
         let now = self.now();
         self.rate_out.activate(now);
-        self.check_terminal()?;
+        self.check_sendable()?;
         if self.tls.is_some() {
             let take = total.min(self.tls_budget());
             self.gate_check(take)?;
@@ -1384,7 +1643,7 @@ impl Link {
         self.gate_check(total.saturating_sub(self.approved))?;
         let mut zero_writes = 0u8;
         loop {
-            self.check_terminal()?;
+            self.check_sendable()?;
             match sys::send_vectored(&self.stream, bufs) {
                 Ok(n) if n > 0 => {
                     self.sent(n);
@@ -1470,11 +1729,11 @@ impl Link {
         let mut sent = 0u64;
         while sent < len {
             let take = (len - sent).min(FILE_CHUNK) as usize;
-            self.check_terminal()?;
+            self.check_sendable()?;
             self.gate_check(take.saturating_sub(self.approved))?;
             self.approved = take;
             loop {
-                self.check_terminal()?;
+                self.check_sendable()?;
                 match self.send_file_once(file, offset + sent, take) {
                     Ok(0) => return Err(self.file_truncated(sent)),
                     Ok(n) => {
@@ -1574,17 +1833,29 @@ impl Link {
             // Set when the bytes went straight into the file, not into `buf`.
             let spliced = std::cell::Cell::new(false);
             #[cfg(target_os = "linux")]
+            let file_failed = std::cell::Cell::new(None);
+            #[cfg(target_os = "linux")]
             let result = match &pipe {
                 Some(pipe) if !refused.get() => {
                     self.read_raw_with(&mut buf[..take], |stream, b| {
                         if !refused.get() {
                             match sys::splice_to_file(stream.sock(), pipe, file, at, b.len()) {
-                                Ok(n) => {
+                                Ok(s) => {
                                     spliced.set(true);
-                                    return Ok(n);
+                                    refused.set(s.file_refused);
+                                    return Ok(s.bytes);
                                 }
-                                Err(e) if sys::send_file_refused(&e) => refused.set(true),
-                                Err(e) => return Err(e),
+                                Err(sys::SpliceError::Socket(e)) if sys::send_file_refused(&e) => {
+                                    refused.set(true);
+                                }
+                                Err(sys::SpliceError::Socket(e)) => return Err(e),
+                                // Bytes left the socket and are lost: never fall back to
+                                // `recv`, which would put later bytes in their place.
+                                Err(sys::SpliceError::File(e)) => {
+                                    let same = Self::same_error(&e);
+                                    file_failed.set(Some(e));
+                                    return Err(same);
+                                }
                             }
                         }
                         sys::recv(stream, b)
@@ -1592,6 +1863,12 @@ impl Link {
                 }
                 _ => self.read(&mut buf[..take]),
             };
+            #[cfg(target_os = "linux")]
+            if let Some(e) = file_failed.take() {
+                // The read path closed the connection with this error's class; the
+                // caller hears it as the file write it was.
+                return Err(NetError::from_os("write", e));
+            }
             #[cfg(not(target_os = "linux"))]
             let result = self.read(&mut buf[..take]);
             match result? {
@@ -1607,6 +1884,13 @@ impl Link {
             }
         }
         Ok(got)
+    }
+
+    /// An error with the OS code (or the kind) of `e`, where `e` itself goes elsewhere.
+    #[cfg(target_os = "linux")]
+    fn same_error(e: &io::Error) -> io::Error {
+        e.raw_os_error()
+            .map_or_else(|| io::Error::from(e.kind()), io::Error::from_raw_os_error)
     }
 
     fn file_truncated(&mut self, sent: u64) -> NetError {
@@ -1727,6 +2011,19 @@ impl Link {
 
     /// Whether bytes wait in the socket now: one zero-timeout wait. A drain leaves a
     /// connection whose next request already arrived to answer it first.
+    /// A connection that has received nothing yet, within `first_request_grace` of
+    /// its accept: a drain lets it bring its first request instead of closing it as
+    /// idle, since a client that connected just before the drain is still writing it.
+    pub(crate) fn awaits_first_request(&self) -> bool {
+        self.bytes_in == 0
+            && self.pending.is_none()
+            && self
+                .info
+                .accepted_at
+                .checked_add(self.limits.first_request_grace)
+                .is_some_and(|until| self.now() < until)
+    }
+
     pub(crate) fn input_waiting(&self) -> bool {
         self.pending.is_some()
             || matches!(
@@ -1814,9 +2111,10 @@ impl Link {
     /// session's reply, so the exchange does not end on them.
     #[cfg(feature = "reactor")]
     pub(crate) fn note_engine_sent(&mut self, n: usize) -> Result<(), NetError> {
-        let replied = self.replied;
+        let (replied, spoke) = (self.replied, self.drains & SPOKE_IDLE);
         let r = self.note_sent(n);
         self.replied = replied;
+        self.drains = self.drains & !SPOKE_IDLE | spoke;
         r
     }
 
@@ -1829,7 +2127,7 @@ impl Link {
         if self.phase == Phase::Idle {
             self.progress_at = now;
         }
-        self.check_terminal()?;
+        self.check_sendable()?;
         self.gate_check(bytes.saturating_sub(self.approved))
     }
 
@@ -1891,13 +2189,16 @@ impl Link {
         if let Some(c) = self.rate_out.next_check(&self.limits.min_rate, now) {
             until = until.min(c);
         }
+        if let Some(d) = self.soft_until() {
+            until = until.min(d);
+        }
         until
     }
 
     /// The checks of a wait for room to write, at the time its timer fired.
     #[cfg(feature = "reactor")]
     pub(crate) fn write_check(&mut self, now: Instant) -> Result<(), NetError> {
-        self.check_terminal()?;
+        self.check_sendable()?;
         if now >= self.progress_at + self.limits.write_timeout {
             return Err(self.timed_out(TimeoutKind::Write));
         }
@@ -1970,15 +2271,44 @@ impl Link {
         let Some(mut t) = self.tls.take() else {
             return Ok(TlsNext::Eof);
         };
-        let r = self.tls_advance(&mut t);
+        let mut r = self.tls_advance(&mut t);
+        if t.held > 0 && matches!(r, Ok(TlsNext::NeedInput)) {
+            // Nothing more to answer in this turn: the held records go out now, and
+            // the machine asks for input again after them.
+            t.event = Some(Ev::NeedInput);
+            t.cout.set_len(t.held);
+            r = Ok(TlsNext::Transmit);
+        }
         self.tls = Some(t);
         r
+    }
+
+    /// Keeps the records in `cout` for the session's first reply instead of sending
+    /// them now (D-180): `true` when they are the handshake's last records
+    /// (the tickets, with the completion still to report) and the client's request
+    /// is already in the input, so the client waits for nothing these records carry
+    /// and the reply follows within this turn. Anything else sends them at once.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_hold(&mut self) -> bool {
+        let Some(t) = self.tls.as_mut() else {
+            return false;
+        };
+        let hold = t.held == 0
+            && !t.done
+            && matches!(t.event, Some(Ev::Handshaken))
+            && t.start < t.cin.len()
+            && !t.cout.is_empty();
+        if hold {
+            t.held = t.cout.len();
+        }
+        hold
     }
 
     /// The records to send; give the buffer back with [`Link::tls_put_cout`].
     #[cfg(feature = "reactor")]
     pub(crate) fn tls_take_cout(&mut self) -> Option<Buffer> {
         let t = self.tls.as_mut()?;
+        t.held = 0;
         Some(std::mem::replace(&mut t.cout, Buffer::placeholder()))
     }
 
@@ -2051,6 +2381,22 @@ impl Link {
         r
     }
 
+    /// After a seal that took the last of the output before a graceful close:
+    /// `close_notify` joins the records in `cout`, so they leave in one send and
+    /// the close sends no second one (D-180). Nothing happens when it does not fit.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn tls_seal_close_notify(&mut self) {
+        let Some(t) = self.tls.as_mut() else { return };
+        if !t.done || t.eof || t.notified || t.cout.spare().len() < TLS_OVERHEAD {
+            return;
+        }
+        let used = t.cout.len();
+        if let Ok(n) = t.session.close(t.cout.spare()) {
+            t.cout.set_len((used + n).min(t.cout.capacity()));
+            t.notified = true;
+        }
+    }
+
     /// The plaintext one sealed write may take.
     #[cfg(feature = "reactor")]
     pub(crate) fn tls_write_budget(&self) -> usize {
@@ -2062,23 +2408,37 @@ impl Link {
     pub(crate) fn check_seal(&mut self, bytes: usize) -> Result<(), NetError> {
         let now = self.now();
         self.rate_out.activate(now);
-        self.check_terminal()?;
+        self.check_sendable()?;
         self.gate_check(bytes)
     }
 
-    /// A graceful close on the reactor: FIN now. `true` when unread input may
-    /// still arrive, so the socket must linger to protect the last response.
+    /// A graceful close on the reactor. `true` when unread input may still arrive,
+    /// so the socket must linger to protect the last response: FIN now, by
+    /// `shutdown`. Otherwise the close that follows sends the FIN itself, behind
+    /// whatever is still queued, and a `shutdown` first would change nothing on the
+    /// wire: once the socket is closed, input that arrives is answered with a reset
+    /// either way (D-198).
     #[cfg(feature = "reactor")]
     pub(crate) fn begin_graceful_close(&mut self, readable: bool) -> bool {
         self.tls_close_notify();
-        let _ = self.stream.shutdown(Shutdown::Write);
-        self.stream.half_closes() && !self.peer_closed && (self.phase != Phase::Idle || readable)
+        let linger = self.stream.half_closes()
+            && !self.peer_closed
+            && (self.phase != Phase::Idle || readable || self.drains & SPOKE_IDLE != 0);
+        if linger {
+            let _ = self.stream.shutdown(Shutdown::Write);
+        }
+        linger
     }
 
     /// Closes the socket after the driver let go of it.
     #[cfg(feature = "reactor")]
     pub(crate) fn finish_reactor(mut self, reason: CloseReason) -> CloseReason {
-        if reason.is_abortive() {
+        // A pipe (the one stream that does not half-close) has written through the
+        // driver; only a denial writes through the stream itself, and a denial
+        // write still pending here waits for a client that is not reading. The
+        // stream would wait up to a second for it on drop, on the worker's thread:
+        // drop it instead, as a reset would (D-209).
+        if (reason.is_abortive() && self.soft_close().is_none()) || !self.stream.half_closes() {
             self.stream.set_abortive();
         }
         self.slot.begin_close();
@@ -2109,18 +2469,44 @@ impl Link {
         Some(stream)
     }
 
-    pub(crate) fn finish(mut self, reason: CloseReason) -> CloseReason {
+    pub(crate) fn finish(self, reason: CloseReason) -> CloseReason {
+        self.finish_with(reason, |_| false)
+    }
+
+    /// As `finish`; `own(k)` says a kill with reason `k` was net-io's own (a drain's
+    /// deadline, a stop). Such a kill during the linger ends the linger and keeps the
+    /// graceful close's reason, as on the reactor; a user's kill still makes it
+    /// `Killed` and a reset (D-201).
+    pub(crate) fn finish_with(
+        mut self,
+        reason: CloseReason,
+        own: impl Fn(KillReason) -> bool,
+    ) -> CloseReason {
         let mut reason = reason;
-        if !reason.is_abortive() {
+        // After a denial or during a soft kill, an abortive reason still closes
+        // gracefully, with the shorter linger: the peer reads what was sent.
+        let soft = if reason.is_abortive() {
+            self.soft_close()
+        } else {
+            None
+        };
+        let graceful = !reason.is_abortive() || soft.is_some();
+        if graceful {
             self.tls_close_notify();
-        }
-        if !reason.is_abortive() && self.linger_gracefully() {
-            // A kill arrived during the linger: close abortively at once.
-            if let Some(k) = self.killed() {
-                reason = CloseReason::Killed(k);
+            let within = soft.unwrap_or(self.limits.graceful_linger);
+            if self.linger_gracefully(within, soft.is_some()) {
+                // A kill arrived during the linger: close abortively at once.
+                if let Some(k) = self.killed().filter(|&k| !own(k)) {
+                    reason = CloseReason::Killed(k);
+                }
             }
         }
-        if reason.is_abortive() {
+        let abort = if soft.is_some() {
+            self.hard_killed()
+        } else {
+            reason.is_abortive()
+        };
+        if abort {
             self.stream.set_abortive();
         }
         // No kill can start after this, and one in flight finishes first.
@@ -2136,7 +2522,7 @@ impl Link {
 
     /// Closes without the linger: never blocks (used when a connection is dropped).
     pub(crate) fn finish_quick(mut self, reason: CloseReason) -> CloseReason {
-        if reason.is_abortive() {
+        if reason.is_abortive() && self.soft_close().is_none() {
             self.stream.set_abortive();
         } else {
             let _ = self.stream.shutdown(Shutdown::Write);
@@ -2181,10 +2567,13 @@ impl Link {
     pub(crate) fn send_denial_once(&mut self, buf: &[u8]) {
         let sent = match self.tls.as_mut() {
             Some(t) => {
-                t.cout.set_len(0);
+                // Held records go first: the denial's record follows them in sequence.
+                let held = t.held;
+                t.cout.set_len(held);
+                t.held = 0;
                 match t.session.encrypt(buf, t.cout.spare()) {
                     Ok(n) if n > 0 => {
-                        t.cout.set_len(n);
+                        t.cout.set_len(held + n);
                         let r = sys::send(&self.stream, t.cout.as_slice());
                         t.cout.set_len(0);
                         r.ok()
@@ -2197,29 +2586,39 @@ impl Link {
         if let Some(n) = sent {
             self.bytes_out += n as u64;
             self.replied = true;
+            if n > 0 && !self.limits.denial_linger.is_zero() {
+                self.soft.get_or_insert_with(Box::default).denial = true;
+            }
         }
     }
 
     /// FIN, then read and discard up to the linger budget so unread input does not
-    /// turn into an RST that destroys the last response. Returns `true` if killed meanwhile.
-    fn linger_gracefully(&mut self) -> bool {
+    /// turn into an RST that destroys the last response, for at most `within`.
+    /// Returns `true` if killed meanwhile (a soft kill does not count). `always`: a
+    /// flush then close (a denial, `close_after_flush`), which lingers in any phase.
+    fn linger_gracefully(&mut self, within: Duration, always: bool) -> bool {
         let _ = self.stream.shutdown(Shutdown::Write);
         if self.peer_closed || !self.stream.half_closes() {
             return false;
         }
         // Between exchanges with nothing unread there is nothing to protect from a
         // reset: close at once (one zero-timeout poll), so a drain of idle
-        // connections does not wait out the linger.
-        if self.phase == Phase::Idle
+        // connections does not wait out the linger. Not after the session spoke
+        // while idle: the peer's answer may be on its way (D-192). Not for a flush
+        // then close either: it ends the connection on the server's terms, and the
+        // peer's request may be crossing it whatever the phase (D-182, D-202).
+        if !always
+            && self.phase == Phase::Idle
+            && self.drains & SPOKE_IDLE == 0
             && !matches!(self.wait(Interest::Read, Duration::ZERO), Ok(Ready::Socket))
         {
             return false;
         }
-        let deadline = self.now() + self.limits.graceful_linger;
+        let deadline = self.now() + within;
         let mut left = self.limits.graceful_linger_bytes as usize;
         let mut scratch = [0u8; 2048];
         while left > 0 {
-            if self.killed().is_some() {
+            if self.hard_killed() {
                 return true;
             }
             let now = self.now();
@@ -2242,7 +2641,7 @@ impl Link {
                 Err(_) => break,
             }
         }
-        self.killed().is_some()
+        self.hard_killed()
     }
 }
 

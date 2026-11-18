@@ -128,8 +128,8 @@ static SYSTEMD: Mutex<Taken> = Mutex::new(Taken {
 /// `BadCount`, `TooMany`, `NamesMismatch`, `PidFdMismatch`, `NotASocket`,
 /// `NotListening`, `WrongKind`, `Os`. Nothing is taken on an error, with one
 /// exception: an OS call that fails while the verified descriptors are being
-/// taken closes those already taken, and later calls return an empty list, so
-/// no number is ever taken twice.
+/// taken closes all of them, and later calls return an empty list, so no number
+/// is ever taken twice or left open with no owner.
 ///
 /// ```no_run
 /// use net_io::{AllowAll, ListenerSpec, ServerBuilder};
@@ -255,15 +255,30 @@ fn plan_systemd(
 }
 
 /// Takes the verified descriptors. A failure here (an OS call that fails on a
-/// descriptor just verified) closes the ones already taken.
+/// descriptor just verified) closes every descriptor of the plan: those already
+/// taken, the one that failed, and those not reached yet, which would otherwise stay
+/// open with no owner, since the variables are never read again.
 #[cfg(unix)]
 fn take_systemd(plan: Plan) -> Result<Vec<InheritedListener>, InheritError> {
     let mut out = Vec::with_capacity(plan.len());
-    for (fd, name) in plan {
-        let owned = crate::sys::claim_inherited(fd).map_err(InheritError::Os)?;
-        let handle =
-            ListenerHandle::verified(owned, name.clone()).map_err(|e| kind_error(e, fd))?;
-        out.push(InheritedListener { name, handle });
+    let mut plan = plan.into_iter();
+    while let Some((fd, name)) = plan.next() {
+        let taken = crate::sys::claim_inherited(fd)
+            .map_err(InheritError::Os)
+            .and_then(|owned| {
+                ListenerHandle::verified(owned, name.clone()).map_err(|e| kind_error(e, fd))
+            });
+        match taken {
+            Ok(handle) => out.push(InheritedListener { name, handle }),
+            Err(e) => {
+                // Claiming takes ownership before anything can fail, so dropping
+                // the result closes the descriptor either way.
+                for (rest, _) in plan {
+                    drop(crate::sys::claim_inherited(rest));
+                }
+                return Err(e);
+            }
+        }
     }
     Ok(out)
 }
@@ -505,5 +520,21 @@ mod tests {
         assert!(crate::sys::inherited_kind(941).is_ok());
         crate::sys::close_number(940);
         crate::sys::close_number(941);
+    }
+
+    /// A take that fails part way closes every descriptor it was given, those
+    /// after the failure too: none is left open with no owner.
+    #[test]
+    fn test_failed_take_leaves_no_descriptor_open() {
+        let first = place(960, 1);
+        let file = std::fs::File::open("/dev/null").unwrap();
+        crate::sys::dup_to(file.as_fd(), 961).unwrap();
+        let _after = place(962, 1);
+        let plan = vec![(960, None), (961, None), (962, None)];
+        assert!(take_systemd(plan).is_err(), "961 is not a socket");
+        for fd in 960..=962 {
+            assert!(!crate::sys::is_open(fd), "descriptor {fd} is still open");
+        }
+        drop(first);
     }
 }

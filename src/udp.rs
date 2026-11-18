@@ -5,13 +5,17 @@
 //! socket and the caller: every datagram is charged to its source's budget
 //! (and the global one) before it is returned, and every send to a source that
 //! has not proved it can receive is limited to `factor` times what it sent us.
+//! Budgets are kept per source prefix (an IPv6 host usually owns a whole /64);
+//! the send allowance is kept per exact address, since that is what a reply hits.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::addr::normalize;
+use crate::addr::{PrefixKey, PrefixPolicy, normalize};
 use crate::error::{ConfigReason, LimitKind, NetError, TimeoutKind};
 use crate::sys::{self, AsSock};
 
@@ -40,6 +44,19 @@ impl UdpBudget {
         bytes_per_sec: 1_000_000,
         burst: 100,
     };
+
+    /// The default budget of a whole socket: 100,000 datagrams and 150 MB per
+    /// second (100,000 full-size 1,500-byte datagrams, 1.2 Gbit/s), bursts of
+    /// 10,000 (a tenth of a second). One listener is one thread, which handles
+    /// on the order of 100,000 datagrams a second once its session does any work
+    /// (an estimate, not a measurement), so a server below that never meets this
+    /// budget; one that expects more sets its own with
+    /// [`UdpOptions::global_budget`].
+    pub const GLOBAL_DEFAULT: UdpBudget = UdpBudget {
+        datagrams_per_sec: 100_000,
+        bytes_per_sec: 150_000_000,
+        burst: 10_000,
+    };
 }
 
 /// Options for [`UdpSocket::bind_with`].
@@ -57,7 +74,9 @@ pub struct UdpOptions {
     factor: u8,
     window: Duration,
     source: UdpBudget,
-    global: Option<UdpBudget>,
+    first: u32,
+    prefix: PrefixPolicy,
+    global: UdpBudget,
     table: u32,
     verified_for: Duration,
     verified_table: u32,
@@ -72,15 +91,18 @@ impl Default for UdpOptions {
 }
 
 impl UdpOptions {
-    /// Factor 1, a 10 s window, [`UdpBudget::SOURCE_DEFAULT`] per source, no
-    /// global budget, 65,536 sources, verification for 60 s and up to 65,536
-    /// verified peers, IPv6-only for IPv6 addresses.
+    /// Factor 1, a 10 s window, [`UdpBudget::SOURCE_DEFAULT`] per source prefix
+    /// (/32 for IPv4, /64 for IPv6) with a first burst of 16,
+    /// [`UdpBudget::GLOBAL_DEFAULT`] for the socket, 65,536 sources, verification
+    /// for 60 s and up to 65,536 verified peers, IPv6-only for IPv6 addresses.
     pub fn new() -> UdpOptions {
         UdpOptions {
             factor: 1,
             window: Duration::from_secs(10),
             source: UdpBudget::SOURCE_DEFAULT,
-            global: None,
+            first: 16,
+            prefix: PrefixPolicy::DEFAULT,
+            global: UdpBudget::GLOBAL_DEFAULT,
             table: 65_536,
             verified_for: Duration::from_secs(60),
             verified_table: 65_536,
@@ -122,19 +144,45 @@ impl UdpOptions {
         self
     }
 
-    /// The budget of each source address.
+    /// The budget of each source (each prefix of [`UdpOptions::source_prefix`]).
     pub fn source_budget(mut self, budget: UdpBudget) -> UdpOptions {
         self.source = budget;
         self
     }
 
-    /// A budget for the whole socket (none by default).
-    pub fn global_budget(mut self, budget: UdpBudget) -> UdpOptions {
-        self.global = Some(budget);
+    /// How addresses are grouped into sources for the budgets
+    /// ([`PrefixPolicy::DEFAULT`]: /32 for IPv4 and /64 for IPv6, as the TCP
+    /// per-source cap groups them; [`PrefixPolicy::HOST`] budgets every address
+    /// on its own). An IPv6 host usually owns a whole /64 and can send from any
+    /// address in it, so a budget per address would give it millions. The send
+    /// allowance and verification stay per address whatever the policy.
+    pub fn source_prefix(mut self, policy: PrefixPolicy) -> UdpOptions {
+        self.prefix = policy;
         self
     }
 
-    /// How many sources are tracked (65,536 by default, about 130 bytes each).
+    /// How many datagrams a source not in the table may send at once (16 by
+    /// default, never more than the source budget's burst). Its bucket then fills
+    /// to the full burst at the budget's rate, so a source that keeps sending sees
+    /// no difference after a moment, while a spoofer that rotates sources, or
+    /// pushes its own entry out of a full table, gets this much per entry instead
+    /// of a full burst.
+    pub fn new_source_burst(mut self, datagrams: u32) -> UdpOptions {
+        self.first = datagrams;
+        self
+    }
+
+    /// The budget of the whole socket ([`UdpBudget::GLOBAL_DEFAULT`] by
+    /// default): what all sources together may send, so a flood from many
+    /// sources, spoofed or not, reaches the caller at this rate at most.
+    pub fn global_budget(mut self, budget: UdpBudget) -> UdpOptions {
+        self.global = budget;
+        self
+    }
+
+    /// How many sources are tracked (65,536 by default): budgets per source
+    /// prefix and send allowances per address, each table bounded by this,
+    /// about 200 bytes per source in all (12.5 MiB for a full default table).
     pub fn source_table(mut self, entries: u32) -> UdpOptions {
         self.table = entries;
         self
@@ -193,14 +241,15 @@ impl UdpOptions {
         if self.verified_table == 0 {
             return invalid("verified_table", ConfigReason::Zero);
         }
+        if self.first == 0 {
+            return invalid("new_source_burst", ConfigReason::Zero);
+        }
         for (field, b) in [
-            ("source_budget", Some(self.source)),
+            ("source_budget", self.source),
             ("global_budget", self.global),
         ] {
-            if let Some(b) = b {
-                if b.datagrams_per_sec == 0 || b.bytes_per_sec == 0 || b.burst == 0 {
-                    return invalid(field, ConfigReason::Zero);
-                }
+            if b.datagrams_per_sec == 0 || b.bytes_per_sec == 0 || b.burst == 0 {
+                return invalid(field, ConfigReason::Zero);
             }
         }
         Ok(())
@@ -250,7 +299,7 @@ pub struct UdpStats {
     pub icmp_errors: u64,
     /// Datagrams from sources that found the table full (the shared overflow budget).
     pub overflow: u64,
-    /// Sources tracked now.
+    /// Sources (prefixes of [`UdpOptions::source_prefix`]) with a budget now.
     pub sources: u32,
 }
 
@@ -269,6 +318,18 @@ impl Bucket {
         Bucket {
             datagrams: u64::from(budget.burst) * MICRO,
             bytes: u64::from(budget.bytes_per_sec) * MICRO,
+            at: now,
+        }
+    }
+
+    /// A bucket for a source new to the table: `first` datagrams (at most the
+    /// burst) and the same share of the byte bucket.
+    fn starting(budget: &UdpBudget, first: u32, now: Instant) -> Bucket {
+        let burst = u64::from(budget.burst.max(1));
+        let first = u64::from(first.min(budget.burst));
+        Bucket {
+            datagrams: first * MICRO,
+            bytes: u64::from(budget.bytes_per_sec) * first / burst * MICRO,
             at: now,
         }
     }
@@ -297,27 +358,21 @@ impl Bucket {
     }
 }
 
-/// What the guard knows about one source address.
+/// The send allowance of one source address: bytes received from it and sent to
+/// it, over the current and the previous window.
 #[derive(Clone, Copy, Debug)]
-struct Entry {
-    ip: IpAddr,
-    bucket: Bucket,
+struct Allowance {
     received: [u64; 2],
     sent: [u64; 2],
     window_at: Instant,
-    /// Set by an admitted datagram, cleared by the hand.
-    referenced: bool,
 }
 
-impl Entry {
-    fn new(ip: IpAddr, budget: &UdpBudget, now: Instant) -> Entry {
-        Entry {
-            ip,
-            bucket: Bucket::full(budget, now),
+impl Allowance {
+    fn new(now: Instant) -> Allowance {
+        Allowance {
             received: [0; 2],
             sent: [0; 2],
             window_at: now,
-            referenced: false,
         }
     }
 
@@ -368,61 +423,71 @@ const MAX_WINDOW_SECS: u64 = 3_600;
 /// The longest verification lifetime (1 day).
 const MAX_VERIFIED_SECS: u64 = 86_400;
 
-/// The source table, a bounded map with CLOCK eviction, and the table of verified
-/// peers, bounded the same way.
+/// A bounded map with CLOCK eviction: a hash index over a slab, a hand, and a
+/// recently-used bit per entry.
 #[derive(Debug)]
-struct Guard {
-    index: HashMap<IpAddr, u32>,
-    slots: Vec<Entry>,
+struct Clock<K, V> {
+    index: HashMap<K, u32>,
+    slots: Vec<Slot<K, V>>,
     hand: usize,
-    proofs: HashMap<PeerKey, u32>,
-    proved: Vec<Proof>,
-    proof_hand: usize,
-    overflow: Bucket,
-    global: Option<Bucket>,
-    options: UdpOptions,
+    cap: usize,
 }
 
-impl Guard {
-    fn new(options: UdpOptions, now: Instant) -> Guard {
-        Guard {
+#[derive(Clone, Copy, Debug)]
+struct Slot<K, V> {
+    key: K,
+    value: V,
+    /// Set by an admitted datagram, cleared by the hand.
+    referenced: bool,
+}
+
+impl<K: Copy + Eq + Hash, V> Clock<K, V> {
+    fn new(cap: u32) -> Clock<K, V> {
+        Clock {
             index: HashMap::new(),
             slots: Vec::new(),
             hand: 0,
-            proofs: HashMap::new(),
-            proved: Vec::new(),
-            proof_hand: 0,
-            overflow: Bucket::full(&options.source, now),
-            global: options.global.map(|g| Bucket::full(&g, now)),
-            options,
+            cap: cap as usize,
         }
     }
 
-    /// Finds or makes room for `ip`; the flag says it was already there. A
-    /// newcomer takes the first entry the hand finds not recently used.
-    fn slot(&mut self, ip: IpAddr, now: Instant) -> Option<(usize, bool)> {
-        if let Some(&i) = self.index.get(&ip) {
-            return Some((i as usize, true));
+    fn get(&self, key: &K) -> Option<usize> {
+        self.index.get(key).map(|&i| i as usize)
+    }
+
+    /// Finds `key`, or makes room for it holding `value`; the flag says it was
+    /// already there. A newcomer takes the first entry the hand finds not
+    /// recently used, within [`SWEEP`] looks; `None` when there is none.
+    fn find_or_insert(&mut self, key: K, value: V) -> Option<(usize, bool)> {
+        if let Some(i) = self.get(&key) {
+            return Some((i, true));
         }
-        let entry = Entry::new(ip, &self.options.source, now);
-        if self.slots.len() < self.options.table as usize {
-            self.slots.push(entry);
+        if self.slots.len() < self.cap {
+            self.slots.push(Slot {
+                key,
+                value,
+                referenced: false,
+            });
             let i = self.slots.len() - 1;
-            self.index.insert(ip, i as u32);
+            self.index.insert(key, i as u32);
             return Some((i, false));
         }
         let n = self.slots.len();
         for _ in 0..SWEEP.min(2 * n) {
             let i = self.hand;
             self.hand = (self.hand + 1) % n;
-            let e = &mut self.slots[i];
-            if e.referenced {
-                e.referenced = false;
+            let s = &mut self.slots[i];
+            if s.referenced {
+                s.referenced = false;
                 continue;
             }
-            self.index.remove(&e.ip);
-            *e = entry;
-            self.index.insert(ip, i as u32);
+            self.index.remove(&s.key);
+            *s = Slot {
+                key,
+                value,
+                referenced: false,
+            };
+            self.index.insert(key, i as u32);
             return Some((i, false));
         }
         None
@@ -432,7 +497,7 @@ impl Guard {
     /// own traffic ages the table, not only newcomers.
     fn turn(&mut self) {
         let n = self.slots.len();
-        if n < self.options.table as usize || n == 0 {
+        if n < self.cap || n == 0 {
             return;
         }
         for _ in 0..TURN {
@@ -440,18 +505,51 @@ impl Guard {
             self.hand = (self.hand + 1) % n;
         }
     }
+}
 
-    /// Charges a received datagram; `false` drops it. `overflow` is set when the
-    /// source found no room in the table. Only an admitted datagram marks its
-    /// entry recently used and counts toward the send allowance.
+/// The budgets of source prefixes and the send allowances of source addresses,
+/// both bounded maps with CLOCK eviction, and the table of verified peers,
+/// bounded the same way.
+#[derive(Debug)]
+struct Guard {
+    budgets: Clock<PrefixKey, Bucket>,
+    allowances: Clock<IpAddr, Allowance>,
+    proofs: HashMap<PeerKey, u32>,
+    proved: Vec<Proof>,
+    proof_hand: usize,
+    overflow: Bucket,
+    global: Bucket,
+    options: UdpOptions,
+}
+
+impl Guard {
+    fn new(options: UdpOptions, now: Instant) -> Guard {
+        Guard {
+            budgets: Clock::new(options.table),
+            allowances: Clock::new(options.table),
+            proofs: HashMap::new(),
+            proved: Vec::new(),
+            proof_hand: 0,
+            overflow: Bucket::full(&options.source, now),
+            global: Bucket::full(&options.global, now),
+            options,
+        }
+    }
+
+    /// Charges a received datagram from `ip` (normalized); `false` drops it.
+    /// `overflow` is set when its prefix found no room in the table. Only an
+    /// admitted datagram marks its entries recently used and counts toward the
+    /// send allowance of its address.
     fn admit(&mut self, ip: IpAddr, len: usize, now: Instant, overflow: &mut bool) -> bool {
         let source = self.options.source;
-        let at = match self.slot(ip, now) {
+        let key = PrefixKey::of(ip, self.options.prefix);
+        let fresh = Bucket::starting(&source, self.options.first, now);
+        let at = match self.budgets.find_or_insert(key, fresh) {
             Some((i, known)) => {
                 if known {
-                    self.turn();
+                    self.budgets.turn();
                 }
-                if !self.slots[i].bucket.take(&source, len, now) {
+                if !self.budgets.slots[i].value.take(&source, len, now) {
                     return false;
                 }
                 Some(i)
@@ -464,17 +562,22 @@ impl Guard {
                 None
             }
         };
-        if let (Some(bucket), Some(budget)) = (&mut self.global, &self.options.global) {
-            if !bucket.take(budget, len, now) {
-                return false;
-            }
+        if !self.global.take(&self.options.global, len, now) {
+            return false;
         }
-        if let Some(i) = at {
+        // A prefix with no room shares the overflow budget, and its addresses get
+        // no send allowance: strangers in a full table could otherwise pool one.
+        let Some(i) = at else { return true };
+        self.budgets.slots[i].referenced = true;
+        if let Some((j, known)) = self.allowances.find_or_insert(ip, Allowance::new(now)) {
+            if known {
+                self.allowances.turn();
+            }
             let window = self.options.window;
-            let e = &mut self.slots[i];
-            e.referenced = true;
-            e.roll(window, now);
-            e.received[0] = e.received[0].saturating_add(len as u64);
+            let s = &mut self.allowances.slots[j];
+            s.referenced = true;
+            s.value.roll(window, now);
+            s.value.received[0] = s.value.received[0].saturating_add(len as u64);
         }
         true
     }
@@ -486,12 +589,12 @@ impl Guard {
         if self.is_verified(to, now) {
             return true;
         }
-        let Some(&i) = self.index.get(&normalize(to.ip())) else {
+        let Some(i) = self.allowances.get(&normalize(to.ip())) else {
             return len == 0;
         };
         let window = self.options.window;
         let factor = u64::from(self.options.factor);
-        let e = &mut self.slots[i as usize];
+        let e = &mut self.allowances.slots[i].value;
         e.roll(window, now);
         let allowed = factor.saturating_mul(e.received[0].saturating_add(e.received[1]));
         let total = e.sent[0]
@@ -585,6 +688,10 @@ pub struct UdpSocket {
     inner: std::net::UdpSocket,
     guard: Guard,
     read_timeout: Option<Duration>,
+    /// Set by the server's loop: receives never wait, and one gives up after
+    /// [`DROP_TURN`] datagrams it dropped. Atomic only so that setting it takes
+    /// `&self`; one thread owns the socket.
+    nonblocking: AtomicBool,
     peer: Option<SocketAddr>,
     v6: bool,
     #[cfg_attr(windows, allow(dead_code))]
@@ -696,6 +803,7 @@ impl UdpSocket {
                         inner,
                         guard: Guard::new(options, Instant::now()),
                         read_timeout: None,
+                        nonblocking: AtomicBool::new(false),
                         peer: None,
                         v6: a.is_ipv6(),
                         packet_info,
@@ -709,34 +817,46 @@ impl UdpSocket {
     }
 
     /// Receives one datagram within the budgets. Datagrams over budget are read,
-    /// dropped, and counted; ICMP error reports are counted and never end the
-    /// socket. Under a flood the call returns within twice the read timeout.
+    /// dropped, and counted; ICMP error reports about earlier sends (port, host,
+    /// or network unreachable, time exceeded, a parameter problem) are counted and
+    /// never end the socket. Under a flood the call returns within twice the read
+    /// timeout.
     ///
     /// # Errors
     ///
     /// `TimedOut { kind: Read }` (only with a read timeout), `Os`.
     pub fn recv_from(&mut self, buf: &mut [u8]) -> Result<Datagram, NetError> {
+        let bounded = self.nonblocking.load(Ordering::Relaxed);
+        self.recv_bounded(buf, bounded)
+    }
+
+    /// As [`UdpSocket::recv_from`]; `bounded` (a socket that never waits) also
+    /// returns `TimedOut` after [`DROP_TURN`] datagrams dropped or reports skipped,
+    /// as if nothing were ready, so a flood over budget cannot hold the caller's
+    /// loop away from its other checks.
+    fn recv_bounded(&mut self, buf: &mut [u8], bounded: bool) -> Result<Datagram, NetError> {
+        let timed_out = || {
+            Err(NetError::TimedOut {
+                kind: TimeoutKind::Read,
+            })
+        };
         // A timeout past the clock's range has no deadline.
         let deadline = self
             .read_timeout
             .and_then(|t| Instant::now().checked_add(t));
+        let mut skipped = 0u32;
         loop {
             let (len, from, truncated, destination) = match self.recv_one(buf) {
                 Ok(got) => got,
                 Err(e) => match e.kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
-                        return Err(NetError::TimedOut {
-                            kind: TimeoutKind::Read,
-                        });
-                    }
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => return timed_out(),
                     io::ErrorKind::Interrupted => continue,
-                    io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => {
-                        // An ICMP report about an earlier send: never fatal (edge case 92).
+                    _ if icmp_report(&e) => {
+                        // About an earlier send: never fatal (edge case 92).
                         self.stats.icmp_errors += 1;
-                        if past(deadline) {
-                            return Err(NetError::TimedOut {
-                                kind: TimeoutKind::Read,
-                            });
+                        skipped += 1;
+                        if past(deadline) || (bounded && skipped >= DROP_TURN) {
+                            return timed_out();
                         }
                         continue;
                     }
@@ -745,10 +865,9 @@ impl UdpSocket {
             };
             let from = crate::addr::normalize_socket(from);
             if !self.admit(from, len, truncated) {
-                if past(deadline) {
-                    return Err(NetError::TimedOut {
-                        kind: TimeoutKind::Read,
-                    });
+                skipped += 1;
+                if past(deadline) || (bounded && skipped >= DROP_TURN) {
+                    return timed_out();
                 }
                 continue;
             }
@@ -833,9 +952,7 @@ impl UdpSocket {
                         });
                     }
                     io::ErrorKind::Interrupted => {}
-                    io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => {
-                        self.stats.icmp_errors += 1;
-                    }
+                    _ if icmp_report(&e) => self.stats.icmp_errors += 1,
                     _ => return Err(NetError::from_os("recvmmsg", e)),
                 },
             }
@@ -865,11 +982,16 @@ impl UdpSocket {
         };
         first.datagram = Some(self.recv_from(first.buf)?);
         let mut filled = 1;
-        self.inner
-            .set_nonblocking(true)
-            .map_err(|e| NetError::from_os("ioctl", e))?;
+        // The rest is what is ready now: the socket stops waiting for them, and
+        // goes back to the mode it was in.
+        let waits = !self.nonblocking.load(Ordering::Relaxed);
+        if waits {
+            self.inner
+                .set_nonblocking(true)
+                .map_err(|e| NetError::from_os("ioctl", e))?;
+        }
         for slot in rest.iter_mut().take(63) {
-            match self.recv_from(slot.buf) {
+            match self.recv_bounded(slot.buf, true) {
                 Ok(d) => {
                     slot.datagram = Some(d);
                     filled += 1;
@@ -877,9 +999,11 @@ impl UdpSocket {
                 Err(_) => break,
             }
         }
-        self.inner
-            .set_nonblocking(false)
-            .map_err(|e| NetError::from_os("ioctl", e))?;
+        if waits {
+            self.inner
+                .set_nonblocking(false)
+                .map_err(|e| NetError::from_os("ioctl", e))?;
+        }
         Ok(filled)
     }
 
@@ -1089,7 +1213,9 @@ impl UdpSocket {
     pub(crate) fn set_nonblocking(&self) -> Result<(), NetError> {
         self.inner
             .set_nonblocking(true)
-            .map_err(|e| NetError::from_os("ioctl", e))
+            .map_err(|e| NetError::from_os("ioctl", e))?;
+        self.nonblocking.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     pub(crate) fn raw_sock(&self) -> sys::Sock<'_> {
@@ -1111,7 +1237,7 @@ impl UdpSocket {
     #[must_use]
     pub fn stats(&self) -> UdpStats {
         UdpStats {
-            sources: self.guard.slots.len() as u32,
+            sources: self.guard.budgets.slots.len() as u32,
             ..self.stats
         }
     }
@@ -1200,6 +1326,42 @@ fn past(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| Instant::now() >= d)
 }
 
+/// Datagrams a receive that never waits drops over budget (or ICMP reports it
+/// skips) before it reports nothing ready. The server's loop then waits in `poll`
+/// again, which returns at once while datagrams are queued: under a flood that is
+/// one more system call per 64 dropped (an estimated 2% of the cost of reading
+/// them), and the loop reaches its stop and drain checks in between.
+const DROP_TURN: u32 = 64;
+
+/// Whether a receive error is an ICMP report about an earlier send rather than a
+/// fault of this socket: port, host, or network unreachable, and on some systems
+/// host down, protocol unreachable, a parameter problem, or (Windows) time
+/// exceeded. Only numbers a receive gives for no other reason are here, so a
+/// lasting fault is never skipped as a report.
+fn icmp_report(e: &io::Error) -> bool {
+    use io::ErrorKind as K;
+    if matches!(
+        e.kind(),
+        K::ConnectionRefused | K::ConnectionReset | K::HostUnreachable | K::NetworkUnreachable
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // EMSGSIZE: an ICMP "fragmentation needed" on a connected socket. A receive
+        // reports a datagram too large for its buffer as truncated, never so.
+        use sys::errno::{EHOSTDOWN, EMSGSIZE, ENONET, ENOPROTOOPT, EPROTO};
+        matches!(
+            e.raw_os_error(),
+            Some(EHOSTDOWN | EMSGSIZE | ENONET | ENOPROTOOPT | EPROTO)
+        )
+    }
+    #[cfg(windows)]
+    {
+        e.raw_os_error() == Some(sys::errno::WSAENETRESET)
+    }
+}
+
 #[cfg(unix)]
 impl std::os::fd::AsFd for UdpSocket {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
@@ -1215,8 +1377,9 @@ impl std::os::windows::io::AsSocket for UdpSocket {
 }
 
 /// The fuzz target `udp`: arbitrary datagrams, sends, verifications, and clock
-/// steps against the guard. It checks that the tables stay consistent and within
-/// their bounds, that no peer is verified that a model says is not, that an
+/// steps against the guard, under three prefix policies. It checks that the
+/// tables stay consistent and within their bounds, that an allowance has its
+/// prefix's budget beside it unless the budget table is full, that no peer is verified that a model says is not, that an
 /// unverified peer is never sent more than the factor times what the guard holds
 /// as received from it, and that the global budget admits no more than its burst
 /// plus its rate.
@@ -1240,6 +1403,12 @@ pub(crate) fn fuzz_udp(data: &[u8]) {
             datagrams_per_sec: 20,
             bytes_per_sec: 4_000,
             burst: 4,
+        })
+        .new_source_burst(u32::from(head[2] >> 5) + 1)
+        .source_prefix(match (head[1] >> 3) & 3 {
+            1 => PrefixPolicy::HOST,
+            2 => PrefixPolicy::new(24, 48).unwrap_or(PrefixPolicy::DEFAULT),
+            _ => PrefixPolicy::DEFAULT,
         })
         .global_budget(global);
     if options.validate().is_err() {
@@ -1273,8 +1442,8 @@ pub(crate) fn fuzz_udp(data: &[u8]) {
                 let verified = guard.is_verified(peer, now);
                 let sent = guard.charge(peer, arg, now);
                 if sent && !verified && arg > 0 {
-                    let i = guard.index[&normalize(peer.ip())] as usize;
-                    let e = &guard.slots[i];
+                    let i = guard.allowances.index[&normalize(peer.ip())] as usize;
+                    let e = &guard.allowances.slots[i].value;
                     let allowed = u64::from(options.factor)
                         .saturating_mul(e.received[0].saturating_add(e.received[1]));
                     assert!(
@@ -1300,10 +1469,29 @@ pub(crate) fn fuzz_udp(data: &[u8]) {
                 );
             }
         }
-        assert_eq!(guard.index.len(), guard.slots.len());
-        assert!(guard.slots.len() <= options.table as usize);
-        for (ip, &i) in &guard.index {
-            assert_eq!(guard.slots[i as usize].ip, *ip, "index points elsewhere");
+        assert_eq!(guard.budgets.index.len(), guard.budgets.slots.len());
+        assert!(guard.budgets.slots.len() <= options.table as usize);
+        for (key, &i) in &guard.budgets.index {
+            assert_eq!(
+                guard.budgets.slots[i as usize].key, *key,
+                "index points elsewhere"
+            );
+        }
+        assert_eq!(guard.allowances.index.len(), guard.allowances.slots.len());
+        assert!(guard.allowances.slots.len() <= options.table as usize);
+        for (ip, &i) in &guard.allowances.index {
+            assert_eq!(
+                guard.allowances.slots[i as usize].key, *ip,
+                "index points elsewhere"
+            );
+            assert!(
+                guard
+                    .budgets
+                    .index
+                    .contains_key(&PrefixKey::of(*ip, options.prefix))
+                    || guard.budgets.slots.len() == options.table as usize,
+                "an allowance with no budget in a table with room"
+            );
         }
         assert_eq!(guard.proofs.len(), guard.proved.len());
         assert!(guard.proved.len() <= options.verified_table as usize);
@@ -1322,6 +1510,7 @@ pub(crate) fn fuzz_udp(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv6Addr;
 
     fn ip(n: u8) -> IpAddr {
         IpAddr::from([10, 0, 0, n])
@@ -1453,8 +1642,8 @@ mod tests {
         // the first entry it then finds.
         assert!(g.admit(ip(5), 10, t, &mut o));
         assert!(!o, "an entry was evicted");
-        assert!(g.index.contains_key(&ip(5)));
-        assert_eq!(g.slots.len(), 4);
+        assert!(g.budgets.index.contains_key(&PrefixKey::exact(ip(5))));
+        assert_eq!(g.budgets.slots.len(), 4);
     }
 
     #[test]
@@ -1669,6 +1858,12 @@ mod tests {
             bytes_per_sec: 1,
             burst: 1
         })));
+        assert!(bad(UdpOptions::new().new_source_burst(0)));
+        assert!(bad(UdpOptions::new().global_budget(UdpBudget {
+            datagrams_per_sec: 1,
+            bytes_per_sec: 1,
+            burst: 0
+        })));
         assert!(UdpOptions::new().validate().is_ok());
         assert_eq!(UdpOptions::default(), UdpOptions::new());
     }
@@ -1851,6 +2046,206 @@ mod tests {
             UdpSocket::bind_with("127.0.0.1:0", UdpOptions::new().packet_info(true)),
             Err(NetError::Unsupported { .. })
         ));
+    }
+
+    /// One IPv6 /64 is one source by default: a host that rotates its interface
+    /// id gets no budget per address, and another /64 keeps its own.
+    #[test]
+    fn test_one_slash64_shares_one_budget() {
+        let t = Instant::now();
+        let budget = UdpBudget {
+            datagrams_per_sec: 1,
+            bytes_per_sec: 1_000_000,
+            burst: 3,
+        };
+        let mut g = Guard::new(UdpOptions::new().source_budget(budget), t);
+        let mut o = false;
+        let mut admitted = 0;
+        for host in 0..1_000u16 {
+            let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, host + 1));
+            for _ in 0..10 {
+                if g.admit(ip, 100, t, &mut o) {
+                    admitted += 1;
+                }
+            }
+        }
+        assert!(admitted <= 3, "{admitted} admitted from one /64");
+        let other = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 0, 0, 0, 1));
+        assert!(g.admit(other, 100, t, &mut o), "another /64 has its own");
+        assert!(!o);
+    }
+
+    /// `PrefixPolicy::HOST` budgets every address on its own, and a first burst
+    /// larger than the budget's burst is cut to it.
+    #[test]
+    fn test_source_prefix_and_first_burst_are_options() {
+        let t = Instant::now();
+        let budget = UdpBudget {
+            datagrams_per_sec: 1,
+            bytes_per_sec: 1_000_000,
+            burst: 3,
+        };
+        let options = UdpOptions::new()
+            .source_budget(budget)
+            .source_prefix(PrefixPolicy::HOST)
+            .new_source_burst(50);
+        let mut g = Guard::new(options, t);
+        let mut o = false;
+        let mut admitted = 0;
+        for host in 1..=10u16 {
+            let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, host));
+            admitted += (0..10).filter(|_| g.admit(ip, 100, t, &mut o)).count();
+        }
+        assert_eq!(admitted, 30, "three per address");
+        let wide = PrefixPolicy::new(24, 48).unwrap();
+        let mut g = Guard::new(UdpOptions::new().source_prefix(wide).new_source_burst(2), t);
+        let n = (1..=20u8)
+            .filter(|&n| g.admit(IpAddr::from([192, 0, 2, n]), 10, t, &mut o))
+            .count();
+        assert_eq!(n, 2, "one /24, a first burst of two");
+    }
+
+    /// The send allowance stays with the exact address that sent, even when its
+    /// budget is shared with the rest of its /64.
+    #[test]
+    fn test_send_allowance_stays_per_address_within_a_prefix() {
+        let t = Instant::now();
+        let mut g = Guard::new(UdpOptions::new(), t);
+        let mut o = false;
+        let a = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let b = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2));
+        assert!(g.admit(a, 100, t, &mut o));
+        assert!(
+            !g.charge(SocketAddr::new(b, 9), 1, t),
+            "a neighbour in the /64 never sent"
+        );
+        assert!(g.charge(SocketAddr::new(a, 9), 100, t));
+        assert!(!g.charge(SocketAddr::new(a, 9), 1, t));
+    }
+
+    /// With the default options a flood of new sources at one instant reaches the
+    /// caller only up to the default global burst.
+    #[test]
+    fn test_default_options_cap_a_flood_of_new_sources() {
+        let t = Instant::now();
+        let mut g = Guard::new(UdpOptions::new(), t);
+        let mut o = false;
+        let admitted = (0..300_000u32)
+            .filter(|n| {
+                let ip = IpAddr::from((0x0A00_0000u32 + n).to_be_bytes());
+                g.admit(ip, 512, t, &mut o)
+            })
+            .count();
+        assert!(admitted <= 10_000, "{admitted} of 300,000 admitted");
+    }
+
+    /// A source new to the table starts with a small burst, and its bucket fills
+    /// to the full burst at its rate.
+    #[test]
+    fn test_a_new_source_starts_with_a_small_burst() {
+        let t = Instant::now();
+        let mut g = Guard::new(UdpOptions::new(), t);
+        let mut o = false;
+        let first = (0..200).filter(|_| g.admit(ip(1), 10, t, &mut o)).count();
+        assert_eq!(first, 16);
+        let later = t + Duration::from_secs(1);
+        let then = (0..200)
+            .filter(|_| g.admit(ip(1), 10, later, &mut o))
+            .count();
+        assert_eq!(then, 100, "the full burst after a second");
+    }
+
+    /// A non-blocking receive (the server's loop) returns after a bounded number
+    /// of datagrams dropped over budget instead of reading the whole queue.
+    #[test]
+    fn test_a_non_blocking_receive_returns_after_a_bounded_number_of_drops() {
+        let budget = UdpBudget {
+            datagrams_per_sec: 1,
+            bytes_per_sec: 1_000_000,
+            burst: 1,
+        };
+        let mut s =
+            UdpSocket::bind_with("127.0.0.1:0", UdpOptions::new().source_budget(budget)).unwrap();
+        let to = s.local_addr().unwrap();
+        let c = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..200 {
+            c.send_to(b"x", to).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        s.set_nonblocking().unwrap();
+        let mut buf = [0u8; 8];
+        assert!(s.recv_from(&mut buf).is_ok(), "the burst");
+        assert!(matches!(
+            s.recv_from(&mut buf),
+            Err(NetError::TimedOut {
+                kind: TimeoutKind::Read
+            })
+        ));
+        assert_eq!(s.stats().dropped, 64, "one call read the whole queue");
+        assert!(s.recv_from(&mut buf).is_err());
+        assert!(s.stats().dropped > 64, "the next call goes on");
+    }
+
+    /// Unreachable reports and the other errors an ICMP message leaves on a
+    /// socket are counted and skipped like a refused port.
+    #[test]
+    fn test_other_icmp_reports_never_end_the_socket() {
+        use crate::sys::shim::{Fault, Op, clear_here, program_here};
+        let mut s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut faults = vec![
+            Fault::Kind(io::ErrorKind::HostUnreachable),
+            Fault::Kind(io::ErrorKind::NetworkUnreachable),
+        ];
+        #[cfg(unix)]
+        faults.extend([
+            Fault::Os(sys::errno::EHOSTDOWN),
+            Fault::Os(sys::errno::ENOPROTOOPT),
+            Fault::Os(sys::errno::EPROTO),
+            Fault::Os(sys::errno::EMSGSIZE),
+        ]);
+        // WSAENETRESET: a "time exceeded" report.
+        #[cfg(windows)]
+        faults.push(Fault::Os(sys::errno::WSAENETRESET));
+        let n = faults.len() as u64;
+        let mut buf = [0u8; 16];
+        for fault in faults {
+            program_here(Op::Recv, 0, 1, fault);
+            let got = s.recv_from(&mut buf);
+            clear_here();
+            assert!(
+                matches!(
+                    got,
+                    Err(NetError::TimedOut {
+                        kind: TimeoutKind::Read
+                    })
+                ),
+                "{got:?}"
+            );
+        }
+        assert_eq!(s.stats().icmp_errors, n);
+    }
+
+    /// A batch receive leaves a non-blocking socket non-blocking.
+    #[test]
+    fn test_a_batch_receive_keeps_the_socket_mode() {
+        let (mut a, mut b) = verified_pair();
+        b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        b.set_nonblocking().unwrap();
+        a.send_to(b"one", b.local_addr().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let mut store = [[0u8; 16]; 4];
+        let mut slots: Vec<_> = store.iter_mut().map(|b| DatagramBuffer::new(b)).collect();
+        assert_eq!(b.recv_batch(&mut slots).unwrap(), 1);
+        let started = Instant::now();
+        let mut buf = [0u8; 16];
+        assert!(b.recv_from(&mut buf).is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the receive waited {:?}: the batch left the socket blocking",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -57,9 +57,14 @@ pub trait Gate: Send + Sync + 'static {
     /// After accept and before any read (`Accept`), on `Server::adopt` (`Adopt`),
     /// or when a client connection gets a gate (`Dialed`).
     ///
+    /// It runs on an accept thread (or, for a per-worker listener, the worker), so
+    /// it must return promptly: a stop joins accept threads, and one that never
+    /// returns from `admit` holds `drain`, `shutdown`, and the server's drop.
+    ///
     /// # Errors
     ///
-    /// A [`Refusal`] closes the connection abortively without reading.
+    /// A [`Refusal`] closes the connection without reading: abortively, or after
+    /// its bytes with FIN ([`Refusal::WithBytes`]).
     fn admit(
         &self,
         info: &ConnectionInfo,
@@ -73,7 +78,8 @@ pub trait Gate: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// A [`Refusal`] closes the connection abortively.
+    /// A [`Refusal`] closes the connection: abortively, or after its bytes with FIN
+    /// and the denial linger ([`Refusal::WithBytes`]).
     fn readmit(&self, ticket: &mut Self::Ticket, info: &ConnectionInfo) -> Result<(), Refusal>;
 
     /// Before every write system call. The path where nothing is revoked should be one atomic load.
@@ -81,7 +87,10 @@ pub trait Gate: Send + Sync + 'static {
     /// # Errors
     ///
     /// A [`Denial`] wipes pending output, writes the session's denial if no byte of
-    /// the current response has left, and resets the connection.
+    /// the current response has left, and closes the connection: FIN after the
+    /// denial and a linger of at most `Limits::denial_linger` (100 ms by default)
+    /// that reads and discards, so the peer reads the denial instead of a reset; a
+    /// reset at once when no denial went out or the linger is zero.
     fn check(&self, ticket: &mut Self::Ticket, write: &WriteCheck) -> Result<(), Denial>;
 
     /// Exactly once per admitted connection, after it closed, with its one close reason.
@@ -136,7 +145,11 @@ pub enum Refusal {
         /// The gate's code.
         code: u16,
     },
-    /// Write these bytes once (non-blocking, at most 512), then RST.
+    /// Write these bytes once (non-blocking, at most `Limits::refusal_bytes_max`),
+    /// then FIN: at admission the close follows at once (the accept thread does not
+    /// wait, and input the peer already sent turns it into a reset); after a PROXY
+    /// header (`readmit`) a linger of at most `Limits::denial_linger` reads and
+    /// discards first. RST when nothing was sent or that linger is zero.
     WithBytes {
         /// The gate's code.
         code: u16,

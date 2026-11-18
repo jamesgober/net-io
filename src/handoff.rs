@@ -112,9 +112,6 @@ pub struct ListenerHandle {
     name: Option<String>,
     local: Endpoint,
     sock: sys::OwnedSock,
-    /// After `sock`, so the socket closes before its value is freed.
-    #[cfg(all(windows, feature = "local"))]
-    adopted: Option<sys::Adoption>,
 }
 
 impl ListenerHandle {
@@ -141,16 +138,10 @@ impl ListenerHandle {
             name,
             local,
             sock,
-            #[cfg(all(windows, feature = "local"))]
-            adopted: None,
         }
     }
 
     pub(crate) fn into_sock(self) -> sys::OwnedSock {
-        #[cfg(all(windows, feature = "local"))]
-        if let Some(adoption) = self.adopted {
-            adoption.keep_for_good();
-        }
         self.sock
     }
 
@@ -648,9 +639,11 @@ impl SharedListeners {
 /// to the address the manifest names. All or nothing: on any error every received
 /// socket is closed, also those listed after the one that failed. A description
 /// that names a socket this process already owns (the same one twice, one from an
-/// earlier hand-off, or one this process made or adopted any other way) is
-/// refused and that socket is left as it was, so no socket gets two owners and
-/// none is closed. Received sockets are not inheritable.
+/// earlier hand-off, or any other socket that is not inheritable, which every
+/// socket net-io and std make is) is refused and that socket is left as it was,
+/// so no socket gets two owners and none is closed. Received sockets are not
+/// inheritable. Once such a socket is closed, its handle value may name a socket
+/// of a later hand-off, which is taken as any other.
 ///
 /// Windows makes each socket in this process when the sender describes it, so a
 /// message that arrives damaged (`Truncated`, `BadChecksum`, or a bad manifest)
@@ -806,7 +799,7 @@ fn adopt_shared(
         return Err(HandoffError::CountMismatch);
     }
     let mut handles = Vec::with_capacity(records.len());
-    for (i, (record, (sock, adoption))) in records.into_iter().zip(claimed).enumerate() {
+    for (i, (record, sock)) in records.into_iter().zip(claimed).enumerate() {
         let index = i as u8;
         let got = sys::listener_kind(sys::AsSock::sock(&sock)).map_err(|e| {
             HandoffError::VerifyFailed {
@@ -824,9 +817,7 @@ fn adopt_shared(
             index,
             why: why(&e),
         })?;
-        let mut handle = ListenerHandle::new(kind, record.name, local, sock);
-        handle.adopted = Some(adoption);
-        handles.push(handle);
+        handles.push(ListenerHandle::new(kind, record.name, local, sock));
     }
     Ok(handles)
 }
@@ -1202,6 +1193,38 @@ mod tests {
         assert_eq!(again[0].local().socket_addr(), Some(addr));
     }
 
+    /// A socket taken by a hand-off and later closed by its new owner frees its
+    /// handle value: a genuine hand-off whose socket gets that value again is taken.
+    #[cfg(all(windows, feature = "local"))]
+    #[test]
+    fn test_a_value_freed_after_a_hand_off_can_be_taken_again() {
+        use std::net::TcpListener as Std;
+        use std::os::windows::io::{AsRawSocket, AsSocket};
+        use std::time::{Duration, Instant};
+        let (mut tx, mut rx) = pipe_pair("reuse");
+        let me = std::process::id();
+        let mut seen = std::collections::HashSet::new();
+        let mut reused = 0;
+        for round in 0..32 {
+            let a = Std::bind("127.0.0.1:0").unwrap();
+            let addr = a.local_addr().unwrap();
+            let blob = sys::share_socket(a.as_socket(), me).unwrap();
+            tx.send_all(&frame(&[tcp_record(addr)], &[blob])).unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut got = match receive_shared(&mut rx, &HandoffPeer::default(), until) {
+                Ok(got) => got,
+                Err(e) => panic!("round {round} ({reused} values reused): {e}"),
+            };
+            // As `ListenerSpec::adopt` does: the socket moves to a new owner.
+            let sock = got.remove(0).into_sock();
+            if !seen.insert(sock.as_raw_socket()) {
+                reused += 1;
+            }
+            drop(sock);
+        }
+        eprintln!("{reused} handle values came back");
+    }
+
     /// A received listener is not inherited by processes this one starts.
     #[cfg(all(windows, feature = "local"))]
     #[test]
@@ -1240,9 +1263,9 @@ mod tests {
         let victim = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let raw = usize::try_from(victim.as_raw_socket()).unwrap();
         match sys::socket_from_shared(&naming(raw)) {
-            Ok((sock, adoption)) => {
+            Ok(sock) => {
                 let same = sock.as_raw_socket() == victim.as_raw_socket();
-                std::mem::forget((sock, adoption));
+                std::mem::forget(sock);
                 panic!("adopted a socket owned here (same handle: {same})");
             }
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),

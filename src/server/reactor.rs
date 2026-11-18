@@ -1,7 +1,9 @@
 //! The reactor: one event loop per worker, thousands of connections each.
 //!
 //! The accept threads and admission are the blocking driver's: a socket reaches
-//! a worker through its bounded inbox, already admitted. From there each
+//! a worker through its bounded inbox, already admitted. A per-worker group is the
+//! exception: each worker accepts on its own socket in its own loop, admits there,
+//! and takes the connection from its own inbox in the same turn (D-197). From there each
 //! connection is a state machine driven by driver completions, a timing wheel,
 //! and a few commands. The rules are the blocking driver's (`engine::drive`), in
 //! resumable form: whatever a blocking worker would wait for here is an operation
@@ -29,9 +31,9 @@ use std::time::{Duration, Instant};
 
 use super::Sessions;
 use super::engine::{
-    CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP, CMD_PRESSURE,
-    CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, RegisteredConn, Shared, announce,
-    count_drained, record_close,
+    AcceptState, CAUSE_DRAIN, CAUSE_STOP, CMD_KILL_ALL, CMD_LISTENER_KILL, CMD_LISTENER_SWEEP,
+    CMD_PRESSURE, CMD_SHED, CMD_SWEEP, Engine, Job, ListenerConf, ListenerRuntime, RegisteredConn,
+    Shared, WorkerAccept, announce, count_drained, record_close,
 };
 use crate::addr::PrefixKey;
 use crate::buf::{Buffer, BufferPool};
@@ -178,6 +180,8 @@ struct Conn<S> {
     linger_left: u32,
     /// The session runs; before that a handshake does.
     opened: bool,
+    /// The session kept it through a drain (`Session::on_drain` returned other than `Close`).
+    drain_kept: bool,
     /// Reading waits for the buffer budget (edge case 11).
     paused: bool,
     /// The last send moved nothing: once is retried, twice is an error.
@@ -192,6 +196,33 @@ struct Conn<S> {
 struct Slot<S> {
     generation: u32,
     conn: Option<Conn<S>>,
+}
+
+/// A listener this worker accepts on itself (D-197). It holds a slot index, with no
+/// connection in it, for its token.
+struct OwnListener {
+    conf: Arc<ListenerConf>,
+    runtime: Arc<ListenerRuntime>,
+    index: u32,
+    token: Token,
+    state: Accepting,
+    st: AcceptState,
+}
+
+/// Where a worker's own listener stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Accepting {
+    /// `Operation::Accept` is in flight: the next connection completes it.
+    Armed,
+    /// A `Nop` is in flight: the next batch runs after this turn's other work.
+    Kicked,
+    /// The door is closed or a drain runs; looked at each turn.
+    Parked,
+    /// Out of descriptors until then.
+    Paused(Instant),
+    /// Failed, or the server stops: deregistered, kept so a rescan does not add it
+    /// again.
+    Gone,
 }
 
 /// One worker.
@@ -225,6 +256,9 @@ struct Reactor<'a, F: SessionFactory, G: Gate> {
     cells: Vec<Box<GateCell<G>>>,
     facts_pool: Vec<Arc<ProxyFacts>>,
     done: Option<Completions>,
+    /// The listeners this worker accepts on (D-197), and the epoch they match.
+    listeners: Vec<OwnListener>,
+    listener_epoch: u64,
     /// Connections whose unfinished TLS handshake holds buffers, and the bytes
     /// they hold (`Conn::handshake_held`).
     handshakes: usize,
@@ -275,22 +309,42 @@ pub(crate) fn run<F: SessionFactory, G: Gate>(engine: &Arc<Engine<Sessions<F>, G
         cells: Vec::new(),
         facts_pool: Vec::new(),
         done: Some(Completions::new()),
+        listeners: Vec::new(),
+        // Not an epoch the server has had: the first turn scans.
+        listener_epoch: u64::MAX,
         handshakes: 0,
         handshake_bytes: 0,
         handshake_cap: engine.limits.buffer_budget / 4 / workers,
     };
-    if guarded(|| r.main()).is_none() {
+    let reason = match guarded(|| r.main()) {
+        Some(Ended::Stopped) => return,
+        // The wait itself failed: no completion will be read again, so a close that
+        // waits for one would never finish.
+        Some(Ended::WaitFailed) => CloseReason::Shutdown,
         // A panic got past every inner boundary: nothing on this worker can be
-        // trusted to finish, so each connection closes now and gives back what it held.
-        r.abandon_all(CloseReason::SessionPanicked);
-    }
+        // trusted to finish.
+        None => CloseReason::SessionPanicked,
+    };
+    // Each connection closes now and gives back what it held. A panic in that
+    // leaves some uncounted, and a drain's bound (`DRAIN_GRACE`) still ends it.
+    let _ = guarded(|| r.abandon_all(reason));
+    r.retire(reason);
+}
+
+/// How a worker's loop ended.
+enum Ended {
+    /// The server stopped and this worker's connections are closed.
+    Stopped,
+    /// The driver's wait failed.
+    WaitFailed,
 }
 
 impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
-    fn main(&mut self) {
+    fn main(&mut self) -> Ended {
         loop {
             begin_turn();
             self.take_inbox();
+            self.poll_listeners();
             self.run_commands();
             self.take_kills();
             self.take_posted();
@@ -299,18 +353,15 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             if self.shared.is_stopping() {
                 self.close_all(CloseReason::Shutdown);
                 if self.open == 0 && self.engine.inbox_empty(self.idx) {
-                    return;
+                    return Ended::Stopped;
                 }
             }
             let timeout = self.wait_timeout();
             let Some(mut done) = self.done.take() else {
-                return;
+                return Ended::WaitFailed;
             };
             if self.driver.wait(&mut done, timeout).is_err() {
-                // The wait itself failed: no completion will be read again, so a close
-                // that waits for one would never finish. Each connection closes now.
-                self.abandon_all(CloseReason::Shutdown);
-                return;
+                return Ended::WaitFailed;
             }
             begin_turn();
             self.bulk_sent = 0;
@@ -350,6 +401,18 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             .wheel
             .next_expiry()
             .map(|t| self.ticks.until(t, now).max(Duration::from_micros(100)));
+        let paused = self
+            .listeners
+            .iter()
+            .filter_map(|l| match l.state {
+                Accepting::Paused(until) => Some(until.saturating_duration_since(now)),
+                _ => None,
+            })
+            .min();
+        let timer = match (timer, paused) {
+            (Some(t), Some(p)) => Some(t.min(p)),
+            (t, p) => t.or(p),
+        };
         if !self.yielded.is_empty() {
             return Some(Duration::ZERO);
         }
@@ -455,6 +518,151 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
     }
 
+    // ---- listeners this worker accepts on (D-197) ---------------------------------
+
+    /// Rescans when the server's listeners changed, and wakes listeners whose door
+    /// opened or whose pause ended. A few loads a turn for each listener.
+    fn poll_listeners(&mut self) {
+        let epoch = self.shared.listener_epoch.load(Ordering::Acquire);
+        if epoch != self.listener_epoch {
+            self.listener_epoch = epoch;
+            self.rescan_listeners();
+        }
+        let now = self.clock.now();
+        for i in 0..self.listeners.len() {
+            let l = &self.listeners[i];
+            let kick = match l.state {
+                Accepting::Parked => self.engine.accepting(&l.conf) || self.shared.is_stopping(),
+                Accepting::Paused(until) => now >= until,
+                _ => false,
+            };
+            if kick {
+                self.kick(i);
+            }
+        }
+    }
+
+    /// Takes up the listeners the server added for this worker and lets go of those
+    /// it removed: their sockets close once every worker has dropped them.
+    /// Sockets are told apart by their runtime: an heir to a dead worker holds two
+    /// sockets of one listener (`Shared::worker_listeners`).
+    fn rescan_listeners(&mut self) {
+        let fresh = self.shared.worker_listeners(self.idx);
+        let mut i = 0;
+        while i < self.listeners.len() {
+            if fresh
+                .iter()
+                .any(|(_, rt)| Arc::ptr_eq(rt, &self.listeners[i].runtime))
+            {
+                i += 1;
+                continue;
+            }
+            let l = self.listeners.swap_remove(i);
+            if l.state != Accepting::Gone {
+                let _ = self.driver.deregister(l.token);
+            }
+            self.free.push(l.index);
+        }
+        for (conf, runtime) in fresh {
+            if self
+                .listeners
+                .iter()
+                .any(|l| Arc::ptr_eq(&l.runtime, &runtime))
+            {
+                continue;
+            }
+            let index = match self.free.pop() {
+                Some(i) => i,
+                None => {
+                    self.slots.push(Slot {
+                        generation: 0,
+                        conn: None,
+                    });
+                    (self.slots.len() - 1) as u32
+                }
+            };
+            self.slots[index as usize].generation =
+                self.slots[index as usize].generation.wrapping_add(1);
+            let token = self.token_of(index);
+            let registered = match runtime.tcp_sock() {
+                Some(sock) => self
+                    .driver
+                    .register(sock, token)
+                    .map_err(std::io::Error::from),
+                None => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+            };
+            let failed = registered.is_err();
+            if let Err(e) = registered {
+                self.shared.event(Event::ListenerFailed {
+                    listener: conf.id,
+                    class: OsErrorClass::from_io(&e),
+                });
+            }
+            self.listeners.push(OwnListener {
+                conf,
+                runtime,
+                index,
+                token,
+                state: if failed {
+                    Accepting::Gone
+                } else {
+                    Accepting::Parked
+                },
+                st: AcceptState::new(),
+            });
+            if !failed {
+                // Connections may already wait: the first batch runs this turn.
+                self.kick(self.listeners.len() - 1);
+            }
+        }
+    }
+
+    /// The next batch runs after this turn's other completions.
+    fn kick(&mut self, i: usize) {
+        let token = self.listeners[i].token;
+        self.listeners[i].state = Accepting::Kicked;
+        let _ = self.driver.submit(Operation::Nop { token });
+    }
+
+    /// A connection waits on one of this worker's listeners, or a kick came back.
+    fn on_accept(&mut self, i: usize) {
+        let engine = self.engine;
+        let idx = self.idx;
+        let l = &mut self.listeners[i];
+        if !matches!(l.state, Accepting::Armed | Accepting::Kicked) {
+            return;
+        }
+        let next = engine.worker_accept(&l.conf, &l.runtime, idx, &mut l.st);
+        // What the batch admitted starts now, in this turn.
+        self.take_inbox();
+        match next {
+            WorkerAccept::Armed => {
+                let token = self.listeners[i].token;
+                self.listeners[i].state = Accepting::Armed;
+                if self
+                    .driver
+                    .submit(Operation::Accept { listener: token })
+                    .is_err()
+                {
+                    self.listener_gone(i);
+                }
+            }
+            WorkerAccept::Kick => self.kick(i),
+            WorkerAccept::Park => self.listeners[i].state = Accepting::Parked,
+            WorkerAccept::Paused(until) => self.listeners[i].state = Accepting::Paused(until),
+            WorkerAccept::Gone => self.listener_gone(i),
+        }
+    }
+
+    fn listener_gone(&mut self, i: usize) {
+        let l = &mut self.listeners[i];
+        if l.state != Accepting::Gone {
+            l.state = Accepting::Gone;
+            let token = l.token;
+            let _ = self.driver.deregister(token);
+        }
+    }
+
     fn start(&mut self, job: Job<G::Ticket>) {
         let (stream, mut info, ticket, listener, source) = job.into_parts();
         let shared = self.shared;
@@ -487,6 +695,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             WakeSource::Reactor,
             Phase::Idle,
         );
+        link.set_soft_closes(&shared.soft_closes);
         slot.set_sink(self.notes.clone(), index);
         let mut cell = self.cells.pop().unwrap_or_else(|| {
             Box::new(GateCell {
@@ -504,7 +713,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             link.info.id,
             RegisteredConn {
                 slot,
-                generation: link.generation,
+                generation: link.generation(),
                 worker: self.idx as u32,
                 index,
             },
@@ -528,6 +737,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             proxy: None,
             linger_left: 0,
             opened: false,
+            drain_kept: false,
             paused: false,
             zero_send: false,
             handshake_held: 0,
@@ -901,6 +1111,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             };
             match next {
                 TlsNext::Transmit => {
+                    if c.link.tls_hold() {
+                        // The tickets wait for the reply to the request already read.
+                        continue;
+                    }
                     let token = c.token;
                     let Some(cout) = c.link.tls_take_cout() else {
                         return self.close(index, CloseReason::TlsFailed);
@@ -1003,6 +1217,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let session = c.session.as_mut()?;
         let output = c.output.as_mut()?;
         let input = c.input.as_mut()?;
+        c.link.note_heard();
         let mut cx = SessionContext {
             link: &mut c.link,
             output,
@@ -1156,8 +1371,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                     let lane = c.link.info.lane;
                     // A request the socket already reported is answered first.
                     let readable = c.readable;
-                    if idle && self.shared.is_draining() && !readable {
-                        return self.close(index, CloseReason::Drained);
+                    let kept = c.drain_kept;
+                    let fresh = c.link.awaits_first_request();
+                    if idle && self.shared.is_draining() && !readable && !kept && !fresh {
+                        return self.drain_reached(index, CloseReason::Drained);
                     }
                     if idle && self.shed(lane) {
                         return self.close(index, CloseReason::Shed);
@@ -1498,6 +1715,14 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 };
                 match sealed {
                     Ok(taken) => {
+                        let last = after == Wait::FlushClose
+                            && taken == total
+                            && output.chunks.len() <= sys::MAX_SLICES
+                            && !output.chunks.iter().any(|ch| ch.is_file());
+                        if last {
+                            // The reply's last records and `close_notify` leave together.
+                            c.link.tls_seal_close_notify();
+                        }
                         let Some(cout) = c.link.tls_take_cout() else {
                             self.close(index, CloseReason::TlsFailed);
                             return Flushed::Waiting;
@@ -1571,6 +1796,9 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             .get(index as usize)
             .is_some_and(|s| u64::from(s.generation) == done.token.0 >> 32 && s.conn.is_some());
         if !current {
+            if let Some(i) = self.listeners.iter().position(|l| l.token == done.token) {
+                return self.on_accept(i);
+            }
             if let Some(b) = done.buffer {
                 self.pool.put(b);
             }
@@ -1908,7 +2136,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 Flushed::Waiting => {}
             },
             Wait::FlushClose => match self.flush(index, Wait::FlushClose) {
-                Flushed::Done => self.session_closed(index),
+                Flushed::Done => match self.conn(index).and_then(|c| c.link.killed()) {
+                    Some(k) => self.close(index, CloseReason::Killed(k)),
+                    None => self.session_closed(index),
+                },
                 Flushed::Waiting => {}
             },
             _ => {}
@@ -2028,9 +2259,20 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             let index = *index;
             let Some(c) = self.conn(index) else { continue };
             let Some(k) = c.link.killed() else { continue };
+            let soft = c.link.soft_kill_left().is_some();
             if c.closing.is_none() {
-                self.close(index, CloseReason::Killed(k));
-            } else {
+                if soft && c.wait != Wait::FlushClose {
+                    // `close_after_flush`: no more input or session calls; what is
+                    // queued goes out (the write timer now ends at the kill's bound),
+                    // then the graceful close.
+                    match self.flush(index, Wait::FlushClose) {
+                        Flushed::Done => self.close(index, CloseReason::Killed(k)),
+                        Flushed::Waiting => self.arm_timer(index),
+                    }
+                } else if !soft {
+                    self.close(index, CloseReason::Killed(k));
+                }
+            } else if !soft {
                 // A kill during the linger ends it at once, abortively.
                 c.closing = Some(CloseReason::Killed(k));
                 if matches!(c.wait, Wait::Linger(_)) {
@@ -2154,15 +2396,44 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
             let idle = self.conn(i).is_some_and(|c| {
                 c.wait == Wait::Read
                     && c.closing.is_none()
+                    && !c.drain_kept
                     && !c.readable
                     && c.link.phase() == Phase::Idle
+                    && (reason != CloseReason::Drained || !c.link.awaits_first_request())
                     && c.input
                         .as_ref()
                         .is_none_or(|n| !n.lent() && n.bytes().is_empty())
                     && pick(&c.link.info)
             });
             if idle {
-                self.close(i, reason);
+                if reason == CloseReason::Drained {
+                    self.drain_reached(i, reason);
+                } else {
+                    self.close(i, reason);
+                }
+            }
+        }
+    }
+
+    /// A drain reached an idle connection: its session's `on_drain` decides, once.
+    /// `Close` flushes what it queued and closes; any other step keeps the connection
+    /// through the drain (the drain deadline still bounds it).
+    fn drain_reached(&mut self, index: u32, reason: CloseReason) {
+        let Some(c) = self.conn(index) else { return };
+        if c.drain_kept {
+            return;
+        }
+        match self.call(index, |s, cx| s.on_drain(cx)) {
+            None => self.close(index, CloseReason::SessionPanicked),
+            Some(Step::Close) => match self.flush(index, Wait::FlushClose) {
+                Flushed::Done => self.close(index, reason),
+                Flushed::Waiting => {}
+            },
+            Some(next) => {
+                if let Some(c) = self.conn(index) {
+                    c.drain_kept = true;
+                }
+                self.run(index, next);
             }
         }
     }
@@ -2196,16 +2467,25 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         // A kill wins over whatever was about to happen.
         let reason = c.link.killed().map_or(reason, CloseReason::Killed);
         c.closing = Some(reason);
-        if !reason.is_abortive() {
+        // After a denial or during a soft kill an abortive reason still closes
+        // gracefully, with the shorter linger, so the peer reads what was sent.
+        let soft = if reason.is_abortive() {
+            c.link.soft_close()
+        } else {
+            None
+        };
+        if !reason.is_abortive() || soft.is_some() {
             if c.opened && c.link.tls_released() {
                 // `close_notify` needs the output buffer; without one the close is a
                 // plain FIN.
                 let _ = self.tls_retake(index);
             }
             let Some(c) = self.conn(index) else { return };
-            let linger = c.link.begin_graceful_close(c.readable);
+            // A flush then close lingers in any phase: the peer's request may be
+            // crossing it, seen or not (D-182, D-202).
+            let linger = c.link.begin_graceful_close(c.readable || soft.is_some());
             if linger && c.sending == Sending::None {
-                let until = c.link.now() + c.link.limits.graceful_linger;
+                let until = c.link.now() + soft.unwrap_or(c.link.limits.graceful_linger);
                 c.linger_left = c.link.limits.graceful_linger_bytes;
                 c.wait = Wait::Linger(until);
                 self.arm_timer(index);
@@ -2376,6 +2656,30 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         self.handshake_bytes = 0;
         shared.notify_progress();
     }
+
+    /// After `abandon_all`: this worker takes no more connections. Those already
+    /// handed to it close at once with `reason` (a reset, the gate's ticket and the
+    /// caps given back, the close counted), and its own listening sockets go to an
+    /// heir, so nothing is left waiting for a loop that will not run again and a
+    /// drain can end.
+    fn retire(&mut self, reason: CloseReason) {
+        let shared = self.shared;
+        let ws = &shared.workers[self.idx];
+        for job in self.engine.retire(self.idx) {
+            let (stream, mut info, ticket, listener, source) = job.into_parts();
+            info.worker = WorkerId(self.idx as u16);
+            announce(shared, &info, &listener);
+            let _ = sys::set_linger(stream.sock(), Some(Duration::ZERO));
+            drop(stream);
+            let gate = &self.engine.gate;
+            let _ = guarded(|| gate.closed(ticket, &info, reason));
+            ws.load.fetch_sub(1, Ordering::Relaxed);
+            count_drained(shared, reason);
+            shared.release(&listener, source);
+            record_close(shared, ws, &info, reason, 0, 0, Duration::ZERO);
+        }
+        shared.worker_lost();
+    }
 }
 
 /// Where `flush` left things.
@@ -2398,6 +2702,9 @@ mod tests {
             size_of::<ConnectionInfo>()
         );
         // 512 is the goal (register R-18); this keeps it from growing meanwhile.
-        assert!(size <= 900, "{size} bytes per idle connection");
+        // 904: D-182's soft close added one pointer (896 before). 912: the kill
+        // slot's lease keeps the generation beside the slot, so a link dropped
+        // without its close ends only its own connection's slot.
+        assert!(size <= 912, "{size} bytes per idle connection");
     }
 }

@@ -1051,7 +1051,7 @@ impl TcpConnection {
         let link = self.link_ref();
         KillHandle {
             slot: link.slot.clone(),
-            generation: link.generation,
+            generation: link.generation(),
             id: link.info.id,
         }
     }
@@ -1669,5 +1669,43 @@ mod tests {
         } else {
             assert!(matches!(c, Err(NetError::Unsupported { .. })));
         }
+    }
+
+    /// A connection whose link is dropped by a panic unwinding past it (no close
+    /// ran) can no longer be killed: its kill slot ended before its socket closed,
+    /// so a kill handle kept elsewhere cannot shut down whatever socket the OS gives
+    /// that descriptor number next.
+    #[test]
+    fn test_kill_after_an_unwound_link_is_refused() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = TcpConnection::connect(l.local_addr().unwrap()).unwrap();
+        let (_peer, _) = l.accept().unwrap();
+        let kill = c.kill_handle();
+        assert!(kill.is_open());
+        let link = c.take_link().unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = link;
+            panic!("a bug past every boundary");
+        }));
+        assert!(unwound.is_err());
+        drop(c);
+        assert!(
+            !kill.is_open(),
+            "the slot still holds the closed connection"
+        );
+        assert!(
+            !kill.kill(crate::error::KillReason(9)),
+            "a kill went through for a closed socket"
+        );
+        // Where descriptor numbers are reused lowest first (Unix), the next socket
+        // may take that number: a stale kill must leave it alone.
+        let l2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut next = std::net::TcpStream::connect(l2.local_addr().unwrap()).unwrap();
+        let (mut next_peer, _) = l2.accept().unwrap();
+        assert!(!kill.kill(crate::error::KillReason(9)));
+        std::io::Write::write_all(&mut next_peer, b"x").unwrap();
+        next.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut next, &mut b).unwrap(), 1);
     }
 }

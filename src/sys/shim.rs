@@ -37,9 +37,12 @@ pub enum Op {
     SetOption,
     /// Registering a socket with a driver (`epoll_ctl`, `kevent`, a completion port).
     Register,
+    /// Writing received bytes into a file (`recv_file`: the `splice` from the pipe,
+    /// and the positioned write).
+    FileWrite,
 }
 
-const OPS: usize = 12;
+const OPS: usize = 13;
 
 /// Every site, for the test that each one has a call site and an injected-error test.
 #[cfg(test)]
@@ -56,6 +59,7 @@ const ALL: [Op; OPS] = [
     Op::Listen,
     Op::SetOption,
     Op::Register,
+    Op::FileWrite,
 ];
 
 /// What a matching call does instead.

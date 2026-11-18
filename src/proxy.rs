@@ -173,7 +173,8 @@ pub enum ProxyError {
     V2BadVersion,
     /// A v2 command other than LOCAL or PROXY.
     V2BadCommand,
-    /// A v2 family and transport byte not in the specification.
+    /// A v2 family and transport byte not in the specification, on a PROXY
+    /// command. A LOCAL header ignores its family and address block.
     V2BadFamily,
     /// A v2 length above the configured maximum.
     V2LengthTooLarge {
@@ -182,7 +183,8 @@ pub enum ProxyError {
         /// The maximum.
         max: u16,
     },
-    /// A v2 address block shorter than its family needs.
+    /// A v2 address block shorter than its family needs, on a PROXY command. A
+    /// LOCAL header ignores its address block.
     V2AddressTooShort,
     /// A v2 TLV that runs past the declared length.
     V2TlvOverrun,

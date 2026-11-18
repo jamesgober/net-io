@@ -115,5 +115,8 @@ mod tests {
     #[test]
     fn test_flags_match_libc() {
         assert_eq!(MSG_DONTWAIT, libc::MSG_DONTWAIT);
+        // A mismatch in argument or result types fails to compile.
+        type Recv = unsafe extern "C" fn(c_int, *mut c_void, usize, c_int) -> isize;
+        let (_, _): (Recv, Recv) = (recv, libc::recv);
     }
 }

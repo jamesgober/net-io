@@ -24,8 +24,26 @@ pub fn addr(server: &Server) -> SocketAddr {
 }
 
 /// A plain std client with a 5 s timeout, so a broken test fails instead of hanging.
+///
+/// A connect that finds the host out of local ports (`AddrInUse`, `AddrNotAvailable`:
+/// Windows runners after a suite run three times, register R-46) is tried again for up
+/// to 5 s; any other failure, and a shortage that lasts, fails the test.
 pub fn client(addr: SocketAddr) -> TcpStream {
-    let s = TcpStream::connect(addr).expect("connect");
+    let start = Instant::now();
+    let s = loop {
+        match TcpStream::connect(addr) {
+            Ok(s) => break s,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AddrNotAvailable
+                ) && start.elapsed() < Duration::from_secs(5) =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("connect: {e:?}"),
+        }
+    };
     s.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
     // A server that already closed makes this fail on the BSDs: the test will see that.

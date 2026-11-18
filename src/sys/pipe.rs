@@ -7,18 +7,22 @@
 //! channel's. Those buffers appear on first use; the reactor reads and writes
 //! through its completion port and never allocates them.
 //!
-//! Every operation's `OVERLAPPED` and buffer live in one box, released only after
-//! the operation has ended (`Drop`). A kill cancels through `CancelIoEx`.
+//! Every operation's `OVERLAPPED` and buffer live in an allocation of their own,
+//! reached only through a raw pointer (the kernel writes them while the operation
+//! runs, so no Rust reference may cover them then) and released only after the
+//! operation has ended (`Drop`). A kill cancels through `CancelIoEx`.
 //!
 //! References: Microsoft Learn, "Named Pipes", `CreateNamedPipeW`,
 //! `ConnectNamedPipe`, `CreateFileW`, `WaitNamedPipeW`, `GetOverlappedResult`,
 //! `ConvertStringSecurityDescriptorToSecurityDescriptorW`. Constants and layouts
 //! are checked against `windows-sys` by the tests below.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::io::{self, IoSlice};
 use std::mem::ManuallyDrop;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -66,8 +70,42 @@ const ERROR_IO_PENDING: i32 = 997;
 
 /// The bytes one direction keeps in user space.
 const BUFFER: usize = 16 * 1024;
-/// How long a close waits for bytes still in flight.
+/// How long one close waits at most for bytes still in flight.
 const CLOSE_FLUSH_MS: u32 = 1_000;
+/// What the closes of one thread may wait in all: a credit of [`CLOSE_FLUSH_MS`]
+/// that comes back at one tenth of the time passed (100 ms a second). A close
+/// whose client reads waits microseconds and gives back what it did not use;
+/// clients that never read cost a thread one second, then 10% of its time at
+/// most, and the closes past that drop their unsent bytes as a reset would.
+const FLUSH_CREDIT_US: u64 = CLOSE_FLUSH_MS as u64 * 1_000;
+
+thread_local! {
+    /// The flush credit of this thread in microseconds, and when it was last taken.
+    static FLUSH_CREDIT: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
+}
+
+/// Takes what this thread's next close may wait for its flush, in microseconds.
+fn take_flush_credit(now: Instant) -> u64 {
+    FLUSH_CREDIT
+        .try_with(|credit| {
+            let (left, at) = credit.get().unwrap_or((FLUSH_CREDIT_US, now));
+            let back = u64::try_from(now.saturating_duration_since(at).as_micros() / 10)
+                .unwrap_or(u64::MAX);
+            let left = left.saturating_add(back).min(FLUSH_CREDIT_US);
+            credit.set(Some((0, now)));
+            left
+        })
+        .unwrap_or(0)
+}
+
+/// Gives back what a close did not wait of what it took.
+fn return_flush_credit(unused: u64) {
+    let _ = FLUSH_CREDIT.try_with(|credit| {
+        if let Some((left, at)) = credit.get() {
+            credit.set(Some((left.saturating_add(unused).min(FLUSH_CREDIT_US), at)));
+        }
+    });
+}
 
 #[repr(C)]
 struct SecurityAttributes {
@@ -213,45 +251,92 @@ unsafe fn result_of(file: Handle, overlapped: *const Overlapped) -> io::Result<O
     }
 }
 
-/// One direction of a stream.
-struct Side {
+/// What the kernel writes while an operation of one direction runs: its
+/// `OVERLAPPED` and its buffer.
+#[repr(C)]
+struct Shared {
     overlapped: Overlapped,
+    buf: [u8; BUFFER],
+}
+
+/// One direction of a stream. `shared` is reached only through raw pointers:
+/// while `pending`, the kernel may write it at any moment, and the code reads it
+/// only after the operation's result says it ended.
+struct Side {
+    shared: NonNull<Shared>,
     event: OwnedHandle,
     pending: bool,
-    buf: Box<[u8]>,
     at: usize,
     len: usize,
     eof: bool,
 }
 
+// SAFETY: `shared` is owned by this side alone, as a `Box` would be (made in
+// `new`, freed in `Drop`), and is touched only through `&mut Side` or by the
+// kernel for the operation this side started; nothing in it is tied to a thread.
+unsafe impl Send for Side {}
+
+impl Drop for Side {
+    fn drop(&mut self) {
+        // SAFETY: `shared` came from `Box::leak` in `new` and is freed once, here.
+        // A side is dropped only with no operation under way: `settle` waits for
+        // every pending one to end before the sides go.
+        drop(unsafe { Box::from_raw(self.shared.as_ptr()) });
+    }
+}
+
 impl Side {
     fn new() -> io::Result<Side> {
-        Ok(Side {
+        let event = event()?;
+        let shared = Box::new(Shared {
             overlapped: Overlapped::default(),
-            event: event()?,
+            buf: [0; BUFFER],
+        });
+        Ok(Side {
+            shared: NonNull::from(Box::leak(shared)),
+            event,
             pending: false,
-            buf: vec![0; BUFFER].into_boxed_slice(),
             at: 0,
             len: 0,
             eof: false,
         })
     }
 
+    /// The operation's `OVERLAPPED`, as a pointer.
+    fn overlapped(&self) -> *mut Overlapped {
+        // SAFETY: `shared` is live as long as `self`; this makes a pointer to a
+        // field, never a reference.
+        unsafe { &raw mut (*self.shared.as_ptr()).overlapped }
+    }
+
+    /// The operation's buffer, as a pointer to its `BUFFER` bytes.
+    fn buf(&self) -> *mut u8 {
+        // SAFETY: as in `overlapped`.
+        unsafe { (&raw mut (*self.shared.as_ptr()).buf).cast::<u8>() }
+    }
+
+    /// Prepares the `OVERLAPPED` for a new operation. Called only while none of
+    /// this side is under way.
     fn arm(&mut self) -> *mut Overlapped {
         // The low bit of the event tells the kernel to queue no completion packet.
         // The handle may be on a reactor worker's completion port, and a packet for
-        // an operation that lives in this box must never reach that port: the
+        // an operation that lives in this side must never reach that port: the
         // stream waits on its own event. Handle values are multiples of four, so
         // the waits that read the field ignore the bit.
-        self.overlapped = Overlapped {
+        let armed = Overlapped {
             event: self.event.as_raw_handle() as usize | 1,
             ..Overlapped::default()
         };
-        &raw mut self.overlapped
+        let at = self.overlapped();
+        // SAFETY: no operation of this side is under way, so nothing else writes
+        // the field; the pointer is valid and aligned.
+        unsafe { at.write(armed) };
+        at
     }
 }
 
-/// Both directions, boxed: the kernel holds their addresses.
+/// Both directions. What the kernel holds an address of is in each side's own
+/// allocation, so this box may be taken out of its place by `settle`.
 struct Sides {
     read: Side,
     write: Side,
@@ -361,12 +446,13 @@ impl PipeStream {
 
     fn start_read(&self, s: &mut Side) -> io::Result<()> {
         let overlapped = s.arm();
-        // SAFETY: `s` lives in the box, which outlives the operation (`Drop`); the
-        // handle is open.
+        // SAFETY: the `OVERLAPPED` and the buffer are in `s.shared`, which outlives
+        // the operation (`settle`, then `Drop`) and which no reference covers while
+        // it runs; no operation of this side is under way; the handle is open.
         let ok = unsafe {
             ReadFile(
                 self.raw(),
-                s.buf.as_mut_ptr(),
+                s.buf(),
                 BUFFER as u32,
                 std::ptr::null_mut(),
                 overlapped,
@@ -397,7 +483,13 @@ impl PipeStream {
             loop {
                 if s.at < s.len {
                     let n = (s.len - s.at).min(out.len());
-                    out[..n].copy_from_slice(&s.buf[s.at..s.at + n]);
+                    // SAFETY: the read that filled the buffer has ended (`len` is
+                    // set from its result and no new one starts until `at` reaches
+                    // it), so the kernel no longer writes it; `at + n <= len`, at
+                    // most `BUFFER`; `out` holds `n` bytes and is another object.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(s.buf().add(s.at), out.as_mut_ptr(), n);
+                    }
                     s.at += n;
                     return Ok(n);
                 }
@@ -409,7 +501,7 @@ impl PipeStream {
                     continue;
                 }
                 // SAFETY: the operation was started on this handle and lives in `s`.
-                match unsafe { result_of(self.raw(), &raw const s.overlapped) } {
+                match unsafe { result_of(self.raw(), s.overlapped()) } {
                     Ok(None) => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
                     Ok(Some(n)) => {
                         s.pending = false;
@@ -443,7 +535,7 @@ impl PipeStream {
             let s = &mut sides.write;
             if s.pending {
                 // SAFETY: the operation was started on this handle and lives in `s`.
-                match unsafe { result_of(self.raw(), &raw const s.overlapped) } {
+                match unsafe { result_of(self.raw(), s.overlapped()) } {
                     Ok(None) => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
                     Ok(Some(_)) => s.pending = false,
                     Err(e) => {
@@ -453,13 +545,16 @@ impl PipeStream {
                 }
             }
             let n = data.len().min(BUFFER);
-            s.buf[..n].copy_from_slice(&data[..n]);
+            // SAFETY: no write of this side is under way (just checked), so the
+            // kernel does not read the buffer; `n <= BUFFER`; `data` is another
+            // object with at least `n` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), s.buf(), n) };
             let overlapped = s.arm();
             // SAFETY: as in `start_read`.
             let ok = unsafe {
                 WriteFile(
                     self.raw(),
-                    s.buf.as_ptr(),
+                    s.buf(),
                     n as u32,
                     std::ptr::null_mut(),
                     overlapped,
@@ -599,11 +694,17 @@ impl PipeStream {
         let Some(sides) = sides else { return };
         let raw = self.handle.as_raw_handle();
         // Closing a pipe keeps what is already in it readable, so only a write the
-        // kernel has not taken yet needs a moment.
+        // kernel has not taken yet needs a moment, within this thread's credit.
         if sides.write.pending && !sides.abortive {
-            // SAFETY: the event is open; the wait is bounded.
-            let _ =
-                unsafe { WaitForSingleObject(sides.write.event.as_raw_handle(), CLOSE_FLUSH_MS) };
+            let started = Instant::now();
+            let credit = take_flush_credit(started);
+            let ms = u32::try_from(credit / 1_000).unwrap_or(CLOSE_FLUSH_MS);
+            if ms > 0 {
+                // SAFETY: the event is open; the wait is bounded.
+                let _ = unsafe { WaitForSingleObject(sides.write.event.as_raw_handle(), ms) };
+            }
+            let waited = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            return_flush_credit(credit.saturating_sub(waited));
         }
         if sides.read.pending || sides.write.pending {
             // SAFETY: the handle is open; a null `OVERLAPPED` means all of its operations.
@@ -613,9 +714,7 @@ impl PipeStream {
                     let mut moved = 0u32;
                     // SAFETY: the operation was started on this handle; this waits for
                     // its end, so the box is released after the kernel lets go of it.
-                    let _ = unsafe {
-                        GetOverlappedResult(raw, &raw const s.overlapped, &raw mut moved, 1)
-                    };
+                    let _ = unsafe { GetOverlappedResult(raw, s.overlapped(), &raw mut moved, 1) };
                 }
             }
         }
@@ -1112,6 +1211,90 @@ mod tests {
         );
     }
 
+    /// Every function declared in this file against its `windows-sys` declaration.
+    #[test]
+    fn test_signatures_match_windows_sys() {
+        use super::super::windows::abi::same_abi;
+        use windows_sys::Win32::Security::Authorization as authz;
+        use windows_sys::Win32::System::IO as io_sys;
+        use windows_sys::Win32::System::Threading as th;
+        same_abi!(
+            CreateNamedPipeW,
+            pipes::CreateNamedPipeW,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _
+        );
+        same_abi!(ConnectNamedPipe, pipes::ConnectNamedPipe, _, _);
+        same_abi!(DisconnectNamedPipe, pipes::DisconnectNamedPipe, _);
+        same_abi!(CreateFileW, fs::CreateFileW, _, _, _, _, _, _, _);
+        same_abi!(WaitNamedPipeW, pipes::WaitNamedPipeW, _, _);
+        same_abi!(
+            GetNamedPipeClientProcessId,
+            pipes::GetNamedPipeClientProcessId,
+            _,
+            _
+        );
+        same_abi!(
+            GetNamedPipeServerProcessId,
+            pipes::GetNamedPipeServerProcessId,
+            _,
+            _
+        );
+        same_abi!(ReadFile, fs::ReadFile, _, _, _, _, _);
+        same_abi!(WriteFile, fs::WriteFile, _, _, _, _, _);
+        same_abi!(GetOverlappedResult, io_sys::GetOverlappedResult, _, _, _, _);
+        same_abi!(CreateEventW, th::CreateEventW, _, _, _, _);
+        same_abi!(
+            WaitForMultipleObjects,
+            th::WaitForMultipleObjects,
+            _,
+            _,
+            _,
+            _
+        );
+        same_abi!(WaitForSingleObject, th::WaitForSingleObject, _, _);
+        same_abi!(GetCurrentProcess, th::GetCurrentProcess,);
+        same_abi!(OpenProcess, th::OpenProcess, _, _, _);
+        same_abi!(GetProcessTimes, th::GetProcessTimes, _, _, _, _, _);
+        same_abi!(LocalFree, wf::LocalFree, _);
+        same_abi!(OpenProcessToken, th::OpenProcessToken, _, _, _);
+        same_abi!(GetTokenInformation, sec::GetTokenInformation, _, _, _, _, _);
+        same_abi!(ConvertSidToStringSidW, authz::ConvertSidToStringSidW, _, _);
+        same_abi!(
+            GetSecurityInfo,
+            authz::GetSecurityInfo,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _
+        );
+        same_abi!(
+            ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            authz::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            _,
+            _,
+            _,
+            _
+        );
+        assert_eq!(SE_KERNEL_OBJECT, authz::SE_KERNEL_OBJECT);
+        assert_eq!(SDDL_REVISION_1, authz::SDDL_REVISION_1);
+        assert_eq!(INFINITE, th::INFINITE);
+        assert_eq!(
+            std::mem::offset_of!(SecurityAttributes, descriptor),
+            std::mem::offset_of!(sec::SECURITY_ATTRIBUTES, lpSecurityDescriptor)
+        );
+    }
+
     /// The owner a client reads is the creator's default owner for new objects.
     #[test]
     fn test_owner_sid_is_the_creators_default_owner() {
@@ -1168,6 +1351,47 @@ mod tests {
             }
         }
         assert_eq!(got, BUFFER, "the drain cut the reply short");
+    }
+
+    /// A server end with a write its client does not read, and the client.
+    fn stalled_pair(tag: &str) -> (PipeStream, PipeStream) {
+        let name = format!("net-io-sys-stall-{tag}-{}", std::process::id());
+        let params = PipeParams {
+            max_instances: 1,
+            inbound: 1024,
+            outbound: 1024,
+        };
+        let sddl = owner_sddl(false).unwrap();
+        let server =
+            PipeServer::create(&name, params, Descriptor::from_sddl(&sddl).unwrap()).unwrap();
+        let client = pipe_connect(&name, Duration::from_secs(1)).unwrap();
+        let stream = server.accept(None).unwrap().unwrap();
+        // More than the pipe holds: the write stays in the kernel until read.
+        assert_eq!(stream.write(&[5u8; BUFFER]).unwrap(), BUFFER);
+        (stream, client)
+    }
+
+    /// Closes that wait for clients that do not read hold their thread a bounded
+    /// time in total, not a second each; an abortive close does not wait at all.
+    #[test]
+    fn test_closes_nobody_reads_hold_a_thread_a_bounded_time() {
+        let pairs: Vec<_> = (0..3).map(|i| stalled_pair(&i.to_string())).collect();
+        let started = Instant::now();
+        let mut clients = Vec::new();
+        for (stream, client) in pairs {
+            drop(stream);
+            clients.push(client);
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(1_600),
+            "three closes took {took:?}"
+        );
+        let (stream, _client) = stalled_pair("abort");
+        stream.set_abortive();
+        let started = Instant::now();
+        drop(stream);
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 
     #[test]

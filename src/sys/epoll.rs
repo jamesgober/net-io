@@ -242,6 +242,18 @@ mod tests {
         assert_eq!(EPOLLET, libc::EPOLLET as u32);
         assert_eq!(EFD_CLOEXEC, libc::EFD_CLOEXEC);
         assert_eq!(EFD_NONBLOCK, libc::EFD_NONBLOCK);
+        // A mismatch in argument or result types fails to compile; `EpollEvent`
+        // against `epoll_event` is compared above.
+        type Create = unsafe extern "C" fn(c_int) -> c_int;
+        let (_, _): (Create, Create) = (epoll_create1, libc::epoll_create1);
+        let _: unsafe extern "C" fn(c_int, c_int, c_int, *mut EpollEvent) -> c_int = epoll_ctl;
+        let _: unsafe extern "C" fn(c_int, c_int, c_int, *mut libc::epoll_event) -> c_int =
+            libc::epoll_ctl;
+        let _: unsafe extern "C" fn(c_int, *mut EpollEvent, c_int, c_int) -> c_int = epoll_wait;
+        let _: unsafe extern "C" fn(c_int, *mut libc::epoll_event, c_int, c_int) -> c_int =
+            libc::epoll_wait;
+        type EventFd = unsafe extern "C" fn(u32, c_int) -> c_int;
+        let (_, _): (EventFd, EventFd) = (eventfd, libc::eventfd);
     }
 
     #[test]

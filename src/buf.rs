@@ -401,7 +401,7 @@ mod tests {
     }
 
     /// Bytes left behind a shorter `len` are wiped too: a cleared buffer, a
-    /// compacted one, and a consumed input (review finding: only `[..len]` was).
+    /// compacted one, and a consumed input (only `[..len]` was, once).
     #[test]
     fn test_pool_wipes_what_a_shorter_len_left_behind() {
         let mut pool = BufferPool::standalone(1 << 20);
