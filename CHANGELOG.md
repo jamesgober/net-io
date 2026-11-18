@@ -11,13 +11,22 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-18
+
+What the first consumers asked for: a close that delivers the last bytes before it
+ends a connection, a drain that tells a session first, workers kept for a
+listener, and a faster TLS path on the reactor, with a set of lower-severity fixes.
+Every 0.7 program builds unchanged; a UDP server above 100,000 datagrams a second
+must raise its global budget.
+
 ### Added
 
 - Flush-then-close: after a denial whose bytes went out, the connection
   stops reading, sends what is queued, sends FIN, and discards input until the
   peer's EOF or `Limits::denial_linger` (default 100 ms; zero keeps the immediate
-  reset), in any phase, including before the session has seen input. `Limits::denial_linger_max` caps how many connections linger at once
-  (default a sixteenth of `max_connections`); past it a denial resets as before.
+  reset), in any phase, including before the session has seen input.
+  `Limits::denial_linger_max` caps how many connections linger at once (default a
+  sixteenth of `max_connections`); past it a denial resets as before.
   On Windows this stops the formatted denial being lost to an abortive close.
 - `ServerHandle::close_after_flush(id, reason, within)`: a soft kill. The session's
   queued output goes out within the bound, then the connection closes the same
@@ -697,7 +706,8 @@ The scaffold and the plan. No functional code yet.
   dependencies, testing, open decisions, and the decision log.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/net-io/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/jamesgober/net-io/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/jamesgober/net-io/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/net-io/compare/v0.6.2...v0.7.0

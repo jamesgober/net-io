@@ -45,14 +45,14 @@
 //!
 //! ## Status
 //!
-//! `0.7.2`: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
+//! `0.8.0`, alpha: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
 //! Linux, macOS, FreeBSD, and Windows. TCP with a client that reconnects with
 //! backoff, Unix domain sockets (AF_UNIX on Windows), Windows named pipes, and UDP
 //! with batches and sessions; zero-copy file sends and file receives; the PROXY
 //! protocol, the TLS seam, systemd and FastCGI inheritance, listener hand-off on Unix
 //! and Windows, and the public [`Driver`] interface. Hardened: an attack test per
-//! threat, continuous fuzzing, and a 24-hour soak. `0.7.2` is a security release;
-//! the remaining fixes from the same work come in `0.8.0`.
+//! threat, continuous fuzzing, and a 24-hour soak. `0.8.0` adds what the first
+//! consumers needed: flush-then-close, a drain hook, and workers kept for a listener.
 
 #![doc(html_root_url = "https://docs.rs/net-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
