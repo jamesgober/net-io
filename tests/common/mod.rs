@@ -44,11 +44,28 @@ pub fn client(addr: SocketAddr) -> TcpStream {
             Err(e) => panic!("connect: {e:?}"),
         }
     };
-    s.set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("timeout");
+    read_timeout(&s, Duration::from_secs(5));
     // A server that already closed makes this fail on the BSDs: the test will see that.
     let _ = s.set_nodelay(true);
     s
+}
+
+/// Sets a client's read timeout. A connection the server already reset has no
+/// timeout to set: macOS answers `EINVAL` once both directions are shut, and the
+/// BSDs may answer `ECONNRESET`. A read on it returns at once, so the test sees the
+/// reset there; any other failure fails the test.
+pub fn read_timeout(s: &TcpStream, within: Duration) {
+    if let Err(e) = s.set_read_timeout(Some(within)) {
+        assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+            ),
+            "timeout: {e:?}"
+        );
+    }
 }
 
 /// Sends `msg` and reads back exactly as many bytes.

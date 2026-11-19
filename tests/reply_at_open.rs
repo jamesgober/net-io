@@ -42,8 +42,6 @@ fn test_a_reply_at_open_survives_the_request_already_sent() {
         server.open_door().expect("open");
         for round in 0..40 {
             let mut c = client(addr(&server));
-            c.set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("timeout");
             // The request goes out after the server's close, as a client's does when
             // the reply and the close cross it on the way.
             std::thread::sleep(Duration::from_millis(30));
