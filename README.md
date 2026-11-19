@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). No dependencies: OS calls the standard library does not expose go through the crate's own fenced FFI layer.
     </p>
     <blockquote>
-        <strong>Status: <code>0.8.0</code>, alpha.</strong> Its own reactor on epoll, kqueue, and IOCP beside the blocking pool, on Linux, macOS, FreeBSD, and Windows; TCP, Unix domain sockets, Windows named pipes, and UDP; zero-copy file sends and file receives; the PROXY protocol, the TLS seam, inheritance, and listener hand-off; an attack test for every threat in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>, continuous fuzzing, and a 24-hour soak. Pre-1.0: the API in <a href="./docs/API.md"><code>docs/API.md</code></a> is locked, and each item says the version that ships it. Next is <code>0.9.0</code>, beta (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
+        <strong>Status: <code>0.8.1</code>, alpha.</strong> Its own reactor on epoll, kqueue, and IOCP beside the blocking pool, on Linux, macOS, FreeBSD, and Windows; TCP, Unix domain sockets, Windows named pipes, and UDP; zero-copy file sends and file receives; the PROXY protocol, the TLS seam, inheritance, and listener hand-off; an attack test for every threat in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>, continuous fuzzing, and a 24-hour soak. Pre-1.0: the API in <a href="./docs/API.md"><code>docs/API.md</code></a> is locked, and each item says the version that ships it. Next is <code>0.9.0</code>, beta (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 

@@ -550,8 +550,35 @@ impl Shared {
                 e.conf.wake.wake();
             }
         }
+        // An accept already past its door check finishes its admission before this
+        // returns, so no connection is admitted after it (D-231). On the thread of
+        // an admission (a gate or an event sink calling this) it cannot wait for
+        // itself, and does not wait at all: two such calls would wait for each other.
+        if !IN_ADMISSION.with(std::cell::Cell::get) {
+            self.wait_admissions();
+        }
         if closed {
             self.event(Event::DoorClosed);
+        }
+    }
+
+    /// Waits until no accept thread is inside an admission. The door is closed, so
+    /// each one either stops at its door check or finishes the admission it began.
+    fn wait_admissions(&self) {
+        // Read after the door closed, sequentially consistent with the accept
+        // thread's count and door check, as in `idle`.
+        if self.admitting.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let mut guard = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        while self.admitting.load(Ordering::SeqCst) != 0 {
+            // `Admitting` notifies while the door is closed; the bound only guards
+            // against a wake that never comes.
+            guard = self
+                .progress_cv
+                .wait_timeout(guard, Duration::from_millis(10))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -1374,6 +1401,8 @@ thread_local! {
     /// reactor worker's own accepts, that worker, with `true`: it takes its inbox
     /// after the batch, so no wake is sent (D-197).
     static FEEDS: std::cell::Cell<Option<(usize, bool)>> = const { std::cell::Cell::new(None) };
+    /// This thread holds an `Admitting`: a `close_door` here does not wait (D-231).
+    static IN_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A worker thread, counted in `Shared::running` until it ends (or its spawn fails
@@ -1387,20 +1416,25 @@ impl Drop for Running {
     }
 }
 
-/// One accept thread inside an admission, for the drain (see `Shared::admitting`).
+/// One accept thread inside an admission, for the drain and `close_door` (see
+/// `Shared::admitting`).
 struct Admitting<'a>(&'a Shared);
 
 impl<'a> Admitting<'a> {
     fn enter(shared: &'a Shared) -> Admitting<'a> {
         shared.admitting.fetch_add(1, Ordering::SeqCst);
+        IN_ADMISSION.with(|a| a.set(true));
         Admitting(shared)
     }
 }
 
 impl Drop for Admitting<'_> {
     fn drop(&mut self) {
+        IN_ADMISSION.with(|a| a.set(false));
         self.0.admitting.fetch_sub(1, Ordering::SeqCst);
-        if self.0.draining.load(Ordering::Acquire) {
+        // A `close_door` may wait for this (D-231). With the door open nobody does,
+        // and the accept path pays one load.
+        if self.0.draining.load(Ordering::Acquire) || !self.0.door.load(Ordering::SeqCst) {
             self.0.notify_progress();
         }
     }
