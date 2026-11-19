@@ -1694,7 +1694,7 @@ impl Drop for Server;   // shutdown with the drain timeout as the deadline
 | Item | Behaviour | Errors | Cost | Grade | Tier | Version |
 |---|---|---|---|---|---|---|
 | `open_door` | start accepting on every listener; a second call is a no-op; refused while draining | `ShuttingDown`, `ForkedChild` | NFR: accepting within 1 ms | P0 | 2 | `0.3.0` |
-| `close_door` | stop accepting on every worker within one loop iteration; listening sockets stay open (the kernel backlog keeps new connections for the next process during a restart); idempotent | | under 1 ms p99 [est.] | P0 | 2 | `0.3.0` |
+| `close_door` | stop accepting on every worker; listening sockets stay open (the kernel backlog keeps new connections for the next process during a restart); an admission already under way finishes before it returns, so none is admitted after it (decision D-231); idempotent | | under 1 ms p99 [est.], plus the longest admission in progress | P0 | 2 | `0.3.0` |
 | `door` | `Open` or `Closed` | | one atomic load | P0 | 2 | `0.3.0` |
 | `drain` | closes the door, tells every session to finish (`SessionContext::draining()`), closes idle connections at once, waits for the rest until `deadline`, then kills them with `DrainDeadline`; returns the counts | none (report) | 10,000 idle connections under 100 ms [est.] | P0 | 2 | `0.3.0` |
 | `shutdown` | `drain`, then closes the listening sockets (except released ones) and joins every worker; afterwards no net-io thread runs and every descriptor net-io opened is closed | none (report) | | P0 | 2 | `0.3.0` |

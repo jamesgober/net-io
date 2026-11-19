@@ -643,40 +643,88 @@ macro_rules! setter {
 pub(crate) const MAX_CONNECTIONS: u32 = 1 << 20;
 
 impl LimitsBuilder {
-    setter!(/// The global connection cap.
-        max_connections, u32);
-    setter!(/// The per-listener connection cap.
-        max_per_listener, u32);
-    setter!(/// The listen backlog.
-        backlog, u32);
-    setter!(/// Connections accepted per wake-up.
-        accept_batch, u16);
-    setter!(/// Time for the PROXY header and TLS handshake together.
-        handshake_timeout, Duration);
-    setter!(/// Time to wait for the next exchange.
-        idle_timeout, Duration);
-    setter!(/// Time to wait for bytes during an exchange.
-        read_timeout, Duration);
-    setter!(/// Time to wait for the peer to take bytes.
-        write_timeout, Duration);
-    setter!(/// Time a parked connection may wait for its completion.
-        park_timeout, Duration);
-    setter!(/// The minimum transfer rate ([`MinRate::off`] to disable).
-        min_rate, MinRate);
-    setter!(/// Pool memory a connection's output may hold.
-        output_budget, u32);
-    setter!(/// Total bytes of buffers all workers may allocate. A quarter of it, shared
+    setter!(
+        /// The global connection cap.
+        max_connections,
+        u32
+    );
+    setter!(
+        /// The per-listener connection cap.
+        max_per_listener,
+        u32
+    );
+    setter!(
+        /// The listen backlog.
+        backlog,
+        u32
+    );
+    setter!(
+        /// Connections accepted per wake-up.
+        accept_batch,
+        u16
+    );
+    setter!(
+        /// Time for the PROXY header and TLS handshake together.
+        handshake_timeout,
+        Duration
+    );
+    setter!(
+        /// Time to wait for the next exchange.
+        idle_timeout,
+        Duration
+    );
+    setter!(
+        /// Time to wait for bytes during an exchange.
+        read_timeout,
+        Duration
+    );
+    setter!(
+        /// Time to wait for the peer to take bytes.
+        write_timeout,
+        Duration
+    );
+    setter!(
+        /// Time a parked connection may wait for its completion.
+        park_timeout,
+        Duration
+    );
+    setter!(
+        /// The minimum transfer rate ([`MinRate::off`] to disable).
+        min_rate,
+        MinRate
+    );
+    setter!(
+        /// Pool memory a connection's output may hold.
+        output_budget,
+        u32
+    );
+    setter!(
+        /// Total bytes of buffers all workers may allocate. A quarter of it, shared
         /// among the workers, is the most unfinished TLS handshakes may hold on the
         /// reactor; see [`Limits::buffer_budget`].
-        buffer_budget, u64);
-    setter!(/// The drain deadline.
-        drain_timeout, Duration);
-    setter!(/// The largest refusal reply (at most 512).
-        refusal_bytes_max, u16);
-    setter!(/// The timer resolution (1 ms to 100 ms).
-        tick, Duration);
-    setter!(/// Adaptive deadlines under pressure.
-        pressure, Pressure);
+        buffer_budget,
+        u64
+    );
+    setter!(
+        /// The drain deadline.
+        drain_timeout,
+        Duration
+    );
+    setter!(
+        /// The largest refusal reply (at most 512).
+        refusal_bytes_max,
+        u16
+    );
+    setter!(
+        /// The timer resolution (1 ms to 100 ms).
+        tick,
+        Duration
+    );
+    setter!(
+        /// Adaptive deadlines under pressure.
+        pressure,
+        Pressure
+    );
 
     /// The per-source concurrency cap and how sources are grouped.
     pub fn max_per_source(mut self, n: u32, policy: PrefixPolicy) -> Self {
