@@ -8,36 +8,44 @@
 //! source by default, and a new server whose workers start slowly on a loaded host
 //! refuses at those caps with a reset, which is what R-43 turned out to be.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use net_io::{
-    AllowAll, ConnectionInfo, DriverKind, Input, Limits, ListenerHandle, ListenerSpec,
-    PrefixPolicy, Server, ServerBuilder, Session, SessionContext, Step, TcpConnection,
+    AllowAll, ConnectOptions, ConnectionInfo, DriverKind, Input, Limits, ListenerHandle,
+    ListenerSpec, NetError, PrefixPolicy, Server, ServerBuilder, Session, SessionContext, Step,
+    TcpConnection,
 };
 
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
 
 /// A client-side shortage of local ports (a shared host's TIME_WAIT), not a refusal.
-fn out_of_ports(e: &std::io::Error) -> bool {
+fn out_of_ports(e: &NetError) -> bool {
     let codes: &[i32] = if cfg!(windows) {
         &[10048, 10049, 10055]
     } else {
         &[98, 99, 48, 49]
     };
-    e.raw_os_error().is_some_and(|c| codes.contains(&c))
+    matches!(e, NetError::AddrNotAvailable { .. })
+        || e.os_error_code().is_some_and(|c| codes.contains(&c))
 }
 
 /// One request on a new connection, written before the reply is read as an HTTP
 /// client does: the server's word, or what went wrong.
+///
+/// The client resets once it has the reply. The server closes first, so a
+/// graceful close here would leave the server a TIME_WAIT entry for every
+/// connection, and Windows drops a SYN whose four-tuple matches one (register
+/// R-53): with thousands of loopback connections a client could reuse a port and
+/// wait 21 s for an answer. The reset ends the server's side at once.
 fn one_request(addr: SocketAddr) -> Result<(), String> {
     let mut tries = 0;
-    let mut s = loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => break s,
+    let options = ConnectOptions::new().timeout(Duration::from_secs(10));
+    let mut c = loop {
+        match TcpConnection::connect_with(addr, options.clone()) {
+            Ok(c) => break c,
             Err(e) if out_of_ports(&e) && tries < 100 => {
                 tries += 1;
                 std::thread::sleep(Duration::from_millis(10));
@@ -45,13 +53,21 @@ fn one_request(addr: SocketAddr) -> Result<(), String> {
             Err(e) => return Err(format!("connect: {e}")),
         }
     };
-    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-    s.write_all(REQUEST).map_err(|e| format!("write: {e}"))?;
+    c.send_all(REQUEST).map_err(|e| format!("write: {e}"))?;
     let mut got = Vec::new();
-    match s.read_to_end(&mut got) {
-        Ok(_) if got == b"old" || got == b"new" => Ok(()),
-        Ok(_) => Err(format!("reply: {got:?}")),
-        Err(e) => Err(format!("read after {} bytes: {e}", got.len())),
+    let mut buf = [0u8; 64];
+    loop {
+        match c.recv(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(format!("read after {} bytes: {e}", got.len())),
+        }
+    }
+    c.abort();
+    if got == b"old" || got == b"new" {
+        Ok(())
+    } else {
+        Err(format!("reply: {got:?}"))
     }
 }
 

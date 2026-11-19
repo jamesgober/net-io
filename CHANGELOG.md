@@ -11,6 +11,19 @@
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-18
+
+A fix to `close_door`. No API change.
+
+### Fixed
+
+- `close_door` could return while an accept was already under way, and that
+  accept could still admit one more connection after the door was closed. It now
+  waits for any admission in progress to finish, so when it returns no connection
+  is admitted until the next `open_door`. A connection whose accept had begun is
+  served, not reset. Called from a gate's `admit` on the thread of an admission,
+  it closes the door without waiting. The same fix is in 0.7.3.
+
 ## [0.8.0] - 2026-11-18
 
 What the first consumers asked for: a close that delivers the last bytes before it
@@ -706,7 +719,8 @@ The scaffold and the plan. No functional code yet.
   dependencies, testing, open decisions, and the decision log.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/jamesgober/net-io/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/jamesgober/net-io/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/jamesgober/net-io/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/jamesgober/net-io/compare/v0.7.0...v0.7.1

@@ -9,7 +9,7 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use common::{addr, client, eventually, round_trip};
+use common::{addr, client, eventually, read_timeout, round_trip};
 use net_io::{
     AdmitStage, Admitted, AllowAll, CloseReason, ConnectOptions, ConnectionId, ConnectionInfo,
     Denial, DriverKind, Gate, GateTag, Input, KillReason, Lane, Limits, ListenOptions,
@@ -217,7 +217,7 @@ fn recv_until_closed(c: &mut TcpConnection) -> (usize, Result<(), NetError>) {
 
 /// Reads until the server closes: the bytes, and `Ok` for FIN or the error (a reset).
 fn read_until_closed(c: &mut TcpStream) -> (Vec<u8>, std::io::Result<()>) {
-    c.set_read_timeout(Some(WAIT)).expect("timeout");
+    read_timeout(c, WAIT);
     let mut got = Vec::new();
     let mut buf = [0u8; 64 << 10];
     loop {

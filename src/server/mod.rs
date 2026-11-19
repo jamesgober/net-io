@@ -1025,7 +1025,15 @@ impl Server {
         self.shared.open_door()
     }
 
-    /// Stops accepting within one loop iteration; listening sockets stay open. Idempotent.
+    /// Stops accepting; listening sockets stay open, and new connections wait in
+    /// the backlog. Idempotent.
+    ///
+    /// When it returns, no connection is admitted until the next
+    /// [`open_door`](Server::open_door). A connection whose accept was already
+    /// under way is admitted before it returns, so it waits for that admission,
+    /// gate included. Called from a gate's `admit` or an event sink on the thread
+    /// of an admission, it closes the door without waiting. A UDP socket's door
+    /// stops reading; a datagram already read still reaches its session.
     pub fn close_door(&self) {
         self.shared.close_door();
     }
@@ -1297,7 +1305,8 @@ impl ServerHandle {
         self.shared.close_after_flush(id, reason, within)
     }
 
-    /// Stops accepting.
+    /// Stops accepting, as [`Server::close_door`]: when it returns, no connection
+    /// is admitted until the door opens again.
     pub fn close_door(&self) {
         self.shared.close_door();
     }
