@@ -210,7 +210,8 @@ fn test_send_file_of_no_bytes_sends_nothing() {
 /// A bound UDP socket connected to `peer`, ready for a driver.
 fn udp_to(peer: &UdpSocket) -> Arc<UdpSocket> {
     let s = UdpSocket::bind("127.0.0.1:0").expect("bind");
-    s.connect(peer.local_addr().expect("addr")).expect("connect");
+    s.connect(peer.local_addr().expect("addr"))
+        .expect("connect");
     s.set_nonblocking(true).expect("nonblocking");
     Arc::new(s)
 }
@@ -230,7 +231,9 @@ fn test_a_udp_socket_registers_and_receives() {
     let mut driver = new_reactor_driver(8).expect("driver");
     let socket = udp_to(&peer);
     let shared: SharedSocket = socket.clone();
-    driver.register(shared, Token(3)).expect("register a UDP socket");
+    driver
+        .register(shared, Token(3))
+        .expect("register a UDP socket");
     let mut pool = BufferPool::standalone(1 << 20);
     receive(&mut *driver, &mut pool, Token(3));
     peer.send_to(b"ping", socket.local_addr().expect("addr"))
@@ -270,7 +273,10 @@ fn test_datagrams_queued_before_the_first_wakeup_all_arrive() {
         got.push(buffer.as_slice()[..n].to_vec());
         pool.put(buffer);
     }
-    assert_eq!(got, vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]);
+    assert_eq!(
+        got,
+        vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+    );
 }
 
 #[test]
