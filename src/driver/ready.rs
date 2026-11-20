@@ -2,11 +2,12 @@
 //! waits until the socket is ready, then the non-blocking call runs.
 //!
 //! A socket's readiness is remembered per direction, because the OS reports
-//! edges. `Receive` makes the call at once when the socket is known to be ready,
-//! and only `WouldBlock` clears the flag: a short read does not prove the socket
-//! is empty (a datagram socket returns one datagram per read), so the receive
-//! after it reads again, and an exchange costs one wait, two receives (the
-//! second finds nothing), and one send. `Send` always tries first:
+//! edges. `Receive` makes the call at once when the socket is known to be ready.
+//! On a stream, a short read clears the flag: the queue was empty when the read
+//! returned, and the next arrival raises a new edge, so an exchange costs one
+//! wait, one receive, and one send. On a datagram socket each read returns one
+//! datagram whatever is queued behind it, so only `WouldBlock` clears the flag
+//! (D-234). `Send` always tries first:
 //! a socket is writable nearly always, and the wait is the expensive part.
 
 use std::collections::VecDeque;
@@ -52,6 +53,9 @@ struct Reg {
     /// The peer hung up: reads must go on until the end of stream, because no
     /// new edge will report it.
     hangup: bool,
+    /// Not a stream (UDP, a Unix datagram or sequenced-packet socket): one read
+    /// returns one message, so a short read says nothing about what is queued.
+    messages: bool,
     recv: Recv,
     out: Out,
     close: bool,
@@ -112,11 +116,18 @@ impl ReadyDriver {
             .poller
             .add(socket, token.0)
             .map_err(|e| NetError::from_os("epoll_ctl", e))?;
-        self.insert(token, registered, None);
+        // The server's reactor registers connections, which are streams.
+        self.insert(token, registered, None, false);
         Ok(())
     }
 
-    fn insert(&mut self, token: Token, socket: Registered, keep: Option<SharedSocket>) {
+    fn insert(
+        &mut self,
+        token: Token,
+        socket: Registered,
+        keep: Option<SharedSocket>,
+        messages: bool,
+    ) {
         let i = token.index();
         if i >= self.regs.len() {
             self.regs.resize_with(i + 1, || None);
@@ -128,6 +139,7 @@ impl ReadyDriver {
             readable: false,
             writable: true,
             hangup: false,
+            messages,
             recv: Recv::None,
             out: Out::None,
             close: false,
@@ -147,15 +159,17 @@ impl ReadyDriver {
                 local.push_back(Completion::new(token, OperationKind::Receive, Ok(0)));
             }
             Recv::Into(mut buffer) if reg.readable => {
+                let room = buffer.spare().len();
                 match reg.socket.recv(buffer.spare()) {
                     Ok(n) => {
-                        // Readiness ends only at `WouldBlock`, as edge-triggered
-                        // polling requires: a short read does not prove the socket
-                        // is empty (a datagram socket returns one datagram per read
-                        // with more queued behind it), so the next receive reads
-                        // again and finds out.
                         let len = buffer.len() + n;
                         buffer.set_len(len);
+                        if n < room && n > 0 && !reg.hangup && !reg.messages {
+                            // A short read from a stream: the socket is drained,
+                            // and the next arrival raises a new edge. Not so for
+                            // messages, where only `WouldBlock` says it.
+                            reg.readable = false;
+                        }
                         let mut c = Completion::new(token, OperationKind::Receive, Ok(n));
                         c.buffer = Some(buffer);
                         local.push_back(c);
@@ -285,11 +299,13 @@ impl Driver for ReadyDriver {
     }
 
     fn register(&mut self, socket: SharedSocket, token: Token) -> Result<(), NetError> {
+        let messages =
+            !sys::is_stream(socket.as_fd()).map_err(|e| NetError::from_os("getsockopt", e))?;
         let registered = self
             .poller
             .add(socket.as_fd(), token.0)
             .map_err(|e| NetError::from_os("epoll_ctl", e))?;
-        self.insert(token, registered, Some(socket));
+        self.insert(token, registered, Some(socket), messages);
         Ok(())
     }
 

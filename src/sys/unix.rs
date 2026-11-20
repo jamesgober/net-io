@@ -1620,6 +1620,12 @@ pub(crate) fn take_error(sock: Sock<'_>) -> io::Result<Option<io::Error>> {
 /// listening when it has no peer (`getpeername` gives `ENOTCONN`) and is bound to
 /// a port. A bound socket that never called `listen` passes too; its first
 /// `accept` then fails with `EINVAL`, which is a listener failure.
+/// Whether `sock` is a stream socket (TCP, a Unix stream socket).
+#[cfg(feature = "reactor")]
+pub(crate) fn is_stream(sock: Sock<'_>) -> io::Result<bool> {
+    Ok(get_int(sock, c::SOL_SOCKET, c::SO_TYPE)? == c::SOCK_STREAM)
+}
+
 pub(crate) fn is_listening_stream(sock: Sock<'_>) -> io::Result<bool> {
     // The type first, as on Windows: only a stream socket can listen, and the
     // listening check below is then never asked of a datagram socket.
