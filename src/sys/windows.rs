@@ -794,9 +794,12 @@ pub(crate) fn take_error(sock: Sock<'_>) -> io::Result<Option<io::Error>> {
 
 /// Whether `sock` is a listening stream socket.
 pub(crate) fn is_listening_stream(sock: Sock<'_>) -> io::Result<bool> {
-    let listening = get_int(sock, c::SOL_SOCKET, c::SO_ACCEPTCONN)? != 0;
-    let stream = get_int(sock, c::SOL_SOCKET, c::SO_TYPE)? == c::SOCK_STREAM;
-    Ok(listening && stream)
+    // The type first: Windows refuses `SO_ACCEPTCONN` on a datagram socket
+    // (`WSAENOPROTOOPT`), and only a stream socket can listen.
+    if get_int(sock, c::SOL_SOCKET, c::SO_TYPE)? != c::SOCK_STREAM {
+        return Ok(false);
+    }
+    Ok(get_int(sock, c::SOL_SOCKET, c::SO_ACCEPTCONN)? != 0)
 }
 
 /// Identifies a socket handed to this process: a listening TCP stream socket
@@ -2031,6 +2034,9 @@ mod layout {
         };
         let l = tcp_listener("127.0.0.1:0".parse().unwrap(), &p).unwrap();
         assert!(is_listening_stream(l.as_socket()).unwrap());
+        // A datagram socket is not listening, and asking is not an error.
+        let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(!is_listening_stream(u.as_socket()).unwrap());
         assert_eq!(
             get_int(l.as_socket(), c::SOL_SOCKET, c::SO_EXCLUSIVEADDRUSE).unwrap(),
             1

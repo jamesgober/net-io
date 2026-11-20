@@ -1316,7 +1316,7 @@ pub(crate) struct ListenerProxy {
 impl ListenerProxy {
     /// A TCP peer must be a trusted proxy; on a Unix socket listener the file's
     /// permissions already decided who may connect.
-    #[cfg_attr(not(any(feature = "reactor", feature = "proxy")), allow(dead_code))]
+    #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
     pub(crate) fn is_trusted(&self, info: &ConnectionInfo) -> bool {
         match (&self.trusted, info.peer.socket_addr()) {
             (Some(list), Some(peer)) => list.contains(peer.ip()),

@@ -2,9 +2,11 @@
 //! waits until the socket is ready, then the non-blocking call runs.
 //!
 //! A socket's readiness is remembered per direction, because the OS reports
-//! edges. `Receive` makes the call at once when the socket is known to be ready;
-//! a short read clears the flag, since the next arrival raises a new edge, so an
-//! exchange costs one wait, one receive, and one send. `Send` always tries first:
+//! edges. `Receive` makes the call at once when the socket is known to be ready,
+//! and only `WouldBlock` clears the flag: a short read does not prove the socket
+//! is empty (a datagram socket returns one datagram per read), so the receive
+//! after it reads again, and an exchange costs one wait, two receives (the
+//! second finds nothing), and one send. `Send` always tries first:
 //! a socket is writable nearly always, and the wait is the expensive part.
 
 use std::collections::VecDeque;
@@ -145,16 +147,15 @@ impl ReadyDriver {
                 local.push_back(Completion::new(token, OperationKind::Receive, Ok(0)));
             }
             Recv::Into(mut buffer) if reg.readable => {
-                let room = buffer.spare().len();
                 match reg.socket.recv(buffer.spare()) {
                     Ok(n) => {
+                        // Readiness ends only at `WouldBlock`, as edge-triggered
+                        // polling requires: a short read does not prove the socket
+                        // is empty (a datagram socket returns one datagram per read
+                        // with more queued behind it), so the next receive reads
+                        // again and finds out.
                         let len = buffer.len() + n;
                         buffer.set_len(len);
-                        if n < room && n > 0 && !reg.hangup {
-                            // Short read: the socket is drained; the next arrival
-                            // raises a new edge.
-                            reg.readable = false;
-                        }
                         let mut c = Completion::new(token, OperationKind::Receive, Ok(n));
                         c.buffer = Some(buffer);
                         local.push_back(c);

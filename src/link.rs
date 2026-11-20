@@ -2237,7 +2237,7 @@ impl Link {
     }
 
     /// Whether the PROXY handshake already ran.
-    #[cfg(feature = "reactor")]
+    #[cfg(all(feature = "reactor", feature = "proxy"))]
     pub(crate) fn proxy_done(&self) -> bool {
         self.info.proxy.is_some()
     }
