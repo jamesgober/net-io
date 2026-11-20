@@ -230,7 +230,7 @@ Done:
 
 ## v0.8.0 - Alpha
 
-Released as `0.8.0` on 2026-11-18 (D-230). The exit below is counted from that date. `0.8.1` (2026-11-18): `close_door` admits nothing after it returns (D-231); `0.7.3` carries the same fix.
+Released as `0.8.0` on 2026-11-18 (D-230). The exit below is counted from that date. `0.8.1` (2026-11-18): `close_door` admits nothing after it returns (D-231); `0.7.3` carries the same fix. `0.8.2` (2026-11-20): UDP sockets on the reactor driver (D-233, D-234) and each feature building alone (D-235).
 
 Exit: two consumers in daily use for two weeks without a net-io defect of severity medium or above.
 

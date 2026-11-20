@@ -3,7 +3,7 @@
 #![cfg(feature = "reactor")]
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -205,4 +205,96 @@ fn test_send_file_of_no_bytes_sends_nothing() {
     client.read_to_end(&mut got).expect("read");
     let _ = std::fs::remove_file(&path);
     assert!(got.is_empty(), "{} bytes reached the peer", got.len());
+}
+
+/// A bound UDP socket connected to `peer`, ready for a driver.
+fn udp_to(peer: &UdpSocket) -> Arc<UdpSocket> {
+    let s = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    s.connect(peer.local_addr().expect("addr"))
+        .expect("connect");
+    s.set_nonblocking(true).expect("nonblocking");
+    Arc::new(s)
+}
+
+fn receive(driver: &mut dyn Driver, pool: &mut BufferPool, token: Token) {
+    let buffer = pool.take(SizeClass::SMALL).expect("buffer");
+    driver
+        .submit(Operation::Receive { token, buffer })
+        .expect("submit");
+}
+
+#[test]
+fn test_a_udp_socket_registers_and_receives() {
+    // Every backend takes a datagram socket (the IOCP driver once refused one
+    // while checking whether it was listening).
+    let peer = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let mut driver = new_reactor_driver(8).expect("driver");
+    let socket = udp_to(&peer);
+    let shared: SharedSocket = socket.clone();
+    driver
+        .register(shared, Token(3))
+        .expect("register a UDP socket");
+    let mut pool = BufferPool::standalone(1 << 20);
+    receive(&mut *driver, &mut pool, Token(3));
+    peer.send_to(b"ping", socket.local_addr().expect("addr"))
+        .expect("send");
+    let mut out = Completions::new();
+    let c = next(&mut *driver, &mut out);
+    assert_eq!(c.kind, OperationKind::Receive);
+    assert_eq!(c.result, Ok(4));
+    assert_eq!(c.buffer.expect("buffer").as_slice(), b"ping");
+    driver.deregister(Token(3)).expect("deregister");
+}
+
+#[test]
+fn test_datagrams_queued_before_the_first_wakeup_all_arrive() {
+    // Two datagrams wait in the socket before the driver looks at it. One read
+    // returns one datagram, shorter than the buffer; that must not be taken to
+    // mean the socket is empty, or the second never arrives.
+    let peer = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let mut driver = new_reactor_driver(8).expect("driver");
+    let socket = udp_to(&peer);
+    let shared: SharedSocket = socket.clone();
+    driver.register(shared, Token(5)).expect("register");
+    let to = socket.local_addr().expect("addr");
+    peer.send_to(b"first", to).expect("send");
+    peer.send_to(b"second", to).expect("send");
+    peer.send_to(b"third", to).expect("send");
+    std::thread::sleep(Duration::from_millis(50));
+    let mut pool = BufferPool::standalone(1 << 20);
+    let mut out = Completions::new();
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        receive(&mut *driver, &mut pool, Token(5));
+        let c = next(&mut *driver, &mut out);
+        assert_eq!(c.kind, OperationKind::Receive);
+        let n = c.result.expect("receive");
+        let buffer = c.buffer.expect("buffer");
+        got.push(buffer.as_slice()[..n].to_vec());
+        pool.put(buffer);
+    }
+    assert_eq!(
+        got,
+        vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+    );
+}
+
+#[test]
+fn test_stream_bytes_after_a_short_read_still_arrive() {
+    // The same rule on a stream: a short read, then more bytes later.
+    let (mut client, server) = pair();
+    let mut driver = new_reactor_driver(8).expect("driver");
+    driver.register(shared(server), Token(9)).expect("register");
+    let mut pool = BufferPool::standalone(1 << 20);
+    let mut out = Completions::new();
+    client.write_all(b"one").expect("write");
+    receive(&mut *driver, &mut pool, Token(9));
+    let c = next(&mut *driver, &mut out);
+    assert_eq!(c.result, Ok(3));
+    receive(&mut *driver, &mut pool, Token(9));
+    std::thread::sleep(Duration::from_millis(20));
+    client.write_all(b"two").expect("write");
+    let c = next(&mut *driver, &mut out);
+    assert_eq!(c.result, Ok(3));
+    assert_eq!(c.buffer.expect("buffer").as_slice(), b"two");
 }

@@ -45,7 +45,7 @@
 //!
 //! ## Status
 //!
-//! `0.8.1`, alpha: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
+//! `0.8.2`, alpha: the reactor on epoll, kqueue, and IOCP, and the blocking pool, on
 //! Linux, macOS, FreeBSD, and Windows. TCP with a client that reconnects with
 //! backoff, Unix domain sockets (AF_UNIX on Windows), Windows named pipes, and UDP
 //! with batches and sessions; zero-copy file sends and file receives; the PROXY

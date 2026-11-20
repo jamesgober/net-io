@@ -11,6 +11,26 @@
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-20
+
+Three fixes for UDP sockets on the reactor driver, and for building with
+`reactor` alone. No API change.
+
+### Fixed
+
+- On Windows, `Driver::register` refused every UDP socket: it asked whether
+  the socket was listening before asking its type, and Windows answers that
+  question with an error for a datagram socket. The type is checked first now,
+  on every platform.
+- On Linux, macOS and FreeBSD, a `Receive` that read less than its buffer
+  marked the socket as empty. For a UDP socket that is not true (each read
+  returns one datagram), so a second datagram already waiting was never
+  delivered. On a socket that is not a stream, only `WouldBlock` marks it
+  empty now. Streams keep the short-read rule, which is exact for them, so
+  TCP costs nothing more; `Driver::register` reads the socket's type once.
+- `default-features = false, features = ["reactor"]` did not compile without
+  `proxy`. CI now builds and lints every feature on its own.
+
 ## [0.8.1] - 2026-11-18
 
 A fix to `close_door`. No API change.
@@ -719,7 +739,8 @@ The scaffold and the plan. No functional code yet.
   dependencies, testing, open decisions, and the decision log.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/jamesgober/net-io/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/jamesgober/net-io/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/jamesgober/net-io/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/jamesgober/net-io/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/jamesgober/net-io/compare/v0.7.1...v0.7.2

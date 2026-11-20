@@ -125,6 +125,7 @@ enum Recv {
     /// Into the TLS machine's input.
     Cipher,
     /// Into the PROXY handshake's buffer.
+    #[cfg(feature = "proxy")]
     Proxy,
     /// Into a buffer whose bytes are thrown away.
     Discard,
@@ -152,6 +153,7 @@ enum Sending {
 
 /// The PROXY handshake in progress.
 struct ProxyWait {
+    #[cfg(feature = "proxy")]
     parser: crate::proxy_parse::ProxyParser,
     buffer: Option<Buffer>,
 }
@@ -783,8 +785,10 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         let acceptor = self.shared.tls.clone();
         let scale = self.shared.deadline_scale();
         let Some(c) = self.conn(index) else { return };
+        #[cfg(any(feature = "proxy", feature = "tls"))]
         let accepted = c.link.info.accepted_at;
         c.link.set_deadline_scale(scale);
+        #[cfg(any(feature = "proxy", feature = "tls"))]
         let timeout = c.link.scaled(c.link.limits.handshake_timeout);
         #[cfg(feature = "proxy")]
         if let Some(settings) = c.listener.proxy.clone() {
@@ -891,9 +895,6 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         self.arm_timer(index);
     }
 
-    #[cfg(not(feature = "proxy"))]
-    fn proxy_read(&mut self, _index: u32) {}
-
     #[cfg(feature = "proxy")]
     fn proxy_data(&mut self, index: u32, mut buffer: Buffer, n: usize) {
         use crate::proxy_parse::{ProxyAddress, ProxyCommand, ProxyProgress};
@@ -973,11 +974,6 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
         }
     }
 
-    #[cfg(not(feature = "proxy"))]
-    fn proxy_data(&mut self, _index: u32, buffer: Buffer, _n: usize) {
-        self.pool.put(buffer);
-    }
-
     // ---- the TLS machine ----------------------------------------------------------
 
     /// A handshake's TLS buffers, under this worker's cap on what unfinished
@@ -1049,6 +1045,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
 
     /// Waits for bytes without holding a buffer (a zero-byte receive), under the
     /// deadline of the connection's wait.
+    #[cfg(feature = "tls")]
     fn receive_zero(&mut self, index: u32) {
         let Some(c) = self.conn(index) else { return };
         let token = c.token;
@@ -1899,6 +1896,7 @@ impl<F: SessionFactory, G: Gate> Reactor<'_, F, G> {
                 }
                 self.tls_turn(index);
             }
+            #[cfg(feature = "proxy")]
             Recv::Proxy => {
                 let Some(buffer) = done.buffer else { return };
                 if closing {
